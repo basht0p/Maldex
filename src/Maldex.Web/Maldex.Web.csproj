@@ -1,5 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
   <ItemGroup>
+    <PackageReference Include="Microsoft.Identity.Web" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Maldex.Data\Maldex.Data.csproj" />
     <ProjectReference Include="..\Maldex.Orchestrator\Maldex.Orchestrator.csproj" />
     <ProjectReference Include="..\Maldex.Processing\Maldex.Processing.csproj" />
   </ItemGroup>
