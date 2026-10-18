@@ -30,24 +30,20 @@ public sealed class DevAuthHandler(
 
     protected override Task<AuthenticateResult> HandleAuthenticateAsync()
     {
-        if (env.IsProduction())
-            return Task.FromResult(AuthenticateResult.Fail("Dev auth is not allowed in Production"));
+        if (!env.IsDevelopment() && !env.IsEnvironment("Testing"))
+            return Task.FromResult(AuthenticateResult.Fail($"Dev auth is not allowed in {env.EnvironmentName}"));
 
-        var honorHeaders = env.IsDevelopment() || env.IsEnvironment("Testing");
         var oid = DefaultOid;
         var name = "Dev User";
         var role = ParseRole(devOptions.Value.DevRole) ?? UserRole.Admin;
 
-        if (honorHeaders)
+        var user = Request.Headers["X-Dev-User"].ToString();
+        if (!string.IsNullOrWhiteSpace(user))
         {
-            var user = Request.Headers["X-Dev-User"].ToString();
-            if (!string.IsNullOrWhiteSpace(user))
-            {
-                name = user;
-                oid = new Guid(SHA256.HashData(Encoding.UTF8.GetBytes("dev:" + user)).AsSpan(0, 16));
-            }
-            role = ParseRole(Request.Headers["X-Dev-Role"].ToString()) ?? role;
+            name = user;
+            oid = new Guid(SHA256.HashData(Encoding.UTF8.GetBytes("dev:" + user)).AsSpan(0, 16));
         }
+        role = ParseRole(Request.Headers["X-Dev-Role"].ToString()) ?? role;
 
         var appRole = role == UserRole.Admin ? AuthSetup.AdminRole : AuthSetup.AnalystRole;
         var identity = new ClaimsIdentity(

@@ -103,6 +103,26 @@ public sealed class AuthAndOrgTests(SqlServerFixture sql) : IDisposable
     }
 
     [Fact]
+    public void DevAuth_RejectedInStaging()
+    {
+        using var staging = new MaldexAppFactory(sql, environment: "Staging", authMode: "Dev");
+        var ex = Assert.ThrowsAny<Exception>(() => staging.CreateClient());
+        var inner = ex is InvalidOperationException ? ex : ex.InnerException ?? ex;
+        Assert.IsType<InvalidOperationException>(inner);
+        Assert.Equal("Dev auth is not allowed in Staging", inner.Message);
+    }
+
+    [Fact]
+    public void InvalidDevRole_FailsStartup()
+    {
+        using var bad = new MaldexAppFactory(sql, devRole: "Superuser");
+        var ex = Assert.ThrowsAny<Exception>(() => bad.CreateClient());
+        var inner = ex is InvalidOperationException ? ex : ex.InnerException ?? ex;
+        Assert.IsType<InvalidOperationException>(inner);
+        Assert.Contains("DevRole", inner.Message);
+    }
+
+    [Fact]
     public async Task ResponsesCarryCsp()
     {
         using var client = _factory.CreateClient();

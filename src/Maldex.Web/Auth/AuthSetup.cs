@@ -20,8 +20,14 @@ public static class AuthSetup
     {
         var mode = builder.Configuration["Maldex:Auth:Mode"] ?? "Entra";
         var isDev = string.Equals(mode, "Dev", StringComparison.OrdinalIgnoreCase);
-        if (isDev && builder.Environment.IsProduction())
-            throw new InvalidOperationException("Dev auth is not allowed in Production");
+        if (isDev)
+        {
+            if (!builder.Environment.IsDevelopment() && !builder.Environment.IsEnvironment("Testing"))
+                throw new InvalidOperationException($"Dev auth is not allowed in {builder.Environment.EnvironmentName}");
+            var devRole = builder.Configuration["Maldex:Auth:DevRole"];
+            if (!string.IsNullOrEmpty(devRole) && !(Enum.TryParse<UserRole>(devRole, true, out var r) && Enum.IsDefined(r)))
+                throw new InvalidOperationException($"Invalid Maldex:Auth:DevRole '{devRole}' (expected Admin or Analyst)");
+        }
 
         builder.Services.Configure<DevAuthOptions>(builder.Configuration.GetSection("Maldex:Auth"));
         if (isDev)

@@ -15,16 +15,18 @@ public class MaldexAppFactory : WebApplicationFactory<Program>
     private readonly string _environment;
     private readonly bool _workers;
     private readonly string _authMode;
+    private readonly string? _devRole;
 
     public string ArtifactRoot { get; } = Path.Combine(Path.GetTempPath(), "maldex-tests-" + Guid.NewGuid().ToString("N"));
     public string ConnectionString { get; }
 
-    public MaldexAppFactory(SqlServerFixture sql, string environment = "Testing", bool workers = false, string authMode = "Dev")
+    public MaldexAppFactory(SqlServerFixture sql, string environment = "Testing", bool workers = false, string authMode = "Dev", string? devRole = null)
     {
         _sql = sql;
         _environment = environment;
         _workers = workers;
         _authMode = authMode;
+        _devRole = devRole;
         ConnectionString = sql.CreateDatabaseConnectionString();
     }
 
@@ -33,6 +35,7 @@ public class MaldexAppFactory : WebApplicationFactory<Program>
         builder.UseEnvironment(_environment);
         builder.UseSetting("Maldex:Mode", "Fake");
         builder.UseSetting("Maldex:Auth:Mode", _authMode);
+        if (_devRole is not null) builder.UseSetting("Maldex:Auth:DevRole", _devRole);
         builder.UseSetting("Maldex:Workers:Enabled", _workers ? "true" : "false");
         builder.UseSetting("Maldex:Artifacts:Root", ArtifactRoot);
         builder.UseSetting("ConnectionStrings:Maldex", ConnectionString);
