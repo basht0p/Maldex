@@ -76,4 +76,11 @@ public class AgentMessageValidatorTests
         Assert.True(t.Record("x"));
         Assert.Equal(10, t.Count);
     }
+
+    [Fact]
+    public void DnsAnswersWithNullElement_Invalid()
+    {
+        Assert.NotNull(AgentMessageValidator.Validate(new DnsEventMessage(T, 1, "a.com", null, ["1.1.1.1", null!])));
+        Assert.Null(AgentMessageValidator.Validate(new DnsEventMessage(T, 1, "a.com", null, ["1.1.1.1"])));
+    }
 }

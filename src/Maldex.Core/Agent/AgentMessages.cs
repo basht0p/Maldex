@@ -10,8 +10,11 @@ public static class AgentJson
 
     private static JsonSerializerOptions Create()
     {
-        var o = new JsonSerializerOptions(JsonSerializerDefaults.Web)
+        var o = new JsonSerializerOptions
         {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            PropertyNameCaseInsensitive = false,
+            NumberHandling = JsonNumberHandling.Strict,
             AllowOutOfOrderMetadataProperties = true,
             RespectRequiredConstructorParameters = true,
             RespectNullableAnnotations = true,

@@ -19,7 +19,8 @@ public static class AgentMessageValidator
             ?? Req(m.RemoteAddress, "RemoteAddress")
             ?? (m.RemotePort is < 1 or > 65535 ? "RemotePort out of range." : null)
             ?? (m.LocalPort is < 0 or > 65535 ? "LocalPort out of range." : null),
-        DnsEventMessage m => Pid(m.Pid) ?? Req(m.Query, "Query"),
+        DnsEventMessage m => Pid(m.Pid) ?? Req(m.Query, "Query")
+            ?? (m.Answers is not null && Array.Exists(m.Answers, a => a is null) ? "Answers contains null." : null),
         ScreenshotMessage m => OneOf(m.Format, "Format", "jpeg", "png") ?? Base64(m.ImageBase64),
         CommandResultMessage m => Req(m.CommandId, "CommandId"),
         _ => "Unknown message type.",

@@ -139,4 +139,92 @@ public class AgentFrameReaderTests
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             AgentFrameWriter.WriteAsync(new MemoryStream(), big, CancellationToken.None).AsTask());
     }
+
+    private static readonly string[] ValidBodies =
+    [
+        Ready,
+        """{"type":"process_started","at":"2026-01-01T00:00:00Z","pid":4,"parentPid":1,"imagePath":"c:\\a.exe","commandLine":"a","user":"u","integrity":"high"}""",
+        """{"type":"process_exited","at":"2026-01-01T00:00:00Z","pid":4,"exitCode":0}""",
+        """{"type":"file","at":"2026-01-01T00:00:00Z","pid":4,"operation":"write","path":"c:\\x","newPath":null}""",
+        """{"type":"registry","at":"2026-01-01T00:00:00Z","pid":4,"operation":"set","key":"HKLM\\k","valueName":"v","data":"d"}""",
+        """{"type":"network","at":"2026-01-01T00:00:00Z","pid":4,"protocol":"tcp","remoteAddress":"1.2.3.4","remotePort":443,"localAddress":null,"localPort":5}""",
+        """{"type":"dns","at":"2026-01-01T00:00:00Z","pid":4,"query":"a.com","queryType":"A","answers":["1.1.1.1"]}""",
+        """{"type":"screenshot","at":"2026-01-01T00:00:00Z","format":"png","imageBase64":"AAAA"}""",
+        """{"type":"command_result","commandId":"c","success":true,"error":null}""",
+    ];
+
+    [Fact]
+    public async Task ValidBodies_AllRead()
+    {
+        foreach (var b in ValidBodies)
+            Assert.IsType<FrameReadResult.Frame>(await new AgentFrameReader(Concat(Frame(b))).ReadAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task MutationFuzz_NeverThrows_AndNextFrameStillReads()
+    {
+        var rnd = new Random(1234);
+        var good = Frame(Ready);
+        for (var i = 0; i < 6000; i++)
+        {
+            var body = Encoding.UTF8.GetBytes(ValidBodies[i % ValidBodies.Length]);
+            var edits = rnd.Next(1, 6);
+            for (var e = 0; e < edits; e++)
+            {
+                switch (rnd.Next(3))
+                {
+                    case 0: body[rnd.Next(body.Length)] = (byte)rnd.Next(256); break;
+                    case 1: body[rnd.Next(body.Length)] ^= (byte)(1 << rnd.Next(8)); break;
+                    default:
+                        if (body.Length > 2) body = body[..rnd.Next(1, body.Length)];
+                        break;
+                }
+            }
+            var hdr = new byte[4];
+            BinaryPrimitives.WriteUInt32BigEndian(hdr, (uint)body.Length);
+            var r = new AgentFrameReader(Concat(hdr, body, good));
+            var first = await r.ReadAsync(CancellationToken.None);
+            Assert.True(first is FrameReadResult.Frame or FrameReadResult.Dropped);
+            Assert.IsType<FrameReadResult.Frame>(await r.ReadAsync(CancellationToken.None));
+        }
+    }
+
+    private static byte[] RawFrame(byte[] body)
+    {
+        var buf = new byte[4 + body.Length];
+        BinaryPrimitives.WriteUInt32BigEndian(buf, (uint)body.Length);
+        body.CopyTo(buf, 4);
+        return buf;
+    }
+
+    public static TheoryData<string> HostileBodies() => new()
+    {
+        "{\"type\":\"ready\",\"agentVersion\":\"1\",\"hostname\":\"h\",\"x\":" + new string('[', 100) + new string(']', 100) + "}",
+        "{\"type\":5,\"agentVersion\":\"1\",\"hostname\":\"h\"}",
+        "{\"type\":\"ready\",\"agentVersion\":\"1\",\"hostname\":null}",
+        "{\"type\":\"process_exited\",\"at\":\"2026-01-01T00:00:00Z\",\"exitCode\":0}",
+        "{\"type\":\"command_result\",\"commandId\":\"c\"}",
+        "{\"type\":\"process_exited\",\"at\":\"not a date\",\"pid\":1,\"exitCode\":0}",
+        "{\"type\":\"process_exited\",\"at\":\"2026-01-01T00:00:00Z\",\"pid\":99999999999999,\"exitCode\":0}",
+        "{\"type\":\"process_exited\",\"at\":\"2026-01-01T00:00:00Z\",\"pid\":\"7\",\"exitCode\":0}",
+        "{\"Type\":\"ready\",\"AgentVersion\":\"1\",\"Hostname\":\"h\"}",
+    };
+
+    [Theory]
+    [MemberData(nameof(HostileBodies))]
+    public async Task HostileBodies_AreDropped(string json)
+    {
+        var r = new AgentFrameReader(Concat(Frame(json), Frame(Ready)));
+        Assert.IsType<FrameReadResult.Dropped>(await r.ReadAsync(CancellationToken.None));
+        Assert.IsType<FrameReadResult.Frame>(await r.ReadAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task InvalidUtf8_IsDropped()
+    {
+        byte[] body = [.. "{\"type\":\"ready\",\"agentVersion\":\""u8, 0xFF, 0xC0, 0x80, .. "\",\"hostname\":\"h\"}"u8];
+        var r = new AgentFrameReader(Concat(RawFrame(body), Frame(Ready)));
+        Assert.IsType<FrameReadResult.Dropped>(await r.ReadAsync(CancellationToken.None));
+        Assert.IsType<FrameReadResult.Frame>(await r.ReadAsync(CancellationToken.None));
+    }
 }
