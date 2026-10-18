@@ -185,6 +185,37 @@ public sealed class ReplayAgentChannelTests : IDisposable
     }
 
     [Fact]
+    public async Task ReadAsync_AfterDispose_YieldsNothing_WithoutThrowing()
+    {
+        var ch = await Open([Ready], holdOpen: true).WaitAsync(Timeout, TestContext.Current.CancellationToken);
+        await ch.DisposeAsync();
+        var list = new List<AgentMessage>();
+        await foreach (var m in ch.ReadAsync(TestContext.Current.CancellationToken)) list.Add(m);
+        Assert.Empty(list);
+        await ch.DisposeAsync(); // idempotent
+    }
+
+    [Fact]
+    public async Task DisposeAsync_DuringReadEnumeration_CompletesItWithoutException()
+    {
+        var ch = await Open([Ready], holdOpen: true).WaitAsync(Timeout, TestContext.Current.CancellationToken);
+        var got = new List<AgentMessage>();
+        var reader = Start(async () => { await foreach (var m in ch.ReadAsync(TestContext.Current.CancellationToken)) lock (got) got.Add(m); });
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
+        {
+            lock (got) if (got.Count == 1) break;
+            Assert.True(sw.Elapsed < Timeout, "No message within the timeout.");
+            _time.Advance(TimeSpan.FromMilliseconds(250));
+            await Task.Delay(1, TestContext.Current.CancellationToken);
+        }
+        await Task.Delay(20, TestContext.Current.CancellationToken); // let the read block on the pipe
+        await ch.DisposeAsync();
+        await reader.WaitAsync(Timeout, TestContext.Current.CancellationToken); // faults if an exception escaped
+        Assert.True(reader.IsCompletedSuccessfully);
+    }
+
+    [Fact]
     public void ShippedScreenshots_AreDecodableBaselineJpegs()
     {
         var shipped = Path.Combine(AppContext.BaseDirectory, "Fakes", "Replays");

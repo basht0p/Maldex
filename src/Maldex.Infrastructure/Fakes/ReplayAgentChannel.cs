@@ -61,11 +61,16 @@ public sealed class ReplayAgentChannel : IAgentChannel
     {
         lock (_gate) { if (_readerCompleted) return; _readerCompleted = true; }
         await _pipe.Reader.CompleteAsync().ConfigureAwait(false);
+        _cts.Dispose(); // the producer has finished by the time the reader is completed
     }
 
     public async IAsyncEnumerable<AgentMessage> ReadAsync([EnumeratorCancellation] CancellationToken ct)
     {
-        lock (_gate) _activeReads++;
+        lock (_gate)
+        {
+            if (_closing) yield break;
+            _activeReads++;
+        }
         try
         {
             await foreach (var m in ReadCoreAsync(ct).ConfigureAwait(false)) yield return m;
@@ -117,7 +122,6 @@ public sealed class ReplayAgentChannel : IAgentChannel
         await _producer.ConfigureAwait(false);
         lock (_gate) { _closing = true; if (_activeReads > 0) return; }
         await CompleteReaderAsync().ConfigureAwait(false);
-        _cts.Dispose();
     }
 
     private async Task ProduceAsync(string[] lines)
