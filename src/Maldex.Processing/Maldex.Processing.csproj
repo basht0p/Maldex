@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\Maldex.Infrastructure\Maldex.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>

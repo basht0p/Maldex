@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <ItemGroup>
+    <ProjectReference Include="..\Maldex.Orchestrator\Maldex.Orchestrator.csproj" />
+    <ProjectReference Include="..\Maldex.Processing\Maldex.Processing.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Maldex.Core/Maldex.Core.csproj" />
+    <Project Path="src/Maldex.Data/Maldex.Data.csproj" />
+    <Project Path="src/Maldex.Infrastructure/Maldex.Infrastructure.csproj" />
+    <Project Path="src/Maldex.Orchestrator/Maldex.Orchestrator.csproj" />
+    <Project Path="src/Maldex.Processing/Maldex.Processing.csproj" />
+    <Project Path="src/Maldex.Web/Maldex.Web.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Maldex.Core.Tests/Maldex.Core.Tests.csproj" />
+    <Project Path="tests/Maldex.Integration.Tests/Maldex.Integration.Tests.csproj" />
+  </Folder>
+</Solution>

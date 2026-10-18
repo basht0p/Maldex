@@ -7,3 +7,16 @@ GEMINI.md
 .cursorrules
 .github/copilot-instructions.md
 docs/superpowers/
+.superpowers/
+
+# .NET / Node / build output
+bin/
+obj/
+TestResults/
+*.user
+.vs/
+.env
+.data/
+node_modules/
+ui/dist/
+src/Maldex.Web/wwwroot/
