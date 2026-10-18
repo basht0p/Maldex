@@ -72,6 +72,51 @@ public sealed class FileSystemArtifactStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task Put_DirectoriesHaveNoOtherBits()
+    {
+        var blob = await _store.PutAsync("samples", Bytes("dirs"), 1024, CancellationToken.None);
+        var shard = Path.GetDirectoryName(_store.GetPath(blob.Key))!;
+        var dirs = new List<string> { _root, Path.Combine(_root, "tmp") };
+        for (var d = shard; d != _root; d = Path.GetDirectoryName(d)!) dirs.Add(d);
+        Assert.Equal(5, dirs.Count);
+        foreach (var d in dirs)
+        {
+            var mode = File.GetUnixFileMode(d);
+            Assert.Equal(UnixFileMode.None, mode & (UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute));
+        }
+    }
+
+    [Fact]
+    public async Task Put_TempFileIsOwnerOnlyWhileIngesting()
+    {
+        using var content = new PausedStream(new byte[] { 1, 2, 3 });
+        var put = Task.Run(() => _store.PutAsync("samples", content, 1024, CancellationToken.None));
+        await content.Reading.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        var temp = Assert.Single(Directory.EnumerateFiles(Path.Combine(_root, "tmp")));
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(temp));
+        content.Release.SetResult();
+        await put;
+    }
+
+    private sealed class PausedStream(byte[] data) : MemoryStream(data)
+    {
+        public TaskCompletionSource Reading { get; } = new();
+        public TaskCompletionSource Release { get; } = new();
+        private int _calls;
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        {
+            // Pause on the second read, after the temp file exists and has been created.
+            if (++_calls == 2)
+            {
+                Reading.TrySetResult();
+                await Release.Task;
+            }
+            return await base.ReadAsync(buffer, ct);
+        }
+    }
+
+    [Fact]
     public async Task Put_OverMax_ThrowsAndLeavesNoTempFile()
     {
         await Assert.ThrowsAsync<BlobTooLargeException>(() =>

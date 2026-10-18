@@ -23,6 +23,11 @@ public sealed partial class FileSystemArtifactStore : IArtifactStore
 
     private const UnixFileMode ReadOnlyMode = UnixFileMode.UserRead | UnixFileMode.GroupRead;
 
+    private const UnixFileMode DirMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+        | UnixFileMode.GroupRead | UnixFileMode.GroupExecute;
+
+    private const UnixFileMode TempMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+
     private readonly string _root;
     private readonly string _tmp;
 
@@ -59,7 +64,7 @@ public sealed partial class FileSystemArtifactStore : IArtifactStore
         if (category is null || !CategoryRegex().IsMatch(category))
             throw new ArgumentException("Category must match ^[a-z]+$.", nameof(category));
 
-        Directory.CreateDirectory(_tmp);
+        EnsureDirectory(_tmp);
         var tempPath = Path.Combine(_tmp, Guid.NewGuid().ToString("N"));
         try
         {
@@ -68,7 +73,15 @@ public sealed partial class FileSystemArtifactStore : IArtifactStore
             using var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
             long size = 0;
 
-            await using (var tmp = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
+            await using (var tmp = new FileStream(tempPath, new FileStreamOptions
+            {
+                Mode = FileMode.CreateNew,
+                Access = FileAccess.Write,
+                Share = FileShare.None,
+                BufferSize = 81920,
+                Options = FileOptions.Asynchronous,
+                UnixCreateMode = TempMode,
+            }))
             {
                 var buffer = new byte[81920];
                 int read;
@@ -86,7 +99,7 @@ public sealed partial class FileSystemArtifactStore : IArtifactStore
             var hash = Convert.ToHexStringLower(sha256.GetHashAndReset());
             var key = $"{category}/{hash[..2]}/{hash[2..4]}/{hash}";
             var dest = GetPath(key);
-            Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+            EnsureDirectory(Path.GetDirectoryName(dest)!);
 
             if (File.Exists(dest))
             {
@@ -115,6 +128,16 @@ public sealed partial class FileSystemArtifactStore : IArtifactStore
             try { File.Delete(tempPath); } catch (IOException) { }
             throw;
         }
+    }
+
+    /// <summary>Creates <paramref name="dir"/> and every missing ancestor at or below the root with owner+group-only mode.
+    /// (Directory.CreateDirectory applies the mode to the leaf only, so each level is created explicitly.)</summary>
+    private void EnsureDirectory(string dir)
+    {
+        if (Directory.Exists(dir)) return;
+        if (!string.Equals(dir, _root, StringComparison.Ordinal))
+            EnsureDirectory(Path.GetDirectoryName(dir)!);
+        Directory.CreateDirectory(dir, DirMode);
     }
 
     private static void ValidateKey(string key)
