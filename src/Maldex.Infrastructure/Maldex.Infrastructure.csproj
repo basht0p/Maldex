@@ -1,5 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
+    <PackageReference Include="SharpZipLib" />
+    <PackageReference Include="Microsoft.Extensions.Options" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\Maldex.Data\Maldex.Data.csproj" />
   </ItemGroup>
 </Project>
