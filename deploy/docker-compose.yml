@@ -1,0 +1,99 @@
+# Maldex production-style stack. Driven by deploy/maldexctl; see DEPLOYMENT.md.
+# All settings come from deploy/.env (copy .env.example, or let `maldexctl install` generate it).
+#
+# Startup order: sql (healthy) -> db-init (creates DB + least-privilege app login)
+#                -> migrate (EF Core bundle) -> web
+name: maldex
+
+x-admin-db-env: &admin-db-env
+  MALDEX_DB_NAME: ${MALDEX_DB_NAME:-maldex}
+  MALDEX_DB_APP_USER: ${MALDEX_DB_APP_USER:-maldex_app}
+  MALDEX_DB_APP_PASSWORD: ${MALDEX_DB_APP_PASSWORD:?set MALDEX_DB_APP_PASSWORD in deploy/.env}
+  SQLCMDPASSWORD: ${MALDEX_DB_ADMIN_PASSWORD:?set MALDEX_DB_ADMIN_PASSWORD in deploy/.env}
+
+services:
+  # Bundled SQL Server. Disable by removing "bundled-db" from COMPOSE_PROFILES
+  # and pointing MALDEX_DB_HOST at an existing server.
+  sql:
+    image: mcr.microsoft.com/mssql/server:${MSSQL_VERSION:-2022-latest}
+    profiles: ["bundled-db"]
+    restart: unless-stopped
+    environment:
+      # SQL Server refuses to start until this is Y (maldexctl install asks).
+      ACCEPT_EULA: ${MSSQL_ACCEPT_EULA:-}
+      MSSQL_PID: ${MSSQL_PID:-Express}
+      MSSQL_MEMORY_LIMIT_MB: ${MSSQL_MEMORY_LIMIT_MB:-2048}
+      MSSQL_SA_PASSWORD: ${MALDEX_DB_ADMIN_PASSWORD:?set MALDEX_DB_ADMIN_PASSWORD in deploy/.env}
+    volumes:
+      - sql-data:/var/opt/mssql
+    # Not published to the host; only reachable on the compose network.
+    healthcheck:
+      test: ["CMD-SHELL", "SQLCMDPASSWORD=\"$$MSSQL_SA_PASSWORD\" /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # Idempotent: creates the database and the app login, re-syncs the app password.
+  db-init:
+    image: mcr.microsoft.com/mssql/server:${MSSQL_VERSION:-2022-latest}
+    restart: "no"
+    entrypoint: ["/opt/mssql-tools18/bin/sqlcmd"]
+    command:
+      - "-S"
+      - "${MALDEX_DB_HOST:-sql},${MALDEX_DB_PORT:-1433}"
+      - "-U"
+      - "${MALDEX_DB_ADMIN_USER:-sa}"
+      - "-C"
+      - "-b"
+      - "-i"
+      - "/init/init.sql"
+    environment: *admin-db-env
+    volumes:
+      - ./sql/init.sql:/init/init.sql:ro
+    depends_on:
+      sql:
+        condition: service_healthy
+        required: false
+
+  migrate:
+    image: maldex-migrate:${MALDEX_VERSION:-local}
+    build:
+      context: ..
+      target: migrate
+    restart: "no"
+    environment:
+      MALDEX_MIGRATE_CONNSTR: "Server=${MALDEX_DB_HOST:-sql},${MALDEX_DB_PORT:-1433};Database=${MALDEX_DB_NAME:-maldex};User Id=${MALDEX_DB_ADMIN_USER:-sa};Password=${MALDEX_DB_ADMIN_PASSWORD};Encrypt=True;TrustServerCertificate=${MALDEX_DB_TRUST_SERVER_CERT:-True}"
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+
+  web:
+    image: maldex-web:${MALDEX_VERSION:-local}
+    build:
+      context: ..
+      target: web
+    restart: unless-stopped
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Production}
+      # Not read by the app yet; provided so wiring up the DbContext needs no deploy change.
+      ConnectionStrings__Maldex: "Server=${MALDEX_DB_HOST:-sql},${MALDEX_DB_PORT:-1433};Database=${MALDEX_DB_NAME:-maldex};User Id=${MALDEX_DB_APP_USER:-maldex_app};Password=${MALDEX_DB_APP_PASSWORD};Encrypt=True;TrustServerCertificate=${MALDEX_DB_TRUST_SERVER_CERT:-True}"
+      Maldex__Artifacts__Root: /var/lib/maldex/artifacts
+    volumes:
+      - artifacts:/var/lib/maldex/artifacts
+    ports:
+      - "${MALDEX_HTTP_BIND:-127.0.0.1}:${MALDEX_HTTP_PORT:-8080}:8080"
+    healthcheck:
+      # Port check only; swap for an HTTP /healthz probe once the app exposes one.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  sql-data:
+  artifacts:

@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# Operator entry point for a Maldex deployment. See DEPLOYMENT.md.
+set -euo pipefail
+
+DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$DEPLOY_DIR/.env"
+COMPOSE=(docker compose --project-directory "$DEPLOY_DIR" -f "$DEPLOY_DIR/docker-compose.yml" --env-file "$ENV_FILE")
+
+die()  { echo "maldexctl: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+warn() { echo "warning: $*" >&2; }
+
+# Reads one key from deploy/.env without sourcing it.
+env_get() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1; }
+
+env_set() {
+  local key="$1" value="$2" tmp
+  tmp="$(mktemp "$ENV_FILE.XXXXXX")"
+  awk -v k="$key" -v v="$value" 'BEGIN{done=0} $0 ~ "^"k"=" {print k"="v; done=1; next} {print} END{if(!done) print k"="v}' "$ENV_FILE" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$ENV_FILE"
+}
+
+# 32 chars that always satisfy SQL Server complexity rules and are safe in connection strings.
+gen_password() {
+  printf 'Mx9%s' "$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 29)"
+}
+
+has_profile() { [[ ",$(env_get COMPOSE_PROFILES)," == *",$1,"* ]]; }
+
+preflight() {
+  command -v docker >/dev/null 2>&1 || die "docker is not installed (https://docs.docker.com/engine/install/)"
+  docker compose version >/dev/null 2>&1 || die "Docker Compose v2 plugin is required ('docker compose')"
+  docker info >/dev/null 2>&1 || die "cannot reach the Docker daemon (is it running, and can this user use it?)"
+
+  local arch; arch="$(uname -m)"
+  if [ -f "$ENV_FILE" ] && has_profile bundled-db && [ "$arch" != "x86_64" ]; then
+    die "the bundled SQL Server image is x86_64 only (this host is $arch). Use an external SQL Server; see DEPLOYMENT.md"
+  fi
+
+  local mem_kb
+  mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  if [ "${mem_kb:-0}" -gt 0 ] && [ "$mem_kb" -lt 4000000 ]; then
+    warn "less than 4 GB RAM detected; SQL Server needs at least 2 GB on its own"
+  fi
+}
+
+require_env() {
+  [ -f "$ENV_FILE" ] || die "no deploy/.env yet. Run '$0 install' first"
+}
+
+wait_healthy() {
+  local svc="$1" cid status
+  info "Waiting for $svc to become healthy"
+  for _ in $(seq 1 60); do
+    cid="$("${COMPOSE[@]}" ps -q "$svc" 2>/dev/null || true)"
+    status="$( [ -n "$cid" ] && docker inspect -f '{{.State.Health.Status}}' "$cid" 2>/dev/null || true)"
+    [ "$status" = "healthy" ] && return 0
+    sleep 5
+  done
+  "${COMPOSE[@]}" logs --tail 50 "$svc" >&2 || true
+  die "$svc did not become healthy"
+}
+
+cmd_install() {
+  local accept_eula=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --accept-sql-eula) accept_eula=1; shift ;;
+      *) die "unknown install option: $1" ;;
+    esac
+  done
+
+  preflight
+
+  if [ ! -f "$ENV_FILE" ]; then
+    info "Creating deploy/.env from .env.example"
+    (umask 077; cp "$DEPLOY_DIR/.env.example" "$ENV_FILE")
+  else
+    info "Keeping existing deploy/.env"
+  fi
+  chmod 600 "$ENV_FILE"
+
+  [ -n "$(env_get MALDEX_DB_ADMIN_PASSWORD)" ] || env_set MALDEX_DB_ADMIN_PASSWORD "$(gen_password)"
+  [ -n "$(env_get MALDEX_DB_APP_PASSWORD)" ]   || env_set MALDEX_DB_APP_PASSWORD "$(gen_password)"
+
+  if has_profile bundled-db && [ "$(env_get MSSQL_ACCEPT_EULA)" != "Y" ]; then
+    if [ "$accept_eula" -eq 0 ] && [ -t 0 ]; then
+      echo "The bundled database is Microsoft SQL Server. Its EULA: https://go.microsoft.com/fwlink/?linkid=857698"
+      local answer; read -r -p "Do you accept the SQL Server EULA? [y/N] " answer
+      [[ "$answer" =~ ^[Yy]$ ]] && accept_eula=1
+    fi
+    [ "$accept_eula" -eq 1 ] || die "the SQL Server EULA must be accepted (re-run with --accept-sql-eula, or set MSSQL_ACCEPT_EULA=Y in deploy/.env)"
+    env_set MSSQL_ACCEPT_EULA Y
+  fi
+
+  preflight
+  info "Building images (first build takes a few minutes)"
+  "${COMPOSE[@]}" build
+  cmd_up
+  echo
+  info "Maldex is up."
+  echo "    URL: http://$(env_get MALDEX_HTTP_BIND):$(env_get MALDEX_HTTP_PORT)/"
+  echo "    Secrets are in $ENV_FILE (mode 600). Back it up somewhere safe."
+}
+
+cmd_up() {
+  require_env
+  "${COMPOSE[@]}" up -d --remove-orphans
+  wait_healthy web
+}
+
+cmd_down() { require_env; "${COMPOSE[@]}" down "$@"; }
+
+cmd_upgrade() {
+  require_env
+  preflight
+  info "Rebuilding images from the current checkout"
+  "${COMPOSE[@]}" build --pull
+  # up re-runs db-init and migrate (one-shot services) before recreating web.
+  cmd_up
+  info "Upgrade complete"
+}
+
+cmd_migrate() {
+  require_env
+  "${COMPOSE[@]}" up --no-deps db-init
+  "${COMPOSE[@]}" up --no-deps --exit-code-from migrate migrate
+}
+
+cmd_status() { require_env; "${COMPOSE[@]}" ps -a; }
+cmd_logs()   { require_env; "${COMPOSE[@]}" logs -f --tail 200 "$@"; }
+
+cmd_backup() {
+  require_env
+  local dest="${1:-$DEPLOY_DIR/backups/$(date -u +%Y%m%dT%H%M%SZ)}" db
+  db="$(env_get MALDEX_DB_NAME)"
+  mkdir -p "$dest"
+  dest="$(cd "$dest" && pwd)"
+
+  if has_profile bundled-db; then
+    info "Backing up database $db"
+    "${COMPOSE[@]}" exec -T sql sh -c \
+      "SQLCMDPASSWORD=\"\$MSSQL_SA_PASSWORD\" /opt/mssql-tools18/bin/sqlcmd -C -b -S localhost -U sa \
+       -Q \"BACKUP DATABASE [$db] TO DISK = N'/var/opt/mssql/data/maldex-backup.bak' WITH COPY_ONLY, INIT, CHECKSUM\""
+    "${COMPOSE[@]}" cp sql:/var/opt/mssql/data/maldex-backup.bak "$dest/$db.bak"
+    "${COMPOSE[@]}" exec -T sql rm -f /var/opt/mssql/data/maldex-backup.bak
+  else
+    warn "external database: back it up with your SQL Server tooling"
+  fi
+
+  info "Backing up artifact store"
+  "${COMPOSE[@]}" run --rm --no-deps -T --user 0 --entrypoint tar -v "$dest:/backup" \
+    web czf /backup/artifacts.tar.gz -C /var/lib/maldex artifacts
+
+  (umask 077; cp "$ENV_FILE" "$dest/env")
+  chmod -R go-rwx "$dest"
+  info "Backup written to $dest (includes deploy/.env secrets; store it securely)"
+}
+
+cmd_restore() {
+  require_env
+  local src="${1:-}" db
+  [ -n "$src" ] && [ -d "$src" ] || die "usage: $0 restore <backup-dir>"
+  src="$(cd "$src" && pwd)"
+  db="$(env_get MALDEX_DB_NAME)"
+  has_profile bundled-db || die "restore only handles the bundled database; restore an external one with your SQL Server tooling"
+  [ -f "$src/$db.bak" ] || die "no $db.bak in $src"
+
+  if [ -t 0 ]; then
+    local answer; read -r -p "This REPLACES database '$db' and the artifact store with $src. Continue? [y/N] " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || die "aborted"
+  fi
+
+  info "Stopping web"
+  "${COMPOSE[@]}" stop web >/dev/null 2>&1 || true
+  "${COMPOSE[@]}" up -d sql
+  wait_healthy sql
+
+  info "Restoring database $db"
+  "${COMPOSE[@]}" cp "$src/$db.bak" sql:/var/opt/mssql/data/maldex-restore.bak
+  "${COMPOSE[@]}" exec -T -u 0 sql chown mssql /var/opt/mssql/data/maldex-restore.bak
+  "${COMPOSE[@]}" exec -T sql sh -c \
+    "SQLCMDPASSWORD=\"\$MSSQL_SA_PASSWORD\" /opt/mssql-tools18/bin/sqlcmd -C -b -S localhost -U sa \
+     -Q \"RESTORE DATABASE [$db] FROM DISK = N'/var/opt/mssql/data/maldex-restore.bak' WITH REPLACE, CHECKSUM\""
+  "${COMPOSE[@]}" exec -T -u 0 sql rm -f /var/opt/mssql/data/maldex-restore.bak
+
+  if [ -f "$src/artifacts.tar.gz" ]; then
+    info "Restoring artifact store"
+    "${COMPOSE[@]}" run --rm --no-deps -T --user 0 --entrypoint sh -v "$src:/backup:ro" web -c \
+      'find /var/lib/maldex/artifacts -mindepth 1 -delete && tar xzf /backup/artifacts.tar.gz -C /var/lib/maldex'
+  fi
+
+  # up re-runs db-init, which re-maps the app login, then any newer migrations.
+  cmd_up
+  info "Restore complete"
+}
+
+usage() {
+  cat <<EOF
+usage: $0 <command> [options]
+
+  install [--accept-sql-eula]
+                  generate deploy/.env (secrets included), build, start
+  up              start or reconcile the stack (runs db-init + migrations first)
+  down [-v]       stop the stack (-v also deletes all data volumes)
+  upgrade         rebuild from the current checkout, migrate, restart
+  migrate         run db-init and EF Core migrations only
+  status          show service state
+  logs [service]  follow logs
+  backup [dir]    database, artifacts and .env to a timestamped folder
+  restore <dir>   replace the bundled database and artifacts from a backup
+EOF
+}
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  install) cmd_install "$@" ;;
+  up)      cmd_up ;;
+  down)    cmd_down "$@" ;;
+  upgrade) cmd_upgrade ;;
+  migrate) cmd_migrate ;;
+  status)  cmd_status ;;
+  logs)    cmd_logs "$@" ;;
+  backup)  cmd_backup "$@" ;;
+  restore) cmd_restore "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage >&2; exit 64 ;;
+esac

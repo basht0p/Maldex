@@ -1,0 +1,3 @@
+# Operator state: secrets and backups never go in git.
+.env
+backups/
