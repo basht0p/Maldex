@@ -1,0 +1,9 @@
+# AI coding assistant files and planning artifacts (kept local, never committed)
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.claude/
+.cursor/
+.cursorrules
+.github/copilot-instructions.md
+docs/superpowers/
