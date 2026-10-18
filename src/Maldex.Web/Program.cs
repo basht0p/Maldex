@@ -1,9 +1,12 @@
 using System.Text.Json.Serialization;
+using Maldex.Core.Abstractions;
 using Maldex.Data;
 using Maldex.Infrastructure;
+using Maldex.Orchestrator;
 using Maldex.Web;
 using Maldex.Web.Auth;
 using Maldex.Web.Endpoints;
+using Maldex.Web.Hubs;
 using Maldex.Web.Security;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.EntityFrameworkCore;
@@ -23,6 +26,15 @@ builder.Services.Configure<FormOptions>(o => o.MultipartBodyLengthLimit =
     new SubmissionOptions { MaxUploadBytes = builder.Configuration.GetValue<long?>("Maldex:MaxUploadBytes") ?? 268_435_456 }.MaxUploadBytes + 65536);
 builder.AddMaldexAuth();
 
+// Real-time surface: the hub carries live status/process/event pushes; enums go over the wire as strings, like the REST DTOs.
+builder.Services.AddSignalR().AddJsonProtocol(o => o.PayloadSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
+builder.Services.AddSingleton<ITaskEventPublisher, SignalRTaskEventPublisher>();
+builder.Services.AddMaldexOrchestrator(builder.Configuration);
+// The orchestrator worker runs inside the web host only when Maldex:Workers:Enabled (default true).
+// (The processing worker is registered the same way by Task 14.)
+if ((builder.Configuration.GetSection(WorkersOptions.SectionName).Get<WorkersOptions>() ?? new WorkersOptions()).Enabled)
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorWorker>());
+
 var app = builder.Build();
 
 await using (var scope = app.Services.CreateAsyncScope())
@@ -40,6 +52,8 @@ app.UseAuthorization();
 app.MapMeEndpoints();
 app.MapOrgEndpoints();
 app.MapTaskEndpoints();
+app.MapLiveControlEndpoints();
+app.MapHub<TaskHub>("/hubs/tasks");
 
 app.Run();
 

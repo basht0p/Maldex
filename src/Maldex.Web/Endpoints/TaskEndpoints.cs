@@ -290,7 +290,7 @@ public static class TaskEndpoints
         }
     }
 
-    private static bool TryParseEnum<T>(string raw, out T value) where T : struct, Enum
+    internal static bool TryParseEnum<T>(string raw, out T value) where T : struct, Enum
     {
         value = default;
         raw = raw.Trim();
