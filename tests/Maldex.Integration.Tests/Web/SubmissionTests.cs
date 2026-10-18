@@ -180,6 +180,59 @@ public sealed class SubmissionTests(SqlServerFixture sql) : IDisposable
         await AssertBadRequest(await client.PostAsync("/api/tasks", Form(org, fields: new() { ["url"] = url }), Ct), "url");
     }
 
+    [Theory]
+    [InlineData("https://exa\tmple.com/")]
+    [InlineData("https://example.com/a\nb")]
+    [InlineData("https://example.com/a b")]
+    [InlineData("https://example.com/\u202Etxt")]
+    [InlineData("https://@example.com/")]
+    public async Task MalformedUrl_400(string url)
+    {
+        using var f = Factory();
+        using var client = f.CreateClient(UserRole.Analyst, "analyst");
+        var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
+        await AssertBadRequest(await client.PostAsync("/api/tasks", Form(org, fields: new() { ["url"] = url }), Ct), "url");
+    }
+
+    [Fact]
+    public async Task Url_StoredCanonical()
+    {
+        using var f = Factory();
+        using var client = f.CreateClient(UserRole.Analyst, "analyst");
+        var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
+        var dto = await Json(await client.PostAsync("/api/tasks", Form(org, fields: new() { ["url"] = "HTTPS://Example.COM" }), Ct));
+        Assert.Equal("https://example.com/", dto.GetProperty("url").GetString());
+    }
+
+    [Fact]
+    public async Task SecondFileSection_400()
+    {
+        using var f = Factory();
+        using var client = f.CreateClient(UserRole.Analyst, "analyst");
+        var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
+        var form = Form(org, [1, 2, 3]);
+        form.Add(new ByteArrayContent([4, 5, 6]), "file", "second.bin");
+        await AssertBadRequest(await client.PostAsync("/api/tasks", form, Ct), "file");
+        Assert.Equal(0, await CountTasks(f));
+    }
+
+    [Fact]
+    public async Task Cancel_AfterStateChange_409()
+    {
+        using var f = Factory();
+        using var client = f.CreateClient(UserRole.Analyst, "analyst");
+        var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
+        var id = (await Json(await client.PostAsync("/api/tasks", Form(org, [1]), Ct))).GetProperty("id").GetGuid();
+        using (var scope = f.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+            var t = await db.Tasks.SingleAsync(x => x.Id == id, Ct);
+            t.TransitionTo(RunStatus.Preparing, "picked up", DateTimeOffset.UtcNow);
+            await db.SaveChangesAsync(Ct);
+        }
+        Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsync($"/api/tasks/{id}/cancel", null, Ct)).StatusCode);
+    }
+
     [Fact]
     public async Task UrlWithCredentials_400()
     {

@@ -8,6 +8,7 @@ using Maldex.Web.Audit;
 using Maldex.Web.Auth;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.WebUtilities;
+using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Microsoft.Net.Http.Headers;
@@ -177,9 +178,10 @@ public static class TaskEndpoints
             errors["file"] = ["Provide a file or a url."];
             errors["url"] = ["Provide a file or a url."];
         }
-        else if (url is not null && !IsValidUrl(url))
+        else if (url is not null)
         {
-            errors["url"] = ["url must be an absolute http or https URL of at most 2048 characters, without credentials."];
+            if (TryNormalizeUrl(url, out var canonical)) url = canonical;
+            else errors["url"] = ["url must be an absolute http or https URL of at most 2048 characters, without credentials, control, whitespace or format characters."];
         }
         if (blob is { Size: 0 }) errors["file"] = ["The file is empty."];
 
@@ -231,21 +233,18 @@ public static class TaskEndpoints
 
     private static async Task EnsureSampleAsync(MaldexDbContext db, StoredBlob blob, string? fileName, TimeProvider time, CancellationToken ct)
     {
-        if (await db.Samples.AsNoTracking().AnyAsync(s => s.Sha256 == blob.Sha256, ct)) return;
-        var sample = new Sample
-        {
-            Sha256 = blob.Sha256, Sha1 = blob.Sha1, Md5 = blob.Md5, Size = blob.Size,
-            OriginalName = fileName, BlobKey = blob.Key, FirstSeen = time.GetUtcNow(),
-        };
-        db.Samples.Add(sample);
+        // Atomic insert-if-absent: concurrent duplicates never raise a key violation, so nothing is logged as an error.
+        var firstSeen = time.GetUtcNow();
         try
         {
-            await db.SaveChangesAsync(ct);
+            await db.Database.ExecuteSqlInterpolatedAsync($@"
+                INSERT INTO Samples (Sha256, Sha1, Md5, Size, OriginalName, BlobKey, FirstSeen)
+                SELECT CAST({blob.Sha256} AS char(64)), CAST({blob.Sha1} AS char(40)), CAST({blob.Md5} AS char(32)), {blob.Size}, {fileName}, {blob.Key}, {firstSeen}
+                WHERE NOT EXISTS (SELECT 1 FROM Samples WITH (UPDLOCK, HOLDLOCK) WHERE Sha256 = CAST({blob.Sha256} AS char(64)))", ct);
         }
-        catch (DbUpdateException ex) when (CurrentUser.IsUniqueViolation(ex))
+        catch (Exception ex) when (ex is SqlException { Number: 2627 or 2601 })
         {
-            // A concurrent upload of the same bytes inserted it first; reference the existing row.
-            db.Entry(sample).State = EntityState.Detached;
+            // Backstop: another writer got in anyway; the existing row is what the task references.
         }
     }
 
@@ -299,11 +298,29 @@ public static class TaskEndpoints
         return Enum.TryParse(raw, ignoreCase: true, out value) && Enum.IsDefined(value);
     }
 
-    private static bool IsValidUrl(string url) =>
-        url.Length <= MaxUrlLength
-        && Uri.TryCreate(url, UriKind.Absolute, out var uri)
-        && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
-        && string.IsNullOrEmpty(uri.UserInfo);
+    /// <summary>Validates the (trimmed) input and returns the canonical form that is stored, so what is stored is what was validated.</summary>
+    private static bool TryNormalizeUrl(string url, out string canonical)
+    {
+        canonical = "";
+        if (url.Length > MaxUrlLength) return false;
+        foreach (var c in url)
+        {
+            if (c < ' ' || c == '\u007F' || char.IsWhiteSpace(c) || char.GetUnicodeCategory(c) == System.Globalization.UnicodeCategory.Format)
+                return false;
+        }
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return false;
+        if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps) return false;
+        if (!string.IsNullOrEmpty(uri.UserInfo)) return false;
+        // Reject an '@' in the authority even when UserInfo parses as empty (https://@host).
+        var start = url.IndexOf("://", StringComparison.Ordinal);
+        if (start < 0) return false;
+        var rest = url.AsSpan(start + 3);
+        var end = rest.IndexOfAny('/', '?', '#');
+        if ((end < 0 ? rest : rest[..end]).Contains('@')) return false;
+        if (uri.AbsoluteUri.Length > MaxUrlLength) return false;
+        canonical = uri.AbsoluteUri;
+        return true;
+    }
 
     /// <summary>Strips C0 control characters and truncates to 260 chars without splitting a surrogate pair. Stored as data only.</summary>
     internal static string? SanitizeFileName(string? name)
