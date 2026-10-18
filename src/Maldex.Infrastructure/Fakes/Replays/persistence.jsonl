@@ -1,0 +1,4 @@
+{"delayMs":200,"message":{"type":"ready","agentVersion":"0.1.0-fake","hostname":"MALDEX-WIN10"}}
+{"delayMs":300,"message":{"type":"process_started","at":"2026-01-01T00:00:00+00:00","pid":4120,"parentPid":1,"imagePath":"C:\\Windows\\explorer.exe","commandLine":"C:\\Windows\\explorer.exe","user":"analyst"}}
+{"delayMs":400,"message":{"type":"process_started","at":"2026-01-01T00:00:00+00:00","pid":7020,"parentPid":4120,"imagePath":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","commandLine":"powershell.exe -NoProfile -WindowStyle Hidden","user":"analyst"}}
+{"delayMs":500,"message":{"type":"registry","at":"2026-01-01T00:00:00+00:00","pid":7020,"operation":"set","key":"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run","valueName":"updater","data":"C:\\Users\\analyst\\AppData\\Local\\Temp\\x.exe"}}

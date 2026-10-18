@@ -1,0 +1,184 @@
+using Maldex.Core.Abstractions;
+using Maldex.Core.Agent;
+using Maldex.Infrastructure.Fakes;
+using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Time.Testing;
+using Xunit;
+
+namespace Maldex.Core.Tests.Fakes;
+
+public sealed class ReplayAgentChannelTests : IDisposable
+{
+    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(10);
+    private readonly string _dir = Directory.CreateTempSubdirectory("maldex-replay-").FullName;
+    private readonly FakeTimeProvider _time = new(new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero));
+    private static readonly VmHandle Vm = VmHandle.For(Guid.NewGuid());
+
+    public void Dispose() => Directory.Delete(_dir, true);
+
+    private static Task Start(Func<Task> work) => Task.Run(work, TestContext.Current.CancellationToken);
+
+    private const string Ready = """{"delayMs":1000,"message":{"type":"ready","agentVersion":"1","hostname":"h"}}""";
+    private const string Proc = """{"delayMs":1000,"message":{"type":"process_started","at":"2000-01-01T00:00:00Z","pid":10,"parentPid":1,"imagePath":"C:\\a.exe","commandLine":"a.exe"}}""";
+    private const string File1 = """{"delayMs":1000,"message":{"type":"file","at":"2000-01-01T00:00:00Z","pid":10,"operation":"write","path":"C:\\f.txt"}}""";
+
+    private Task<IAgentChannel> Open(string[] lines, double speed = 1.0, bool holdOpen = false)
+    {
+        File.WriteAllLines(Path.Combine(_dir, "t.jsonl"), lines);
+        var opts = new ReplayOptions { Directory = _dir, DefaultFile = "t.jsonl", Speed = speed, HoldOpen = holdOpen };
+        return new FakeAgentChannelFactory(new StaticMonitor(opts), _time).ConnectAsync(Vm, TestContext.Current.CancellationToken);
+    }
+
+    private async Task<List<AgentMessage>> Drain(IAgentChannel ch, int? max = null, TimeSpan? step = null)
+    {
+        var list = new List<AgentMessage>();
+        var reader = Start(async () =>
+        {
+            await foreach (var m in ch.ReadAsync(TestContext.Current.CancellationToken))
+            {
+                lock (list) list.Add(m);
+                if (max is not null && list.Count >= max) break;
+            }
+        });
+        while (!reader.IsCompleted)
+        {
+            _time.Advance(step ?? TimeSpan.FromMilliseconds(250));
+            await Task.Delay(1, TestContext.Current.CancellationToken);
+        }
+        await reader.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+        return list;
+    }
+
+    [Fact]
+    public async Task Replay_YieldsMessagesInOrder_WithScaledDelays()
+    {
+        await using var ch = await Open([Ready, Proc, File1], speed: 2.0).WaitAsync(Timeout, TestContext.Current.CancellationToken);
+        var start = _time.GetUtcNow();
+        var firstAt = TimeSpan.Zero;
+        var seen = new List<(AgentMessage M, DateTimeOffset Now)>();
+        var reader = Start(async () =>
+        {
+            await foreach (var m in ch.ReadAsync(TestContext.Current.CancellationToken)) lock (seen) seen.Add((m, _time.GetUtcNow()));
+        });
+        while (!reader.IsCompleted) { _time.Advance(TimeSpan.FromMilliseconds(50)); await Task.Delay(1, TestContext.Current.CancellationToken); }
+        await reader.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+
+        Assert.Collection(seen.Select(s => s.M), m => Assert.IsType<ReadyMessage>(m), m => Assert.IsType<ProcessStartedMessage>(m), m => Assert.IsType<FileEventMessage>(m));
+        // 1000ms at speed 2 = 500ms between messages (unscaled would be 1000ms).
+        firstAt = seen[0].Now - start;
+        Assert.InRange(firstAt, TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(900));
+        Assert.InRange(seen[1].Now - seen[0].Now, TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(900));
+        // At is rewritten to the (fake) clock.
+        var p = Assert.IsType<ProcessStartedMessage>(seen[1].M);
+        Assert.True(p.At >= start, "At must be rewritten to time provider now");
+        Assert.Equal(0, ch.Violations);
+    }
+
+    [Fact]
+    public async Task Replay_HoldOpen_DoesNotComplete_UntilDisposed()
+    {
+        var ch = await Open([Ready], holdOpen: true).WaitAsync(Timeout, TestContext.Current.CancellationToken);
+        var got = new List<AgentMessage>();
+        var reader = Start(async () => { await foreach (var m in ch.ReadAsync(TestContext.Current.CancellationToken)) lock (got) got.Add(m); });
+        while (true) { lock (got) if (got.Count == 1) break; _time.Advance(TimeSpan.FromMilliseconds(250)); await Task.Delay(1, TestContext.Current.CancellationToken); }
+        for (var i = 0; i < 20; i++) { _time.Advance(TimeSpan.FromSeconds(1)); await Task.Delay(1, TestContext.Current.CancellationToken); }
+        Assert.False(reader.IsCompleted);
+        await ch.DisposeAsync();
+        await reader.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => ch.SendAsync(new ShutdownCommand("c"), TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task Replay_NotHoldOpen_CompletesAfterLast()
+    {
+        await using var ch = await Open([Ready, Proc]).WaitAsync(Timeout, TestContext.Current.CancellationToken);
+        var list = await Drain(ch);
+        Assert.Equal(2, list.Count);
+    }
+
+    [Fact]
+    public async Task Replay_MalformedLine_CountsViolation_AndContinues()
+    {
+        const string badPid = """{"delayMs":10,"message":{"type":"process_started","at":"2000-01-01T00:00:00Z","pid":-5,"parentPid":1,"imagePath":"x","commandLine":"x"}}""";
+        const string noMessage = """{"delayMs":10}""";
+        await using var ch = await Open([Ready, "this is not json", badPid, noMessage, File1]).WaitAsync(Timeout, TestContext.Current.CancellationToken);
+        var list = await Drain(ch);
+        Assert.Collection(list, m => Assert.IsType<ReadyMessage>(m), m => Assert.IsType<FileEventMessage>(m));
+        Assert.Equal(3, ch.Violations);
+    }
+
+    [Fact]
+    public async Task Replay_TenViolations_EndsTheChannel()
+    {
+        var lines = Enumerable.Repeat("garbage", 10).Append(Ready).ToArray();
+        await using var ch = await Open(lines).WaitAsync(Timeout, TestContext.Current.CancellationToken);
+        var list = await Drain(ch);
+        Assert.Empty(list);
+        Assert.Equal(10, ch.Violations);
+    }
+
+    [Fact]
+    public async Task Replay_RecordsSentCommands()
+    {
+        await using var ch = await Open([Ready]).WaitAsync(Timeout, TestContext.Current.CancellationToken);
+        await ch.SendAsync(new OpenUrlCommand("c1", "http://x"), TestContext.Current.CancellationToken);
+        var rc = (ReplayAgentChannel)ch;
+        Assert.Equal("c1", Assert.Single(rc.SentCommands).CommandId);
+    }
+
+    [Fact]
+    public async Task Factory_ReadsOptionsOnEveryConnect()
+    {
+        File.WriteAllLines(Path.Combine(_dir, "a.jsonl"), [Ready]);
+        File.WriteAllLines(Path.Combine(_dir, "b.jsonl"), [Ready, Proc]);
+        var opts = new ReplayOptions { Directory = _dir, DefaultFile = "a.jsonl", HoldOpen = false };
+        var mon = new StaticMonitor(opts);
+        var f = new FakeAgentChannelFactory(mon, _time);
+        await using (var c1 = await f.ConnectAsync(Vm, TestContext.Current.CancellationToken)) Assert.Single(await Drain(c1));
+        mon.Value = new ReplayOptions { Directory = _dir, DefaultFile = "b.jsonl", HoldOpen = false };
+        await using (var c2 = await f.ConnectAsync(Vm, TestContext.Current.CancellationToken)) Assert.Equal(2, (await Drain(c2)).Count);
+    }
+
+    [Fact]
+    public async Task AllShippedReplays_ParseWithoutViolations()
+    {
+        var shipped = Path.Combine(AppContext.BaseDirectory, "Fakes", "Replays");
+        var files = Directory.GetFiles(shipped, "*.jsonl");
+        Assert.True(files.Length >= 4);
+        foreach (var file in files)
+        {
+            var opts = new ReplayOptions { Directory = shipped, DefaultFile = Path.GetFileName(file), Speed = 1000, HoldOpen = false };
+            await using var ch = await new FakeAgentChannelFactory(new StaticMonitor(opts), _time).ConnectAsync(Vm, TestContext.Current.CancellationToken).WaitAsync(Timeout, TestContext.Current.CancellationToken);
+            var list = await Drain(ch);
+            Assert.NotEmpty(list);
+            Assert.IsType<ReadyMessage>(list[0]);
+            Assert.True(ch.Violations == 0, $"{file}: {ch.Violations} violations");
+        }
+    }
+
+    [Fact]
+    public async Task DefaultReplay_HasReadyExplorerNotepadFileDnsScreenshot_InOrder()
+    {
+        var opts = new ReplayOptions { Speed = 1000, HoldOpen = false };
+        await using var ch = await new FakeAgentChannelFactory(new StaticMonitor(opts), _time).ConnectAsync(Vm, TestContext.Current.CancellationToken).WaitAsync(Timeout, TestContext.Current.CancellationToken);
+        var list = await Drain(ch);
+        Assert.Equal(6, list.Count);
+        Assert.IsType<ReadyMessage>(list[0]);
+        var explorer = Assert.IsType<ProcessStartedMessage>(list[1]);
+        Assert.EndsWith("explorer.exe", explorer.ImagePath);
+        var notepad = Assert.IsType<ProcessStartedMessage>(list[2]);
+        Assert.EndsWith("notepad.exe", notepad.ImagePath);
+        Assert.Equal(explorer.Pid, notepad.ParentPid);
+        Assert.IsType<FileEventMessage>(list[3]);
+        Assert.IsType<DnsEventMessage>(list[4]);
+        Assert.IsType<ScreenshotMessage>(list[5]);
+    }
+
+    private sealed class StaticMonitor(ReplayOptions value) : IOptionsMonitor<ReplayOptions>
+    {
+        public ReplayOptions Value { get; set; } = value;
+        public ReplayOptions CurrentValue => Value;
+        public ReplayOptions Get(string? name) => Value;
+        public IDisposable? OnChange(Action<ReplayOptions, string?> listener) => null;
+    }
+}

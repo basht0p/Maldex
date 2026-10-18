@@ -1,0 +1,4 @@
+{"delayMs":200,"message":{"type":"ready","agentVersion":"0.1.0-fake","hostname":"MALDEX-WIN10"}}
+{"delayMs":300,"message":{"type":"process_started","at":"2026-01-01T00:00:00+00:00","pid":4120,"parentPid":1,"imagePath":"C:\\Windows\\explorer.exe","commandLine":"C:\\Windows\\explorer.exe","user":"analyst"}}
+{"delayMs":400,"message":{"type":"process_started","at":"2026-01-01T00:00:00+00:00","pid":6100,"parentPid":4120,"imagePath":"C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE","commandLine":"WINWORD.EXE /n \"C:\\Users\\analyst\\Desktop\\invoice.doc\"","user":"analyst"}}
+{"delayMs":600,"message":{"type":"process_started","at":"2026-01-01T00:00:00+00:00","pid":6244,"parentPid":6100,"imagePath":"C:\\Windows\\System32\\calc.exe","commandLine":"calc.exe","user":"analyst"}}

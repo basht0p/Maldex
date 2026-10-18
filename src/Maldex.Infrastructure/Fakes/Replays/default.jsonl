@@ -1,0 +1,6 @@
+{"delayMs":200,"message":{"type":"ready","agentVersion":"0.1.0-fake","hostname":"MALDEX-WIN10"}}
+{"delayMs":300,"message":{"type":"process_started","at":"2026-01-01T00:00:00+00:00","pid":4120,"parentPid":1,"imagePath":"C:\\Windows\\explorer.exe","commandLine":"C:\\Windows\\explorer.exe","user":"analyst"}}
+{"delayMs":400,"message":{"type":"process_started","at":"2026-01-01T00:00:00+00:00","pid":5012,"parentPid":4120,"imagePath":"C:\\Windows\\System32\\notepad.exe","commandLine":"notepad.exe","user":"analyst"}}
+{"delayMs":300,"message":{"type":"file","at":"2026-01-01T00:00:00+00:00","pid":5012,"operation":"write","path":"C:\\Users\\analyst\\Documents\\notes.txt"}}
+{"delayMs":300,"message":{"type":"dns","at":"2026-01-01T00:00:00+00:00","pid":5012,"query":"example.com","queryType":"A","answers":["93.184.216.34"]}}
+{"delayMs":500,"message":{"type":"screenshot","at":"2026-01-01T00:00:00+00:00","format":"jpeg","imageBase64":"/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA="}}

@@ -1,7 +1,6 @@
 using System.Text.Json.Serialization;
 using Maldex.Data;
-using Maldex.Infrastructure.Storage;
-using Maldex.Core.Abstractions;
+using Maldex.Infrastructure;
 using Maldex.Web;
 using Maldex.Web.Auth;
 using Maldex.Web.Endpoints;
@@ -12,12 +11,10 @@ using Microsoft.EntityFrameworkCore;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
-builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddDbContext<MaldexDbContext>(o => o.UseSqlServer(
     builder.Configuration.GetConnectionString("Maldex")
     ?? throw new InvalidOperationException("ConnectionStrings:Maldex is not configured")));
-builder.Services.Configure<ArtifactStoreOptions>(builder.Configuration.GetSection(ArtifactStoreOptions.SectionName));
-if (!OperatingSystem.IsWindows()) builder.Services.AddSingleton<IArtifactStore, FileSystemArtifactStore>(); // Task 10 moves this into AddMaldexInfrastructure
+builder.Services.AddMaldexInfrastructure(builder.Configuration);
 builder.Services.Configure<WorkersOptions>(builder.Configuration.GetSection(WorkersOptions.SectionName));
 builder.Services.Configure<SubmissionOptions>(builder.Configuration.GetSection(SubmissionOptions.SectionName));
 builder.Services.PostConfigure<SubmissionOptions>(o => o.ApplyDefaults());
