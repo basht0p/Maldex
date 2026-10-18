@@ -37,6 +37,9 @@ public sealed class ReplayAgentChannel : IAgentChannel
     private readonly double _speed;
     private readonly bool _holdOpen;
     private int _disposed;
+    private int _activeReads;
+    private bool _closing;
+    private bool _readerCompleted;
 
     public ReplayAgentChannel(IReadOnlyList<string> lines, double speed, bool holdOpen, TimeProvider time)
     {
@@ -54,7 +57,28 @@ public sealed class ReplayAgentChannel : IAgentChannel
         get { lock (_gate) return _sent.ToArray(); }
     }
 
+    private async ValueTask CompleteReaderAsync()
+    {
+        lock (_gate) { if (_readerCompleted) return; _readerCompleted = true; }
+        await _pipe.Reader.CompleteAsync().ConfigureAwait(false);
+    }
+
     public async IAsyncEnumerable<AgentMessage> ReadAsync([EnumeratorCancellation] CancellationToken ct)
+    {
+        lock (_gate) _activeReads++;
+        try
+        {
+            await foreach (var m in ReadCoreAsync(ct).ConfigureAwait(false)) yield return m;
+        }
+        finally
+        {
+            bool complete;
+            lock (_gate) { _activeReads--; complete = _closing && _activeReads == 0; }
+            if (complete) await CompleteReaderAsync().ConfigureAwait(false);
+        }
+    }
+
+    private async IAsyncEnumerable<AgentMessage> ReadCoreAsync([EnumeratorCancellation] CancellationToken ct)
     {
         while (true)
         {
@@ -91,6 +115,8 @@ public sealed class ReplayAgentChannel : IAgentChannel
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         await _cts.CancelAsync().ConfigureAwait(false);
         await _producer.ConfigureAwait(false);
+        lock (_gate) { _closing = true; if (_activeReads > 0) return; }
+        await CompleteReaderAsync().ConfigureAwait(false);
         _cts.Dispose();
     }
 

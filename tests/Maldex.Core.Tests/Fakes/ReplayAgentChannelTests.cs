@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Maldex.Core.Abstractions;
 using Maldex.Core.Agent;
 using Maldex.Infrastructure.Fakes;
@@ -29,23 +30,26 @@ public sealed class ReplayAgentChannelTests : IDisposable
         return new FakeAgentChannelFactory(new StaticMonitor(opts), _time).ConnectAsync(Vm, TestContext.Current.CancellationToken);
     }
 
-    private async Task<List<AgentMessage>> Drain(IAgentChannel ch, int? max = null, TimeSpan? step = null)
+    private async Task Pump(Task reader, TimeSpan step)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!reader.IsCompleted)
+        {
+            Assert.True(sw.Elapsed < Timeout, "Replay did not complete within the timeout.");
+            _time.Advance(step);
+            await Task.Delay(1, TestContext.Current.CancellationToken);
+        }
+        await reader.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+    }
+
+    private async Task<List<AgentMessage>> Drain(IAgentChannel ch)
     {
         var list = new List<AgentMessage>();
         var reader = Start(async () =>
         {
-            await foreach (var m in ch.ReadAsync(TestContext.Current.CancellationToken))
-            {
-                lock (list) list.Add(m);
-                if (max is not null && list.Count >= max) break;
-            }
+            await foreach (var m in ch.ReadAsync(TestContext.Current.CancellationToken)) lock (list) list.Add(m);
         });
-        while (!reader.IsCompleted)
-        {
-            _time.Advance(step ?? TimeSpan.FromMilliseconds(250));
-            await Task.Delay(1, TestContext.Current.CancellationToken);
-        }
-        await reader.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+        await Pump(reader, TimeSpan.FromMilliseconds(250));
         return list;
     }
 
@@ -60,8 +64,7 @@ public sealed class ReplayAgentChannelTests : IDisposable
         {
             await foreach (var m in ch.ReadAsync(TestContext.Current.CancellationToken)) lock (seen) seen.Add((m, _time.GetUtcNow()));
         });
-        while (!reader.IsCompleted) { _time.Advance(TimeSpan.FromMilliseconds(50)); await Task.Delay(1, TestContext.Current.CancellationToken); }
-        await reader.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+        await Pump(reader, TimeSpan.FromMilliseconds(50));
 
         Assert.Collection(seen.Select(s => s.M), m => Assert.IsType<ReadyMessage>(m), m => Assert.IsType<ProcessStartedMessage>(m), m => Assert.IsType<FileEventMessage>(m));
         // 1000ms at speed 2 = 500ms between messages (unscaled would be 1000ms).
@@ -80,7 +83,14 @@ public sealed class ReplayAgentChannelTests : IDisposable
         var ch = await Open([Ready], holdOpen: true).WaitAsync(Timeout, TestContext.Current.CancellationToken);
         var got = new List<AgentMessage>();
         var reader = Start(async () => { await foreach (var m in ch.ReadAsync(TestContext.Current.CancellationToken)) lock (got) got.Add(m); });
-        while (true) { lock (got) if (got.Count == 1) break; _time.Advance(TimeSpan.FromMilliseconds(250)); await Task.Delay(1, TestContext.Current.CancellationToken); }
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
+        {
+            lock (got) if (got.Count == 1) break;
+            Assert.True(sw.Elapsed < Timeout, "No message within the timeout.");
+            _time.Advance(TimeSpan.FromMilliseconds(250));
+            await Task.Delay(1, TestContext.Current.CancellationToken);
+        }
         for (var i = 0; i < 20; i++) { _time.Advance(TimeSpan.FromSeconds(1)); await Task.Delay(1, TestContext.Current.CancellationToken); }
         Assert.False(reader.IsCompleted);
         await ch.DisposeAsync();
@@ -172,6 +182,24 @@ public sealed class ReplayAgentChannelTests : IDisposable
         Assert.IsType<FileEventMessage>(list[3]);
         Assert.IsType<DnsEventMessage>(list[4]);
         Assert.IsType<ScreenshotMessage>(list[5]);
+    }
+
+    [Fact]
+    public void ShippedScreenshots_AreDecodableBaselineJpegs()
+    {
+        var shipped = Path.Combine(AppContext.BaseDirectory, "Fakes", "Replays");
+        var count = 0;
+        foreach (var file in Directory.GetFiles(shipped, "*.jsonl"))
+            foreach (var line in File.ReadLines(file).Where(l => l.Contains("\"screenshot\"")))
+            {
+                var msg = Assert.IsType<ScreenshotMessage>(System.Text.Json.JsonDocument.Parse(line).RootElement.GetProperty("message").Deserialize<AgentMessage>(AgentJson.Options));
+                var b = Convert.FromBase64String(msg.ImageBase64);
+                Assert.True(b.Length > 4 && b[0] == 0xFF && b[1] == 0xD8, "missing SOI");
+                Assert.True(b[^2] == 0xFF && b[^1] == 0xD9, "missing EOI");
+                Assert.True(b.AsSpan().IndexOf(new byte[] { 0xFF, 0xC0 }) > 0, "missing SOF0 (baseline)");
+                count++;
+            }
+        Assert.True(count >= 1);
     }
 
     private sealed class StaticMonitor(ReplayOptions value) : IOptionsMonitor<ReplayOptions>

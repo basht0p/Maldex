@@ -16,9 +16,10 @@ public class NoopEgressRouterTests
     [InlineData(NetworkMode.LiveTor)]
     public async Task Egress_LiveUnavailable_Throws(NetworkMode mode)
     {
-        var ex = await Assert.ThrowsAsync<EgressUnavailableException>(() => Make().CreateAsync(Guid.NewGuid(), mode, null, TestContext.Current.CancellationToken));
+        var router = Make();
+        var ex = await Assert.ThrowsAsync<EgressUnavailableException>(() => router.CreateAsync(Guid.NewGuid(), mode, null, TestContext.Current.CancellationToken));
         Assert.Equal("live egress is not available in fake mode", ex.Message);
-        Assert.Empty(await Make().ListAsync(TestContext.Current.CancellationToken));
+        Assert.Empty(await router.ListAsync(TestContext.Current.CancellationToken));
     }
 
     [Fact]
