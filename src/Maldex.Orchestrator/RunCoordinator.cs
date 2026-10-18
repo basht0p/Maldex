@@ -26,6 +26,7 @@ public sealed class RunCoordinator(
     TimeProvider time,
     ILogger<RunCoordinator> logger)
 {
+    private const int MaxAttempts = 2;
     private const int MaxViolations = 10;
     private const int MaxTransitionAttempts = 5;
 
@@ -48,8 +49,6 @@ public sealed class RunCoordinator(
         }
 
         NetworkLease? lease = null;
-        VmHandle? vm = null;
-        IAgentChannel? channel = null;
         try
         {
             try
@@ -58,6 +57,7 @@ public sealed class RunCoordinator(
             }
             catch (EgressUnavailableException ex)
             {
+                // Fail closed: no VM, no retry, no fallback to another network mode.
                 await FailAsync(db, task, $"egress unavailable: {ex.Message}").ConfigureAwait(false);
                 return;
             }
@@ -69,11 +69,24 @@ public sealed class RunCoordinator(
                 return;
             }
 
-            vm = await hypervisor.StartAsync(
-                new VmSpec(task.Id, task.Image, _options.VmMemoryMiB, _options.VmVCpus, lease.NetworkId), ct).ConfigureAwait(false);
-            channel = await channels.ConnectAsync(vm, ct).ConfigureAwait(false);
+            // Retry once on a fresh VM (same network lease), then Failed. Each attempt releases its own VM.
+            for (var attempt = 1; attempt <= MaxAttempts; attempt++)
+            {
+                await SetAttemptAsync(db, task, attempt, ct).ConfigureAwait(false);
+                var outcome = await AttemptAsync(db, task, lease, command, ct).ConfigureAwait(false);
+                if (outcome == AttemptOutcome.Completed) break;
 
-            await RunGuestAsync(db, task, channel, command, ct).ConfigureAwait(false);
+                if (attempt == MaxAttempts)
+                {
+                    var reason = outcome == AttemptOutcome.VmStartFailed
+                        ? $"vm failed to start after {MaxAttempts} attempts"
+                        : $"agent not ready after {MaxAttempts} attempts";
+                    await FailAsync(db, task, reason).ConfigureAwait(false);
+                    return;
+                }
+
+                logger.LogWarning("Run {TaskId} attempt {Attempt} ended with {Outcome}; retrying on a fresh VM.", taskId, attempt, outcome);
+            }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -86,15 +99,64 @@ public sealed class RunCoordinator(
         }
         finally
         {
-            await ReleaseAsync(taskId, channel, vm, lease).ConfigureAwait(false);
+            await ReleaseLeaseAsync(taskId, lease).ConfigureAwait(false);
         }
 
         if (task.Status == RunStatus.Collecting)
             await TransitionAsync(db, task, RunStatus.Processing, "collection complete", null, CancellationToken.None).ConfigureAwait(false);
     }
 
-    /// <summary>Waits for the agent, then ingests until the run ends and moves the task to Collecting (or Failed if the agent never became ready).</summary>
-    private async Task RunGuestAsync(MaldexDbContext db, AnalysisTask task, IAgentChannel channel, AgentCommand command, CancellationToken ct)
+    private enum AttemptOutcome { Completed, VmStartFailed, AgentNotReady }
+
+    /// <summary>One try on a fresh VM. The VM and agent channel are always released before this returns.</summary>
+    private async Task<AttemptOutcome> AttemptAsync(MaldexDbContext db, AnalysisTask task, NetworkLease lease, AgentCommand command, CancellationToken ct)
+    {
+        VmHandle? vm = null;
+        IAgentChannel? channel = null;
+        try
+        {
+            try
+            {
+                vm = await hypervisor.StartAsync(
+                    new VmSpec(task.Id, task.Image, _options.VmMemoryMiB, _options.VmVCpus, lease.NetworkId), ct).ConfigureAwait(false);
+            }
+            catch (VmStartException ex)
+            {
+                logger.LogWarning(ex, "VM start failed for {TaskId} (attempt {Attempt}).", task.Id, task.Attempt);
+                return AttemptOutcome.VmStartFailed;
+            }
+
+            channel = await channels.ConnectAsync(vm, ct).ConfigureAwait(false);
+            var ready = await RunGuestAsync(db, task, channel, command, ct).ConfigureAwait(false);
+            return ready ? AttemptOutcome.Completed : AttemptOutcome.AgentNotReady;
+        }
+        finally
+        {
+            await ReleaseGuestAsync(task.Id, channel, vm).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Records the attempt number. The row is also written by the API, so reload and retry on a conflict.</summary>
+    private async Task SetAttemptAsync(MaldexDbContext db, AnalysisTask task, int attempt, CancellationToken ct)
+    {
+        for (var tries = 1; ; tries++)
+        {
+            await db.Entry(task).ReloadAsync(ct).ConfigureAwait(false);
+            task.Attempt = attempt;
+            try
+            {
+                await db.SaveChangesAsync(ct).ConfigureAwait(false);
+                return;
+            }
+            catch (DbUpdateConcurrencyException) when (tries < MaxTransitionAttempts) { }
+        }
+    }
+
+    /// <summary>
+    /// Waits for the agent, then ingests until the run ends and moves the task to Collecting.
+    /// Returns false (without touching the task) if the agent never became ready.
+    /// </summary>
+    private async Task<bool> RunGuestAsync(MaldexDbContext db, AnalysisTask task, IAgentChannel channel, AgentCommand command, CancellationToken ct)
     {
         using var readerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var enumerator = channel.ReadAsync(readerCts.Token).GetAsyncEnumerator(readerCts.Token);
@@ -102,10 +164,7 @@ public sealed class RunCoordinator(
         try
         {
             if (!await WaitForReadyAsync(enumerator, readerCts, ct).ConfigureAwait(false))
-            {
-                await FailAsync(db, task, $"agent not ready after {_options.AgentReadyTimeout.TotalSeconds:0} s").ConfigureAwait(false);
-                return;
-            }
+                return false;
 
             var now = time.GetUtcNow();
             await TransitionAsync(db, task, RunStatus.Running, "agent ready", t =>
@@ -148,6 +207,7 @@ public sealed class RunCoordinator(
 
             var ended = time.GetUtcNow();
             await TransitionAsync(db, task, RunStatus.Collecting, reason, t => t.EndedAt = ended, ct).ConfigureAwait(false);
+            return true;
         }
         finally
         {
@@ -268,7 +328,7 @@ public sealed class RunCoordinator(
         return blobKey is null ? null : new OpenSampleCommand(commandId, task.OriginalFileName ?? "sample", blobKey);
     }
 
-    private async Task ReleaseAsync(Guid taskId, IAgentChannel? channel, VmHandle? vm, NetworkLease? lease)
+    private async Task ReleaseGuestAsync(Guid taskId, IAgentChannel? channel, VmHandle? vm)
     {
         if (channel is not null)
         {
@@ -281,12 +341,13 @@ public sealed class RunCoordinator(
             try { await hypervisor.DestroyAsync(vm, CancellationToken.None).ConfigureAwait(false); }
             catch (Exception ex) { logger.LogError(ex, "Destroying VM {Vm} for {TaskId} failed.", vm.Name, taskId); }
         }
+    }
 
-        if (lease is not null)
-        {
-            try { await egress.ReleaseAsync(lease, CancellationToken.None).ConfigureAwait(false); }
-            catch (Exception ex) { logger.LogError(ex, "Releasing network lease for {TaskId} failed.", taskId); }
-        }
+    private async Task ReleaseLeaseAsync(Guid taskId, NetworkLease? lease)
+    {
+        if (lease is null) return;
+        try { await egress.ReleaseAsync(lease, CancellationToken.None).ConfigureAwait(false); }
+        catch (Exception ex) { logger.LogError(ex, "Releasing network lease for {TaskId} failed.", taskId); }
     }
 
     private async Task FailAsync(MaldexDbContext db, AnalysisTask task, string reason)

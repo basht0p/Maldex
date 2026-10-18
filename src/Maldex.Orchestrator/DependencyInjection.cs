@@ -7,7 +7,7 @@ namespace Maldex.Orchestrator;
 public static class DependencyInjection
 {
     /// <summary>
-    /// Registers the run coordinator and its options. Requires the execution abstractions (<c>AddMaldexInfrastructure</c>),
+    /// Registers the run coordinator, reconciler, worker (not hosted here) and options. Requires the execution abstractions (<c>AddMaldexInfrastructure</c>),
     /// <c>MaldexDbContext</c> and an <c>ITaskEventPublisher</c>.
     /// </summary>
     public static IServiceCollection AddMaldexOrchestrator(this IServiceCollection services, IConfiguration configuration)
@@ -15,6 +15,9 @@ public static class DependencyInjection
         services.TryAddSingleton(TimeProvider.System);
         services.Configure<OrchestratorOptions>(configuration.GetSection(OrchestratorOptions.SectionName));
         services.AddSingleton<RunCoordinator>();
+        services.AddSingleton<Reconciler>();
+        // Hosted by Maldex.Web only when Maldex:Workers:Enabled (Task 13): AddHostedService(sp => sp.GetRequiredService<OrchestratorWorker>()).
+        services.AddSingleton<OrchestratorWorker>();
         return services;
     }
 }

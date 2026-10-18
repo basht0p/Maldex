@@ -1,5 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\Maldex.Infrastructure\Maldex.Infrastructure.csproj" />
   </ItemGroup>
 </Project>
