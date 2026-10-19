@@ -16,6 +16,9 @@ public static class DependencyInjection
         services.AddSingleton<ProcessingPipeline>();
         // Hosted by Maldex.Web only when Maldex:Workers:Enabled: AddHostedService(sp => sp.GetRequiredService<ProcessingWorker>()).
         services.AddSingleton<ProcessingWorker>();
+        services.AddSingleton<RetentionService>();
+        // Hosted alongside the others: AddHostedService(sp => sp.GetRequiredService<RetentionWorker>()).
+        services.AddSingleton<RetentionWorker>();
         return services;
     }
 }

@@ -1,0 +1,280 @@
+using System.Text;
+using Maldex.Core.Abstractions;
+using Maldex.Core.Domain;
+using Maldex.Integration.Tests.Fixtures;
+using Maldex.Integration.Tests.Orchestrator;
+using Maldex.Processing;
+using Microsoft.EntityFrameworkCore;
+using Xunit;
+using OrgEntity = Maldex.Core.Domain.Org;
+
+namespace Maldex.Integration.Tests.Processing;
+
+[Collection("sql")]
+public class RetentionTests(SqlServerFixture sql)
+{
+    private static CancellationToken Ct => TestContext.Current.CancellationToken;
+
+    private static DateTimeOffset Now => new(2030, 6, 1, 0, 0, 0, TimeSpan.Zero);
+
+    private sealed record Seeded(Guid TaskId, string? SampleSha, string? SampleKey, List<string> ArtifactKeys);
+
+    private static async Task<Guid> SeedOrgAsync(OrchestratorHarness h, int retentionDays)
+    {
+        await using var db = h.NewContext();
+        var org = new OrgEntity { Id = Guid.NewGuid(), Name = "Org-" + Guid.NewGuid().ToString("N"), RetentionDays = retentionDays };
+        db.Add(org);
+        await db.SaveChangesAsync(Ct);
+        return org.Id;
+    }
+
+    private static async Task<(string Sha, string Key)> SeedSampleAsync(OrchestratorHarness h)
+    {
+        await using var content = new MemoryStream(Encoding.ASCII.GetBytes("sample " + Guid.NewGuid()));
+        var blob = await h.Get<IArtifactStore>().PutAsync("samples", content, 1_048_576, Ct);
+        await using var db = h.NewContext();
+        db.Add(new Sample { Sha256 = blob.Sha256, Sha1 = blob.Sha1, Md5 = blob.Md5, Size = blob.Size, BlobKey = blob.Key, FirstSeen = Now.AddDays(-400) });
+        await db.SaveChangesAsync(Ct);
+        return (blob.Sha256, blob.Key);
+    }
+
+    /// <summary>Seeds a task with a process tree, events, a detection, history and two screenshot artifacts (rows + blobs).</summary>
+    private static async Task<Seeded> SeedTaskAsync(OrchestratorHarness h, Guid orgId, RunStatus status, DateTimeOffset createdAt, DateTimeOffset? completedAt,
+        string? sampleSha = null)
+    {
+        var store = h.Get<IArtifactStore>();
+        var keys = new List<string>();
+        var artifacts = new List<Artifact>();
+        var taskId = Guid.NewGuid();
+        for (var i = 0; i < 2; i++)
+        {
+            await using var content = new MemoryStream(Encoding.ASCII.GetBytes("shot " + Guid.NewGuid()));
+            var blob = await store.PutAsync("screenshots", content, 1_048_576, Ct);
+            keys.Add(blob.Key);
+            artifacts.Add(new Artifact { Id = Guid.NewGuid(), TaskId = taskId, Kind = ArtifactKind.Screenshot, BlobKey = blob.Key, Sha256 = blob.Sha256, Size = blob.Size, CreatedAt = createdAt });
+        }
+
+        await using var db = h.NewContext();
+        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "A", Role = UserRole.Analyst };
+        var task = new AnalysisTask
+        {
+            Id = taskId, OrgId = orgId, SubmittedByUserId = user.Id, SampleSha256 = sampleSha, Url = sampleSha is null ? "http://example.test/" : null,
+            Image = "win10", NetworkMode = NetworkMode.Simulated, DurationSec = 300, CreatedAt = createdAt, Status = status, CompletedAt = completedAt,
+        };
+        task.StatusHistory.Add(new TaskStatusHistory { TaskId = taskId, From = null, To = RunStatus.Queued, At = createdAt, Reason = "seed" });
+        db.AddRange(user, task);
+        await db.SaveChangesAsync(Ct);
+
+        var root = new ProcessNode { TaskId = taskId, Pid = 100, ParentPid = 4, ImagePath = "a.exe", CommandLine = "a.exe", StartedAt = createdAt };
+        db.Add(root);
+        await db.SaveChangesAsync(Ct);
+        var child = new ProcessNode { TaskId = taskId, Pid = 200, ParentPid = 100, ParentNodeId = root.Id, ImagePath = "b.exe", CommandLine = "b.exe", StartedAt = createdAt };
+        db.Add(child);
+        await db.SaveChangesAsync(Ct);
+        db.AddRange(
+            new BehaviorEvent { TaskId = taskId, ProcessNodeId = child.Id, Pid = 200, Type = EventType.File, At = createdAt, Summary = "write" },
+            new Detection { TaskId = taskId, Source = DetectionSource.Heuristic, Rule = "r", Tags = "", Target = "t" });
+        db.AddRange(artifacts);
+        await db.SaveChangesAsync(Ct);
+
+        var sampleKey = sampleSha is null ? null : await db.Samples.Where(s => s.Sha256 == sampleSha).Select(s => s.BlobKey).SingleAsync(Ct);
+        return new Seeded(taskId, sampleSha, sampleKey, keys);
+    }
+
+    private static async Task<bool> TaskExistsAsync(OrchestratorHarness h, Guid id)
+    {
+        await using var db = h.NewContext();
+        return await db.Tasks.AnyAsync(t => t.Id == id, Ct);
+    }
+
+    private static async Task<int> ChildRowsAsync(OrchestratorHarness h, Guid id)
+    {
+        await using var db = h.NewContext();
+        return await db.ProcessNodes.CountAsync(x => x.TaskId == id, Ct)
+            + await db.BehaviorEvents.CountAsync(x => x.TaskId == id, Ct)
+            + await db.Detections.CountAsync(x => x.TaskId == id, Ct)
+            + await db.TaskStatusHistory.CountAsync(x => x.TaskId == id, Ct)
+            + await db.Artifacts.CountAsync(x => x.TaskId == id, Ct);
+    }
+
+    [Fact]
+    public async Task PurgesOnlyExpiredTerminalTasks()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        var org = await SeedOrgAsync(h, 30);
+        var store = h.Get<IArtifactStore>();
+        var oldCompleted = await SeedTaskAsync(h, org, RunStatus.Completed, Now.AddDays(-50), Now.AddDays(-45));
+        var oldFailed = await SeedTaskAsync(h, org, RunStatus.Failed, Now.AddDays(-50), Now.AddDays(-45));
+        // Cancelled is aged by CreatedAt (its CompletedAt is recent here on purpose).
+        var oldCancelled = await SeedTaskAsync(h, org, RunStatus.Cancelled, Now.AddDays(-50), Now.AddDays(-1));
+        var recentCompleted = await SeedTaskAsync(h, org, RunStatus.Completed, Now.AddDays(-50), Now.AddDays(-5));
+        var recentCancelled = await SeedTaskAsync(h, org, RunStatus.Cancelled, Now.AddDays(-5), Now.AddDays(-5));
+
+        var result = await h.Get<RetentionService>().PurgeAsync(Now, Ct);
+
+        Assert.Equal(new RetentionResult(TasksDeleted: 3, BlobsDeleted: 6, SamplesDeleted: 0), result);
+        foreach (var gone in new[] { oldCompleted, oldFailed, oldCancelled })
+        {
+            Assert.False(await TaskExistsAsync(h, gone.TaskId));
+            Assert.Equal(0, await ChildRowsAsync(h, gone.TaskId));
+            Assert.All(gone.ArtifactKeys, k => Assert.False(store.Exists(k)));
+        }
+        foreach (var kept in new[] { recentCompleted, recentCancelled })
+        {
+            Assert.True(await TaskExistsAsync(h, kept.TaskId));
+            Assert.Equal(7, await ChildRowsAsync(h, kept.TaskId));
+            Assert.All(kept.ArtifactKeys, k => Assert.True(store.Exists(k)));
+        }
+
+        await using var db = h.NewContext();
+        var audit = await db.AuditLogs.SingleAsync(a => a.Action == "retention.purge", Ct);
+        Assert.Null(audit.UserId);
+        Assert.Contains("tasks=3", audit.Details);
+        Assert.Contains("blobs=6", audit.Details);
+        Assert.Contains("samples=0", audit.Details);
+    }
+
+    [Theory]
+    [InlineData(RunStatus.Queued)]
+    [InlineData(RunStatus.Preparing)]
+    [InlineData(RunStatus.Running)]
+    [InlineData(RunStatus.Collecting)]
+    [InlineData(RunStatus.Processing)]
+    public async Task NeverPurgesRunningTask_EvenIfOld(RunStatus status)
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        var org = await SeedOrgAsync(h, 1);
+        var sample = await SeedSampleAsync(h);
+        var t = await SeedTaskAsync(h, org, status, Now.AddDays(-400), completedAt: null, sampleSha: sample.Sha);
+
+        var result = await h.Get<RetentionService>().PurgeAsync(Now, Ct);
+
+        Assert.Equal(new RetentionResult(0, 0, 0), result);
+        Assert.True(await TaskExistsAsync(h, t.TaskId));
+        Assert.All(t.ArtifactKeys, k => Assert.True(h.Get<IArtifactStore>().Exists(k)));
+        Assert.True(h.Get<IArtifactStore>().Exists(sample.Key));
+    }
+
+    [Fact]
+    public async Task SharedSample_KeptWhileReferenced()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        var org = await SeedOrgAsync(h, 30);
+        var store = h.Get<IArtifactStore>();
+        var sample = await SeedSampleAsync(h);
+        var expired = await SeedTaskAsync(h, org, RunStatus.Completed, Now.AddDays(-60), Now.AddDays(-59), sample.Sha);
+        var surviving = await SeedTaskAsync(h, org, RunStatus.Completed, Now.AddDays(-2), Now.AddDays(-1), sample.Sha);
+
+        var result = await h.Get<RetentionService>().PurgeAsync(Now, Ct);
+
+        Assert.Equal(new RetentionResult(TasksDeleted: 1, BlobsDeleted: 2, SamplesDeleted: 0), result);
+        Assert.False(await TaskExistsAsync(h, expired.TaskId));
+        Assert.True(await TaskExistsAsync(h, surviving.TaskId));
+        await using var db = h.NewContext();
+        Assert.True(await db.Samples.AnyAsync(s => s.Sha256 == sample.Sha, Ct));
+        Assert.True(store.Exists(sample.Key));
+
+        // Once the last referencing task expires too, the sample goes with it.
+        var later = Now.AddDays(60);
+        var second = await h.Get<RetentionService>().PurgeAsync(later, Ct);
+        Assert.Equal(new RetentionResult(1, 2, 1), second);
+        await using var check = h.NewContext();
+        Assert.False(await check.Samples.AnyAsync(s => s.Sha256 == sample.Sha, Ct));
+        Assert.False(store.Exists(sample.Key));
+    }
+
+    [Fact]
+    public async Task OrphanSample_DeletedWithBlob()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        var org = await SeedOrgAsync(h, 30);
+        var store = h.Get<IArtifactStore>();
+        var viaTask = await SeedSampleAsync(h);
+        var alreadyOrphan = await SeedSampleAsync(h);
+        var referenced = await SeedSampleAsync(h);
+        await SeedTaskAsync(h, org, RunStatus.Completed, Now.AddDays(-60), Now.AddDays(-59), viaTask.Sha);
+        var live = await SeedTaskAsync(h, org, RunStatus.Running, Now.AddDays(-60), null, referenced.Sha);
+
+        var result = await h.Get<RetentionService>().PurgeAsync(Now, Ct);
+
+        Assert.Equal(new RetentionResult(TasksDeleted: 1, BlobsDeleted: 2, SamplesDeleted: 2), result);
+        await using var db = h.NewContext();
+        Assert.False(await db.Samples.AnyAsync(s => s.Sha256 == viaTask.Sha, Ct));
+        Assert.False(store.Exists(viaTask.Key));
+        Assert.False(await db.Samples.AnyAsync(s => s.Sha256 == alreadyOrphan.Sha, Ct));
+        Assert.False(store.Exists(alreadyOrphan.Key));
+        Assert.True(await db.Samples.AnyAsync(s => s.Sha256 == referenced.Sha, Ct));
+        Assert.True(store.Exists(referenced.Key));
+        Assert.True(await TaskExistsAsync(h, live.TaskId));
+    }
+
+    [Fact]
+    public async Task PerOrgRetentionRespected()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        var shortOrg = await SeedOrgAsync(h, 1);
+        var longOrg = await SeedOrgAsync(h, 30);
+        var inShort = await SeedTaskAsync(h, shortOrg, RunStatus.Completed, Now.AddDays(-11), Now.AddDays(-10));
+        var inLong = await SeedTaskAsync(h, longOrg, RunStatus.Completed, Now.AddDays(-11), Now.AddDays(-10));
+
+        var result = await h.Get<RetentionService>().PurgeAsync(Now, Ct);
+
+        Assert.Equal(new RetentionResult(1, 2, 0), result);
+        Assert.False(await TaskExistsAsync(h, inShort.TaskId));
+        Assert.True(await TaskExistsAsync(h, inLong.TaskId));
+        Assert.All(inLong.ArtifactKeys, k => Assert.True(h.Get<IArtifactStore>().Exists(k)));
+    }
+
+    [Fact]
+    public async Task ArtifactBlobSharedWithSurvivingTask_IsKept()
+    {
+        // Blobs are content-addressed, so identical screenshots in two tasks share one file.
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        var org = await SeedOrgAsync(h, 30);
+        var store = h.Get<IArtifactStore>();
+        var expired = await SeedTaskAsync(h, org, RunStatus.Completed, Now.AddDays(-60), Now.AddDays(-59));
+        var surviving = await SeedTaskAsync(h, org, RunStatus.Completed, Now.AddDays(-2), Now.AddDays(-1));
+        await using (var db = h.NewContext())
+        {
+            var shared = await db.Artifacts.SingleAsync(a => a.BlobKey == expired.ArtifactKeys[0], Ct);
+            db.Add(new Artifact { Id = Guid.NewGuid(), TaskId = surviving.TaskId, Kind = ArtifactKind.Screenshot, BlobKey = shared.BlobKey, Sha256 = shared.Sha256, Size = shared.Size, CreatedAt = Now });
+            await db.SaveChangesAsync(Ct);
+            var result = await h.Get<RetentionService>().PurgeAsync(Now, Ct);
+            Assert.Equal(new RetentionResult(1, 1, 0), result);
+            Assert.True(store.Exists(shared.BlobKey));
+        }
+        Assert.False(store.Exists(expired.ArtifactKeys[1]));
+    }
+
+    [Fact]
+    public async Task Worker_PurgesAfterStartupDelay()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        var org = await SeedOrgAsync(h, 1);
+        // Harness time is 2030-01-01; seed relative to it.
+        var t0 = h.Time.GetUtcNow();
+        var expired = await SeedTaskAsync(h, org, RunStatus.Completed, t0.AddDays(-10), t0.AddDays(-9));
+        var worker = h.Get<RetentionWorker>();
+
+        await worker.StartAsync(Ct);
+        try
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            // Nothing happens before the 5-minute startup delay has elapsed.
+            h.Time.Advance(TimeSpan.FromMinutes(4));
+            await Task.Delay(100, Ct);
+            Assert.True(await TaskExistsAsync(h, expired.TaskId));
+
+            while (await TaskExistsAsync(h, expired.TaskId))
+            {
+                Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30), "Worker did not purge within 30 s of real time.");
+                h.Time.Advance(TimeSpan.FromMinutes(1));
+                await Task.Delay(50, Ct);
+            }
+        }
+        finally
+        {
+            await worker.StopAsync(CancellationToken.None);
+        }
+    }
+}

@@ -45,6 +45,7 @@ if ((builder.Configuration.GetSection(WorkersOptions.SectionName).Get<WorkersOpt
 {
     builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorWorker>());
     builder.Services.AddHostedService(sp => sp.GetRequiredService<ProcessingWorker>());
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<RetentionWorker>());
 }
 
 var app = builder.Build();
