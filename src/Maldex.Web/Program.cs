@@ -3,6 +3,7 @@ using Maldex.Core.Abstractions;
 using Maldex.Data;
 using Maldex.Infrastructure;
 using Maldex.Orchestrator;
+using Maldex.Processing;
 using Maldex.Web;
 using Maldex.Web.Auth;
 using Maldex.Web.Endpoints;
@@ -30,10 +31,13 @@ builder.AddMaldexAuth();
 builder.Services.AddSignalR().AddJsonProtocol(o => o.PayloadSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddSingleton<ITaskEventPublisher, SignalRTaskEventPublisher>();
 builder.Services.AddMaldexOrchestrator(builder.Configuration);
-// The orchestrator worker runs inside the web host only when Maldex:Workers:Enabled (default true).
-// (The processing worker is registered the same way by Task 14.)
+builder.Services.AddMaldexProcessing(builder.Configuration);
+// The orchestrator and processing workers run inside the web host only when Maldex:Workers:Enabled (default true).
 if ((builder.Configuration.GetSection(WorkersOptions.SectionName).Get<WorkersOptions>() ?? new WorkersOptions()).Enabled)
+{
     builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorWorker>());
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<ProcessingWorker>());
+}
 
 var app = builder.Build();
 

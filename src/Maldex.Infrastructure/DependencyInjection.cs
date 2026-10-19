@@ -1,5 +1,6 @@
 using Maldex.Core.Abstractions;
 using Maldex.Infrastructure.Fakes;
+using Maldex.Infrastructure.Scanning;
 using Maldex.Infrastructure.Storage;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -19,9 +20,12 @@ public static class DependencyInjection
         services.Configure<ReplayOptions>(configuration.GetSection(ReplayOptions.SectionName));
         services.Configure<FakeHypervisorOptions>(configuration.GetSection(FakeHypervisorOptions.SectionName));
         services.Configure<FakeEgressOptions>(configuration.GetSection(FakeEgressOptions.SectionName));
+        services.Configure<YaraOptions>(configuration.GetSection(YaraOptions.SectionName));
 
         if (!OperatingSystem.IsWindows()) services.AddSingleton<IArtifactStore, FileSystemArtifactStore>();
         services.AddSingleton<IDiskSpaceProbe, DiskSpaceProbe>();
+        // YARA is real in every mode; the yara binary is a host dependency, not a fake.
+        services.AddSingleton<IYaraScanner, YaraCliScanner>();
 
         switch (mode)
         {
@@ -29,6 +33,7 @@ public static class DependencyInjection
                 services.AddSingleton<IHypervisor, FakeHypervisor>();
                 services.AddSingleton<IAgentChannelFactory, FakeAgentChannelFactory>();
                 services.AddSingleton<IEgressRouter, NoopEgressRouter>();
+                services.AddSingleton<ISuricataRunner, NoopSuricataRunner>();
                 break;
             case "Real":
                 throw new NotSupportedException("Real mode is implemented in Plan 1b");

@@ -7,6 +7,8 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="Fakes/Replays/*.jsonl" CopyToOutputDirectory="PreserveNewest" />
+    <!-- YARA rules are source; they ship next to the binaries so the default relative index path resolves everywhere. -->
+    <None Include="..\..\rules\**\*.yar" Link="rules\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Maldex.Data\Maldex.Data.csproj" />

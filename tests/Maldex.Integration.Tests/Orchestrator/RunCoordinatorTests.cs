@@ -8,6 +8,7 @@ using Maldex.Infrastructure;
 using Maldex.Infrastructure.Fakes;
 using Maldex.Integration.Tests.Fixtures;
 using Maldex.Orchestrator;
+using Maldex.Processing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -99,6 +100,7 @@ internal sealed class OrchestratorHarness : IAsyncDisposable
         services.Replace(ServiceDescriptor.Singleton<IAgentChannelFactory>(Channels));
         services.AddSingleton<ITaskEventPublisher>(Publisher);
         services.AddMaldexOrchestrator(config);
+        services.AddMaldexProcessing(config);
         _services = services.BuildServiceProvider();
     }
 
@@ -116,13 +118,22 @@ internal sealed class OrchestratorHarness : IAsyncDisposable
         new(new DbContextOptionsBuilder<MaldexDbContext>().UseSqlServer(_connectionString).Options);
 
     /// <summary>Seeds a sample-backed task that the worker would already have claimed (<c>Preparing</c>).</summary>
-    public async Task<Guid> SeedPreparingTaskAsync(NetworkMode mode = NetworkMode.Simulated, int durationSec = 300)
+    public async Task<Guid> SeedPreparingTaskAsync(NetworkMode mode = NetworkMode.Simulated, int durationSec = 300, byte[]? sampleContent = null)
     {
         await using var db = NewContext();
         var sha = Guid.NewGuid().ToString("N") + Guid.NewGuid().ToString("N");
+        var blobKey = $"samples/{sha[..2]}/{sha[2..4]}/{sha}";
+        if (sampleContent is not null)
+        {
+            // A real blob in the artifact store, keyed by its real hash (what the submission endpoint does).
+            await using var content = new MemoryStream(sampleContent, writable: false);
+            var blob = await Get<IArtifactStore>().PutAsync("samples", content, 1_048_576, TestContext.Current.CancellationToken);
+            sha = blob.Sha256;
+            blobKey = blob.Key;
+        }
         var org = new OrgEntity { Id = Guid.NewGuid(), Name = "Org-" + Guid.NewGuid().ToString("N"), RetentionDays = 30 };
         var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "A", Role = UserRole.Analyst };
-        var sample = new Sample { Sha256 = sha, Sha1 = new string('b', 40), Md5 = new string('c', 32), Size = 5, BlobKey = $"samples/{sha[..2]}/{sha[2..4]}/{sha}", FirstSeen = Time.GetUtcNow() };
+        var sample = new Sample { Sha256 = sha, Sha1 = new string('b', 40), Md5 = new string('c', 32), Size = 5, BlobKey = blobKey, FirstSeen = Time.GetUtcNow() };
         var task = new AnalysisTask
         {
             Id = Guid.NewGuid(), OrgId = org.Id, SubmittedByUserId = user.Id, SampleSha256 = sha, OriginalFileName = "invoice.exe",
