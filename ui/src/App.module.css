@@ -1,0 +1,15 @@
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  padding: 0.6rem 1.5rem;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+.nav a { color: #e2e8f0; text-decoration: none; }
+.nav a:hover, .nav a.active { color: #fff; text-decoration: underline; }
+.brand { font-weight: 700; letter-spacing: 0.04em; margin-right: 1rem; }
+.spacer { flex: 1; }
+.user { font-size: 0.85rem; color: #94a3b8; }
+.main { padding: 1.5rem; max-width: 1200px; margin: 0 auto; }
+.error { color: #b91c1c; }

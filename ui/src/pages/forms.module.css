@@ -1,0 +1,23 @@
+.form { display: grid; gap: 1rem; max-width: 640px; }
+.field { display: grid; gap: 0.25rem; }
+.field label, .legend { font-weight: 600; font-size: 0.9rem; }
+.field input[type='text'], .field input[type='number'], .field input[type='file'], .field select, .field input[type='url'] {
+  padding: 0.45rem 0.55rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font: inherit;
+  background: #fff;
+}
+.inline { display: flex; align-items: center; gap: 0.5rem; }
+.hint { color: #64748b; font-size: 0.85rem; }
+.error { color: #b91c1c; font-size: 0.85rem; margin: 0; }
+.primary { padding: 0.5rem 1rem; border: 0; border-radius: 6px; background: #1d4ed8; color: #fff; font-weight: 600; }
+.primary:disabled { background: #94a3b8; cursor: default; }
+.secondary { padding: 0.3rem 0.7rem; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; }
+.secondary:disabled { color: #94a3b8; cursor: default; }
+.table { width: 100%; border-collapse: collapse; background: #fff; }
+.table th, .table td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
+.table th { font-size: 0.8rem; text-transform: uppercase; color: #64748b; }
+.filters { display: flex; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; align-items: end; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; overflow-wrap: anywhere; }
+.pager { display: flex; gap: 0.75rem; align-items: center; margin-top: 1rem; }

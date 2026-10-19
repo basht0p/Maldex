@@ -1,0 +1,114 @@
+// Mirrors the REST/SignalR DTOs of Maldex.Web / Maldex.Core. Field names are camelCase and enums travel as strings
+// (Program.cs registers a global JsonStringEnumConverter for HTTP and SignalR).
+
+export type RunStatus = 'Queued' | 'Preparing' | 'Running' | 'Collecting' | 'Processing' | 'Completed' | 'Failed' | 'Cancelled'
+export type NetworkMode = 'None' | 'Simulated' | 'LiveVpn' | 'LiveTor'
+export type Verdict = 'Unknown' | 'NoThreats' | 'Suspicious' | 'Malicious'
+export type EventType = 'Process' | 'File' | 'Registry' | 'Network' | 'Dns'
+export type ArtifactKind = 'Sample' | 'Dropped' | 'Pcap' | 'Screenshot' | 'Report' | 'MitmFlows'
+export type UserRole = 'Analyst' | 'Admin'
+
+export const RUN_STATUSES: readonly RunStatus[] = ['Queued', 'Preparing', 'Running', 'Collecting', 'Processing', 'Completed', 'Failed', 'Cancelled']
+export const NETWORK_MODES: readonly NetworkMode[] = ['None', 'Simulated', 'LiveVpn', 'LiveTor']
+
+export interface MeDto {
+  id: string
+  displayName: string
+  role: UserRole
+}
+
+export interface OrgDto {
+  id: string
+  name: string
+  retentionDays: number
+}
+
+export interface TaskDto {
+  id: string
+  orgId: string
+  orgName: string
+  sampleSha256?: string | null
+  url?: string | null
+  originalFileName?: string | null
+  image: string
+  networkMode: NetworkMode
+  exitCountry?: string | null
+  durationSec: number
+  interactive: boolean
+  status: RunStatus
+  verdict: Verdict
+  queuePosition: number
+  createdAt: string
+  startedAt?: string | null
+  deadlineAt?: string | null
+  completedAt?: string | null
+  failureReason?: string | null
+  processingWarnings: string[]
+}
+
+export interface TaskListDto {
+  items: TaskDto[]
+  total: number
+}
+
+export interface ProcessNodeDto {
+  id: number
+  pid: number
+  parentId?: number | null
+  imagePath: string
+  commandLine: string
+  user?: string | null
+  startedAt: string
+  endedAt?: string | null
+}
+
+export interface LiveEventDto {
+  id: number
+  type: EventType
+  at: string
+  pid: number
+  processId?: number | null
+  summary: string
+  dataJson: string
+}
+
+export interface TaskStatusUpdate {
+  taskId: string
+  status: RunStatus
+  verdict: Verdict
+  deadlineAt?: string | null
+  reason?: string | null
+}
+
+export interface ArtifactDto {
+  id: string
+  kind: ArtifactKind
+  sha256: string
+  size: number
+}
+
+export interface OrgRequest {
+  name: string
+  retentionDays: number
+}
+
+export interface TaskListQuery {
+  orgId?: string
+  status?: RunStatus
+  skip?: number
+  take?: number
+}
+
+export interface EventsQuery {
+  afterId?: number
+  type?: EventType
+  take?: number
+}
+
+/** ASP.NET ValidationProblemDetails / ProblemDetails (the parts the UI reads). */
+export interface ProblemDetails {
+  title?: string
+  status?: number
+  detail?: string
+  errors?: Record<string, string[]>
+}

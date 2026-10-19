@@ -1,0 +1,87 @@
+import { getAccessToken } from '../auth/auth'
+import type {
+  ArtifactDto,
+  EventsQuery,
+  LiveEventDto,
+  MeDto,
+  OrgDto,
+  OrgRequest,
+  ProcessNodeDto,
+  TaskDto,
+  TaskListDto,
+  TaskListQuery,
+} from './types'
+
+/** A non-2xx response. `problem` is the parsed body (ProblemDetails for JSON, the raw text otherwise, or undefined when empty). */
+export class ApiError extends Error {
+  readonly status: number
+  readonly problem: unknown
+
+  constructor(status: number, problem: unknown) {
+    super(problemTitle(problem) ?? `Request failed with status ${status}`)
+    this.name = 'ApiError'
+    this.status = status
+    this.problem = problem
+  }
+}
+
+function problemTitle(problem: unknown): string | undefined {
+  if (problem && typeof problem === 'object' && 'title' in problem && typeof problem.title === 'string') return problem.title
+  return undefined
+}
+
+async function parseBody(res: Response): Promise<unknown> {
+  const text = await res.text()
+  if (!text) return undefined
+  try {
+    return JSON.parse(text)
+  } catch {
+    return text
+  }
+}
+
+async function request<T>(method: string, path: string, body?: BodyInit | null, json?: unknown): Promise<T> {
+  const headers: Record<string, string> = { Accept: 'application/json' }
+  const token = await getAccessToken()
+  if (token) headers.Authorization = `Bearer ${token}`
+  let payload = body ?? undefined
+  if (json !== undefined) {
+    headers['Content-Type'] = 'application/json'
+    payload = JSON.stringify(json)
+  }
+  // FormData bodies must not get a Content-Type: the browser adds the multipart boundary itself.
+  const res = await fetch(path, { method, headers, body: payload })
+  const parsed = await parseBody(res)
+  if (!res.ok) throw new ApiError(res.status, parsed)
+  return parsed as T
+}
+
+function query(params: Record<string, string | number | undefined>): string {
+  const q = new URLSearchParams()
+  for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== '') q.set(k, String(v))
+  const s = q.toString()
+  return s ? `?${s}` : ''
+}
+
+const get = <T>(path: string) => request<T>('GET', path)
+const post = <T>(path: string, json?: unknown) => request<T>('POST', path, undefined, json)
+
+export const getMe = () => get<MeDto>('/api/me')
+
+export const listOrgs = () => get<OrgDto[]>('/api/orgs')
+export const createOrg = (req: OrgRequest) => request<OrgDto>('POST', '/api/orgs', undefined, req)
+export const updateOrg = (id: string, req: OrgRequest) => request<OrgDto>('PUT', `/api/orgs/${id}`, undefined, req)
+
+/** `form` is multipart: orgId, one of file/url, and optionally networkMode, durationSec, interactive, exitCountry, image. */
+export const submitTask = (form: FormData) => request<TaskDto>('POST', '/api/tasks', form)
+export const listTasks = (q: TaskListQuery = {}) =>
+  get<TaskListDto>(`/api/tasks${query({ orgId: q.orgId, status: q.status, skip: q.skip, take: q.take })}`)
+export const getTask = (id: string) => get<TaskDto>(`/api/tasks/${id}`)
+export const cancelTask = (id: string) => post<void>(`/api/tasks/${id}/cancel`)
+export const extendTask = (id: string, seconds: number) => post<TaskDto>(`/api/tasks/${id}/extend`, { seconds })
+export const stopTask = (id: string) => post<void>(`/api/tasks/${id}/stop`)
+
+export const getProcesses = (id: string) => get<ProcessNodeDto[]>(`/api/tasks/${id}/processes`)
+export const getEvents = (id: string, q: EventsQuery = {}) =>
+  get<LiveEventDto[]>(`/api/tasks/${id}/events${query({ afterId: q.afterId, type: q.type, take: q.take })}`)
+export const listArtifacts = (id: string) => get<ArtifactDto[]>(`/api/tasks/${id}/artifacts`)

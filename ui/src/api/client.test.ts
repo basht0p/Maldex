@@ -1,0 +1,88 @@
+import { http, HttpResponse } from 'msw'
+import { setupServer } from 'msw/node'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { ApiError, extendTask, getMe, listTasks, stopTask } from './client'
+
+vi.mock('../auth/auth', () => ({ getAccessToken: vi.fn(async () => null) }))
+import { getAccessToken } from '../auth/auth'
+
+const server = setupServer()
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }))
+afterEach(() => server.resetHandlers())
+afterAll(() => server.close())
+
+describe('client', () => {
+  it('client_ThrowsApiErrorWithProblem', async () => {
+    const problem = { title: 'Bad', status: 400, errors: { url: ['url must be http'] } }
+    server.use(http.get('/api/tasks', () => HttpResponse.json(problem, { status: 400 })))
+
+    const err = await listTasks().catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).status).toBe(400)
+    expect((err as ApiError).problem).toEqual(problem)
+  })
+
+  it('keeps a non-JSON error body as text', async () => {
+    server.use(http.get('/api/me', () => new HttpResponse('boom', { status: 500 })))
+    const err = (await getMe().catch((e: unknown) => e)) as ApiError
+    expect(err.status).toBe(500)
+    expect(err.problem).toBe('boom')
+  })
+
+  it('sends no Authorization header when there is no token (dev mode)', async () => {
+    let auth: string | null = 'unset'
+    server.use(
+      http.get('/api/me', ({ request }) => {
+        auth = request.headers.get('authorization')
+        return HttpResponse.json({ id: 'u', displayName: 'Dev', role: 'Admin' })
+      }),
+    )
+    const me = await getMe()
+    expect(me.role).toBe('Admin')
+    expect(auth).toBeNull()
+  })
+
+  it('attaches the bearer token when auth provides one (entra mode)', async () => {
+    vi.mocked(getAccessToken).mockResolvedValueOnce('tok123')
+    let auth: string | null = null
+    server.use(
+      http.get('/api/me', ({ request }) => {
+        auth = request.headers.get('authorization')
+        return HttpResponse.json({ id: 'u', displayName: 'A', role: 'Analyst' })
+      }),
+    )
+    await getMe()
+    expect(auth).toBe('Bearer tok123')
+  })
+
+  it('builds the task list query string', async () => {
+    let search = ''
+    server.use(
+      http.get('/api/tasks', ({ request }) => {
+        search = new URL(request.url).search
+        return HttpResponse.json({ items: [], total: 0 })
+      }),
+    )
+    await listTasks({ orgId: 'o1', status: 'Queued', skip: 50, take: 25 })
+    const q = new URLSearchParams(search)
+    expect(q.get('orgId')).toBe('o1')
+    expect(q.get('status')).toBe('Queued')
+    expect(q.get('skip')).toBe('50')
+    expect(q.get('take')).toBe('25')
+  })
+
+  it('extend posts {seconds}; stop tolerates an empty 202', async () => {
+    let body: unknown
+    server.use(
+      http.post('/api/tasks/t1/extend', async ({ request }) => {
+        body = await request.json()
+        return HttpResponse.json({ id: 't1' })
+      }),
+      http.post('/api/tasks/t1/stop', () => new HttpResponse(null, { status: 202 })),
+    )
+    await extendTask('t1', 120)
+    expect(body).toEqual({ seconds: 120 })
+    await expect(stopTask('t1')).resolves.toBeUndefined()
+  })
+})
