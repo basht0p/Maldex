@@ -1,0 +1,158 @@
+@using Maldex.Core.Domain
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Maldex report @Model.TaskId</title>
+<style>
+body { font-family: Arial, Helvetica, sans-serif; font-size: 11px; color: #1a1a1a; margin: 24px; }
+h1 { font-size: 20px; margin: 0 0 4px 0; }
+h2 { font-size: 14px; margin: 22px 0 6px 0; border-bottom: 1px solid #bbb; padding-bottom: 2px; }
+table { border-collapse: collapse; width: 100%; table-layout: fixed; }
+th, td { border: 1px solid #ccc; padding: 3px 5px; text-align: left; vertical-align: top; word-wrap: break-word; overflow-wrap: anywhere; }
+th { background: #eee; }
+td.k { width: 22%; background: #f6f6f6; font-weight: bold; }
+.verdict { display: inline-block; padding: 3px 10px; border-radius: 4px; color: #fff; font-size: 14px; font-weight: bold; }
+.v-NoThreats { background: #2e7d32; }
+.v-Suspicious { background: #ef6c00; }
+.v-Malicious { background: #c62828; }
+.v-Unknown { background: #616161; }
+.warn { background: #fff3cd; border: 1px solid #e0c36c; padding: 4px 8px; margin: 4px 0; }
+.mono { font-family: "DejaVu Sans Mono", Consolas, monospace; font-size: 10px; }
+.shots img { max-width: 48%; border: 1px solid #999; margin: 4px 1% 4px 0; }
+.muted { color: #666; }
+tr { page-break-inside: avoid; }
+</style>
+</head>
+<body>
+<h1>Maldex analysis report</h1>
+<div class="muted">Task @Model.TaskId, generated @Fmt(Model.GeneratedAt)</div>
+
+<h2>Verdict</h2>
+<p><span class="@("verdict v-" + Model.Verdict)">@Model.VerdictLabel</span></p>
+@foreach (var w in Model.ProcessingWarnings)
+{
+    <div class="warn">Processing warning: @w</div>
+}
+
+<h2>Task</h2>
+<table>
+<tr><td class="k">Organization</td><td>@Model.OrgName</td></tr>
+@if (Model.SampleName is not null)
+{
+    <tr><td class="k">File name</td><td>@Model.SampleName</td></tr>
+}
+@if (Model.Url is not null)
+{
+    <tr><td class="k">URL</td><td class="mono">@Model.Url</td></tr>
+}
+@if (Model.Sha256 is not null)
+{
+    <tr><td class="k">SHA-256</td><td class="mono">@Model.Sha256</td></tr>
+}
+@if (Model.Sha1 is not null)
+{
+    <tr><td class="k">SHA-1</td><td class="mono">@Model.Sha1</td></tr>
+}
+@if (Model.Md5 is not null)
+{
+    <tr><td class="k">MD5</td><td class="mono">@Model.Md5</td></tr>
+}
+@if (Model.SampleSize is { } size)
+{
+    <tr><td class="k">Size</td><td>@size bytes</td></tr>
+}
+<tr><td class="k">Image</td><td>@Model.Image</td></tr>
+<tr><td class="k">Network</td><td>@Model.NetworkMode@(Model.ExitCountry is null ? "" : " (" + Model.ExitCountry + ")")</td></tr>
+<tr><td class="k">Planned duration</td><td>@Model.DurationSec s</td></tr>
+<tr><td class="k">Submitted</td><td>@Fmt(Model.CreatedAt)</td></tr>
+<tr><td class="k">Started</td><td>@Fmt(Model.StartedAt)</td></tr>
+<tr><td class="k">Completed</td><td>@Fmt(Model.CompletedAt)</td></tr>
+</table>
+
+<h2>Detections (@Model.Detections.Count)</h2>
+@if (Model.Detections.Count == 0)
+{
+    <p class="muted">No detections.</p>
+}
+else
+{
+    <table>
+    <tr><th style="width:11%">Source</th><th style="width:22%">Rule</th><th style="width:8%">Severity</th><th style="width:16%">Tags</th><th>Target / details</th></tr>
+    @foreach (var d in Model.Detections)
+    {
+        <tr><td>@d.Source</td><td>@d.Rule</td><td>@d.Severity</td><td>@d.Tags</td><td class="mono">@d.Target@(d.Details is null ? "" : " | " + d.Details)</td></tr>
+    }
+    </table>
+}
+
+<h2>Process tree (@Model.Processes.Count)</h2>
+@if (Model.Processes.Count == 0)
+{
+    <p class="muted">No processes recorded.</p>
+}
+else
+{
+    <table>
+    <tr><th style="width:8%">PID</th><th>Process</th><th style="width:14%">User</th><th style="width:16%">Started</th></tr>
+    @foreach (var p in Model.Processes)
+    {
+        <tr>
+            <td>@p.Pid</td>
+            <td style="@("padding-left:" + (5 + p.Depth * 14) + "px")"><span class="mono">@p.ImagePath</span><br /><span class="mono muted">@p.CommandLine</span></td>
+            <td>@p.User</td>
+            <td>@Fmt(p.StartedAt)</td>
+        </tr>
+    }
+    </table>
+}
+
+<h2>Network (@Model.NetworkEvents.Count)</h2>
+@Events(Model.NetworkEvents, "No network activity recorded.")
+
+<h2>DNS (@Model.DnsEvents.Count)</h2>
+@Events(Model.DnsEvents, "No DNS lookups recorded.")
+
+<h2>Timeline (@Model.Timeline.Count of @Model.TotalEvents events)</h2>
+@Events(Model.Timeline, "No events recorded.", showType: true)
+
+<h2>Screenshots (@Model.Screenshots.Count)</h2>
+@if (Model.Screenshots.Count == 0)
+{
+    <p class="muted">No screenshots.</p>
+}
+else
+{
+    <div class="shots">
+    @foreach (var s in Model.Screenshots)
+    {
+        <img src="@s.DataUri" alt="@("Screenshot at " + Fmt(s.At))" />
+    }
+    </div>
+}
+</body>
+</html>
+
+@code {
+    [Parameter, EditorRequired] public ReportModel Model { get; set; } = default!;
+
+    private static string Fmt(DateTimeOffset? at) => at is { } v ? v.UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss 'UTC'", System.Globalization.CultureInfo.InvariantCulture) : "-";
+
+    private RenderFragment Events(IReadOnlyList<ReportTimelineRow> rows, string empty, bool showType = false) => __builder =>
+    {
+        if (rows.Count == 0)
+        {
+            <p class="muted">@empty</p>
+        }
+        else
+        {
+            <table>
+            <tr><th style="width:17%">Time</th>@if (showType){<th style="width:9%">Type</th>}<th style="width:8%">PID</th><th>Summary</th></tr>
+            @foreach (var e in rows)
+            {
+                <tr><td>@Fmt(e.At)</td>@if (showType){<td>@e.Type</td>}<td>@e.Pid</td><td class="mono">@e.Summary</td></tr>
+            }
+            </table>
+        }
+    };
+}

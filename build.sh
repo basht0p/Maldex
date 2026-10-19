@@ -19,7 +19,8 @@ cmd_setup() {
     echo "Generated .env"
   fi
   dotnet tool restore
-  # Task 15 adds the Playwright browser install here.
+  # Chromium for PDF reports (Microsoft.Playwright); also installs the OS libraries it needs, which uses sudo.
+  dotnet run --project src/Maldex.Web -- --install-browsers
 }
 
 cmd_dev_db() {
