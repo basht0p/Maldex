@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -65,6 +65,35 @@ describe('TaskPage', () => {
     expect(screen.getByRole('link', { name: 'Sample (ZIP)' })).toHaveAttribute('href', '/api/tasks/t1/sample')
     expect(await screen.findByRole('link', { name: /Pcap/ })).toHaveAttribute('href', '/api/artifacts/a1/download')
     expect(screen.getByRole('button', { name: 'Stop' })).toBeDisabled()
+  })
+
+  it('re-fetches the task after a reconnect so a status missed during the outage is reconciled', async () => {
+    const stale = { taskId: 't1', status: 'Running', verdict: 'Unknown', deadlineAt: null }
+    live.value = { status: stale, processes: [], events: [], connected: false }
+    getTask.mockResolvedValue(task({}))
+    const view = renderPage()
+    expect(await screen.findByText('Running')).toBeInTheDocument()
+
+    // While disconnected the run completed; the hub reconnects but replays no status.
+    getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious' }))
+    live.value = { status: stale, processes: [], events: [], connected: true }
+    view.rerender(
+      <MemoryRouter initialEntries={['/tasks/t1']}>
+        <Routes><Route path="/tasks/:id" element={<TaskPage />} /></Routes>
+      </MemoryRouter>,
+    )
+    expect(await screen.findByText('Completed')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('link', { name: 'HTML report' })).toBeInTheDocument())
+    expect(screen.queryByLabelText('Time remaining')).toBeNull()
+
+    // A push newer than the fetch wins again.
+    live.value = { status: { ...stale, status: 'Failed', reason: 'x' }, processes: [], events: [], connected: true }
+    view.rerender(
+      <MemoryRouter initialEntries={['/tasks/t1']}>
+        <Routes><Route path="/tasks/:id" element={<TaskPage />} /></Routes>
+      </MemoryRouter>,
+    )
+    expect(await screen.findByText('Failed')).toBeInTheDocument()
   })
 
   it('does not show report links while running', async () => {

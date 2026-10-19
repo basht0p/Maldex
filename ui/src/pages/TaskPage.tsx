@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { ApiError, extendTask, getTask, listArtifacts, stopTask } from '../api/client'
-import type { ArtifactDto, RunStatus, TaskDto } from '../api/types'
+import type { ArtifactDto, RunStatus, TaskDto, TaskStatusUpdate } from '../api/types'
 import { EventTable } from '../components/EventTable'
 import { ProcessTree } from '../components/ProcessTree'
 import { SessionPane } from '../components/SessionPane'
@@ -32,7 +32,9 @@ export default function TaskPage() {
 
 function LiveTask({ taskId }: { taskId: string }) {
   const live = useTaskLive(taskId)
-  const [task, setTask] = useState<TaskDto | null>(null)
+  // `basis` is the pushed status that was current when the fetch was issued: only a *different* (newer) push beats it.
+  const [fetched, setFetched] = useState<{ task: TaskDto; basis: TaskStatusUpdate | null } | null>(null)
+  const task = fetched?.task ?? null
   const [loadError, setLoadError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   // Set by Extend; valid only until the next pushed deadline (`basis`) replaces it.
@@ -41,12 +43,21 @@ function LiveTask({ taskId }: { taskId: string }) {
   const [now, setNow] = useState(() => Date.now())
   const [busy, setBusy] = useState(false)
 
+  // Fetched on mount and again whenever the hub (re)connects: a status push missed during an outage is not in the
+  // hub backlog, so this is what reconciles status, verdict and the report links after a reconnect.
+  const connected = live.connected
+  const pushedRef = useRef<TaskStatusUpdate | null>(null)
+  useEffect(() => {
+    pushedRef.current = live.status // declared before the fetch effect, so it is current when that one runs
+  })
   useEffect(() => {
     let cancelled = false
+    const basis = pushedRef.current
     getTask(taskId).then(
       (t) => {
         if (cancelled) return
-        setTask(t)
+        setFetched({ task: t, basis })
+        setLoadError(null)
       },
       (e: unknown) => {
         if (!cancelled) setLoadError(errorMessage(e))
@@ -55,15 +66,16 @@ function LiveTask({ taskId }: { taskId: string }) {
     return () => {
       cancelled = true
     }
-  }, [taskId])
+  }, [taskId, connected])
 
   // A pushed status carries the authoritative deadline (also after someone else extends the run).
-  const pushedDeadline = live.status?.deadlineAt ?? null
+  const liveNow = live.status !== fetched?.basis ? live.status : null // a push older than the last fetch is stale
+  const pushedDeadline = liveNow?.deadlineAt ?? null
   const deadlineAt =
     extended && extended.basis === pushedDeadline ? extended.value : (pushedDeadline ?? task?.deadlineAt ?? null)
 
-  const status: RunStatus | null = live.status?.status ?? task?.status ?? null
-  const verdict = live.status?.verdict ?? task?.verdict ?? 'Unknown'
+  const status: RunStatus | null = liveNow?.status ?? task?.status ?? null
+  const verdict = liveNow?.verdict ?? task?.verdict ?? 'Unknown'
   const completed = status === 'Completed'
 
   useEffect(() => {
@@ -126,7 +138,7 @@ function LiveTask({ taskId }: { taskId: string }) {
       </div>
       {target && <p className={styles.mono}>{safeText(target)}</p>}
       {actionError && <p className={styles.error} role="alert">{actionError}</p>}
-      {(live.status?.reason ?? task?.failureReason) && <p className={styles.error}>{safeText(live.status?.reason ?? task?.failureReason)}</p>}
+      {(liveNow?.reason ?? task?.failureReason) && <p className={styles.error}>{safeText(liveNow?.reason ?? task?.failureReason)}</p>}
 
       {completed && (
         <nav className={styles.links} aria-label="Results">

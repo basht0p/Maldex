@@ -29,6 +29,8 @@ export interface TaskLive {
 
 /** Must equal the server's per-request cap (LiveControlEndpoints.MaxEventsPerRequest); a shorter page means "no more". */
 const PAGE = 1000
+const RETRY_MS = 2000
+const MAX_RETRY_MS = 15000
 
 export function createHubConnection(): HubConnectionLike {
   return new HubConnectionBuilder()
@@ -38,8 +40,12 @@ export function createHubConnection(): HubConnectionLike {
     .build()
 }
 
-/** Appends the events whose ids are not yet in `seen`, keeping the list ascending by id. Returns `prev` when nothing is new. */
-export function mergeEvents(prev: LiveEventDto[], incoming: LiveEventDto[], seen: Set<number>): LiveEventDto[] {
+/**
+ * Appends the events whose ids are not already in `prev` (or earlier in `incoming`), keeping the list ascending by id.
+ * Returns `prev` when nothing is new. PURE: it is used inside setState updaters, which React runs twice under StrictMode.
+ */
+export function mergeEvents(prev: LiveEventDto[], incoming: LiveEventDto[]): LiveEventDto[] {
+  const seen = new Set(prev.map((e) => e.id))
   const fresh: LiveEventDto[] = []
   for (const e of incoming) {
     if (seen.has(e.id)) continue
@@ -92,13 +98,15 @@ export function useTaskLive(taskId: string, options: UseTaskLiveOptions = {}): T
     let syncing = false
     let generation = 0
     let buffer: Buffered[] = []
-    const seen = new Set<number>()
+    let syncRetry: ReturnType<typeof setTimeout> | undefined
+    let connectRetry: ReturnType<typeof setTimeout> | undefined
+    let syncFailures = 0
     const conn = factory()
 
     const apply = (m: Buffered) => {
       if (m.kind === 'status') setStatus(m.value)
       else if (m.kind === 'process') setProcesses((prev) => upsertProcesses(prev, [m.value]))
-      else setEvents((prev) => mergeEvents(prev, m.value, seen))
+      else setEvents((prev) => mergeEvents(prev, m.value))
     }
     const live = (m: Buffered) => {
       if (cancelled) return
@@ -112,8 +120,8 @@ export function useTaskLive(taskId: string, options: UseTaskLiveOptions = {}): T
 
     const sync = async () => {
       const mine = ++generation
-      syncing = true
-      buffer = []
+      clearTimeout(syncRetry)
+      syncing = true // the buffer is kept across retries: a status push is not in any backlog, and event dupes are dropped by id
       try {
         await conn.invoke('JoinTask', taskId) // 1. join first: from now on everything saved is pushed to us
         const procs = await getProcesses(taskId) // 3. backlog (live callbacks accumulate in `buffer` meanwhile)
@@ -127,14 +135,20 @@ export function useTaskLive(taskId: string, options: UseTaskLiveOptions = {}): T
         }
         if (cancelled || mine !== generation) return
         setProcesses((prev) => upsertProcesses(prev, procs)) // 4. backlog, then the buffer
-        setEvents((prev) => mergeEvents(prev, backlog, seen))
+        setEvents((prev) => mergeEvents(prev, backlog))
         for (const m of buffer) apply(m)
         buffer = []
         syncing = false
+        syncFailures = 0
         setConnected(true)
       } catch {
-        // Join/backlog failed (e.g. the connection dropped mid-sync): stay "disconnected"; automatic reconnect re-runs the sync.
-        if (!cancelled && mine === generation) setConnected(false)
+        // Join/backlog failed (a 5xx, or the connection dropped mid-sync). Stay disconnected, keep buffering, and retry
+        // with a short backoff; a reconnect meanwhile starts its own sync, which supersedes this one.
+        if (!cancelled && mine === generation) {
+          setConnected(false)
+          syncRetry = setTimeout(() => void sync(), Math.min(RETRY_MS * 2 ** syncFailures, MAX_RETRY_MS))
+          syncFailures++
+        }
       }
     }
 
@@ -146,25 +160,30 @@ export function useTaskLive(taskId: string, options: UseTaskLiveOptions = {}): T
     conn.onreconnected(() => {
       if (!cancelled) void sync()
     })
-    conn.onclose(() => {
-      if (!cancelled) setConnected(false)
-    })
-
-    // SignalR's automatic reconnect only covers an established connection, so retry the first start ourselves.
-    let retry: ReturnType<typeof setTimeout> | undefined
+    // SignalR's automatic reconnect only covers an established connection (and gives up after about 42 s), so the first
+    // start and a start after `onclose` are retried here until they succeed.
     const connect = () => {
       conn.start().then(
         () => (cancelled ? undefined : sync()),
         () => {
-          if (!cancelled) retry = setTimeout(connect, 2000)
+          if (!cancelled) connectRetry = setTimeout(connect, RETRY_MS)
         },
       )
     }
+    conn.onclose(() => {
+      if (cancelled) return
+      generation++ // abandon any sync in flight
+      syncing = true
+      setConnected(false)
+      clearTimeout(syncRetry)
+      connectRetry = setTimeout(connect, RETRY_MS)
+    })
     connect()
 
     return () => {
       cancelled = true
-      clearTimeout(retry)
+      clearTimeout(syncRetry)
+      clearTimeout(connectRetry)
       // Reset so a different task id never shows the previous task's data.
       setStatus(null)
       setProcesses([])

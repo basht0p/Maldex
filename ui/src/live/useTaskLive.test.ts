@@ -1,5 +1,6 @@
 import { act, renderHook, waitFor } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { StrictMode } from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { LiveEventDto, ProcessNodeDto, TaskStatusUpdate } from '../api/types'
 
 const getProcesses = vi.fn()
@@ -15,13 +16,14 @@ class MockHub implements HubConnectionLike {
   closed: Array<() => void> = []
   calls: string[] = []
   started = false
+  startCount = 0
   stopped = false
   onJoin?: () => void
   on(name: string, cb: (...args: never[]) => void) { this.handlers.set(name, cb) }
   onreconnecting(cb: () => void) { this.reconnecting.push(cb) }
   onreconnected(cb: () => void) { this.reconnected.push(cb) }
   onclose(cb: () => void) { this.closed.push(cb) }
-  async start() { this.started = true; this.calls.push('start') }
+  async start() { this.started = true; this.startCount++; this.calls.push('start') }
   async stop() { this.stopped = true; this.calls.push('stop') }
   async invoke(method: string, ...args: unknown[]) {
     this.calls.push(`${method}:${args.join(',')}`)
@@ -41,6 +43,7 @@ beforeEach(() => {
   getProcesses.mockReset()
   getEvents.mockReset()
 })
+afterEach(() => vi.useRealTimers())
 
 describe('useTaskLive', () => {
   it('useTaskLive_MergesBacklogAndLive_NoDuplicates', async () => {
@@ -115,5 +118,51 @@ describe('useTaskLive', () => {
     unmount()
     await waitFor(() => expect(hub.stopped).toBe(true))
     expect(hub.calls).toContain('LeaveTask:t1')
+  })
+
+  it('keeps every event under StrictMode (state updaters run twice and must be pure)', async () => {
+    const hub = new MockHub()
+    getProcesses.mockResolvedValue([proc(1)])
+    getEvents.mockResolvedValue([ev(1), ev(2), ev(3)])
+    const { result } = renderHook(() => useTaskLive('t1', { createConnection: () => hub }), { wrapper: StrictMode })
+    await waitFor(() => expect(result.current.connected).toBe(true))
+    expect(ids(result.current.events)).toEqual([1, 2, 3])
+
+    hub.push('events', [ev(3), ev(4), ev(5)])
+    hub.push('events', [ev(6)])
+    expect(ids(result.current.events)).toEqual([1, 2, 3, 4, 5, 6])
+    expect(ids(result.current.processes)).toEqual([1])
+  })
+
+  it('retries a failed sync, keeping what arrived live meanwhile', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const hub = new MockHub()
+    getProcesses.mockResolvedValue([proc(1)])
+    getEvents.mockRejectedValueOnce(new Error('500')).mockResolvedValue([ev(1), ev(2)])
+    const { result } = renderHook(() => useTaskLive('t1', { createConnection: () => hub }))
+    await waitFor(() => expect(getEvents).toHaveBeenCalledTimes(1))
+    hub.push('events', [ev(3)]) // buffered while the sync is failed/pending
+    expect(result.current.connected).toBe(false)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(2100) })
+    await waitFor(() => expect(result.current.connected).toBe(true))
+    expect(hub.calls.filter((c) => c === 'JoinTask:t1')).toHaveLength(2)
+    expect(ids(result.current.events)).toEqual([1, 2, 3])
+  })
+
+  it('restarts the connection after it closes for good, then re-syncs', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const hub = new MockHub()
+    getProcesses.mockResolvedValue([])
+    getEvents.mockResolvedValueOnce([ev(1)]).mockResolvedValueOnce([ev(1), ev(2)])
+    const { result } = renderHook(() => useTaskLive('t1', { createConnection: () => hub }))
+    await waitFor(() => expect(result.current.connected).toBe(true))
+
+    act(() => hub.closed.forEach((f) => f()))
+    expect(result.current.connected).toBe(false)
+    await act(async () => { await vi.advanceTimersByTimeAsync(2100) })
+    await waitFor(() => expect(result.current.connected).toBe(true))
+    expect(hub.startCount).toBe(2)
+    expect(ids(result.current.events)).toEqual([1, 2])
   })
 })
