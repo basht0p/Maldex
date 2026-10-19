@@ -1,0 +1,11 @@
+.header { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; margin-bottom: 0.5rem; }
+.header h1 { margin: 0; font-size: 1.25rem; }
+.spacer { flex: 1; }
+.countdown { font-variant-numeric: tabular-nums; font-weight: 600; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; overflow-wrap: anywhere; }
+.offline { color: #92400e; font-size: 0.85rem; }
+.links { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; margin: 0.5rem 0 1rem; }
+.error { color: #b91c1c; margin: 0.5rem 0; }
+.grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; margin-bottom: 1rem; }
+.panel h2 { font-size: 1rem; margin: 0 0 0.5rem; }
+@media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }

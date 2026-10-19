@@ -1,0 +1,2 @@
+.pane { display: grid; place-items: center; align-content: center; min-height: 12rem; border: 1px dashed #cbd5e1; border-radius: 8px; background: #f8fafc; color: #64748b; }
+.placeholder { font-weight: 600; margin: 0; }

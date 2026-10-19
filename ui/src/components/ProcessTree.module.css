@@ -1,0 +1,8 @@
+.list { list-style: none; margin: 0; padding-left: 1.25rem; border-left: 1px solid #cbd5e1; }
+.root { padding-left: 0; border-left: 0; }
+.row { display: flex; gap: 0.6rem; align-items: baseline; padding: 0.15rem 0; min-width: 0; }
+.image { font-weight: 600; white-space: nowrap; }
+.pid { color: #64748b; font-size: 0.8rem; white-space: nowrap; }
+.cmd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; color: #475569; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.exited .image { color: #94a3b8; font-weight: 400; }
+.empty { color: #64748b; }
