@@ -231,14 +231,16 @@ public sealed class ReportTests(SqlServerFixture sql) : IDisposable
     [Fact]
     public async Task PdfRenderer_Cancelled_Throws()
     {
-        await using var renderer = new Maldex.Web.Reports.PdfRenderer(new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build());
-        var html = "<html><body>" + string.Concat(Enumerable.Repeat("<p>cancel me cancel me cancel me cancel me</p>", 60_000)) + "</body></html>";
+        // Cancel from a hook the moment rendering starts, so the outcome does not depend on how fast Chromium renders.
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
-        var render = renderer.RenderAsync(html, cts.Token);
-        cts.CancelAfter(TimeSpan.FromMilliseconds(1500));
+        await using var renderer = new Maldex.Web.Reports.PdfRenderer(new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build())
+        {
+            OnRenderStarting = cts.Cancel,
+        };
+        var html = "<html><body>" + string.Concat(Enumerable.Repeat("<p>cancel me cancel me cancel me cancel me</p>", 60_000)) + "</body></html>";
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => render);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => renderer.RenderAsync(html, cts.Token));
         Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10), "cancellation did not abort the render promptly");
     }
 }

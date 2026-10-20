@@ -14,6 +14,9 @@ public sealed class PdfRenderer(IConfiguration configuration) : IAsyncDisposable
     private readonly SemaphoreSlim _initGate = new(1, 1);
     private IPlaywright? _playwright;
 
+    /// <summary>Test seam: called once the browser is up and cancellation is wired, just before the page is rendered.</summary>
+    public Action? OnRenderStarting { get; init; }
+
     public async Task<byte[]> RenderAsync(string html, CancellationToken ct)
     {
         await _concurrency.WaitAsync(ct);
@@ -42,6 +45,7 @@ public sealed class PdfRenderer(IConfiguration configuration) : IAsyncDisposable
         await using var context = await browser.NewContextAsync(new BrowserNewContextOptions { JavaScriptEnabled = false, Offline = true });
         // Playwright calls take no token: closing the browser aborts whatever is in flight.
         await using var onCancel = ct.Register(() => _ = CloseQuietlyAsync(browser));
+        OnRenderStarting?.Invoke();
         var page = await context.NewPageAsync();
         await page.SetContentAsync(html, new PageSetContentOptions { WaitUntil = WaitUntilState.Load });
         return await page.PdfAsync(new PagePdfOptions { Format = "A4", PrintBackground = true });

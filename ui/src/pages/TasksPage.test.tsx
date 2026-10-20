@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { MemoryRouter } from 'react-router-dom'
@@ -52,5 +52,19 @@ describe('TasksPage', () => {
     // The refresh that follows the failed cancel must not wipe the message.
     await new Promise((r) => setTimeout(r, 100))
     expect(screen.getByText('Only queued tasks can be cancelled.')).toBeInTheDocument()
+  })
+
+  it('clears the cancel error when the filter changes', async () => {
+    server.use(
+      http.get('/api/tasks', () => HttpResponse.json({ items: [task({})], total: 1 })),
+      http.post('/api/tasks/t1/cancel', () => HttpResponse.json({ title: 'Conflict' }, { status: 409 })),
+    )
+    render(<MemoryRouter><TasksPage /></MemoryRouter>)
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
+    expect(await screen.findByText('Only queued tasks can be cancelled.')).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('Status'), { target: { value: 'Queued' } })
+
+    await waitFor(() => expect(screen.queryByText('Only queued tasks can be cancelled.')).toBeNull())
   })
 })

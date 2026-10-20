@@ -231,34 +231,47 @@ public sealed class RunCoordinator(
     private async Task<ReadyResult> WaitForReadyAsync(MaldexDbContext db, Guid taskId, IAsyncEnumerator<AgentMessage> enumerator, CancellationTokenSource readerCts, CancellationToken ct)
     {
         var deadline = time.GetUtcNow() + _options.AgentReadyTimeout;
+        var nextPollAt = time.GetUtcNow() + _options.ControlPollInterval;
         Task<bool>? next = null;
         try
         {
             while (true)
             {
                 next ??= enumerator.MoveNextAsync().AsTask();
-                var remaining = deadline - time.GetUtcNow();
-                if (remaining <= TimeSpan.Zero) return await AbandonAsync(ReadyResult.NotReady).ConfigureAwait(false);
+                var now = time.GetUtcNow();
+                if (deadline - now <= TimeSpan.Zero) return await AbandonAsync(ReadyResult.NotReady).ConfigureAwait(false);
 
-                var moved = false;
+                var wait = Min(deadline - now, nextPollAt - now);
+                if (wait < TimeSpan.Zero) wait = TimeSpan.Zero;
                 try
                 {
-                    moved = await next.WaitAsync(remaining < _options.ControlPollInterval ? remaining : _options.ControlPollInterval, time, ct).ConfigureAwait(false);
+                    if (await next.WaitAsync(wait, time, ct).ConfigureAwait(false))
+                    {
+                        next = null;
+                        if (enumerator.Current is ReadyMessage) return ReadyResult.Ready;
+                        // Anything the agent sends before it is ready is not telemetry yet; ignore it.
+                    }
+                    else
+                    {
+                        next = null;
+                        return ReadyResult.NotReady; // the channel closed first
+                    }
                 }
                 catch (TimeoutException)
                 {
+                    // the same MoveNextAsync is still in flight
+                }
+
+                // Poll on the clock, not only when the guest is quiet: a chatty guest must not defer a stop.
+                if (time.GetUtcNow() >= nextPollAt)
+                {
+                    nextPollAt = time.GetUtcNow() + _options.ControlPollInterval;
                     var stop = await db.Tasks.AsNoTracking()
                         .Where(t => t.Id == taskId)
                         .Select(t => t.StopRequestedAt)
                         .SingleAsync(ct).ConfigureAwait(false);
                     if (stop is not null) return await AbandonAsync(ReadyResult.Stopped).ConfigureAwait(false);
-                    continue; // the same MoveNextAsync is still in flight
                 }
-
-                next = null;
-                if (!moved) return ReadyResult.NotReady;
-                if (enumerator.Current is ReadyMessage) return ReadyResult.Ready;
-                // Anything the agent sends before it is ready is not telemetry yet; ignore it.
             }
         }
         catch when (next is { IsCompleted: false })
@@ -269,10 +282,13 @@ public sealed class RunCoordinator(
             throw;
         }
 
+        static TimeSpan Min(TimeSpan a, TimeSpan b) => a < b ? a : b;
+
         async Task<ReadyResult> AbandonAsync(ReadyResult result)
         {
             await readerCts.CancelAsync().ConfigureAwait(false);
-            try { await next!.ConfigureAwait(false); } catch (OperationCanceledException) { }
+            // The cancelled read may end in any exception; a stop or timeout must never turn into a failure.
+            if (next is not null) { try { await next.ConfigureAwait(false); } catch (Exception) { } }
             return result;
         }
     }
@@ -423,25 +439,7 @@ public sealed class RunCoordinator(
     /// </summary>
     private async Task TransitionAsync(MaldexDbContext db, AnalysisTask task, RunStatus to, string reason, Action<AnalysisTask>? mutate, CancellationToken ct)
     {
-        for (var attempt = 1; ; attempt++)
-        {
-            await db.Entry(task).ReloadAsync(ct).ConfigureAwait(false);
-            task.TransitionTo(to, reason, time.GetUtcNow());
-            mutate?.Invoke(task);
-            try
-            {
-                await db.SaveChangesAsync(ct).ConfigureAwait(false);
-                break;
-            }
-            catch (DbUpdateConcurrencyException) when (attempt < MaxTransitionAttempts)
-            {
-                foreach (var h in task.StatusHistory.Where(h => db.Entry(h).State == EntityState.Added).ToList())
-                {
-                    db.Entry(h).State = EntityState.Detached;
-                    task.StatusHistory.Remove(h);
-                }
-            }
-        }
+        await TaskTransitions.TransitionWithRetryAsync(db, task, to, reason, time.GetUtcNow(), mutate, ct, maxAttempts: MaxTransitionAttempts).ConfigureAwait(false);
 
         try
         {

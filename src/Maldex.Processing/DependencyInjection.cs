@@ -13,11 +13,11 @@ public static class DependencyInjection
     public static IServiceCollection AddMaldexProcessing(this IServiceCollection services, IConfiguration configuration)
     {
         services.TryAddSingleton(TimeProvider.System);
+        services.Configure<ProcessingOptions>(configuration.GetSection(ProcessingOptions.SectionName));
         services.AddSingleton<ProcessingPipeline>();
+        services.AddSingleton<IProcessingPipeline>(sp => sp.GetRequiredService<ProcessingPipeline>());
         // Hosted by Maldex.Web only when Maldex:Workers:Enabled: AddHostedService(sp => sp.GetRequiredService<ProcessingWorker>()).
-        services.AddSingleton(sp => new ProcessingWorker(
-            sp.GetRequiredService<IServiceScopeFactory>(), sp.GetRequiredService<ProcessingPipeline>(), sp.GetRequiredService<TimeProvider>(),
-            configuration, sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<ProcessingWorker>>()));
+        services.AddSingleton<ProcessingWorker>();
         services.AddSingleton<RetentionService>();
         // Hosted alongside the others: AddHostedService(sp => sp.GetRequiredService<RetentionWorker>()).
         services.AddSingleton<RetentionWorker>();

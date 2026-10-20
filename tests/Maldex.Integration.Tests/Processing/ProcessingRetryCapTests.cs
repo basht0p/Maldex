@@ -4,9 +4,9 @@ using Maldex.Integration.Tests.Fixtures;
 using Maldex.Integration.Tests.Orchestrator;
 using Maldex.Processing;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace Maldex.Integration.Tests.Processing;
@@ -16,13 +16,11 @@ public class ProcessingRetryCapTests(SqlServerFixture sql)
 {
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
 
-    private sealed class AlwaysThrowingPipeline(OrchestratorHarness h) : ProcessingPipeline(
-        h.Get<IServiceScopeFactory>(), h.Get<IYaraScanner>(), h.Get<ISuricataRunner>(), h.Get<IArtifactStore>(),
-        h.Get<ITaskEventPublisher>(), h.Time, NullLogger<ProcessingPipeline>.Instance)
+    private sealed class AlwaysThrowingPipeline : IProcessingPipeline
     {
         public int Calls;
 
-        public override Task ProcessAsync(Guid taskId, CancellationToken ct)
+        public Task ProcessAsync(Guid taskId, CancellationToken ct)
         {
             Calls++;
             throw new InvalidOperationException("boom");
@@ -37,9 +35,8 @@ public class ProcessingRetryCapTests(SqlServerFixture sql)
         await h.RunAsync(id);
         Assert.Equal(RunStatus.Processing, await h.StatusOfAsync(id));
 
-        var pipeline = new AlwaysThrowingPipeline(h);
-        var config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { ["Maldex:Processing:MaxAttempts"] = "3" }).Build();
-        var worker = new ProcessingWorker(h.Get<IServiceScopeFactory>(), pipeline, h.Time, config, NullLogger<ProcessingWorker>.Instance);
+        var pipeline = new AlwaysThrowingPipeline();
+        var worker = new ProcessingWorker(h.Get<IServiceScopeFactory>(), pipeline, h.Time, Options.Create(new ProcessingOptions { MaxAttempts = 3 }), NullLogger<ProcessingWorker>.Instance);
 
         await worker.ProcessPendingAsync(Ct);
         Assert.Equal(1, pipeline.Calls);

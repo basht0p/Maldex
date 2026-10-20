@@ -3,10 +3,10 @@ using Maldex.Core.Domain;
 using Maldex.Core.Live;
 using Maldex.Data;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Maldex.Processing;
 
@@ -18,21 +18,20 @@ namespace Maldex.Processing;
 /// </summary>
 public sealed class ProcessingWorker(
     IServiceScopeFactory scopes,
-    ProcessingPipeline pipeline,
+    IProcessingPipeline pipeline,
     TimeProvider time,
-    IConfiguration configuration,
+    IOptions<ProcessingOptions> options,
     ILogger<ProcessingWorker> logger) : BackgroundService
 {
     public static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(2);
 
     private const int DefaultMaxAttempts = 5;
-    private const int MaxSaveAttempts = 5;
     private static readonly TimeSpan MaxBackoff = TimeSpan.FromSeconds(60);
 
     // In memory only: a restart gives every task a fresh set of attempts.
     private readonly Dictionary<Guid, (int Failures, DateTimeOffset RetryAt)> _failures = [];
 
-    private int MaxAttempts => configuration.GetValue("Maldex:Processing:MaxAttempts", DefaultMaxAttempts) is > 0 and var n ? n : DefaultMaxAttempts;
+    private int MaxAttempts => options.Value.MaxAttempts > 0 ? options.Value.MaxAttempts : DefaultMaxAttempts;
 
     /// <summary>Delay before the next attempt after <paramref name="failures"/> failures: 2 s, 4 s, 8 s ... capped at 60 s.</summary>
     public static TimeSpan BackoffFor(int failures)
@@ -69,6 +68,7 @@ public sealed class ProcessingWorker(
     public async Task<IReadOnlyList<Guid>> ProcessPendingAsync(CancellationToken ct)
     {
         var done = new List<Guid>();
+        await PruneFailuresAsync(ct).ConfigureAwait(false);
         var now = time.GetUtcNow();
         HashSet<Guid> tried = [.. _failures.Where(f => f.Value.RetryAt > now).Select(f => f.Key)]; // still backing off
         while (!ct.IsCancellationRequested)
@@ -116,6 +116,20 @@ public sealed class ProcessingWorker(
         }
     }
 
+    /// <summary>Forgets tasks that are no longer in Processing (completed, failed elsewhere, deleted).</summary>
+    private async Task PruneFailuresAsync(CancellationToken ct)
+    {
+        if (_failures.Count == 0) return;
+        await using var scope = scopes.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        var ids = _failures.Keys.ToList();
+        var still = await db.Tasks.AsNoTracking()
+            .Where(t => ids.Contains(t.Id) && t.Status == RunStatus.Processing)
+            .Select(t => t.Id)
+            .ToListAsync(ct).ConfigureAwait(false);
+        foreach (var id in ids.Except(still)) _failures.Remove(id);
+    }
+
     private async Task FailTaskAsync(Guid taskId, string reason, CancellationToken ct)
     {
         await using var scope = scopes.CreateAsyncScope();
@@ -123,28 +137,13 @@ public sealed class ProcessingWorker(
         var task = await db.Tasks.SingleOrDefaultAsync(t => t.Id == taskId, ct).ConfigureAwait(false);
         if (task is null) return;
 
-        for (var attempt = 1; ; attempt++)
+        var at = time.GetUtcNow();
+        var moved = await TaskTransitions.TransitionWithRetryAsync(db, task, RunStatus.Failed, reason, at, t =>
         {
-            await db.Entry(task).ReloadAsync(ct).ConfigureAwait(false);
-            if (task.Status != RunStatus.Processing) return;
-            var at = time.GetUtcNow();
-            task.TransitionTo(RunStatus.Failed, reason, at);
-            task.FailureReason = reason;
-            task.EndedAt ??= at;
-            try
-            {
-                await db.SaveChangesAsync(ct).ConfigureAwait(false);
-                break;
-            }
-            catch (DbUpdateConcurrencyException) when (attempt < MaxSaveAttempts)
-            {
-                foreach (var h in task.StatusHistory.Where(h => db.Entry(h).State == EntityState.Added).ToList())
-                {
-                    db.Entry(h).State = EntityState.Detached;
-                    task.StatusHistory.Remove(h);
-                }
-            }
-        }
+            t.FailureReason = reason;
+            t.EndedAt ??= at;
+        }, ct, onlyFrom: RunStatus.Processing).ConfigureAwait(false);
+        if (!moved) return;
 
         try
         {

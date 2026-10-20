@@ -54,6 +54,7 @@ export default function TasksPage() {
     setActionError(null)
     try {
       await cancelTask(id)
+      setActionError(null)
     } catch (e) {
       setActionError(e instanceof ApiError && e.status === 409 ? 'Only queued tasks can be cancelled.' : e instanceof Error ? e.message : 'Cancel failed.')
     }
@@ -69,14 +70,14 @@ export default function TasksPage() {
       <div className={styles.filters}>
         <div className={styles.field}>
           <label htmlFor="filterOrg">Organization</label>
-          <select id="filterOrg" value={orgId} onChange={(e) => { setOrgId(e.target.value); setSkip(0) }}>
+          <select id="filterOrg" value={orgId} onChange={(e) => { setOrgId(e.target.value); setSkip(0); setActionError(null) }}>
             <option value="">All</option>
             {orgs.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
           </select>
         </div>
         <div className={styles.field}>
           <label htmlFor="filterStatus">Status</label>
-          <select id="filterStatus" value={status} onChange={(e) => { setStatus(e.target.value as RunStatus | ''); setSkip(0) }}>
+          <select id="filterStatus" value={status} onChange={(e) => { setStatus(e.target.value as RunStatus | ''); setSkip(0); setActionError(null) }}>
             <option value="">All</option>
             {RUN_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
           </select>
@@ -118,9 +119,9 @@ export default function TasksPage() {
       </table>
 
       <div className={styles.pager}>
-        <button type="button" className={styles.secondary} disabled={skip === 0} onClick={() => setSkip(Math.max(0, skip - PAGE_SIZE))}>Previous</button>
+        <button type="button" className={styles.secondary} disabled={skip === 0} onClick={() => { setSkip(Math.max(0, skip - PAGE_SIZE)); setActionError(null) }}>Previous</button>
         <span>{from}–{to} of {total}</span>
-        <button type="button" className={styles.secondary} disabled={skip + PAGE_SIZE >= total} onClick={() => setSkip(skip + PAGE_SIZE)}>Next</button>
+        <button type="button" className={styles.secondary} disabled={skip + PAGE_SIZE >= total} onClick={() => { setSkip(skip + PAGE_SIZE); setActionError(null) }}>Next</button>
       </div>
     </section>
   )
