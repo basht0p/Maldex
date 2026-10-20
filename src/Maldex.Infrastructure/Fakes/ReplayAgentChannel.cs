@@ -17,7 +17,7 @@ public sealed class FakeAgentChannelFactory(IOptionsMonitor<ReplayOptions> optio
         var o = options.CurrentValue;
         var path = Path.Combine(o.ResolveDirectory(), o.DefaultFile);
         var lines = await File.ReadAllLinesAsync(path, ct).ConfigureAwait(false);
-        return new ReplayAgentChannel(lines, o.Speed, o.HoldOpen, time, guest);
+        return new ReplayAgentChannel(lines, o.Speed, o.HoldOpen, time, guest, vm.TaskId);
     }
 }
 
@@ -36,6 +36,7 @@ public sealed class ReplayAgentChannel : IAgentChannel
     // Every frame (replayed or answered) goes through one queue and one writer, so frames never interleave.
     private readonly Channel<byte[]> _outbox = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true });
     private readonly FakeGuest? _guest;
+    private readonly Guid? _taskId;
     private readonly TaskCompletionSource _opened = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly List<AgentCommand> _sent = [];
     private readonly object _gate = new();
@@ -51,9 +52,10 @@ public sealed class ReplayAgentChannel : IAgentChannel
     /// When given, the channel behaves like a guest during bulk transfers (see <see cref="FakeGuest"/>) and, unless it holds the
     /// stream open, keeps it open until the host has sent its open command so that transfer answers can still be delivered.
     /// </param>
-    public ReplayAgentChannel(IReadOnlyList<string> lines, double speed, bool holdOpen, TimeProvider time, FakeGuest? guest = null)
+    public ReplayAgentChannel(IReadOnlyList<string> lines, double speed, bool holdOpen, TimeProvider time, FakeGuest? guest = null, Guid? taskId = null)
     {
         _guest = guest;
+        _taskId = taskId;
         _time = time;
         _speed = speed > 0 ? speed : 1.0;
         _holdOpen = holdOpen;
@@ -124,8 +126,23 @@ public sealed class ReplayAgentChannel : IAgentChannel
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
         lock (_gate) _sent.Add(command);
+        if (command is SelfTestCommand self) RespondSelfTest(self);
         if (_guest is not null) Respond(command);
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// A fake guest is perfectly isolated unless a test says otherwise: every probe blocked, no echo. Without a <see cref="FakeGuest"/>
+    /// the channel answers exactly that. Fake LiveVpn runs echo the configured exit IP (see <see cref="FakeEgressOptions.LiveEgressIp"/>).
+    /// </summary>
+    private void RespondSelfTest(SelfTestCommand c)
+    {
+        if (_guest is { SilentSelfTest: true }) return;
+        var reachable = _guest is null ? [] : _guest.ReachableProbes.ToHashSet(StringComparer.Ordinal);
+        var echo = _guest is not null && _taskId is { } id ? _guest.EchoFor(id) : null;
+        Enqueue(new SelfTestResultMessage(_time.GetUtcNow(), c.CommandId,
+            c.Targets.Select(t => new ProbeResult(t.Name, reachable.Contains(t.Name))).ToList(), echo));
+        Enqueue(new CommandResultMessage(c.CommandId, true));
     }
 
     /// <summary>Plays the guest's side of a command: acknowledge sample chunks, serve collected files, then note that the run has started.</summary>

@@ -1,3 +1,4 @@
+using Maldex.Agent.Probes;
 using Maldex.Agent.Transfers;
 using Maldex.Core.Agent;
 
@@ -17,10 +18,11 @@ public sealed class CommandDispatcher : IDisposable
     private readonly string _desktop;
     private readonly InboundTransfers _inbound;
     private readonly TimeProvider _time;
+    private readonly ISelfTestProbes _probes;
 
     /// <param name="desktopDirectory">Where delivered samples are placed; defaults to %USERPROFILE%\Desktop.</param>
     /// <param name="stagingDirectory">Where in-flight chunks are buffered; defaults to a folder under the temp directory.</param>
-    public CommandDispatcher(ISampleOpener sample, IUrlOpener url, Action requestStop, string? desktopDirectory = null, string? stagingDirectory = null, TimeProvider? time = null)
+    public CommandDispatcher(ISampleOpener sample, IUrlOpener url, Action requestStop, string? desktopDirectory = null, string? stagingDirectory = null, TimeProvider? time = null, ISelfTestProbes? probes = null)
     {
         _sample = sample;
         _url = url;
@@ -29,6 +31,7 @@ public sealed class CommandDispatcher : IDisposable
             Environment.GetEnvironmentVariable("USERPROFILE") ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Desktop");
         _inbound = new InboundTransfers(stagingDirectory ?? Path.Combine(Path.GetTempPath(), "maldex-inbound"));
         _time = time ?? TimeProvider.System;
+        _probes = probes ?? new SelfTestProbes();
     }
 
     /// <summary>Called by the host once the result for <paramref name="command"/> has been written.</summary>
@@ -60,8 +63,11 @@ public sealed class CommandDispatcher : IDisposable
                     return new CommandResultMessage(c.CommandId, true);
                 case ShutdownCommand c:
                     return new CommandResultMessage(c.CommandId, true);
+                case SelfTestCommand c:
+                    if (emit is null) return new CommandResultMessage(c.CommandId, false, "self_test is not available here");
+                    await emit(await _probes.RunAsync(c, ct).ConfigureAwait(false), ct).ConfigureAwait(false);
+                    return new CommandResultMessage(c.CommandId, true);
                 default:
-                    // self_test arrives with a later task.
                     return new CommandResultMessage(command.CommandId, false, "unsupported command");
             }
         }

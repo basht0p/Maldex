@@ -5,6 +5,8 @@ using Maldex.Core.Domain;
 using Maldex.Core.Live;
 using Maldex.Core.Text;
 using Maldex.Data;
+using Maldex.Infrastructure.Isolation;
+using Maldex.Infrastructure.Net;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -21,6 +23,10 @@ public sealed class RunCoordinator(
     IHypervisor hypervisor,
     IAgentChannelFactory channels,
     IEgressRouter egress,
+    IRunNetworkInfo networkInfo,
+    IExpectedEgress expectedEgress,
+    IOptions<NetOptions> netOptions,
+    IOptions<SelfTestOptions> selfTestOptions,
     ITaskEventPublisher publisher,
     IArtifactStore artifacts,
     IOptions<OrchestratorOptions> options,
@@ -99,6 +105,12 @@ public sealed class RunCoordinator(
         {
             throw; // host shutdown: the reconciler picks the task up on restart
         }
+        catch (IsolationException ex)
+        {
+            // Not retried: a second VM would sit on the same network.
+            logger.LogWarning("Run {TaskId}: {Reason}", taskId, ex.Message);
+            await FailAsync(db, task, ex.Message).ConfigureAwait(false);
+        }
         catch (SampleDeliveryException ex)
         {
             // Not retried: a second VM would receive the same sample the same way.
@@ -140,7 +152,7 @@ public sealed class RunCoordinator(
             }
 
             channel = await channels.ConnectAsync(vm, ct).ConfigureAwait(false);
-            return await RunGuestAsync(db, task, channel, command, ct).ConfigureAwait(false);
+            return await RunGuestAsync(db, task, lease, channel, command, ct).ConfigureAwait(false);
         }
         finally
         {
@@ -169,7 +181,7 @@ public sealed class RunCoordinator(
     /// Returns <c>AgentNotReady</c> (without touching the task) if the agent never became ready, or <c>Stopped</c>
     /// if the analyst asked to stop while the VM was still preparing.
     /// </summary>
-    private async Task<AttemptOutcome> RunGuestAsync(MaldexDbContext db, AnalysisTask task, IAgentChannel channel, AgentCommand command, CancellationToken ct)
+    private async Task<AttemptOutcome> RunGuestAsync(MaldexDbContext db, AnalysisTask task, NetworkLease lease, IAgentChannel channel, AgentCommand command, CancellationToken ct)
     {
         using var readerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var enumerator = channel.ReadAsync(readerCts.Token).GetAsyncEnumerator(readerCts.Token);
@@ -199,13 +211,14 @@ public sealed class RunCoordinator(
             IReadOnlyList<DroppedFile> dropped = [];
             try
             {
-                // SEAM (Task 13): the isolation self-test runs here, after the agent is ready and before anything is delivered.
+                // The isolation self-test runs after the agent is ready and before anything is delivered or opened: no sample reaches a guest that failed it.
+                await RunSelfTestAsync(db, task, lease, channel, inbox, ct).ConfigureAwait(false);
 
                 if (command is OpenSampleCommand open)
                     await DeliverSampleAsync(db, channel, inbox, task, open, ct).ConfigureAwait(false);
 
                 var now = time.GetUtcNow();
-                await TransitionAsync(db, task, RunStatus.Running, "agent ready", t =>
+                await TransitionAsync(db, task, RunStatus.Running, "agent ready; isolation self-test passed", t =>
                 {
                     t.StartedAt = now;
                     t.DeadlineAt = now.AddSeconds(t.DurationSec);
@@ -229,7 +242,7 @@ public sealed class RunCoordinator(
                 await reader.ConfigureAwait(false);
                 try { await flusher.ConfigureAwait(false); } catch (Exception) { /* the original error wins */ }
                 // A stop during delivery ends like a stop during the ready wait: Cancelled from Preparing.
-                if (ex is DeliveryStoppedException) return AttemptOutcome.Stopped;
+                if (ex is DeliveryStoppedException or SelfTestStoppedException) return AttemptOutcome.Stopped;
                 throw;
             }
 
@@ -244,6 +257,55 @@ public sealed class RunCoordinator(
         {
             if (!disposed) await enumerator.DisposeAsync().ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Runs the isolation self-test and records the verdict in the task's audit log. A failed (or impossible) test throws
+    /// <see cref="IsolationException"/>, which fails the run in Preparing without a retry.
+    /// </summary>
+    private async Task RunSelfTestAsync(MaldexDbContext db, AnalysisTask task, NetworkLease lease, IAgentChannel channel, TransferInbox inbox, CancellationToken ct)
+    {
+        IsolationVerdict verdict;
+        try
+        {
+            verdict = await EvaluateIsolationAsync(db, task, lease, channel, inbox, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not (OperationCanceledException or SelfTestStoppedException))
+        {
+            // Any unexpected error is a failed self-test (and is audited), never a pass.
+            logger.LogError(ex, "Isolation self-test of task {TaskId} failed unexpectedly.", task.Id);
+            verdict = IsolationVerdict.Fail($"self-test error: {GuestText.Clean(ex.Message, 200)}");
+        }
+
+        db.AuditLogs.Add(new AuditLog
+        {
+            At = time.GetUtcNow(),
+            Action = verdict.Isolated ? "isolation.selftest.passed" : "isolation.selftest.failed",
+            Target = task.Id.ToString(),
+            Details = $"mode={task.NetworkMode}; {(verdict.Isolated ? "guest-reported probes all blocked" : "not isolated: " + GuestText.Clean(verdict.Reason, 500))}",
+        });
+        await db.SaveChangesAsync(ct).ConfigureAwait(false);
+
+        if (!verdict.Isolated) throw new IsolationException($"isolation self-test failed: {GuestText.Clean(verdict.Reason, 500)}");
+    }
+
+    private async Task<IsolationVerdict> EvaluateIsolationAsync(MaldexDbContext db, AnalysisTask task, NetworkLease lease, IAgentChannel channel, TransferInbox inbox, CancellationToken ct)
+    {
+        var info = await networkInfo.GetAsync(lease, ct).ConfigureAwait(false);
+        if (info is null) return IsolationVerdict.Fail("the run's network addressing is unknown");
+        if (info.Mode != task.NetworkMode) return IsolationVerdict.Fail($"network mode mismatch: lease {info.Mode}, task {task.NetworkMode}");
+
+        var plan = IsolationProbePlan.Build(netOptions.Value, info);
+        if (selfTestOptions.Value.RequireControlPlaneProbes && !plan.Targets.Any(t => t.Name.StartsWith("control_plane_", StringComparison.Ordinal)))
+            return IsolationVerdict.Fail("no control-plane probe targets configured");
+
+        var expectedEgressIp = task.NetworkMode == NetworkMode.LiveVpn
+            ? await expectedEgress.GetAsync(task.NetworkMode, task.ExitCountry, ct).ConfigureAwait(false)
+            : null;
+        return await new SelfTestGate(time, pollInterval: _options.ControlPollInterval)
+            .RunAsync(channel, inbox, task.NetworkMode, expectedEgressIp, plan, ct, async token =>
+                await db.Tasks.AsNoTracking().Where(t => t.Id == task.Id).Select(t => t.StopRequestedAt).SingleAsync(token).ConfigureAwait(false) is not null)
+            .ConfigureAwait(false);
     }
 
     /// <summary>Streams the stored sample into the guest and has it opened. Any failure fails the run in Preparing (no retry).</summary>

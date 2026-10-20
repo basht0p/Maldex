@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Maldex.Core.Domain;
 
 namespace Maldex.Infrastructure.Fakes;
 
@@ -18,6 +19,38 @@ public sealed class FakeGuest
 
     /// <summary>When set, the chunk with this index is never answered (a guest that hangs mid-delivery).</summary>
     public int? SilentSampleChunkIndex { get; set; }
+
+    private readonly ConcurrentDictionary<string, byte> _reachable = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<Guid, string> _echoByTask = new();
+
+    /// <summary>Self-test probe names the fake guest reports as reachable (empty = everything blocked, as a correctly isolated guest would).</summary>
+    public ICollection<string> ReachableProbes => _reachable.Keys;
+
+    /// <summary>When set, the self-test echo body for every run (wins over the per-run value). Null = the echo fails.</summary>
+    public string? SelfTestEchoBody { get; set; }
+
+    /// <summary>When true, the fake guest never answers a self-test.</summary>
+    public bool SilentSelfTest { get; set; }
+
+    public void SetReachable(string probe) => _reachable[probe] = 0;
+
+    private readonly ConcurrentDictionary<Guid, NetworkMode> _modeByTask = new();
+
+    internal void SetModeFor(Guid taskId, NetworkMode? mode)
+    {
+        if (mode is null) _modeByTask.TryRemove(taskId, out _);
+        else _modeByTask[taskId] = mode.Value;
+    }
+
+    internal NetworkMode? ModeFor(Guid taskId) => _modeByTask.TryGetValue(taskId, out var m) ? m : null;
+
+    internal void SetEchoFor(Guid taskId, string? body)
+    {
+        if (body is null) _echoByTask.TryRemove(taskId, out _);
+        else _echoByTask[taskId] = body;
+    }
+
+    internal string? EchoFor(Guid taskId) => SelfTestEchoBody ?? (_echoByTask.TryGetValue(taskId, out var b) ? b : null);
 
     public void AddFile(string path, byte[] data) => _files[path] = new FakeGuestFile(data);
 

@@ -17,6 +17,9 @@ public sealed class NetOptions
     public string DnsmasqBinary { get; set; } = "dnsmasq";
     public string WireGuardConfigDir { get; set; } = "/etc/maldex/wg";
     public string RunDir { get; set; } = ".data/vm/run";
+    /// <summary>Fetched by the guest during the isolation self-test; the answer must match the run's network mode. The URL must return a bare IP address (the body is compared as an IP in LiveVpn mode).</summary>
+    public string EchoUrl { get; set; } = "http://api.ipify.org/";
+
     public int MaxRuns { get; set; } = 64;
 
     /// <summary>The CA directory the guest image trusts (mitmproxy confdir). Resolved with Path.GetFullPath.</summary>

@@ -1,6 +1,8 @@
 using Maldex.Core.Abstractions;
 using Maldex.Infrastructure.Fakes;
 using Maldex.Infrastructure.Guacamole;
+using Maldex.Infrastructure.Isolation;
+using Maldex.Infrastructure.Net;
 using Maldex.Infrastructure.Scanning;
 using Maldex.Infrastructure.Storage;
 using Microsoft.Extensions.Configuration;
@@ -24,6 +26,8 @@ public static class DependencyInjection
         services.Configure<YaraOptions>(configuration.GetSection(YaraOptions.SectionName));
         services.Configure<GuacamoleOptions>(configuration.GetSection(GuacamoleOptions.SectionName));
         services.AddSingleton<GuacamoleTokenService>();
+        services.Configure<NetOptions>(configuration.GetSection(NetOptions.SectionName));
+        services.Configure<SelfTestOptions>(configuration.GetSection(SelfTestOptions.SectionName));
 
         if (!OperatingSystem.IsWindows()) services.AddSingleton<IArtifactStore, FileSystemArtifactStore>();
         services.AddSingleton<IDiskSpaceProbe, DiskSpaceProbe>();
@@ -37,6 +41,9 @@ public static class DependencyInjection
                 services.AddSingleton<FakeGuest>();
                 services.AddSingleton<IAgentChannelFactory, FakeAgentChannelFactory>();
                 services.AddSingleton<IEgressRouter, NoopEgressRouter>();
+                services.PostConfigure<SelfTestOptions>(o => o.RequireControlPlaneProbes = false); // fake mode has no host LAN to protect
+                services.AddSingleton<IRunNetworkInfo, FakeRunNetworkInfo>();
+                services.AddSingleton<IExpectedEgress, FakeExpectedEgress>();
                 services.AddSingleton<ISuricataRunner, NoopSuricataRunner>();
                 services.AddSingleton<IVmConsoleLocator, FakeConsoleLocator>();
                 break;
