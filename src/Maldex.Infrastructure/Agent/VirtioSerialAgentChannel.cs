@@ -75,10 +75,28 @@ public sealed class VirtioSerialAgentChannel : IAgentChannel
     public async Task SendAsync(AgentCommand command, CancellationToken ct)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        await _sendGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            await AgentFrameWriter.WriteAsync(_stream, command, ct).ConfigureAwait(false);
+            // The caller token is honoured only while waiting for the send slot.
+            using var wait = CancellationTokenSource.CreateLinkedTokenSource(ct, _closed.Token);
+            await _sendGate.WaitAsync(wait.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new ObjectDisposedException(nameof(VirtioSerialAgentChannel));
+        }
+
+        try
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            // Once a frame starts it must finish: a cancel mid-frame would desync the guest's reader.
+            // Only channel disposal (or a transport failure, which breaks the channel) interrupts it.
+            await AgentFrameWriter.WriteAsync(_stream, command, _closed.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or IOException or ObjectDisposedException or SocketException)
+        {
+            await DisposeAsync().ConfigureAwait(false); // possibly a partial frame on the wire: channel is unusable
+            throw new ObjectDisposedException(nameof(VirtioSerialAgentChannel), ex);
         }
         finally
         {

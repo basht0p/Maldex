@@ -52,10 +52,10 @@ public sealed class VirtioSerialAgentChannelTests : IDisposable
         return (new VirtioSerialAgentChannel(new NetworkStream(client, true)), new NetworkStream(server, true));
     }
 
-    private async Task<List<AgentMessage>> DrainAsync(IAgentChannel channel)
+    private async Task<List<AgentMessage>> DrainAsync(IAgentChannel channel, CancellationToken? ct = null)
     {
         var list = new List<AgentMessage>();
-        await foreach (var m in channel.ReadAsync(Ct)) list.Add(m);
+        await foreach (var m in channel.ReadAsync(ct ?? Ct)) list.Add(m);
         return list;
     }
 
@@ -92,6 +92,7 @@ public sealed class VirtioSerialAgentChannelTests : IDisposable
     public async Task OversizeLength_IsFatal_Completes()
     {
         var (channel, guest) = await PairAsync();
+        using var _g = guest;
         await using var _ = channel;
         await guest.WriteAsync(Frame(Ready), Ct);
         await guest.WriteAsync(new byte[] { 0x00, 0x10, 0x00, 0x01 }, Ct);
@@ -106,6 +107,7 @@ public sealed class VirtioSerialAgentChannelTests : IDisposable
     public async Task TenViolations_Completes_AndViolationsIsTen()
     {
         var (channel, guest) = await PairAsync();
+        using var _g = guest;
         await using var _ = channel;
         for (var i = 0; i < 12; i++) await guest.WriteAsync(Frame(Invalid), Ct);
         await guest.WriteAsync(Frame(Ready), Ct);
@@ -119,6 +121,7 @@ public sealed class VirtioSerialAgentChannelTests : IDisposable
     public async Task Send_WritesFrame_GuestReadsItBack()
     {
         var (channel, guest) = await PairAsync();
+        using var _g = guest;
         await using var _ = channel;
         await channel.SendAsync(new OpenUrlCommand("c1", "http://example.test/"), Ct);
 
@@ -132,6 +135,7 @@ public sealed class VirtioSerialAgentChannelTests : IDisposable
     public async Task ConcurrentSends_DoNotInterleave()
     {
         var (channel, guest) = await PairAsync();
+        using var _g = guest;
         await using var _ = channel;
         var big = new string('x', 300_000); // larger than a socket buffer, forces partial writes
         var guestRead = Task.Run(async () =>
@@ -198,6 +202,56 @@ public sealed class VirtioSerialAgentChannelTests : IDisposable
             Assert.IsType<ReadyMessage>(m);
             break;
         }
+    }
+
+
+    [Fact]
+    public async Task SendAfterDispose_ThrowsObjectDisposed()
+    {
+        var (channel, guest) = await PairAsync();
+        using var _g = guest;
+        await channel.DisposeAsync();
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => channel.SendAsync(new ShutdownCommand("c"), Ct));
+    }
+
+    [Fact]
+    public async Task DisposeDuringBlockedSend_ThrowsObjectDisposed()
+    {
+        var (channel, guest) = await PairAsync();
+        using var _g = guest; // never reads, so the send blocks on a full socket buffer
+        var send = channel.SendAsync(new OpenUrlCommand("c", "http://e.test/" + new string('x', 900_000)), Ct);
+        await Task.Delay(200, Ct);
+        Assert.False(send.IsCompleted);
+        await channel.DisposeAsync();
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => send);
+    }
+
+    [Fact]
+    public async Task CancelMidFrame_DoesNotDesyncGuest()
+    {
+        var (channel, guest) = await PairAsync();
+        await using var _ = channel;
+        using var _g = guest;
+        using var cancel = new CancellationTokenSource();
+        var send = channel.SendAsync(new OpenUrlCommand("big", "http://e.test/" + new string('x', 900_000)), cancel.Token);
+        await Task.Delay(200, Ct);
+        Assert.False(send.IsCompleted); // blocked mid-frame: guest has not read yet
+        await cancel.CancelAsync();
+
+        Assert.Equal("big", (await ReadCommandAsync(guest)).CommandId);
+        await send.WaitAsync(Ct); // frame completed despite the cancel
+        await channel.SendAsync(new ShutdownCommand("next"), Ct);
+        Assert.Equal("next", (await ReadCommandAsync(guest)).CommandId);
+    }
+
+    [Fact]
+    public async Task CallerCancellation_OfRead_Throws()
+    {
+        var (channel, guest) = await PairAsync();
+        await using var _ = channel;
+        using var _g = guest;
+        using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => DrainAsync(channel, cancel.Token));
     }
 
     private async Task<AgentCommand> ReadCommandAsync(Stream s)
