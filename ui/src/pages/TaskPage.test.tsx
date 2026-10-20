@@ -53,7 +53,7 @@ describe('TaskPage', () => {
     stopTask.mockResolvedValue(undefined)
     await userEvent.click(screen.getByRole('button', { name: 'Stop' }))
     expect(stopTask).toHaveBeenCalledWith('t1')
-    expect(screen.getByText('Live view arrives with real mode')).toBeInTheDocument()
+    expect(screen.getByLabelText('Live view')).toBeInTheDocument()
   })
 
   it('links the reports and downloads only once Completed', async () => {

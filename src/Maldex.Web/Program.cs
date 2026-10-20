@@ -60,6 +60,7 @@ await using (var scope = app.Services.CreateAsyncScope())
 app.UseMiddleware<SecurityHeadersMiddleware>();
 // The built React SPA is copied into wwwroot by ./build.sh build; it is served same-origin with the API.
 app.UseStaticFiles();
+app.UseWebSockets();
 app.UseAuthentication();
 app.UseMiddleware<CurrentUserMiddleware>();
 app.UseAuthorization();
@@ -70,6 +71,7 @@ app.MapTaskEndpoints();
 app.MapLiveControlEndpoints();
 app.MapReportEndpoints();
 app.MapArtifactEndpoints();
+app.MapGuacamoleTunnelEndpoints();
 app.MapHub<TaskHub>("/hubs/tasks");
 // Client-side routes resolve to the SPA. Extension-less paths only (a missing .js stays a 404), and never /api or
 // /hubs: those keep their own 404/401 behaviour instead of answering with index.html.

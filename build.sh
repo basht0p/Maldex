@@ -71,7 +71,23 @@ BACKEND_PID=""
 VITE_PID=""
 BACKEND_LOG=".data/backend.log"
 
+GUACD_STARTED=0
+
+# Real mode only (MALDEX_MODE=Real): guacd proxies the live view to the VM's VNC console, on 127.0.0.1:4822.
+start_guacd() {
+  [ "${MALDEX_MODE:-Fake}" = "Real" ] || return 0
+  docker rm -f maldex-guacd >/dev/null 2>&1 || true
+  docker run -d --rm --name maldex-guacd --network host guacamole/guacd:1.5.5 /opt/guacamole/sbin/guacd -b 127.0.0.1 -L info -f >/dev/null
+  GUACD_STARTED=1
+  export Maldex__Mode=Real
+}
+
+stop_guacd() {
+  if [ "$GUACD_STARTED" = "1" ]; then docker stop maldex-guacd >/dev/null 2>&1 || true; GUACD_STARTED=0; fi
+}
+
 stop_children() {
+  stop_guacd
   for pid in "$VITE_PID" "$BACKEND_PID"; do
     if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
   done
@@ -118,6 +134,7 @@ cmd_run() {
   cmd_dev_db
   [ -d ui/node_modules ] || npm --prefix ui ci
   trap stop_children EXIT INT TERM
+  start_guacd
   start_backend
   wait_for_api
   echo "Backend on http://localhost:5080 (log: $BACKEND_LOG). Starting Vite..."
