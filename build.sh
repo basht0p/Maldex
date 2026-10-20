@@ -228,6 +228,17 @@ ensure_mitm_user() {
   fi
 }
 
+# INetSim insists on root; it runs in a user namespace whose root is maldex-isroot and whose 'inetsim' is maldex-isuser.
+# Both are dedicated, powerless system accounts: own group only, no home, no shell, no sudoers, own nothing on the host.
+ensure_inetsim_userns_ids() {
+  local u
+  for u in maldex-isroot maldex-isuser; do
+    if ! id "$u" >/dev/null 2>&1; then
+      sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "$u"
+    fi
+  done
+}
+
 # mitmproxy's CA (the guest image trusts it); generated once, copied per run into a private confdir for maldex-mitm.
 MITM_CA_DIR=".data/mitm/ca"
 ensure_mitm_ca() {
@@ -308,6 +319,7 @@ cmd_real_setup() {
 
   install_host_guard
   ensure_mitm_user
+  ensure_inetsim_userns_ids
   ensure_mitm_ca
   harden_inetsim_template
 
@@ -346,6 +358,12 @@ real_verify() {
     bash -c '[ ! -e /proc/sys/net/bridge/bridge-nf-call-iptables ] || [ "$(cat /proc/sys/net/bridge/bridge-nf-call-iptables)" != 1 ]'
   real_check "maldex-mitm user exists with no supplementary groups" "./build.sh real-setup" \
     bash -c '[ "$(id -nG maldex-mitm)" = maldex-mitm ] && ! sudo -n grep -rqs maldex-mitm /etc/sudoers /etc/sudoers.d'
+  for u in maldex-isroot maldex-isuser; do
+    real_check "$u user exists, non-root, own group only, no sudoers" "./build.sh real-setup" \
+      bash -c "[ \"\$(id -nG $u)\" = $u ] && [ \"\$(id -u $u)\" != 0 ] && ! sudo -n grep -rqs $u /etc/sudoers /etc/sudoers.d"
+  done
+  real_check "INetSim user-namespace ids are distinct" "./build.sh real-setup" \
+    bash -c '[ "$(id -u maldex-isroot)" != "$(id -u maldex-isuser)" ] && [ "$(id -g maldex-isroot)" != "$(id -g maldex-isuser)" ]'
   real_check "mitmproxy CA present (.data/mitm/ca)" "./build.sh real-setup" \
     bash -c "[ -f $MITM_CA_DIR/mitmproxy-ca.pem ] && [ -f $MITM_CA_DIR/mitmproxy-ca-cert.pem ]"
   real_check "/var/lib/inetsim is root-owned, not group/world-writable, symlink-free" "./build.sh real-setup" inetsim_template_clean

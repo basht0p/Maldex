@@ -21,6 +21,7 @@ public sealed class NetnsEgressRouterTests : IDisposable
         public bool GuardPresent = true;
         public string TemplateOffender = "";
         public bool HonorCancellation;
+        public string? MissingUser;
 
         public Task<ProcessResult> RunAsync(string file, IReadOnlyList<string> args, CancellationToken ct, string? stdin = null, TimeSpan? timeout = null)
         {
@@ -36,6 +37,13 @@ public sealed class NetnsEgressRouterTests : IDisposable
             if (line.Contains(" ss -ltn")) return Ok(out_: string.Join('\n', Enumerable.Range(0, 20).Select(i => $"LISTEN 0 128 10.213.{i / 64}.{i % 64 * 4 + 1}:8080 0.0.0.0:*")));
             if (line == "id -u" || line == "id -g") return Ok(out_: "1000\n");
             if (line == "id -u maldex-mitm") return Ok(out_: "995\n");
+            if (MissingUser is not null && line.EndsWith(" " + MissingUser)) return Ok(1);
+            if (line == "id -u maldex-isroot") return Ok(out_: "994\n");
+            if (line == "id -g maldex-isroot") return Ok(out_: "987\n");
+            if (line == "id -u maldex-isuser") return Ok(out_: "993\n");
+            if (line == "id -g maldex-isuser") return Ok(out_: "986\n");
+            if (line == "id -u inetsim") return Ok(out_: "110\n");
+            if (line == "id -g inetsim") return Ok(out_: "112\n");
             if (line.Contains(" find ") && line.Contains("-type l")) return Ok(out_: TemplateOffender);
             if (line.Contains(" curl ")) return Ok(out_: "200");
             if (line.Contains("latest-handshakes")) return Ok(out_: Handshakes);
@@ -351,50 +359,67 @@ public sealed class NetnsEgressRouterTests : IDisposable
         var root = _r.IndexOf(c => c == $"sudo -n install -d -m 0755 -o root -g root /run/maldex /run/maldex/inetsim {iDir} {data}");
         var cp = _r.IndexOf(c => c == "sudo -n cp -rP --no-preserve=ownership /var/lib/inetsim/. " + data + "/");
         Assert.True(check >= 0 && root > check && cp > root, "template check, then root-owned dirs, then copy");
+        // INetSim runs in a user namespace: inside root = maldex-isroot (994:987), inside inetsim (110:112) = maldex-isuser
+        // (993:986). Host root/inetsim own nothing it can write; real root only creates entries in root-owned parents.
+        Assert.Contains(_r.Calls, c => c == $"sudo -n chown maldex-isroot:maldex-isuser {data}/certs/default_key.pem");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n chmod 0640 {data}/certs/default_key.pem");
         foreach (var w in new[] { "http/postdata", "ftp/upload" })
         {
             var rm = _r.IndexOf(c => c == $"sudo -n rm -rf -- {data}/{w}");
-            var mk = _r.IndexOf(c => c == $"sudo -n install -d -m 0750 -o inetsim -g inetsim {data}/{w}");
+            var mk = _r.IndexOf(c => c == $"sudo -n install -d -m 0750 -o maldex-isuser -g maldex-isuser {data}/{w}");
             Assert.True(rm > cp && mk > rm, w);
         }
-        // SMTP's configure_hook runs as ROOT and opens/chmods/chowns the mbox (following symlinks): smtp/ is root:inetsim 0750
-        // (inetsim cannot create/replace entries) and both mbox files are pre-created root:inetsim 0660 before INetSim starts.
         var smtpRm = _r.IndexOf(c => c == $"sudo -n rm -rf -- {data}/smtp");
-        var smtpMk = _r.IndexOf(c => c == $"sudo -n install -d -m 0750 -o root -g inetsim {data}/smtp");
-        Assert.True(smtpRm > cp && smtpMk > smtpRm, "smtp dir recreated root:inetsim");
+        var smtpMk = _r.IndexOf(c => c == $"sudo -n install -d -m 0755 -o root -g root {data}/smtp");
+        Assert.True(smtpRm > cp && smtpMk > smtpRm, "smtp dir recreated root-owned");
         var start = _r.IndexOf(c => c.Contains("--config"));
         foreach (var mbox in new[] { "smtp.mbox", "smtps.mbox" })
         {
-            var mf = _r.IndexOf(c => c == $"sudo -n install -m 0660 -o root -g inetsim /dev/null {data}/smtp/{mbox}");
+            var mf = _r.IndexOf(c => c == $"sudo -n install -m 0660 -o maldex-isroot -g maldex-isuser /dev/null {data}/smtp/{mbox}");
             Assert.True(mf > smtpMk && mf < start, mbox);
         }
-        // root writes logs/reports (following symlinks), so inetsim must own neither: log/ is root:inetsim 0750 with pre-created
-        // group-writable files, reports go to a separate root:root dir
-        Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0750 -o root -g inetsim {iDir}/log");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0755 -o root -g root {iDir}/log");
         foreach (var lf in new[] { "main.log", "service.log", "debug.log" })
-            Assert.Contains(_r.Calls, c => c == $"sudo -n install -m 0660 -o root -g inetsim /dev/null {iDir}/log/{lf}");
+            Assert.Contains(_r.Calls, c => c == $"sudo -n install -m 0660 -o maldex-isroot -g maldex-isuser /dev/null {iDir}/log/{lf}");
         Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0755 -o root -g root {iDir}/report");
-        // the only inetsim-owned directories are the two upload leaves root never writes into
-        var owned = _r.Where(c => c.Contains("-o inetsim") && c.Contains("install -d")).Select(c => c.Split(' ')[^1]).OrderBy(x => x).ToList();
-        Assert.Equal(new[] { $"{data}/ftp/upload", $"{data}/http/postdata" }.OrderBy(x => x), owned);
-        Assert.DoesNotContain(_r.Calls, c => c.Contains("-o inetsim") && !c.Contains("install -d -m 0750 -o inetsim -g inetsim"));
-        Assert.DoesNotContain(_r.Calls, c => c.Contains("-o inetsim") && c.Contains("/dev/null"));
+        Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0755 -o maldex-isroot -g maldex-isroot {iDir}/pid");
+        // host 'inetsim' owns nothing; the only directories the mapped ids own are the two upload leaves and the pid dir
+        Assert.DoesNotContain(_r.Calls, c => c.StartsWith("sudo", StringComparison.Ordinal) && (c.Contains("-o inetsim") || c.Contains("-g inetsim") || c.Contains("chgrp inetsim")));
+        var owned = _r.Where(c => c.Contains("install -d") && (c.Contains("-o maldex-is") || c.Contains("-g maldex-is"))).Select(c => c.Split(' ')[^1]).OrderBy(x => x).ToList();
+        Assert.Equal(new[] { $"{data}/ftp/upload", $"{data}/http/postdata", $"{iDir}/pid" }.OrderBy(x => x), owned);
+        // low ports without any capability in the init user namespace (per-netns sysctl), set before INetSim starts
+        var ports = _r.IndexOf(c => c == $"sudo -n ip netns exec {n.Namespace} sysctl -w net.ipv4.ip_unprivileged_port_start=0");
+        Assert.True(ports >= 0 && ports < start);
         var inet = Assert.Single(_r.Where(c => c.Contains("--config")));
         Assert.Contains($"--data-dir {data} --log-dir {iDir}/log --report-dir {iDir}/report", inet);
-        // per-run pid file in the root-owned run dir (never the shared /var/run/inetsim.pid)
-        Assert.Contains($"--pidfile {iDir}/inetsim.pid", inet);
-        // INetSim's config lives in a fixed-key, mode-0666 SysV shared memory segment that its ROOT main process reads back
-        // (e.g. report settings at shutdown): a private IPC namespace per run, and a mount namespace where everything but the
-        // run's own dir is read-only, so neither another run nor a compromised service child can steer root's writes.
-        Assert.Contains($"ip netns exec {n.Namespace} unshare --ipc --mount --propagation private -- sh -c ", inet);
-        Assert.Contains(NetnsEgressRouter.InetSimSandboxScript + " " + iDir + " " + "inetsim --config", inet);
+        Assert.Contains($"--pidfile {iDir}/pid/inetsim.pid", inet);
+        // real root sets up IPC + read-only mount namespaces, then the launcher enters the user namespace last
+        Assert.Contains($"ip netns exec {n.Namespace} unshare --ipc --mount --propagation private -- python3 -I -c "
+            + NetnsEgressRouter.UserNsLauncherScript + " 0 994 1\n110 993 1\n 0 987 1\n112 986 1\n " + iDir + " "
+            + NetnsEgressRouter.InetSimSandboxScript + " inetsim --config", inet);
+        Assert.Contains("CLONE_NEWUSER", NetnsEgressRouter.UserNsLauncherScript);
+        var confCopy = _r.IndexOf(c => c.StartsWith("sudo -n install -m 0644 -o root -g root ") && c.EndsWith($"inetsim.conf {iDir}/inetsim.conf"));
+        Assert.True(confCopy >= 0 && confCopy < start, "root-owned config copy staged before start");
+        Assert.Contains($"inetsim --config {iDir}/inetsim.conf ", inet);
         Assert.Contains("remount,bind,ro", NetnsEgressRouter.InetSimSandboxScript);
         Assert.Contains("exit 1", NetnsEgressRouter.InetSimSandboxScript); // fails closed if anything stays writable
-        Assert.EndsWith("exec \"$@\"", NetnsEgressRouter.InetSimSandboxScript.TrimEnd());
         Assert.Contains("create_reports          no", File.ReadAllText(Path.Combine(RepoRoot(), "deploy", "net", "inetsim", "inetsim.conf")));
         Assert.DoesNotContain("--data-dir /var/lib/inetsim", inet);
         await router.ReleaseAsync(lease, CancellationToken.None);
         Assert.Contains(_r.Calls, c => c == $"sudo -n rm -rf -- /run/maldex/inetsim/{n.Namespace}");
+    }
+
+    [Theory]
+    [InlineData("maldex-isroot")]
+    [InlineData("maldex-isuser")]
+    [InlineData("inetsim")]
+    public async Task Simulated_MissingUserNamespaceIds_FailsClosed(string user)
+    {
+        _r.MissingUser = user;
+        var id = Guid.NewGuid();
+        await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(id, NetworkMode.Simulated, null, CancellationToken.None));
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("--config"));
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip netns del {RunNetNames.For(id).Namespace}");
     }
 
     [Fact]
@@ -438,7 +463,7 @@ public sealed class NetnsEgressRouterTests : IDisposable
         WriteWg("nl", GoodWg);
         await Router().CreateAsync(Guid.NewGuid(), NetworkMode.Simulated, null, CancellationToken.None);
         await Router().CreateAsync(Guid.NewGuid(), NetworkMode.LiveVpn, "nl", CancellationToken.None);
-        Assert.All(_r.Calls.Where(c => c is not ("id -u" or "id -g" or "id -u maldex-mitm")), c => Assert.StartsWith("sudo -n ", c));
+        Assert.All(_r.Calls.Where(c => !c.StartsWith("id -", StringComparison.Ordinal)), c => Assert.StartsWith("sudo -n ", c)); // unprivileged id lookups
     }
 
     // ---- host-side invariants ----

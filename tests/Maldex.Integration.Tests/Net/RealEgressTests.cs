@@ -49,7 +49,7 @@ public class RealEgressTests
             foreach (var id in ids[..2])
             {
                 var ns = RunNetNames.For(id).Namespace;
-                mains.Add(await AssertPidFileAsync("/run/maldex/inetsim/" + ns, ns));
+                mains.Add(await AssertInetSimSandboxAsync("/run/maldex/inetsim/" + ns, ns));
                 var code = (await Sudo("ip", "netns", "exec", ns, "curl", "-s", "-o", "/dev/null", "-m", "5", "-w", "%{http_code}", "http://198.18.0.10/")).Stdout.Trim();
                 Assert.Contains(code, new[] { "200", "404" });
             }
@@ -60,7 +60,7 @@ public class RealEgressTests
             await router.ReleaseAsync(leases[0], CancellationToken.None);
             await router.CreateAsync(ids[2], NetworkMode.Simulated, null, CancellationToken.None);
             var ns3 = RunNetNames.For(ids[2]).Namespace;
-            await AssertPidFileAsync("/run/maldex/inetsim/" + ns3, ns3);
+            await AssertInetSimSandboxAsync("/run/maldex/inetsim/" + ns3, ns3);
             // the second run is still serving
             var ns2 = RunNetNames.For(ids[1]).Namespace;
             Assert.Contains((await Sudo("ip", "netns", "exec", ns2, "curl", "-s", "-o", "/dev/null", "-m", "5", "-w", "%{http_code}", "http://198.18.0.10/")).Stdout.Trim(), new[] { "200", "404" });
@@ -80,17 +80,18 @@ public class RealEgressTests
         }
     }
 
-    /// <summary>The run's INetSim pid file is root-owned in its root-owned run dir and names a live process in that namespace.</summary>
-    private static async Task<string> AssertPidFileAsync(string iRoot, string ns)
+    /// <summary>
+    /// INetSim's main process: per-run pid file, own IPC namespace, read-only mounts except its run dir, and a user namespace
+    /// whose root is the unprivileged maldex-isroot (no host capability: cannot read root-only files, write devices, remount
+    /// or enter host namespaces). Returns its host PID.
+    /// </summary>
+    private static async Task<string> AssertInetSimSandboxAsync(string iRoot, string ns)
     {
         Assert.Equal("root:root 755", (await Sudo("stat", "-c", "%U:%G %a", iRoot)).Stdout.Trim());
-        Assert.Equal("root", (await Sudo("stat", "-c", "%U", iRoot + "/inetsim.pid")).Stdout.Trim());
-        var pid = (await Sudo("cat", iRoot + "/inetsim.pid")).Stdout.Trim();
+        var pid = (await Sudo("cat", iRoot + "/pid/inetsim.pid")).Stdout.Trim();
         Assert.Matches("^[0-9]+$", pid);
         Assert.Contains(pid, (await Sudo("ip", "netns", "pids", ns)).Stdout.Split([' ', '\n'], StringSplitOptions.RemoveEmptyEntries));
         Assert.False(File.Exists("/var/run/inetsim.pid"), "the shared default pid file must not be used");
-        // sandbox: own IPC namespace (INetSim's 0666 "CNFG" shm segment is per run), and the only writable mount the root
-        // main process sees is its own run dir
         var ipc = (await Sudo("readlink", $"/proc/{pid}/ns/ipc")).Stdout.Trim();
         Assert.StartsWith("ipc:[", ipc);
         Assert.NotEqual((await Sudo("readlink", "/proc/1/ns/ipc")).Stdout.Trim(), ipc);
@@ -99,6 +100,44 @@ public class RealEgressTests
             .Where(f => !f[5].Split(',').Contains("ro") && f[Array.IndexOf(f, "-") + 1] != "nsfs")
             .Select(f => f[4] + " " + f[5]).ToArray();
         Assert.Equal([iRoot + " rw,nosuid,nodev,noexec,relatime"], writable);
+
+        // user namespace: host credentials are the dedicated ids, never 0
+        var isRootUid = (await Proc.RunAsync("id", ["-u", "maldex-isroot"], CancellationToken.None)).Stdout.Trim();
+        var isRootGid = (await Proc.RunAsync("id", ["-g", "maldex-isroot"], CancellationToken.None)).Stdout.Trim();
+        var isUserUid = (await Proc.RunAsync("id", ["-u", "maldex-isuser"], CancellationToken.None)).Stdout.Trim();
+        var inUid = (await Proc.RunAsync("id", ["-u", "inetsim"], CancellationToken.None)).Stdout.Trim();
+        Assert.NotEqual((await Sudo("readlink", "/proc/1/ns/user")).Stdout.Trim(), (await Sudo("readlink", $"/proc/{pid}/ns/user")).Stdout.Trim());
+        var status = File.ReadAllLines($"/proc/{pid}/status").ToDictionary(l => l.Split(':')[0], l => l.Split(':', 2)[1].Trim());
+        Assert.Equal([isRootUid, isRootUid, isRootUid, isRootUid], status["Uid"].Split('\t'));
+        Assert.Equal([isRootGid, isRootGid, isRootGid, isRootGid], status["Gid"].Split('\t'));
+        var uidMap = (await Sudo("cat", $"/proc/{pid}/uid_map")).Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(l => string.Join(' ', l.Split(' ', StringSplitOptions.RemoveEmptyEntries))).ToArray();
+        Assert.Equal([$"0 {isRootUid} 1", $"{inUid} {isUserUid} 1"], uidMap);
+        // every INetSim process (main + service children) has a non-root host uid; the services run as maldex-isuser
+        var uids = new List<string>();
+        foreach (var p in (await Sudo("ip", "netns", "pids", ns)).Stdout.Split([' ', '\n'], StringSplitOptions.RemoveEmptyEntries))
+        {
+            var ps = (await Proc.RunAsync("ps", ["-o", "uid=,comm=", "-p", p], CancellationToken.None)).Stdout.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
+            if (ps.Length == 2 && ps[1].StartsWith("inetsim", StringComparison.Ordinal)) uids.Add(ps[0]);
+        }
+        Assert.Contains(isRootUid, uids);
+        Assert.Contains(isUserUid, uids);
+        Assert.DoesNotContain("0", uids);
+
+        // from INSIDE its namespaces, as its root: no host privilege at all
+        async Task<ProcessResult> AsInetSimRoot(string script) =>
+            await Sudo("nsenter", "-t", pid, "-U", "-m", "-n", "-i", "--", "sh", "-c", script);
+        Assert.Equal("0", (await AsInetSimRoot("id -u")).Stdout.Trim()); // it IS root in its own namespace...
+        var shadow = await AsInetSimRoot("cat /etc/shadow >/dev/null");
+        Assert.NotEqual(0, shadow.ExitCode);
+        Assert.Contains("Permission denied", shadow.Stderr); // EACCES: host DAC applies, no CAP_DAC_OVERRIDE on the host
+        var disk = (await Proc.RunAsync("sh", ["-c", "lsblk -dnpo NAME,TYPE | awk '$2==\"disk\"{print $1; exit}'"], CancellationToken.None)).Stdout.Trim();
+        Assert.StartsWith("/dev/", disk);
+        Assert.NotEqual(0, (await AsInetSimRoot($": >> {disk}")).ExitCode); // opens only (no byte written): device write denied
+        Assert.NotEqual(0, (await AsInetSimRoot("mount -o remount,bind,rw /")).ExitCode);
+        Assert.NotEqual(0, (await AsInetSimRoot("unshare -m mount -o remount,bind,rw /")).ExitCode); // own mount ns: mounts locked
+        Assert.NotEqual(0, (await AsInetSimRoot("nsenter -t 1 -m true")).ExitCode); // no setns into host namespaces
+        Assert.NotEqual(0, (await AsInetSimRoot($"echo x > {iRoot}/../escape")).ExitCode);
         return pid;
     }
 
@@ -225,34 +264,39 @@ public class RealEgressTests
                 var dataDir = NetnsEgressRouter.InetSimDataPath(id);
                 Assert.Equal(0, (await Sudo("test", "-d", dataDir + "/http/postdata")).ExitCode);
                 Assert.Equal(0, (await Sudo("test", "-f", dataDir + "/http/mime.types")).ExitCode);
-                Assert.Equal("inetsim", (await Sudo("stat", "-c", "%U", dataDir + "/http/postdata")).Stdout.Trim());
-                // nothing under the run's inetsim tree is owned by (or writable for) inetsim except the leaves and the log dir
+                // host 'inetsim' owns nothing; the user-namespace ids own exactly what INetSim must write
                 var iRoot = Path.GetDirectoryName(dataDir)!;
-                var owned = (await Sudo("find", iRoot, "-user", "inetsim", "-type", "d")).Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries).OrderBy(x => x).ToArray();
-                Assert.Equal(new[] { dataDir + "/ftp/upload", dataDir + "/http/postdata" }.OrderBy(x => x), owned);
-                // inetsim owns nothing at all outside those two leaves (no files either)
-                var ownedAny = (await Sudo("find", iRoot, "-user", "inetsim")).Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries).OrderBy(x => x).ToArray();
-                Assert.Equal(owned, ownedAny);
-                // SMTP's root-context mbox handling only ever meets root-owned entries in a root-owned dir
-                Assert.Equal("root:inetsim 750", (await Sudo("stat", "-c", "%U:%G %a", dataDir + "/smtp")).Stdout.Trim());
+                async Task<string[]> Find(params string[] a) =>
+                    (await Sudo(["find", iRoot, .. a])).Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries).OrderBy(x => x, StringComparer.Ordinal).ToArray();
+                static string[] Sorted(params string[] a) => a.OrderBy(x => x, StringComparer.Ordinal).ToArray();
+                Assert.Empty(await Find("-user", "inetsim"));
+                Assert.Empty(await Find("-group", "inetsim"));
+                Assert.Equal(Sorted(dataDir + "/ftp/upload", dataDir + "/http/postdata"), await Find("-user", "maldex-isuser"));
+                Assert.Equal(Sorted(iRoot + "/pid", iRoot + "/pid/inetsim.pid", dataDir + "/certs/default_key.pem",
+                    dataDir + "/smtp/smtp.mbox", dataDir + "/smtp/smtps.mbox", iRoot + "/log/main.log", iRoot + "/log/service.log", iRoot + "/log/debug.log"),
+                    await Find("-user", "maldex-isroot"));
+                Assert.Empty(await Find("-type", "l"));
+                // every directory except the two upload leaves and the pid dir is root:root and not writable by others
+                Assert.Equal(Sorted(dataDir + "/ftp/upload", dataDir + "/http/postdata", iRoot + "/pid"), await Find("-type", "d", "(", "!", "-user", "root", "-o", "-perm", "/022", ")"));
+                Assert.Equal("maldex-isuser:maldex-isuser 750", (await Sudo("stat", "-c", "%U:%G %a", dataDir + "/http/postdata")).Stdout.Trim());
+                Assert.Equal("maldex-isroot:maldex-isroot 755", (await Sudo("stat", "-c", "%U:%G %a", iRoot + "/pid")).Stdout.Trim());
                 foreach (var mbox in new[] { "smtp.mbox", "smtps.mbox" })
-                    Assert.Equal("root:inetsim 660 regular empty file", (await Sudo("stat", "-c", "%U:%G %a %F", $"{dataDir}/smtp/{mbox}")).Stdout.Trim());
-                Assert.Equal("", (await Sudo("find", dataDir + "/smtp", "-mindepth", "1", "!", "-name", "smtp.mbox", "!", "-name", "smtps.mbox")).Stdout.Trim());
-                // SMTP still delivers into the pre-created mbox (appended by the dropped-privilege child), which stays root-owned
+                    Assert.Equal("maldex-isroot:maldex-isuser 660 regular empty file", (await Sudo("stat", "-c", "%U:%G %a %F", $"{dataDir}/smtp/{mbox}")).Stdout.Trim());
+                Assert.Equal("maldex-isroot:maldex-isuser 640", (await Sudo("stat", "-c", "%U:%G %a", dataDir + "/certs/default_key.pem")).Stdout.Trim());
+                Assert.Equal("root:root 755", (await Sudo("stat", "-c", "%U:%G %a", iRoot + "/log")).Stdout.Trim());
+                Assert.Equal("root:root 755", (await Sudo("stat", "-c", "%U:%G %a", iRoot + "/report")).Stdout.Trim());
+                Assert.Equal("root:root 755", (await Sudo("stat", "-c", "%U:%G %a", dataDir + "/smtp")).Stdout.Trim());
+                // HTTP (above), HTTPS, SMTP and FTP all answer; SMTP appends to the pre-created mbox
+                var https = (await Sudo("ip", "netns", "exec", n.Namespace, "curl", "-sk", "-o", "/dev/null", "-m", "8", "-w", "%{http_code}", "https://198.18.0.10/")).Stdout.Trim();
+                Assert.Contains(https, new[] { "200", "404" });
                 var mail = await Proc.RunAsync("sudo", ["-n", "ip", "netns", "exec", n.Namespace, "curl", "-s", "-m", "8", "smtp://198.18.0.10/",
                     "--mail-from", "a@example.org", "--mail-rcpt", "b@example.org", "-T", "-"], CancellationToken.None, "Subject: maldex\r\n\r\nhello\r\n", TimeSpan.FromSeconds(30));
                 Assert.Equal(0, mail.ExitCode);
                 Assert.Contains("hello", (await Sudo("cat", dataDir + "/smtp/smtp.mbox")).Stdout);
-                Assert.Equal("root:inetsim 660", (await Sudo("stat", "-c", "%U:%G %a", dataDir + "/smtp/smtp.mbox")).Stdout.Trim());
-                // per-run pid file, root-owned, in the root-owned run dir; nothing at the shared default path
-                await AssertPidFileAsync(iRoot, n.Namespace);
-                // log/ is root:inetsim 0750 (inetsim cannot create entries); reports go to a separate root dir; no inetsim-owned file is in either
-                Assert.Equal("root:inetsim 750", (await Sudo("stat", "-c", "%U:%G %a", iRoot + "/log")).Stdout.Trim());
-                Assert.Equal("root:root 755", (await Sudo("stat", "-c", "%U:%G %a", iRoot + "/report")).Stdout.Trim());
-                Assert.Equal("", (await Sudo("find", iRoot + "/log", iRoot + "/report", "-user", "inetsim")).Stdout.Trim());
-                Assert.Equal("", (await Sudo("find", iRoot, "-type", "l")).Stdout.Trim());
-                Assert.Equal("root", (await Sudo("stat", "-c", "%U", iRoot)).Stdout.Trim());
-                Assert.Equal("root", (await Sudo("stat", "-c", "%U", dataDir)).Stdout.Trim());
+                // FTP control channel (INetSim's FTP has no passive mode configured; a login proves the service runs)
+                var ftp = await Sudo("ip", "netns", "exec", n.Namespace, "curl", "-sS", "-v", "-m", "8", "-o", "/dev/null", "ftp://198.18.0.10/");
+                Assert.Contains("230 Login successful", ftp.Stderr);
+                await AssertInetSimSandboxAsync(iRoot, n.Namespace);
             }
             Assert.Contains(lease, await router.ListAsync(CancellationToken.None));
             if (mode == NetworkMode.Simulated)

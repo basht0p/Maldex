@@ -50,14 +50,70 @@ public sealed partial class NetnsEgressRouter(
 
     private static string InetSimDir(string ns) => "/run/maldex/inetsim/" + ns;
 
+    /// <summary>Unprivileged host account that is uid/gid 0 inside INetSim's user namespace (created by <c>./build.sh real-setup</c>).</summary>
+    public const string IsRootUser = "maldex-isroot";
+
+    /// <summary>Unprivileged host account that INetSim's service user 'inetsim' maps to inside its user namespace.</summary>
+    public const string IsUserUser = "maldex-isuser";
+
     /// <summary>
-    /// Fixed script INetSim starts under, inside a fresh IPC + mount namespace (<c>$0</c> = the run's INetSim dir, then the
-    /// INetSim command). INetSim keeps its whole configuration in a fixed-key ("CNFG"), mode-0666 SysV shared memory segment
+    /// Fixed launcher, run by real root inside fresh IPC + mount namespaces. argv: uid_map, gid_map, run dir, sandbox script,
+    /// command. The child unshares a user namespace; the parent writes its uid/gid maps (only real root may map arbitrary host
+    /// ids; done before /proc goes read-only), then runs <see cref="InetSimSandboxScript"/> on the shared mount namespace
+    /// (owned by the initial user namespace, so the child can never undo it) and exits. Only then does the child switch to the
+    /// namespace's root (= the unprivileged maldex-isroot) and exec the command, with capabilities inside its user namespace
+    /// only. Any failure kills the child before it execs and exits non-zero.
+    /// </summary>
+    public const string UserNsLauncherScript = """
+        import os, subprocess, sys, time
+        umap, gmap, rundir, sandbox, argv = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(w)
+            os.unshare(os.CLONE_NEWUSER)
+            if os.read(r, 1) != b"1":
+                os._exit(111)
+            os.setgroups([])
+            os.setresgid(0, 0, 0)
+            os.setresuid(0, 0, 0)
+            os.chdir(rundir)
+            os.execvp(argv[0], argv)
+        os.close(r)
+        def fail(msg):
+            os.kill(pid, 9)
+            sys.exit("inetsim launcher: " + msg)
+        me = os.readlink("/proc/self/ns/user")
+        for _ in range(500):
+            try:
+                if os.readlink(f"/proc/{pid}/ns/user") != me:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.01)
+        else:
+            fail("child did not enter a user namespace")
+        try:
+            with open(f"/proc/{pid}/gid_map", "w") as f:
+                f.write(gmap)
+            with open(f"/proc/{pid}/uid_map", "w") as f:
+                f.write(umap)
+        except OSError as e:
+            fail(f"cannot write id maps: {e}")
+        if subprocess.run(["sh", "-c", sandbox, rundir]).returncode != 0:
+            fail("mount sandbox failed")
+        os.write(w, b"1")
+        os._exit(0)
+        """;
+
+    /// <summary>
+    /// Fixed mount sandbox the launcher applies to INetSim's fresh IPC + mount namespace (<c>$0</c> = the run's INetSim dir). INetSim keeps its whole configuration in a fixed-key ("CNFG"), mode-0666 SysV shared memory segment
     /// that its ROOT main process reads back after the services (which a guest can take over) are running, e.g. the report
     /// settings at shutdown, where root then writes/chmods/chowns a file at a path taken from that segment. The private IPC
     /// namespace keeps runs (and every other local uid) apart; the mount namespace makes every mount read-only except the
-    /// run's own dir (nosuid/nodev/noexec), so whatever a compromised child plants there, root can write nowhere else. Mounts
-    /// that cannot be made read-only are detached; if any writable mount other than an nsfs handle remains, it fails closed.
+    /// run's own dir (nosuid/nodev/noexec). Mounts that cannot be made read-only are detached; if any writable mount other
+    /// than an nsfs handle remains, it fails closed. Run by <see cref="UserNsLauncherScript"/>, so INetSim's "root" is an
+    /// unprivileged host id that holds no host capability and cannot undo these mounts (owned by the initial user namespace).
     /// </summary>
     public const string InetSimSandboxScript = """
         set -eu
@@ -72,7 +128,6 @@ public sealed partial class NetnsEgressRouter(
         if [ -n "$left" ]; then echo "inetsim sandbox: writable mounts remain: $left" >&2; exit 1; fi
         mount --bind "$d" "$d"
         mount -o remount,bind,rw,nosuid,nodev,noexec "$d"
-        exec "$@"
         """;
 
     // mitmdump cannot traverse the owner's home (the repo and .data live there), so everything it touches is staged here.
@@ -250,9 +305,24 @@ public sealed partial class NetnsEgressRouter(
     private async Task StartSimulatedAsync(string ns, string dir, CancellationToken ct)
     {
         await Must(PrivilegedCommands.InNs(ns, "ip", "route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", "main"), ct);
-        // INetSim's service processes drop to the unprivileged 'inetsim' user (a guest can take it over). Root therefore only
-        // ever follows paths whose every parent is root-owned: the template is verified (root-owned, not writable by others,
-        // no symlinks) and copied without following links, and 'inetsim' owns just the empty leaf directories below.
+        // INetSim insists on starting as root, keeps its config in a mode-0666 shared memory segment its service children (which
+        // a guest can take over) can write, and its root main process acts on that config. So its "root" is not root on the
+        // host: it runs in a user namespace where inside uid/gid 0 is the dedicated unprivileged maldex-isroot and the inside
+        // 'inetsim' ids (looked up from /etc/passwd, as INetSim does) are maldex-isuser. It holds no capability in the initial
+        // user namespace (no device writes, no host mounts, no setns), and host DAC applies to everything it opens.
+        var isRootUid = await IdAsync("-u", ct, IsRootUser);
+        var isRootGid = await IdAsync("-g", ct, IsRootUser);
+        var isUserUid = await IdAsync("-u", ct, IsUserUser);
+        var isUserGid = await IdAsync("-g", ct, IsUserUser);
+        var inUid = await IdAsync("-u", ct, "inetsim");
+        var inGid = await IdAsync("-g", ct, "inetsim");
+        if (new[] { isRootUid, isRootGid, isUserUid, isUserGid, inUid, inGid }.Any(v => v == "0") || isRootUid == isUserUid || isRootGid == isUserGid)
+            throw new EgressUnavailableException("INetSim user-namespace ids are invalid (zero or shared); run ./build.sh real-setup.");
+        var uidMap = $"0 {isRootUid} 1\n{inUid} {isUserUid} 1\n";
+        var gidMap = $"0 {isRootGid} 1\n{inGid} {isUserGid} 1\n";
+
+        // Real root still stages the tree: it only ever creates entries in root-owned parents (or rm -rf, which never follows
+        // links). The template is verified (root-owned, not writable by others, no symlinks) and copied without following links.
         var isDir = InetSimDir(ns);
         var tmpl = _o.InetSimDataDir.TrimEnd('/');
         var bad = await Run(PrivilegedCommands.Sudo("find", tmpl, "(", "-type", "l", "-o", "!", "-user", "root", "-o", "-perm", "/022", ")", "-print", "-quit"), ct);
@@ -261,36 +331,40 @@ public sealed partial class NetnsEgressRouter(
         var data = isDir + "/data";
         var log = isDir + "/log";
         var report = isDir + "/report";
+        var pid = isDir + "/pid";
+        const string rootIds = IsRootUser + ":" + IsUserUser;
         await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", "root", "-g", "root", "/run/maldex", "/run/maldex/inetsim", isDir, data), ct);
         await Must(PrivilegedCommands.Sudo("cp", "-rP", "--no-preserve=ownership", tmpl + "/.", data + "/"), ct);
-        // the TLS key must be readable by the dropped-privilege service user
-        await Must(PrivilegedCommands.Sudo("chgrp", "inetsim", data + "/certs/default_key.pem"), ct);
+        // the TLS key: read by the namespace's root at start-up (owner) and by the service user (group)
+        await Must(PrivilegedCommands.Sudo("chown", rootIds, data + "/certs/default_key.pem"), ct);
         await Must(PrivilegedCommands.Sudo("chmod", "0640", data + "/certs/default_key.pem"), ct);
-        // Root never opens anything inside these two (INetSim's root code only chowns the directory itself, whose parent is root's).
+        // guest uploads: owned by the service user (inside: inetsim)
         foreach (var w in new[] { "http/postdata", "ftp/upload" })
         {
             await Must(PrivilegedCommands.Sudo("rm", "-rf", "--", $"{data}/{w}"), ct);
-            await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0750", "-o", "inetsim", "-g", "inetsim", $"{data}/{w}"), ct);
+            await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0750", "-o", IsUserUser, "-g", IsUserUser, $"{data}/{w}"), ct);
         }
-        // SMTP's configure_hook runs as ROOT before the privilege drop and opens(>>)/chmods/chowns the mbox, following symlinks;
-        // services start back to back, so an already-compromised inetsim child must not be able to plant one there. smtp/ is
-        // therefore root:inetsim 0750 and the mbox files exist up front as root:inetsim 0660 (SMTP only appends to / reads them).
+        // mbox and log files live in root-owned dirs (nobody in the namespace can create/replace entries there) and are
+        // pre-created owner maldex-isroot / group maldex-isuser 0660: INetSim requires group 'inetsim' + group rw on them.
         await Must(PrivilegedCommands.Sudo("rm", "-rf", "--", $"{data}/smtp"), ct);
-        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0750", "-o", "root", "-g", "inetsim", $"{data}/smtp"), ct);
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", "root", "-g", "root", $"{data}/smtp"), ct);
         foreach (var mbox in new[] { "smtp.mbox", "smtps.mbox" })
-            await Must(PrivilegedCommands.Sudo("install", "-m", "0660", "-o", "root", "-g", "inetsim", "/dev/null", $"{data}/smtp/{mbox}"), ct);
-        // INetSim's ROOT main process appends to these logs and writes reports (following symlinks), so inetsim must never be able
-        // to create/unlink/rename entries where root writes: log/ is root:inetsim 0750 (no write for inetsim) with pre-created
-        // group-writable log files (INetSim only checks group inetsim + group rw); reports go to a separate root-only dir.
-        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0750", "-o", "root", "-g", "inetsim", log), ct);
+            await Must(PrivilegedCommands.Sudo("install", "-m", "0660", "-o", IsRootUser, "-g", IsUserUser, "/dev/null", $"{data}/smtp/{mbox}"), ct);
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", "root", "-g", "root", log), ct);
         foreach (var lf in new[] { "main.log", "service.log", "debug.log" })
-            await Must(PrivilegedCommands.Sudo("install", "-m", "0660", "-o", "root", "-g", "inetsim", "/dev/null", $"{log}/{lf}"), ct);
-        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", "root", "-g", "root", report), ct);
-        var conf = Path.GetFullPath(Path.Combine(_o.DeployNetDir, "inetsim", "inetsim.conf"));
+            await Must(PrivilegedCommands.Sudo("install", "-m", "0660", "-o", IsRootUser, "-g", IsUserUser, "/dev/null", $"{log}/{lf}"), ct);
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", "root", "-g", "root", report), ct); // create_reports no
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", IsRootUser, "-g", IsRootUser, pid), ct);
+        // the namespace's root has no CAP_NET_BIND_SERVICE on the host: allow low ports in this run's netns only
+        await Must(PrivilegedCommands.InNs(ns, "sysctl", "-w", "net.ipv4.ip_unprivileged_port_start=0"), ct);
+        // the namespace's root cannot traverse the owner's home: stage a root-owned copy of the config
+        var conf = isDir + "/inetsim.conf";
+        await Must(PrivilegedCommands.Sudo("install", "-m", "0644", "-o", "root", "-g", "root",
+            Path.GetFullPath(Path.Combine(_o.DeployNetDir, "inetsim", "inetsim.conf")), conf), ct);
         await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "inetsim.out"), ["unshare", "--ipc", "--mount", "--propagation", "private", "--",
-            "sh", "-c", InetSimSandboxScript, isDir, _o.InetSimBinary,
+            "python3", "-I", "-c", UserNsLauncherScript, uidMap, gidMap, isDir, InetSimSandboxScript, _o.InetSimBinary,
             "--config", conf, "--data-dir", data, "--log-dir", log, "--report-dir", report, "--bind-address", "0.0.0.0",
-            "--pidfile", isDir + "/inetsim.pid"]), ct); // per run, root-owned dir: no shared/stale /var/run/inetsim.pid
+            "--pidfile", pid + "/inetsim.pid"]), ct); // per run: no shared/stale /var/run/inetsim.pid
         await WaitFor(async () =>
         {
             var r = await Run(PrivilegedCommands.InNs(ns, "curl", "-s", "-o", "/dev/null", "-m", "2", "-w", "%{http_code}", $"http://{_o.SinkholeIp}/"), ct);
