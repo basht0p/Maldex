@@ -344,6 +344,22 @@ cmd_real_smoke() {
   echo "real-smoke OK: OVMF + TPM 2.0 + KVM work under $LIBVIRT_URI"
 }
 
+# Unattended Windows 11 26H2 guest image (needs MALDEX_WIN_ISO; see deploy/guest/README.md).
+# Sysmon.zip is pinned by the SHA-256 of a download on 2026-10-20 (Sysinternals publishes no checksum file).
+SYSMON_URL="https://download.sysinternals.com/files/Sysmon.zip"
+SYSMON_SHA256="00ecf1b46aec99299d3ae0bca79dc621458bd014b20b509d7c5c8e8c8611aa54"
+
+cmd_build_guest() {
+  if [ -z "${MALDEX_WIN_ISO:-}" ] || [ ! -f "${MALDEX_WIN_ISO:-}" ]; then
+    echo "MALDEX_WIN_ISO must point to a Windows 11 x64 Enterprise (evaluation) ISO (got: '${MALDEX_WIN_ISO:-}')." >&2
+    return 2
+  fi
+  mkdir -p "$VM_DIR/iso"
+  fetch_cached "$SYSMON_URL" "$VM_DIR/iso/Sysmon.zip" "$SYSMON_SHA256"
+  SYSMON_ZIP="$PWD/$VM_DIR/iso/Sysmon.zip" VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" \
+    deploy/guest/build-guest.sh
+}
+
 case "${1:-}" in
   setup)  cmd_setup ;;
   dev-db) cmd_dev_db ;;
@@ -353,6 +369,7 @@ case "${1:-}" in
   build)  cmd_build ;;
   real-setup) cmd_real_setup ;;
   real-smoke) cmd_real_smoke ;;
+  build-guest) cmd_build_guest ;;
   e2e)    echo "Real-VM E2E is implemented in Plan 1b"; exit 2 ;;
-  *) echo "usage: $0 setup|dev-db|run|test|smoke|build|real-setup|real-smoke|e2e" >&2; exit 64 ;;
+  *) echo "usage: $0 setup|dev-db|run|test|smoke|build|real-setup|real-smoke|build-guest|e2e" >&2; exit 64 ;;
 esac

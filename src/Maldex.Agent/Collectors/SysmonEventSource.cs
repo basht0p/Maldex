@@ -28,7 +28,7 @@ public sealed class SysmonEventSource : IEventSource
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine("Sysmon record skipped: " + ex.Message);
+                AgentLog.Write("Sysmon record skipped: " + ex.Message);
             }
         };
         watcher.Enabled = true;
