@@ -141,8 +141,10 @@ public sealed class RunCoordinator(
         }
         finally
         {
-            await ReleaseLeaseAsync(taskId, lease).ConfigureAwait(false);
-            if (capture.Used && capture.Stored) CleanupRunNetDir(taskId);
+            // The run's net dir (lease record, daemon logs, the router's flows copy) goes once the lease is released, whether or
+            // not a capture ran. It stays when the release failed (the reconciler needs the lease record) or when captured
+            // data could not be stored (the router's copy is then the only one left).
+            if (await ReleaseLeaseAsync(taskId, lease).ConfigureAwait(false) && (!capture.Used || capture.Stored)) CleanupRunNetDir(taskId);
         }
 
         if (task.Status == RunStatus.Collecting)
@@ -380,7 +382,7 @@ public sealed class RunCoordinator(
         }
     }
 
-    /// <summary>The run's leftovers (lease record, logs, the router's own copy of the flows) once everything is stored. Best effort.</summary>
+    /// <summary>The run's leftovers (lease record, logs, the router's own copy of the flows) once the lease is released. Best effort.</summary>
     private void CleanupRunNetDir(Guid taskId)
     {
         try
@@ -683,11 +685,20 @@ public sealed class RunCoordinator(
         }
     }
 
-    private async Task ReleaseLeaseAsync(Guid taskId, NetworkLease? lease)
+    /// <summary>True when a lease existed and its release succeeded.</summary>
+    private async Task<bool> ReleaseLeaseAsync(Guid taskId, NetworkLease? lease)
     {
-        if (lease is null) return;
-        try { await egress.ReleaseAsync(lease, CancellationToken.None).ConfigureAwait(false); }
-        catch (Exception ex) { logger.LogError(ex, "Releasing network lease for {TaskId} failed.", taskId); }
+        if (lease is null) return false;
+        try
+        {
+            await egress.ReleaseAsync(lease, CancellationToken.None).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Releasing network lease for {TaskId} failed.", taskId);
+            return false;
+        }
     }
 
     private async Task CancelAsync(MaldexDbContext db, AnalysisTask task, string reason)

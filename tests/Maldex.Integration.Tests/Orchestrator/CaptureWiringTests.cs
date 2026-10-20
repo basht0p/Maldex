@@ -201,4 +201,59 @@ public class CaptureWiringTests(SqlServerFixture sql)
         Assert.Equal(["capture: pcap truncated at the size limit"], task.ProcessingWarnings);
         Assert.Equal(2, await db.Artifacts.CountAsync(a => a.TaskId == id && (a.Kind == ArtifactKind.Pcap || a.Kind == ArtifactKind.MitmFlows), Ct));
     }
+
+    /// <summary>A router whose release always fails (the run's namespace may still exist).</summary>
+    private sealed class FailingReleaseRouter(IEgressRouter inner) : IEgressRouter
+    {
+        public Task<NetworkLease> CreateAsync(Guid taskId, NetworkMode mode, string? exitCountry, CancellationToken ct) => inner.CreateAsync(taskId, mode, exitCountry, ct);
+        public Task ReleaseAsync(NetworkLease lease, CancellationToken ct) => throw new IOException("ip netns del: device busy");
+        public Task<IReadOnlyList<NetworkLease>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
+    }
+
+    private static string SeedNetDir(string runDir, Guid taskId)
+    {
+        var dir = Path.Combine(runDir, "net", Maldex.Infrastructure.Net.RunNetNames.For(taskId).Namespace);
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "lease.json"), "{}");
+        return dir;
+    }
+
+    [Fact]
+    public async Task Coordinator_ReleaseSucceeded_NetDirRemoved_EvenWithoutCapture()
+    {
+        var runDir = Directory.CreateTempSubdirectory("maldex-netdir-").FullName;
+        try
+        {
+            await using var h = await OrchestratorHarness.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Real:Net:RunDir"] = runDir });
+            h.Get<Maldex.Infrastructure.Fakes.FakeGuest>().SetReachable("gateway"); // self-test fails: the capture never starts
+            var id = await h.SeedPreparingTaskAsync();
+            var dir = SeedNetDir(runDir, id);
+            await h.RunAsync(id);
+
+            await using var db = h.NewContext();
+            Assert.Equal(RunStatus.Failed, (await db.Tasks.SingleAsync(t => t.Id == id, Ct)).Status);
+            Assert.False(Directory.Exists(dir), "the lease was released: its run dir must go");
+        }
+        finally { Directory.Delete(runDir, true); }
+    }
+
+    [Fact]
+    public async Task Coordinator_ReleaseFailed_NetDirKept()
+    {
+        var runDir = Directory.CreateTempSubdirectory("maldex-netdir-").FullName;
+        try
+        {
+            await using var h = await OrchestratorHarness.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Real:Net:RunDir"] = runDir }, s =>
+            {
+                var inner = s.Last(d => d.ServiceType == typeof(IEgressRouter));
+                s.Replace(ServiceDescriptor.Singleton<IEgressRouter>(sp => new FailingReleaseRouter((IEgressRouter)ActivatorUtilities.CreateInstance(sp, inner.ImplementationType!))));
+            });
+            var id = await h.SeedPreparingTaskAsync();
+            var dir = SeedNetDir(runDir, id);
+            await h.RunAsync(id);
+
+            Assert.True(File.Exists(Path.Combine(dir, "lease.json")), "a lease that failed to release keeps its record (the reconciler needs it)");
+        }
+        finally { Directory.Delete(runDir, true); }
+    }
 }
