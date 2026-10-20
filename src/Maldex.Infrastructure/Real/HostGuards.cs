@@ -96,27 +96,57 @@ public sealed class GuardedWorkerStartGate(IHostGuardProbe probe, ILogger<Guarde
 
 /// <summary>
 /// Starts the wrapped hosted service in the background once <see cref="IWorkerStartGate"/> allows it, so a slow guard check
-/// never delays the web host (Kestrel) from coming up.
+/// never delays the web host (Kestrel) from coming up. The host only watches <see cref="BackgroundService.ExecuteTask"/> of
+/// services it registered itself, so this wrapper does it for the inner one: a failed start or a faulted ExecuteTask is
+/// logged as critical and stops the application (a dead orchestrator must not look healthy). A denied gate is not a fault:
+/// the web app stays up, as the guard's own critical log explains.
 /// </summary>
-public sealed class GatedHostedService<T>(T inner, IWorkerStartGate gate) : IHostedService where T : class, IHostedService
+public sealed class GatedHostedService<T>(T inner, IWorkerStartGate gate, IHostApplicationLifetime lifetime, ILogger logger)
+    : IHostedService where T : class, IHostedService
 {
     private readonly CancellationTokenSource _cts = new();
     private Task? _start;
     private volatile bool _started;
+    private volatile bool _stopping;
 
     public Task StartAsync(CancellationToken ct)
     {
         _start = Task.Run(async () =>
         {
             if (!await gate.AllowStartAsync(_cts.Token).ConfigureAwait(false)) return;
-            await inner.StartAsync(_cts.Token).ConfigureAwait(false);
+            try
+            {
+                await inner.StartAsync(_cts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested) { return; }
+            catch (Exception e)
+            {
+                Fatal(e, "failed to start");
+                return;
+            }
             _started = true;
+            if (inner is BackgroundService { ExecuteTask: { } execute }) _ = WatchAsync(execute);
         });
         return Task.CompletedTask;
     }
 
+    private async Task WatchAsync(Task execute)
+    {
+        try { await execute.ConfigureAwait(false); }
+        catch (OperationCanceledException) when (_stopping || _cts.IsCancellationRequested) { }
+        catch (Exception e) { Fatal(e, "stopped with an error"); }
+    }
+
+    private void Fatal(Exception e, string what)
+    {
+        if (_stopping) return;
+        logger.LogCritical(e, "Hosted service {Service} {What}; stopping the application.", inner.GetType().Name, what);
+        lifetime.StopApplication();
+    }
+
     public async Task StopAsync(CancellationToken ct)
     {
+        _stopping = true;
         if (_start is not null)
         {
             try { await _start.WaitAsync(ct).ConfigureAwait(false); }
@@ -131,7 +161,8 @@ public static class GatedHostedServiceExtensions
 {
     /// <summary>Hosts <typeparamref name="T"/> (already registered as a service) behind <see cref="IWorkerStartGate"/>.</summary>
     public static IServiceCollection AddGatedHostedService<T>(this IServiceCollection services) where T : class, IHostedService =>
-        services.AddSingleton<IHostedService>(sp => new GatedHostedService<T>(sp.GetRequiredService<T>(), sp.GetRequiredService<IWorkerStartGate>()));
+        services.AddSingleton<IHostedService>(sp => new GatedHostedService<T>(sp.GetRequiredService<T>(), sp.GetRequiredService<IWorkerStartGate>(),
+            sp.GetRequiredService<IHostApplicationLifetime>(), sp.GetRequiredService<ILoggerFactory>().CreateLogger<GatedHostedService<T>>()));
 }
 
 public sealed class HostGuardProbe(IProcessRunner runner, IOptions<LibvirtOptions> libvirt, IConfiguration configuration) : IHostGuardProbe
