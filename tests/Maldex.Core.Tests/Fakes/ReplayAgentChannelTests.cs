@@ -12,7 +12,7 @@ public sealed class ReplayAgentChannelTests : IDisposable
 {
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(10);
     private readonly string _dir = Directory.CreateTempSubdirectory("maldex-replay-").FullName;
-    private readonly FakeTimeProvider _time = new(new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero));
+    private readonly CountingTimeProvider _time = new(new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero));
     private static readonly VmHandle Vm = VmHandle.For(Guid.NewGuid());
 
     public void Dispose() => Directory.Delete(_dir, true);
@@ -28,6 +28,16 @@ public sealed class ReplayAgentChannelTests : IDisposable
         File.WriteAllLines(Path.Combine(_dir, "t.jsonl"), lines);
         var opts = new ReplayOptions { Directory = _dir, DefaultFile = "t.jsonl", Speed = speed, HoldOpen = holdOpen };
         return new FakeAgentChannelFactory(new StaticMonitor(opts), _time).ConnectAsync(Vm, TestContext.Current.CancellationToken);
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, string failure)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!condition())
+        {
+            Assert.True(sw.Elapsed < Timeout, failure);
+            await Task.Delay(1, TestContext.Current.CancellationToken);
+        }
     }
 
     private async Task Pump(Task reader, TimeSpan step)
@@ -64,13 +74,22 @@ public sealed class ReplayAgentChannelTests : IDisposable
         {
             await foreach (var m in ch.ReadAsync(TestContext.Current.CancellationToken)) lock (seen) seen.Add((m, _time.GetUtcNow()));
         });
-        await Pump(reader, TimeSpan.FromMilliseconds(50));
+        // Advance the fake clock only once the replay has registered the delay it is waiting on, so cold-start
+        // latency cannot shift the schedule: each message must arrive exactly one scaled delay after the previous.
+        for (var i = 0; i < 3; i++)
+        {
+            await WaitUntilAsync(() => _time.TimersCreated >= i + 1, "The replay did not register its delay.");
+            _time.Advance(TimeSpan.FromMilliseconds(500));
+            await WaitUntilAsync(() => { lock (seen) return seen.Count >= i + 1; }, "The replay did not yield the next message.");
+        }
+        await reader.WaitAsync(Timeout, TestContext.Current.CancellationToken);
 
         Assert.Collection(seen.Select(s => s.M), m => Assert.IsType<ReadyMessage>(m), m => Assert.IsType<ProcessStartedMessage>(m), m => Assert.IsType<FileEventMessage>(m));
         // 1000ms at speed 2 = 500ms between messages (unscaled would be 1000ms).
         firstAt = seen[0].Now - start;
-        Assert.InRange(firstAt, TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(900));
-        Assert.InRange(seen[1].Now - seen[0].Now, TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(900));
+        Assert.Equal(TimeSpan.FromMilliseconds(500), firstAt);
+        Assert.Equal(TimeSpan.FromMilliseconds(500), seen[1].Now - seen[0].Now);
+        Assert.Equal(TimeSpan.FromMilliseconds(500), seen[2].Now - seen[1].Now);
         // At is rewritten to the (fake) clock.
         var p = Assert.IsType<ProcessStartedMessage>(seen[1].M);
         Assert.True(p.At >= start, "At must be rewritten to time provider now");
@@ -231,6 +250,19 @@ public sealed class ReplayAgentChannelTests : IDisposable
                 count++;
             }
         Assert.True(count >= 1);
+    }
+
+    /// <summary>A fake clock that counts the timers (delays) created on it.</summary>
+    private sealed class CountingTimeProvider(DateTimeOffset start) : FakeTimeProvider(start)
+    {
+        private int _timers;
+        public int TimersCreated => Volatile.Read(ref _timers);
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            Interlocked.Increment(ref _timers);
+            return base.CreateTimer(callback, state, dueTime, period);
+        }
     }
 
     private sealed class StaticMonitor(ReplayOptions value) : IOptionsMonitor<ReplayOptions>

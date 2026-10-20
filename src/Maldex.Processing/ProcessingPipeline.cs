@@ -16,7 +16,7 @@ namespace Maldex.Processing;
 /// <c>Processing</c>): the first thing it does is discard that task's earlier detections and warnings.
 /// A failing step becomes a processing warning; the task still completes.
 /// </summary>
-public sealed class ProcessingPipeline(
+public class ProcessingPipeline(
     IServiceScopeFactory scopes,
     IYaraScanner yara,
     ISuricataRunner suricata,
@@ -32,7 +32,7 @@ public sealed class ProcessingPipeline(
     // GuestText.Clean appends a 12-character marker when it truncates.
     private const int SuffixLength = 12;
 
-    public async Task ProcessAsync(Guid taskId, CancellationToken ct)
+    public virtual async Task ProcessAsync(Guid taskId, CancellationToken ct)
     {
         await using var scope = scopes.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();

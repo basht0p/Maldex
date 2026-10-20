@@ -227,4 +227,18 @@ public sealed class ReportTests(SqlServerFixture sql) : IDisposable
         var bytes = await resp.Content.ReadAsByteArrayAsync(Ct);
         Assert.StartsWith("%PDF-", Encoding.ASCII.GetString(bytes, 0, 5));
     }
+
+    [Fact]
+    public async Task PdfRenderer_Cancelled_Throws()
+    {
+        await using var renderer = new Maldex.Web.Reports.PdfRenderer(new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build());
+        var html = "<html><body>" + string.Concat(Enumerable.Repeat("<p>cancel me cancel me cancel me cancel me</p>", 60_000)) + "</body></html>";
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        var render = renderer.RenderAsync(html, cts.Token);
+        cts.CancelAfter(TimeSpan.FromMilliseconds(1500));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => render);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10), "cancellation did not abort the render promptly");
+    }
 }

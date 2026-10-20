@@ -76,6 +76,12 @@ public sealed class RunCoordinator(
                 var outcome = await AttemptAsync(db, task, lease, command, ct).ConfigureAwait(false);
                 if (outcome == AttemptOutcome.Completed) break;
 
+                if (outcome == AttemptOutcome.Stopped)
+                {
+                    await CancelAsync(db, task, "stopped by analyst").ConfigureAwait(false);
+                    return;
+                }
+
                 if (attempt == MaxAttempts)
                 {
                     var reason = outcome == AttemptOutcome.VmStartFailed
@@ -106,7 +112,7 @@ public sealed class RunCoordinator(
             await TransitionAsync(db, task, RunStatus.Processing, "collection complete", null, CancellationToken.None).ConfigureAwait(false);
     }
 
-    private enum AttemptOutcome { Completed, VmStartFailed, AgentNotReady }
+    private enum AttemptOutcome { Completed, VmStartFailed, AgentNotReady, Stopped }
 
     /// <summary>One try on a fresh VM. The VM and agent channel are always released before this returns.</summary>
     private async Task<AttemptOutcome> AttemptAsync(MaldexDbContext db, AnalysisTask task, NetworkLease lease, AgentCommand command, CancellationToken ct)
@@ -127,8 +133,7 @@ public sealed class RunCoordinator(
             }
 
             channel = await channels.ConnectAsync(vm, ct).ConfigureAwait(false);
-            var ready = await RunGuestAsync(db, task, channel, command, ct).ConfigureAwait(false);
-            return ready ? AttemptOutcome.Completed : AttemptOutcome.AgentNotReady;
+            return await RunGuestAsync(db, task, channel, command, ct).ConfigureAwait(false);
         }
         finally
         {
@@ -154,17 +159,19 @@ public sealed class RunCoordinator(
 
     /// <summary>
     /// Waits for the agent, then ingests until the run ends and moves the task to Collecting.
-    /// Returns false (without touching the task) if the agent never became ready.
+    /// Returns <c>AgentNotReady</c> (without touching the task) if the agent never became ready, or <c>Stopped</c>
+    /// if the analyst asked to stop while the VM was still preparing.
     /// </summary>
-    private async Task<bool> RunGuestAsync(MaldexDbContext db, AnalysisTask task, IAgentChannel channel, AgentCommand command, CancellationToken ct)
+    private async Task<AttemptOutcome> RunGuestAsync(MaldexDbContext db, AnalysisTask task, IAgentChannel channel, AgentCommand command, CancellationToken ct)
     {
         using var readerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var enumerator = channel.ReadAsync(readerCts.Token).GetAsyncEnumerator(readerCts.Token);
         var disposed = false;
         try
         {
-            if (!await WaitForReadyAsync(enumerator, readerCts, ct).ConfigureAwait(false))
-                return false;
+            var ready = await WaitForReadyAsync(db, task.Id, enumerator, readerCts, ct).ConfigureAwait(false);
+            if (ready != ReadyResult.Ready)
+                return ready == ReadyResult.Stopped ? AttemptOutcome.Stopped : AttemptOutcome.AgentNotReady;
 
             var now = time.GetUtcNow();
             await TransitionAsync(db, task, RunStatus.Running, "agent ready", t =>
@@ -207,7 +214,7 @@ public sealed class RunCoordinator(
 
             var ended = time.GetUtcNow();
             await TransitionAsync(db, task, RunStatus.Collecting, reason, t => t.EndedAt = ended, ct).ConfigureAwait(false);
-            return true;
+            return AttemptOutcome.Completed;
         }
         finally
         {
@@ -215,28 +222,58 @@ public sealed class RunCoordinator(
         }
     }
 
-    /// <summary>Waits for the agent's ReadyMessage. Returns false on timeout or if the channel closes first.</summary>
-    private async Task<bool> WaitForReadyAsync(IAsyncEnumerator<AgentMessage> enumerator, CancellationTokenSource readerCts, CancellationToken ct)
+    private enum ReadyResult { Ready, NotReady, Stopped }
+
+    /// <summary>
+    /// Waits for the agent's ReadyMessage, re-reading StopRequestedAt every poll interval. NotReady on timeout or if the
+    /// channel closes first. On every exit the pending read has finished, so the caller may dispose the enumerator.
+    /// </summary>
+    private async Task<ReadyResult> WaitForReadyAsync(MaldexDbContext db, Guid taskId, IAsyncEnumerator<AgentMessage> enumerator, CancellationTokenSource readerCts, CancellationToken ct)
     {
         var deadline = time.GetUtcNow() + _options.AgentReadyTimeout;
-        while (true)
+        Task<bool>? next = null;
+        try
         {
-            var remaining = deadline - time.GetUtcNow();
-            var next = enumerator.MoveNextAsync().AsTask();
-            try
+            while (true)
             {
-                if (remaining <= TimeSpan.Zero) throw new TimeoutException();
-                if (!await next.WaitAsync(remaining, time, ct).ConfigureAwait(false)) return false;
-            }
-            catch (TimeoutException)
-            {
-                await readerCts.CancelAsync().ConfigureAwait(false);
-                try { await next.ConfigureAwait(false); } catch (OperationCanceledException) { }
-                return false;
-            }
+                next ??= enumerator.MoveNextAsync().AsTask();
+                var remaining = deadline - time.GetUtcNow();
+                if (remaining <= TimeSpan.Zero) return await AbandonAsync(ReadyResult.NotReady).ConfigureAwait(false);
 
-            if (enumerator.Current is ReadyMessage) return true;
-            // Anything the agent sends before it is ready is not telemetry yet; ignore it.
+                var moved = false;
+                try
+                {
+                    moved = await next.WaitAsync(remaining < _options.ControlPollInterval ? remaining : _options.ControlPollInterval, time, ct).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    var stop = await db.Tasks.AsNoTracking()
+                        .Where(t => t.Id == taskId)
+                        .Select(t => t.StopRequestedAt)
+                        .SingleAsync(ct).ConfigureAwait(false);
+                    if (stop is not null) return await AbandonAsync(ReadyResult.Stopped).ConfigureAwait(false);
+                    continue; // the same MoveNextAsync is still in flight
+                }
+
+                next = null;
+                if (!moved) return ReadyResult.NotReady;
+                if (enumerator.Current is ReadyMessage) return ReadyResult.Ready;
+                // Anything the agent sends before it is ready is not telemetry yet; ignore it.
+            }
+        }
+        catch when (next is { IsCompleted: false })
+        {
+            // Cancellation or a failed query: let the in-flight read finish before the enumerator can be disposed.
+            await readerCts.CancelAsync().ConfigureAwait(false);
+            try { await next.ConfigureAwait(false); } catch (Exception) { /* the original error wins */ }
+            throw;
+        }
+
+        async Task<ReadyResult> AbandonAsync(ReadyResult result)
+        {
+            await readerCts.CancelAsync().ConfigureAwait(false);
+            try { await next!.ConfigureAwait(false); } catch (OperationCanceledException) { }
+            return result;
         }
     }
 
@@ -348,6 +385,19 @@ public sealed class RunCoordinator(
         if (lease is null) return;
         try { await egress.ReleaseAsync(lease, CancellationToken.None).ConfigureAwait(false); }
         catch (Exception ex) { logger.LogError(ex, "Releasing network lease for {TaskId} failed.", taskId); }
+    }
+
+    private async Task CancelAsync(MaldexDbContext db, AnalysisTask task, string reason)
+    {
+        try
+        {
+            var ended = time.GetUtcNow();
+            await TransitionAsync(db, task, RunStatus.Cancelled, reason, t => t.EndedAt ??= ended, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Could not record cancellation of task {TaskId}: {Reason}", task.Id, reason);
+        }
     }
 
     private async Task FailAsync(MaldexDbContext db, AnalysisTask task, string reason)

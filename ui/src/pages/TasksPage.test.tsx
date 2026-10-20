@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { MemoryRouter } from 'react-router-dom'
@@ -37,5 +37,20 @@ describe('TasksPage', () => {
     expect(screen.getByText(/#2 in queue/)).toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: 'Cancel' })).toHaveLength(1)
     expect(screen.getByText('Malicious')).toBeInTheDocument()
+  })
+
+  it('TasksPage_Cancel409_ShowsError', async () => {
+    server.use(
+      http.get('/api/tasks', () => HttpResponse.json({ items: [task({})], total: 1 })),
+      http.post('/api/tasks/t1/cancel', () => HttpResponse.json({ title: 'Conflict' }, { status: 409 })),
+    )
+    render(<MemoryRouter><TasksPage /></MemoryRouter>)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
+
+    expect(await screen.findByText('Only queued tasks can be cancelled.')).toBeInTheDocument()
+    // The refresh that follows the failed cancel must not wipe the message.
+    await new Promise((r) => setTimeout(r, 100))
+    expect(screen.getByText('Only queued tasks can be cancelled.')).toBeInTheDocument()
   })
 })
