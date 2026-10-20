@@ -43,5 +43,10 @@ public static class AgentLog
         System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Maldex", "agent.log"),
         MaxBytes));
 
-    public static void Write(string text, DateTimeOffset? at = null) => Sink.Value.Write($"{at ?? DateTimeOffset.UtcNow:O} {text}");
+    public static void Write(string text, DateTimeOffset? at = null)
+    {
+        var line = $"{at ?? DateTimeOffset.UtcNow:O} {text}";
+        Sink.Value.Write(line);
+        try { Console.Error.WriteLine(line); } catch { /* WinExe has no console; ignore */ }
+    }
 }

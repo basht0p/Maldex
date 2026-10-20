@@ -63,10 +63,27 @@ done
 
 mkdir -p "$BASE_DIR" "$WORK"
 
-ejector_pid=""
+keypress_pid=""
+finished=0
 cleanup() {
-  if [ -n "$ejector_pid" ]; then kill "$ejector_pid" 2>/dev/null || true; fi
-  if virsh_ domstate "$DOMAIN" 2>/dev/null | grep -q running; then virsh_ destroy "$DOMAIN" >/dev/null 2>&1 || true; fi
+  local rc=$?
+  if [ -n "$keypress_pid" ]; then kill "$keypress_pid" 2>/dev/null || true; fi
+  if [ "$rc" -ne 0 ] && [ "$finished" -ne 1 ]; then
+    if [ "${MALDEX_KEEP_FAILED_BUILD:-}" = 1 ]; then
+      echo "Build failed; keeping the VM and files (MALDEX_KEEP_FAILED_BUILD=1)." >&2
+      echo "  Watch it: virsh -c $LIBVIRT_URI vncdisplay $DOMAIN   (VNC on 127.0.0.1)" >&2
+      echo "  Remove it later: virsh -c $LIBVIRT_URI destroy $DOMAIN; virsh -c $LIBVIRT_URI undefine $DOMAIN --nvram" >&2
+      return
+    fi
+    echo "Build failed (exit $rc); removing the build VM and intermediate files. Re-run with MALDEX_KEEP_FAILED_BUILD=1 to keep them." >&2
+    virsh_ destroy "$DOMAIN" >/dev/null 2>&1 || true
+    if virsh_ list --all --name 2>/dev/null | grep -qx "$DOMAIN"; then
+      virsh_ undefine "$DOMAIN" --nvram >/dev/null 2>&1 || virsh_ undefine "$DOMAIN" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$BUILDING_DISK" "$BUILDING_VARS" "$BUILDING_VARS.final" "$PROV_ISO" "$STAGE"
+  elif virsh_ domstate "$DOMAIN" 2>/dev/null | grep -q running; then
+    virsh_ destroy "$DOMAIN" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
@@ -141,17 +158,19 @@ virt-install --osinfo list 2>/dev/null | grep -qx 'win11' || osinfo=(--osinfo "d
 office=()
 [ -n "${MALDEX_OFFICE_ISO:-}" ] && office=(--disk "path=$MALDEX_OFFICE_ISO,device=cdrom")
 
+# --import defines ONE persistent domain (virt-install's install mode would set on_reboot=destroy and stop at Setup's first
+# reboot). Boot order: Windows CD first, then the disk; the "press any key" prompt times out on later reboots.
 log "Starting the unattended install (no network; VNC on 127.0.0.1, see 'virsh -c $LIBVIRT_URI vncdisplay $DOMAIN')"
 virt-install --connect "$LIBVIRT_URI" --name "$DOMAIN" --memory 4096 --vcpus 2 --cpu host-passthrough --machine q35 \
   --boot "uefi,loader=$OVMF_CODE_SECBOOT,loader.readonly=yes,loader.type=pflash,loader.secure=yes,nvram=$BUILDING_VARS" \
   --features smm.state=on \
   --tpm emulator,model=tpm-crb,version=2.0 \
-  --disk "path=$BUILDING_DISK,bus=virtio,format=qcow2" \
-  --cdrom "$MALDEX_WIN_ISO" \
+  --disk "path=$BUILDING_DISK,bus=virtio,format=qcow2,boot.order=2" \
+  --disk "path=$MALDEX_WIN_ISO,device=cdrom,boot.order=1" \
   --disk "path=$VIRTIO_ISO,device=cdrom" \
   --disk "path=$PROV_ISO,device=cdrom" \
   "${office[@]}" \
-  --events on_reboot=restart \
+  --import --events on_reboot=restart \
   --network none --graphics vnc,listen=127.0.0.1 \
   --channel unix,target.type=virtio,target.name=org.maldex.agent \
   --noautoconsole "${osinfo[@]}"
@@ -160,7 +179,7 @@ virt-install --connect "$LIBVIRT_URI" --name "$DOMAIN" --memory 4096 --vcpus 2 -
 (
   for _ in $(seq 1 25); do virsh_ send-key "$DOMAIN" KEY_SPACE >/dev/null 2>&1 || true; sleep 2; done
 ) &
-ejector_pid=$!
+keypress_pid=$!
 
 # ---- 6. Wait for the domain to shut off (Provision.ps1 ends with shutdown) ----
 start=$SECONDS
@@ -170,7 +189,7 @@ while :; do
   elapsed=$((SECONDS - start))
   [ "$state" = "shut off" ] && break
   if [ "$elapsed" -ge "$INSTALL_CAP_SECONDS" ]; then
-    echo "Install did not finish within $((INSTALL_CAP_SECONDS / 3600)) h (state: $state); inspect with VNC." >&2
+    echo "Install did not finish within $((INSTALL_CAP_SECONDS / 3600)) h (state: $state). Re-run with MALDEX_KEEP_FAILED_BUILD=1 to keep the VM for inspection." >&2
     exit 1
   fi
   if [ $((elapsed - last_report)) -ge 60 ]; then
@@ -179,7 +198,7 @@ while :; do
   fi
   sleep 10
 done
-kill "$ejector_pid" 2>/dev/null || true; ejector_pid=""
+kill "$keypress_pid" 2>/dev/null || true; keypress_pid=""
 log "Install and provisioning finished after $(((SECONDS - start) / 60)) min"
 
 # ---- 7. Verify: boot without installer media and wait for the agent's ready frame ----
@@ -214,18 +233,20 @@ nvram_path="$(virsh_ dumpxml "$DOMAIN" | xmllint --xpath 'string(//os/nvram)' - 
 [ -n "$nvram_path" ] && [ -f "$nvram_path" ] || nvram_path="$BUILDING_VARS"
 virsh_ shutdown "$DOMAIN" >/dev/null 2>&1 || true
 for _ in $(seq 1 45); do
-  [ "$(virsh_ domstate "$DOMAIN" 2>/dev/null)" = "shut off" ] && break
+  if [ "$(virsh_ domstate "$DOMAIN" 2>/dev/null)" = "shut off" ]; then break; fi
   sleep 2
 done
-virsh_ destroy "$DOMAIN" >/dev/null 2>&1 || true
+if [ "$(virsh_ domstate "$DOMAIN" 2>/dev/null)" != "shut off" ]; then
+  echo "The guest did not shut down cleanly within 90 s; refusing to finalise a possibly dirty image." >&2
+  exit 1
+fi
 cp -f "$nvram_path" "$BUILDING_VARS.final"
-virsh_ undefine "$DOMAIN" --keep-nvram --keep-tpm >/dev/null 2>&1 \
-  || virsh_ undefine "$DOMAIN" --keep-nvram >/dev/null 2>&1 \
-  || virsh_ undefine "$DOMAIN" >/dev/null
+virsh_ undefine "$DOMAIN" --keep-nvram >/dev/null 2>&1 || virsh_ undefine "$DOMAIN" >/dev/null
 mv -f "$BUILDING_VARS.final" "$BUILDING_VARS"
 
 rm -f "$BASE_DIR/$IMAGE_ID.qcow2" "$BASE_DIR/$IMAGE_ID.vars.fd"
 mv "$BUILDING_DISK" "$BASE_DIR/$IMAGE_ID.qcow2"
 mv "$BUILDING_VARS" "$BASE_DIR/$IMAGE_ID.vars.fd"
 chmod 0444 "$BASE_DIR/$IMAGE_ID.qcow2" "$BASE_DIR/$IMAGE_ID.vars.fd"
+finished=1
 log "Done: $BASE_DIR/$IMAGE_ID.qcow2 and $IMAGE_ID.vars.fd (read-only)"

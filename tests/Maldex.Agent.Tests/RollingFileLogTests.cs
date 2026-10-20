@@ -37,6 +37,6 @@ public class RollingFileLogTests : IDisposable
     {
         Directory.CreateDirectory(_dir);
         var log = new RollingFileLog(_dir, 100); // path is a directory
-        log.Write("x");
+        Assert.Null(Record.Exception(() => log.Write("x")));
     }
 }

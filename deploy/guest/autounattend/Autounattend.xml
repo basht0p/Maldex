@@ -74,6 +74,7 @@
       <UserData>
         <AcceptEula>true</AcceptEula>
         <!-- No product key: evaluation media does not need one. -->
+        <ProductKey><WillShowUI>OnError</WillShowUI></ProductKey>
       </UserData>
     </component>
   </settings>
