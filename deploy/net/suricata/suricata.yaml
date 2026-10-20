@@ -1,0 +1,55 @@
+%YAML 1.1
+---
+# Maldex minimal Suricata 7 config for offline pcap processing (suricata -r <pcap> -c this -S dev.rules -l <dir>).
+vars:
+  address-groups:
+    HOME_NET: "[10.213.0.0/16]"
+    EXTERNAL_NET: "!$HOME_NET"
+    HTTP_SERVERS: "any"
+    DNS_SERVERS: "any"
+    SMTP_SERVERS: "any"
+  port-groups:
+    HTTP_PORTS: "80"
+    SHELLCODE_PORTS: "!80"
+
+default-log-dir: /var/log/suricata/
+default-rule-path: /etc/suricata/rules
+
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert
+        - http
+        - dns
+        - tls
+        - flow
+
+app-layer:
+  protocols:
+    http:
+      enabled: yes
+    tls:
+      enabled: yes
+      detection-ports:
+        dp: 443
+    dns:
+      tcp:
+        enabled: yes
+        detection-ports:
+          dp: 53
+      udp:
+        enabled: yes
+        detection-ports:
+          dp: 53
+
+stream:
+  checksum-validation: no
+
+rule-files:
+  - dev.rules
+
+classification-file: /etc/suricata/classification.config
+reference-config-file: /etc/suricata/reference.config

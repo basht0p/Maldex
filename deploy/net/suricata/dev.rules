@@ -1,0 +1,2 @@
+# Maldex development rules. Task 10 extends this file.
+alert dns any any -> any any (msg:"MALDEX DEV DNS query for .invalid TLD"; dns.query; content:".invalid"; endswith; nocase; classtype:misc-activity; sid:9000001; rev:1;)
