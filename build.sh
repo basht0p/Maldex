@@ -139,6 +139,147 @@ cmd_smoke() {
   return "$rc"
 }
 
+# ---- Real mode (Plan 1b) host toolchain ----
+
+MITMPROXY_VERSION="11.1.3"
+GUACD_IMAGE="guacamole/guacd:1.5.5"
+VIRTIO_WIN_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
+ALPINE_ISO_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-virt-3.20.3-x86_64.iso"
+OVMF_CODE_SECBOOT="/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
+OVMF_CODE_PLAIN="/usr/share/OVMF/OVMF_CODE_4M.fd"
+LIBVIRT_URI="qemu:///session"
+VM_DIR=".data/vm"
+
+# Download $1 to $2 unless it already exists (atomic via .part).
+fetch_cached() {
+  local url="$1" dest="$2"
+  [ -s "$dest" ] && return 0
+  echo "Downloading $url"
+  curl -fsSL --retry 3 -o "$dest.part" "$url"
+  mv "$dest.part" "$dest"
+}
+
+cmd_real_setup() {
+  sudo apt-get update -qq
+  sudo apt-get install -y qemu-system-x86 qemu-utils libvirt-daemon libvirt-clients virtinst ovmf swtpm swtpm-tools \
+    dnsmasq-base nftables tcpdump suricata inetsim wireguard-tools xorriso libxml2-utils socat genisoimage
+
+  if ! command -v pwsh >/dev/null 2>&1; then
+    sudo snap install powershell --classic   # script parse checks only
+  fi
+
+  if ! { [ -x /opt/mitmproxy/mitmdump ] && /opt/mitmproxy/mitmdump --version 2>/dev/null | grep -q "$MITMPROXY_VERSION"; }; then
+    local tmp; tmp="$(mktemp -d)"
+    curl -fsSL --retry 3 -o "$tmp/mitmproxy.tar.gz" \
+      "https://downloads.mitmproxy.org/$MITMPROXY_VERSION/mitmproxy-$MITMPROXY_VERSION-linux-x86_64.tar.gz"
+    sudo mkdir -p /opt/mitmproxy
+    sudo tar -xzf "$tmp/mitmproxy.tar.gz" -C /opt/mitmproxy
+    rm -rf "$tmp"
+  fi
+  sudo ln -sf /opt/mitmproxy/mitmdump /usr/local/bin/mitmdump
+
+  docker pull "$GUACD_IMAGE"
+
+  mkdir -p "$VM_DIR/base" "$VM_DIR/run" "$VM_DIR/iso"
+  fetch_cached "$VIRTIO_WIN_URL" "$VM_DIR/iso/virtio-win.iso"
+
+  # kvm group for future logins; ACL so this session can use /dev/kvm without re-login.
+  sudo usermod -aG kvm maldex_admin
+  # udev re-creates/re-triggers /dev/kvm (apt installs, hotplug events) and drops the ACL, so also re-apply it from a rule.
+  echo 'KERNEL=="kvm", ACTION=="add|change", RUN+="/usr/bin/setfacl -m u:maldex_admin:rw $env{DEVNAME}"' \
+    | sudo tee /etc/udev/rules.d/99-maldex-kvm.rules >/dev/null
+  sudo udevadm control --reload
+  if ! { [ -r /dev/kvm ] && [ -w /dev/kvm ]; }; then
+    sudo setfacl -m u:maldex_admin:rw /dev/kvm
+  fi
+
+  # Maldex runs these per run / on demand, not as system services.
+  sudo systemctl disable --now inetsim suricata 2>/dev/null || true
+
+  sudo nft -f deploy/host/maldex-host-guard.nft
+
+  real_verify
+}
+
+# Run "$@" quietly; on failure print the hint and record the failure.
+REAL_FAILED=0
+real_check() {
+  local what="$1" hint="$2"; shift 2
+  if "$@" >/dev/null 2>&1; then
+    echo "ok   $what"
+  else
+    echo "FAIL $what -- install/fix: $hint" >&2
+    REAL_FAILED=1
+  fi
+}
+
+real_verify() {
+  REAL_FAILED=0
+  real_check "/dev/kvm readable+writable" "add user to kvm group / sudo setfacl -m u:\$USER:rw /dev/kvm" \
+    bash -c '[ -r /dev/kvm ] && [ -w /dev/kvm ]'
+  real_check "virsh $LIBVIRT_URI" "libvirt-clients, libvirt-daemon" virsh -c "$LIBVIRT_URI" version
+  real_check "OVMF secboot firmware" "apt install ovmf" test -f "$OVMF_CODE_SECBOOT"
+  real_check "swtpm" "apt install swtpm swtpm-tools" swtpm --version
+  real_check "suricata" "apt install suricata" bash -c 'suricata --build-info | head -1'
+  real_check "mitmdump" "./build.sh real-setup (mitmproxy $MITMPROXY_VERSION)" mitmdump --version
+  real_check "guacd image" "docker pull $GUACD_IMAGE" docker image inspect "$GUACD_IMAGE"
+  real_check "inetsim" "apt install inetsim" inetsim --version
+  real_check "wireguard-tools" "apt install wireguard-tools" wg --version
+  real_check "xorriso" "apt install xorriso" xorriso -version
+  real_check "xmllint" "apt install libxml2-utils" xmllint --version
+  real_check "pwsh" "sudo snap install powershell --classic" pwsh -v
+  return "$REAL_FAILED"
+}
+
+# Proves session libvirt + KVM + OVMF + TPM 2.0 work, using a throwaway Alpine domain (no Windows media).
+cmd_real_smoke() {
+  local name="maldex-smoke" iso="$VM_DIR/iso/alpine-virt-3.20.3-x86_64.iso"
+  mkdir -p "$VM_DIR/iso"
+  fetch_cached "$ALPINE_ISO_URL" "$iso"
+  [ -f "$OVMF_CODE_SECBOOT" ] || { echo "Missing $OVMF_CODE_SECBOOT; run ./build.sh real-setup" >&2; return 1; }
+  # Fail instead of silently falling back to software emulation.
+  { [ -r /dev/kvm ] && [ -w /dev/kvm ]; } || { echo "/dev/kvm is not usable by this session; run ./build.sh real-setup" >&2; return 1; }
+  virsh -c "$LIBVIRT_URI" domcapabilities --virttype kvm >/dev/null 2>&1 \
+    || { echo "libvirt reports no KVM support for $LIBVIRT_URI" >&2; return 1; }
+
+  virsh -c "$LIBVIRT_URI" destroy "$name" >/dev/null 2>&1 || true
+  smoke_cleanup() { virsh -c "$LIBVIRT_URI" destroy "$name" >/dev/null 2>&1 || true; }
+  trap smoke_cleanup RETURN
+
+  # Alpine is not Secure-Boot-signed, so Secure Boot is off for this domain only; the point is OVMF + TPM + KVM.
+  # Prefer the secboot CODE file; fall back to the plain 4M CODE file if virt-install refuses it with secure=no.
+  local code osinfo=(--osinfo alpinelinux3.19) started=0
+  if ! virt-osinfo-query os short-id=alpinelinux3.19 >/dev/null 2>&1; then osinfo=(--osinfo detect=on,require=off); fi
+  for code in "$OVMF_CODE_SECBOOT" "$OVMF_CODE_PLAIN"; do
+    [ -f "$code" ] || continue
+    if virt-install --connect "$LIBVIRT_URI" --transient --name "$name" --memory 512 --vcpus 1 --cdrom "$iso" --disk none \
+        --boot "uefi,loader=$code,loader.readonly=yes,loader.type=pflash,loader.secure=no" \
+        --tpm emulator,model=tpm-crb,version=2.0 --network none --graphics none --noautoconsole \
+        "${osinfo[@]}"; then
+      started=1; echo "Smoke domain started with firmware $code"; break
+    fi
+    echo "virt-install failed with $code" >&2
+  done
+  [ "$started" = 1 ] || { echo "Could not start smoke domain" >&2; return 1; }
+
+  local state=""
+  for _ in $(seq 1 30); do
+    state="$(virsh -c "$LIBVIRT_URI" domstate "$name" 2>/dev/null || true)"
+    [ "$state" = "running" ] && break
+    sleep 1
+  done
+  [ "$state" = "running" ] || { echo "Smoke domain did not reach running (state: $state)" >&2; return 1; }
+  sleep 10
+  state="$(virsh -c "$LIBVIRT_URI" domstate "$name" 2>/dev/null || true)"
+  [ "$state" = "running" ] || { echo "Smoke domain stopped early (state: $state)" >&2; return 1; }
+
+  virsh -c "$LIBVIRT_URI" destroy "$name"
+  if virsh -c "$LIBVIRT_URI" list --all --name | grep -qx "$name"; then
+    echo "$name still defined after destroy" >&2; return 1
+  fi
+  echo "real-smoke OK: OVMF + TPM 2.0 + KVM work under $LIBVIRT_URI"
+}
+
 case "${1:-}" in
   setup)  cmd_setup ;;
   dev-db) cmd_dev_db ;;
@@ -146,6 +287,8 @@ case "${1:-}" in
   run)    cmd_run ;;
   smoke)  cmd_smoke ;;
   build)  cmd_build ;;
+  real-setup) cmd_real_setup ;;
+  real-smoke) cmd_real_smoke ;;
   e2e)    echo "Real-VM E2E is implemented in Plan 1b"; exit 2 ;;
-  *) echo "usage: $0 setup|dev-db|run|test|smoke|build|e2e" >&2; exit 64 ;;
+  *) echo "usage: $0 setup|dev-db|run|test|smoke|build|real-setup|real-smoke|e2e" >&2; exit 64 ;;
 esac
