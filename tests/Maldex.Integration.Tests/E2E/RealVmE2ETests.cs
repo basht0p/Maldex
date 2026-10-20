@@ -121,22 +121,16 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
             failure = ex;
         }
 
-        // ---- cleanup: always runs, with its own token so a cancelled test still tidies up ----
-        string? leak = null;
-        try
-        {
-            using var cleanup = new CancellationTokenSource(TimeSpan.FromMinutes(4));
-            if (taskId != default) await StopAndWaitAsync(f, taskId, cleanup.Token);
-            f.Dispose(); // stops the workers and the host
-            _factories.Remove(f);
-            if (taskId != default) leak = await CheckAndForceCleanAsync(taskId, cleanup.Token);
-        }
-        catch (Exception ex)
-        {
-            leak = (leak is null ? "" : leak + "; ") + $"cleanup itself failed: {ex.Message}";
-        }
+        // ---- cleanup: always runs; every phase has its own bound (see E2ECleanup) and none uses the test's token ----
+        var leak = await new E2ECleanup(
+            stop: ct => taskId == default ? Task.CompletedTask : StopAndWaitAsync(f, taskId, ct),
+            dispose: () => { f.Dispose(); _factories.Remove(f); },
+            find: ct => taskId == default ? Task.FromResult(LeftOver.None) : FindAsync(taskId, ct),
+            forceRemove: ForceRemoveAsync,
+            stopBound: TimeSpan.FromSeconds(90), checkBound: TimeSpan.FromMinutes(2), removeBound: TimeSpan.FromMinutes(1),
+            pollInterval: TimeSpan.FromSeconds(2), checkAttempts: 15).RunAsync();
 
-        if (failure is not null && leak is not null) throw new AggregateException($"E2E failed AND left resources behind: {leak}", failure, new InvalidOperationException(leak));
+        if (failure is not null && leak is not null) throw new AggregateException($"E2E failed AND cleanup reported problems: {leak}", failure, new InvalidOperationException(leak));
         if (leak is not null) throw new InvalidOperationException(leak);
         if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
     }
@@ -185,7 +179,7 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
 
     // ---- leak check, scoped to this run --------------------------------------------------------------------------
 
-    private static async Task<string> RunToolAsync(string file, params string[] args)
+    private static async Task<string> RunToolAsync(CancellationToken ct, string file, params string[] args)
     {
         var psi = new ProcessStartInfo(file) { RedirectStandardOutput = true, RedirectStandardError = true };
         foreach (var a in args) psi.ArgumentList.Add(a);
@@ -197,50 +191,53 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
         }
         using (p)
         {
-            var stdout = p.StandardOutput.ReadToEndAsync();
-            _ = p.StandardError.ReadToEndAsync();
-            await p.WaitForExitAsync();
-            return await stdout;
+            try
+            {
+                var stdout = p.StandardOutput.ReadToEndAsync(ct);
+                _ = p.StandardError.ReadToEndAsync(ct);
+                await p.WaitForExitAsync(ct);
+                return await stdout;
+            }
+            catch (OperationCanceledException)
+            {
+                try { p.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+                throw;
+            }
         }
     }
 
     private static string[] Lines(string s) => s.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
     /// <summary>Resources of this run only: domain maldex-{id:N} and links/namespaces carrying h = id:N[..12] (mxb/mxt/mxv/mxg/mxn/mxw + h).</summary>
-    private static async Task<(List<string> Domains, List<string> Links, List<string> Namespaces)> FindAsync(Guid taskId)
+    private static async Task<LeftOver> FindAsync(Guid taskId, CancellationToken ct)
     {
         var n = taskId.ToString("N");
         var h = n[..12];
         var vm = "maldex-" + n;
         string[] prefixes = ["mxb", "mxt", "mxv", "mxg", "mxn", "mxw"];
         bool Ours(string name) => prefixes.Any(p => name == p + h);
-        var domains = Lines(await RunToolAsync("virsh", "-c", "qemu:///session", "list", "--all", "--name")).Where(d => d == vm).ToList();
-        var links = Lines(await RunToolAsync("ip", "-o", "link", "show"))
+        var domains = Lines(await RunToolAsync(ct, "virsh", "-c", "qemu:///session", "list", "--all", "--name")).Where(d => d == vm).ToList();
+        var links = Lines(await RunToolAsync(ct, "ip", "-o", "link", "show"))
             .Select(l => l.Split(':', 3)).Where(p => p.Length > 2).Select(p => p[1].Trim().Split('@')[0]).Where(Ours).ToList();
-        var spaces = Lines(await RunToolAsync("ip", "netns", "list")).Select(l => l.Split(' ')[0]).Where(Ours).ToList();
-        return (domains, links, spaces);
+        var spaces = Lines(await RunToolAsync(ct, "ip", "netns", "list")).Select(l => l.Split(' ')[0]).Where(Ours).ToList();
+        return new LeftOver(domains, links, spaces);
     }
 
-    /// <summary>Waits briefly for teardown to finish; anything still there is recorded as the returned failure text and then force-removed.</summary>
-    private static async Task<string?> CheckAndForceCleanAsync(Guid taskId, CancellationToken ct)
+    /// <summary>Only a positive integer greater than 1 may be handed to <c>kill -9</c> (never init, never a stray token).</summary>
+    internal static bool IsKillablePid(string s) =>
+        int.TryParse(s, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var pid) && pid > 1;
+
+    private static async Task ForceRemoveAsync(LeftOver found, CancellationToken ct)
     {
-        (List<string> Domains, List<string> Links, List<string> Namespaces) found = ([], [], []);
-        for (var attempt = 0; attempt < 15; attempt++)
-        {
-            found = await FindAsync(taskId);
-            if (found.Domains.Count + found.Links.Count + found.Namespaces.Count == 0) return null;
-            await Task.Delay(TimeSpan.FromSeconds(2), ct);
-        }
-        var message = $"left behind by task {taskId}: domains [{string.Join(", ", found.Domains)}], links [{string.Join(", ", found.Links)}], namespaces [{string.Join(", ", found.Namespaces)}] (force-removed)";
-        foreach (var d in found.Domains) await RunToolAsync("virsh", "-c", "qemu:///session", "destroy", d);
+        foreach (var d in found.Domains) await RunToolAsync(ct, "virsh", "-c", "qemu:///session", "destroy", d);
         foreach (var ns in found.Namespaces)
         {
             // Kill whatever still runs inside before deleting the namespace.
-            foreach (var pid in Lines(await RunToolAsync("sudo", "-n", "ip", "netns", "pids", ns))) await RunToolAsync("sudo", "-n", "kill", "-9", pid);
-            await RunToolAsync("sudo", "-n", "ip", "netns", "del", ns);
+            foreach (var pid in Lines(await RunToolAsync(ct, "sudo", "-n", "ip", "netns", "pids", ns)).Where(IsKillablePid))
+                await RunToolAsync(ct, "sudo", "-n", "kill", "-9", pid);
+            await RunToolAsync(ct, "sudo", "-n", "ip", "netns", "del", ns);
         }
-        foreach (var l in found.Links) await RunToolAsync("sudo", "-n", "ip", "link", "del", l);
-        return message;
+        foreach (var l in found.Links) await RunToolAsync(ct, "sudo", "-n", "ip", "link", "del", l);
     }
 
     // ---- tests --------------------------------------------------------------------------------------------------
