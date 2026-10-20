@@ -260,8 +260,11 @@ public sealed class ReplayAgentChannelTests : IDisposable
 
         public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
         {
+            // Counted only once the timer is registered: a test that advances the clock as soon as it sees the count must
+            // never advance before the timer exists (it would then be due one delay after the advance and never fire).
+            var timer = base.CreateTimer(callback, state, dueTime, period);
             Interlocked.Increment(ref _timers);
-            return base.CreateTimer(callback, state, dueTime, period);
+            return timer;
         }
     }
 
