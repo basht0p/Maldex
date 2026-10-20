@@ -22,11 +22,13 @@ public sealed class SelfTestProbes : ISelfTestProbes
     private const int MaxTargets = 64;
     private const int MaxPortsPerTarget = 64;
     private const int MaxEchoBytes = 4096;
+    private const int MaxConcurrentConnects = 64;
 
     private readonly TimeSpan _connectTimeout;
     private readonly TimeSpan _echoTimeout;
     private readonly Func<string, int, CancellationToken, Task> _connect;
     private readonly TimeProvider _time;
+    private readonly SemaphoreSlim _gate = new(MaxConcurrentConnects);
 
     /// <param name="connect">Test seam: a TCP connect that completes when the connection is accepted and throws otherwise.</param>
     public SelfTestProbes(TimeSpan? connectTimeout = null, TimeSpan? echoTimeout = null, Func<string, int, CancellationToken, Task>? connect = null, TimeProvider? time = null)
@@ -55,10 +57,11 @@ public sealed class SelfTestProbes : ISelfTestProbes
 
     private async Task<bool> TryConnectAsync(string host, int port, CancellationToken ct)
     {
-        using var timeout = new CancellationTokenSource(_connectTimeout, _time);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
+        await _gate.WaitAsync(ct).ConfigureAwait(false); // bounds concurrency across all targets and ports
         try
         {
+            using var timeout = new CancellationTokenSource(_connectTimeout, _time);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
             await _connect(host, port, linked.Token).ConfigureAwait(false);
             return true;
         }
@@ -69,6 +72,10 @@ public sealed class SelfTestProbes : ISelfTestProbes
         catch (Exception)
         {
             return false;
+        }
+        finally
+        {
+            _gate.Release();
         }
     }
 

@@ -4,9 +4,11 @@ using Maldex.Core.Domain;
 using Maldex.Infrastructure.Fakes;
 using Maldex.Infrastructure.Isolation;
 using Maldex.Infrastructure.Net;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Maldex.Integration.Tests.Fixtures;
 using Maldex.Orchestrator;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Time.Testing;
 using Xunit;
 
@@ -272,7 +274,8 @@ public class SelfTestGateTests(SqlServerFixture sql)
 
         await h.RunAsync(id, async () =>
         {
-            await Task.Delay(300, Ct);
+            // Deterministic: stop only once the self-test is actually waiting for its answer.
+            while (!h.Channels.Channels.Any(c => c.SentCommands.Any(x => x is SelfTestCommand))) await Task.Delay(2, Ct);
             await using var api = h.NewContext();
             var t = await api.Tasks.SingleAsync(x => x.Id == id, Ct);
             t.StopRequestedAt = h.Time.GetUtcNow();
@@ -284,5 +287,90 @@ public class SelfTestGateTests(SqlServerFixture sql)
         Assert.Equal(RunStatus.Preparing, history.Last().From);
         Assert.Equal("stopped by analyst", history.Last().Reason);
         Assert.Empty(await h.Get<IHypervisor>().ListAsync(Ct));
+    }
+
+    private sealed class StubNetworkInfo(Func<RunNetworkInfo?> answer) : IRunNetworkInfo
+    {
+        public Task<RunNetworkInfo?> GetAsync(NetworkLease lease, CancellationToken ct) => Task.FromResult(answer());
+    }
+
+    private static Action<IServiceCollection> RequireControlPlane(bool value) =>
+        services => services.PostConfigure<SelfTestOptions>(o => o.RequireControlPlaneProbes = value);
+
+    [Fact]
+    public async Task SelfTest_RequireControlPlane_NoControlPlaneIps_FailsClosed_AndIsAudited()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql, configure: RequireControlPlane(true));
+        var id = await h.SeedPreparingTaskAsync();
+        await h.RunAsync(id);
+
+        var (task, _, audit) = await LoadAsync(h, id);
+        Assert.Equal(RunStatus.Failed, task.Status);
+        Assert.Equal("isolation self-test failed: no control-plane probe targets configured", task.FailureReason);
+        Assert.Equal("isolation.selftest.failed", Assert.Single(audit).Action);
+        Assert.DoesNotContain(Sent(h), c => c is PutFileChunkCommand or OpenSampleCommand);
+    }
+
+    [Fact]
+    public async Task SelfTest_RequireControlPlane_WithControlPlaneIps_Passes()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql,
+            new Dictionary<string, string?> { ["Maldex:Real:Net:ControlPlaneIps:0"] = "192.168.1.10" }, RequireControlPlane(true));
+        var id = await h.SeedPreparingTaskAsync();
+        await h.RunAsync(id);
+
+        Assert.Equal(RunStatus.Processing, (await LoadAsync(h, id)).Task.Status);
+        var self = Sent(h).OfType<SelfTestCommand>().Single();
+        Assert.Contains(self.Targets, t => t.Name == "control_plane_0" && t.Host == "192.168.1.10");
+    }
+
+    [Fact]
+    public async Task SelfTest_NotRequired_NoControlPlaneIps_Passes()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql, configure: RequireControlPlane(false));
+        var id = await h.SeedPreparingTaskAsync();
+        await h.RunAsync(id);
+
+        Assert.Equal(RunStatus.Processing, (await LoadAsync(h, id)).Task.Status);
+    }
+
+    [Fact]
+    public async Task SelfTest_LeaseModeDiffersFromTaskMode_Fails()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql, configure: services =>
+            services.AddSingleton<IRunNetworkInfo>(new StubNetworkInfo(() => new RunNetworkInfo("10.213.0.1", "10.213.0.2", NetworkMode.LiveVpn))));
+        var id = await h.SeedPreparingTaskAsync(NetworkMode.None);
+        await h.RunAsync(id);
+
+        var (task, _, audit) = await LoadAsync(h, id);
+        Assert.Equal(RunStatus.Failed, task.Status);
+        Assert.Equal("isolation self-test failed: network mode mismatch: lease LiveVpn, task None", task.FailureReason);
+        Assert.Equal("isolation.selftest.failed", Assert.Single(audit).Action);
+        Assert.Empty(Sent(h)); // not even the probes were sent
+    }
+
+    [Fact]
+    public async Task SelfTest_UnknownLease_Fails()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql, configure: services =>
+            services.AddSingleton<IRunNetworkInfo>(new StubNetworkInfo(() => null)));
+        var id = await h.SeedPreparingTaskAsync();
+        await h.RunAsync(id);
+
+        Assert.Equal(RunStatus.Failed, (await LoadAsync(h, id)).Task.Status);
+    }
+
+    [Fact]
+    public async Task SelfTest_UnexpectedException_FailsAndIsAudited()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql, configure: services =>
+            services.AddSingleton<IRunNetworkInfo>(new StubNetworkInfo(() => throw new InvalidOperationException("boom"))));
+        var id = await h.SeedPreparingTaskAsync();
+        await h.RunAsync(id);
+
+        var (task, _, audit) = await LoadAsync(h, id);
+        Assert.Equal(RunStatus.Failed, task.Status);
+        Assert.Contains("boom", task.FailureReason);
+        Assert.Equal("isolation.selftest.failed", Assert.Single(audit).Action);
     }
 }

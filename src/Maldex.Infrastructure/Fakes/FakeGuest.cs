@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Maldex.Core.Domain;
 
 namespace Maldex.Infrastructure.Fakes;
 
@@ -32,6 +33,16 @@ public sealed class FakeGuest
     public bool SilentSelfTest { get; set; }
 
     public void SetReachable(string probe) => _reachable[probe] = 0;
+
+    private readonly ConcurrentDictionary<Guid, NetworkMode> _modeByTask = new();
+
+    internal void SetModeFor(Guid taskId, NetworkMode? mode)
+    {
+        if (mode is null) _modeByTask.TryRemove(taskId, out _);
+        else _modeByTask[taskId] = mode.Value;
+    }
+
+    internal NetworkMode? ModeFor(Guid taskId) => _modeByTask.TryGetValue(taskId, out var m) ? m : null;
 
     internal void SetEchoFor(Guid taskId, string? body)
     {

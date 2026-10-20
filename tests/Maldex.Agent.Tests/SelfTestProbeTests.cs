@@ -59,6 +59,26 @@ public class SelfTestProbeTests
     }
 
     [Fact]
+    public async Task Probes_ConcurrencyIsBounded()
+    {
+        int current = 0, max = 0;
+        var probes = new SelfTestProbes(connect: async (h, p, ct) =>
+        {
+            var now = Interlocked.Increment(ref current);
+            int seen;
+            while ((seen = Volatile.Read(ref max)) < now && Interlocked.CompareExchange(ref max, now, seen) != seen) { }
+            await Task.Delay(30, ct);
+            Interlocked.Decrement(ref current);
+            throw new IOException("refused");
+        });
+        var ports = Enumerable.Range(1, 64).ToList();
+        var targets = Enumerable.Range(0, 5).Select(i => new ProbeTarget("t" + i, "10.0.0." + (i + 1), ports)).ToList();
+        var result = await probes.RunAsync(new SelfTestCommand("c1", targets, ""), Ct);
+        Assert.All(result.Probes, p => Assert.False(p.Reachable));
+        Assert.InRange(max, 1, 64);
+    }
+
+    [Fact]
     public async Task Echo_Success_TruncatesTo256()
     {
         using var server = new TcpListener(IPAddress.Loopback, 0);

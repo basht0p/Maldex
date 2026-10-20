@@ -40,6 +40,8 @@ public sealed record IsolationProbePlan(IReadOnlyList<ProbeTarget> Targets, stri
 /// <summary>
 /// Decides whether the guest's self-test answer proves the run's isolation. Nothing passes by default: every check must
 /// positively succeed, and anything missing, duplicated, unexpected or unparseable is a failure.
+/// Limitation: the probe results and the echo are reported by the guest itself, so a compromised guest could lie. The
+/// check runs before any sample is delivered; it catches misconfiguration, not a malicious guest.
 /// </summary>
 public static class IsolationVerifier
 {

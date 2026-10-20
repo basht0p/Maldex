@@ -26,6 +26,7 @@ public sealed class RunCoordinator(
     IRunNetworkInfo networkInfo,
     IExpectedEgress expectedEgress,
     IOptions<NetOptions> netOptions,
+    IOptions<SelfTestOptions> selfTestOptions,
     ITaskEventPublisher publisher,
     IArtifactStore artifacts,
     IOptions<OrchestratorOptions> options,
@@ -265,21 +266,15 @@ public sealed class RunCoordinator(
     private async Task RunSelfTestAsync(MaldexDbContext db, AnalysisTask task, NetworkLease lease, IAgentChannel channel, TransferInbox inbox, CancellationToken ct)
     {
         IsolationVerdict verdict;
-        var info = await networkInfo.GetAsync(lease, ct).ConfigureAwait(false);
-        if (info is null)
+        try
         {
-            verdict = IsolationVerdict.Fail("the run's network addressing is unknown");
+            verdict = await EvaluateIsolationAsync(db, task, lease, channel, inbox, ct).ConfigureAwait(false);
         }
-        else
+        catch (Exception ex) when (ex is not (OperationCanceledException or SelfTestStoppedException))
         {
-            var plan = IsolationProbePlan.Build(netOptions.Value, info);
-            var expectedEgressIp = task.NetworkMode == NetworkMode.LiveVpn
-                ? await expectedEgress.GetAsync(task.NetworkMode, task.ExitCountry, ct).ConfigureAwait(false)
-                : null;
-            verdict = await new SelfTestGate(time, pollInterval: _options.ControlPollInterval)
-                .RunAsync(channel, inbox, task.NetworkMode, expectedEgressIp, plan, ct, async token =>
-                    await db.Tasks.AsNoTracking().Where(t => t.Id == task.Id).Select(t => t.StopRequestedAt).SingleAsync(token).ConfigureAwait(false) is not null)
-                .ConfigureAwait(false);
+            // Any unexpected error is a failed self-test (and is audited), never a pass.
+            logger.LogError(ex, "Isolation self-test of task {TaskId} failed unexpectedly.", task.Id);
+            verdict = IsolationVerdict.Fail($"self-test error: {GuestText.Clean(ex.Message, 200)}");
         }
 
         db.AuditLogs.Add(new AuditLog
@@ -287,11 +282,30 @@ public sealed class RunCoordinator(
             At = time.GetUtcNow(),
             Action = verdict.Isolated ? "isolation.selftest.passed" : "isolation.selftest.failed",
             Target = task.Id.ToString(),
-            Details = $"mode={task.NetworkMode}; {(verdict.Isolated ? "isolated" : "not isolated: " + GuestText.Clean(verdict.Reason, 500))}",
+            Details = $"mode={task.NetworkMode}; {(verdict.Isolated ? "guest-reported probes all blocked" : "not isolated: " + GuestText.Clean(verdict.Reason, 500))}",
         });
         await db.SaveChangesAsync(ct).ConfigureAwait(false);
 
         if (!verdict.Isolated) throw new IsolationException($"isolation self-test failed: {GuestText.Clean(verdict.Reason, 500)}");
+    }
+
+    private async Task<IsolationVerdict> EvaluateIsolationAsync(MaldexDbContext db, AnalysisTask task, NetworkLease lease, IAgentChannel channel, TransferInbox inbox, CancellationToken ct)
+    {
+        var info = await networkInfo.GetAsync(lease, ct).ConfigureAwait(false);
+        if (info is null) return IsolationVerdict.Fail("the run's network addressing is unknown");
+        if (info.Mode != task.NetworkMode) return IsolationVerdict.Fail($"network mode mismatch: lease {info.Mode}, task {task.NetworkMode}");
+
+        var plan = IsolationProbePlan.Build(netOptions.Value, info);
+        if (selfTestOptions.Value.RequireControlPlaneProbes && !plan.Targets.Any(t => t.Name.StartsWith("control_plane_", StringComparison.Ordinal)))
+            return IsolationVerdict.Fail("no control-plane probe targets configured");
+
+        var expectedEgressIp = task.NetworkMode == NetworkMode.LiveVpn
+            ? await expectedEgress.GetAsync(task.NetworkMode, task.ExitCountry, ct).ConfigureAwait(false)
+            : null;
+        return await new SelfTestGate(time, pollInterval: _options.ControlPollInterval)
+            .RunAsync(channel, inbox, task.NetworkMode, expectedEgressIp, plan, ct, async token =>
+                await db.Tasks.AsNoTracking().Where(t => t.Id == task.Id).Select(t => t.StopRequestedAt).SingleAsync(token).ConfigureAwait(false) is not null)
+            .ConfigureAwait(false);
     }
 
     /// <summary>Streams the stored sample into the guest and has it opened. Any failure fails the run in Preparing (no retry).</summary>

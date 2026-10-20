@@ -77,7 +77,7 @@ internal sealed class OrchestratorHarness : IAsyncDisposable
     public RecordingPublisher Publisher { get; } = new();
     public CapturingChannelFactory Channels { get; }
 
-    private OrchestratorHarness(SqlServerFixture sql, IDictionary<string, string?> settings)
+    private OrchestratorHarness(SqlServerFixture sql, IDictionary<string, string?> settings, Action<IServiceCollection>? configure)
     {
         _connectionString = sql.CreateDatabaseConnectionString();
         var values = new Dictionary<string, string?>
@@ -101,12 +101,13 @@ internal sealed class OrchestratorHarness : IAsyncDisposable
         services.AddSingleton<ITaskEventPublisher>(Publisher);
         services.AddMaldexOrchestrator(config);
         services.AddMaldexProcessing(config);
+        configure?.Invoke(services);
         _services = services.BuildServiceProvider();
     }
 
-    public static async Task<OrchestratorHarness> CreateAsync(SqlServerFixture sql, IDictionary<string, string?>? settings = null)
+    public static async Task<OrchestratorHarness> CreateAsync(SqlServerFixture sql, IDictionary<string, string?>? settings = null, Action<IServiceCollection>? configure = null)
     {
-        var h = new OrchestratorHarness(sql, settings ?? new Dictionary<string, string?>());
+        var h = new OrchestratorHarness(sql, settings ?? new Dictionary<string, string?>(), configure);
         await using var db = h.NewContext();
         await db.Database.MigrateAsync(TestContext.Current.CancellationToken);
         return h;
