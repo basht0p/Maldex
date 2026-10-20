@@ -285,7 +285,9 @@ public sealed partial class NetnsEgressRouter(
         await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "mitmdump.log"), ["setpriv", $"--reuid={MitmUser}", $"--regid={MitmUser}",
             "--clear-groups", "--no-new-privs", "--inh-caps=-all", "--bounding-set=-all", "--", _o.MitmdumpBinary,
             "--mode", "transparent", "--listen-host", gw, "--listen-port", _o.MitmPort.ToString(CultureInfo.InvariantCulture),
-            "--set", $"confdir={mdir}/conf", "--set", "block_global=false", "--set", "http3=false",
+            // ssl_insecure: never verify upstream certificates. This is an analysis proxy and malware infrastructure (and
+            // INetSim in Simulated) is routinely self-signed; verification would turn every such flow into an error record.
+            "--set", $"confdir={mdir}/conf", "--set", "block_global=false", "--set", "http3=false", "--set", "ssl_insecure=true",
             "-s", mdir + "/addon/maldex_jsonl.py", "--set", $"maldex_out={mdir}/out/flows.jsonl", "--set", $"maldex_enable_file={mdir}/ctl/capture.on"]), ct);
         await WaitFor(async () =>
         {

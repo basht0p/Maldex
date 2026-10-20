@@ -334,6 +334,25 @@ public class RealEgressTests
                 }
                 Assert.NotEmpty(lines);
                 Assert.Contains("203.0.113.5", lines[0]);
+
+                // HTTPS through the proxy: mitmdump must accept INetSim's self-signed upstream cert (ssl_insecure) and record
+                // a real response from INetSim, not an upstream-verification error record
+                var tlsCode = await Guest("curl", "-sk", "-m", "8", "-o", "/dev/null", "-w", "%{http_code}", "https://203.0.113.9/");
+                Assert.Contains(tlsCode.Stdout.Trim(), new[] { "200", "404" });
+                System.Text.Json.JsonElement tlsFlow = default;
+                for (var i = 0; i < 50 && tlsFlow.ValueKind == System.Text.Json.JsonValueKind.Undefined; i++)
+                {
+                    foreach (var l in File.ReadAllLines(flowsPath))
+                    {
+                        var doc = System.Text.Json.JsonDocument.Parse(l).RootElement;
+                        if (doc.GetProperty("url").GetString()!.StartsWith("https://203.0.113.9", StringComparison.Ordinal)) tlsFlow = doc.Clone();
+                    }
+                    if (tlsFlow.ValueKind == System.Text.Json.JsonValueKind.Undefined) await Task.Delay(100);
+                }
+                Assert.Equal(System.Text.Json.JsonValueKind.Object, tlsFlow.ValueKind);
+                Assert.False(tlsFlow.TryGetProperty("error", out var tlsErr), "HTTPS flow is an error record: " + tlsErr);
+                Assert.Contains(tlsFlow.GetProperty("status").GetInt32(), new[] { 200, 404 });
+                Assert.True(tlsFlow.GetProperty("tls").GetBoolean());
                 Assert.Equal("maldex-mitm 640", (await Sudo("stat", "-c", "%U %a", flowsPath)).Stdout.Trim());
                 var dataDir = NetnsEgressRouter.InetSimDataPath(id);
                 Assert.Equal(0, (await Sudo("test", "-d", dataDir + "/http/postdata")).ExitCode);

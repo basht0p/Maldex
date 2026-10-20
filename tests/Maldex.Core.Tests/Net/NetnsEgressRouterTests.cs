@@ -460,6 +460,18 @@ public sealed class NetnsEgressRouterTests : IDisposable
         Assert.DoesNotContain("--mode wireguard", m);
     }
 
+    /// <summary>Malware infrastructure is often self-signed: the analysis proxy must not refuse the upstream (INetSim's own cert in Simulated).</summary>
+    [Theory]
+    [InlineData(NetworkMode.Simulated)]
+    [InlineData(NetworkMode.LiveVpn)]
+    public async Task Mitm_DoesNotVerifyUpstreamCertificates(NetworkMode mode)
+    {
+        if (mode == NetworkMode.LiveVpn) WriteWg("nl", GoodWg);
+        await Router().CreateAsync(Guid.NewGuid(), mode, mode == NetworkMode.LiveVpn ? "nl" : null, CancellationToken.None);
+        var m = Assert.Single(_r.Where(c => c.Contains("mitmdump --mode transparent")));
+        Assert.Contains("--set ssl_insecure=true", m);
+    }
+
     [Fact]
     public async Task EveryCommand_IsSudoN_WithDiscreteArgs()
     {
