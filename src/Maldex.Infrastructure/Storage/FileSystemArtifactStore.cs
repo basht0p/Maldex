@@ -45,6 +45,20 @@ public sealed partial class FileSystemArtifactStore : IArtifactStore
 
     public bool Exists(string key) => File.Exists(GetPath(key));
 
+    public async IAsyncEnumerable<(string Key, DateTimeOffset LastWrite)> ListAsync(
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+    {
+        await Task.CompletedTask.ConfigureAwait(false);
+        if (!Directory.Exists(_root)) yield break;
+        foreach (var path in Directory.EnumerateFiles(_root, "*", SearchOption.AllDirectories))
+        {
+            ct.ThrowIfCancellationRequested();
+            var key = Path.GetRelativePath(_root, path).Replace(Path.DirectorySeparatorChar, '/');
+            if (!KeyRegex().IsMatch(key)) continue; // skips tmp/ and anything foreign
+            yield return (key, new DateTimeOffset(File.GetLastWriteTimeUtc(path), TimeSpan.Zero));
+        }
+    }
+
     public Task<Stream> OpenReadAsync(string key, CancellationToken ct)
     {
         var path = GetPath(key);
