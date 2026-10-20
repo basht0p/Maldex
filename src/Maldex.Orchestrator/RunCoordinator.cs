@@ -3,6 +3,7 @@ using Maldex.Core.Abstractions;
 using Maldex.Core.Agent;
 using Maldex.Core.Domain;
 using Maldex.Core.Live;
+using Maldex.Core.Text;
 using Maldex.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -98,6 +99,12 @@ public sealed class RunCoordinator(
         {
             throw; // host shutdown: the reconciler picks the task up on restart
         }
+        catch (SampleDeliveryException ex)
+        {
+            // Not retried: a second VM would receive the same sample the same way.
+            logger.LogWarning("Run {TaskId}: {Reason}", taskId, ex.Message);
+            await FailAsync(db, task, ex.Message).ConfigureAwait(false);
+        }
         catch (Exception ex)
         {
             logger.LogError(ex, "Run {TaskId} failed.", taskId);
@@ -173,16 +180,10 @@ public sealed class RunCoordinator(
             if (ready != ReadyResult.Ready)
                 return ready == ReadyResult.Stopped ? AttemptOutcome.Stopped : AttemptOutcome.AgentNotReady;
 
-            var now = time.GetUtcNow();
-            await TransitionAsync(db, task, RunStatus.Running, "agent ready", t =>
-            {
-                t.StartedAt = now;
-                t.DeadlineAt = now.AddSeconds(t.DurationSec);
-            }, ct).ConfigureAwait(false);
-
-            await channel.SendAsync(command, ct).ConfigureAwait(false);
-
-            var ingestor = new EventIngestor(task.Id, db, artifacts, publisher, time, logger);
+            // The ingestor has its own DbContext: the run's context stays free for status transitions while telemetry
+            // is flushed, which now happens from the moment the agent is ready (delivery and collection run alongside it).
+            await using var ingestScope = scopes.CreateAsyncScope();
+            var ingestor = new EventIngestor(task.Id, ingestScope.ServiceProvider.GetRequiredService<MaldexDbContext>(), artifacts, publisher, time, logger);
             var messages = Channel.CreateBounded<AgentMessage>(new BoundedChannelOptions(1024)
             {
                 SingleReader = true,
@@ -190,21 +191,45 @@ public sealed class RunCoordinator(
                 FullMode = BoundedChannelFullMode.Wait,
             });
 
-            var reader = ReadLoopAsync(enumerator, messages.Writer, readerCts.Token);
+            var inbox = new TransferInbox();
+            var reader = ReadLoopAsync(enumerator, messages.Writer, inbox, readerCts.Token);
             var flusher = FlushLoopAsync(messages.Reader, ingestor, ct);
             disposed = true; // the reader task now owns the enumerator
 
-            string reason;
+            IReadOnlyList<DroppedFile> dropped = [];
             try
             {
-                reason = await ControlLoopAsync(task.Id, reader, flusher, channel, ct).ConfigureAwait(false);
+                // SEAM (Task 13): the isolation self-test runs here, after the agent is ready and before anything is delivered.
+
+                if (command is OpenSampleCommand open)
+                    await DeliverSampleAsync(db, channel, inbox, task, open, ct).ConfigureAwait(false);
+
+                var now = time.GetUtcNow();
+                await TransitionAsync(db, task, RunStatus.Running, "agent ready", t =>
+                {
+                    t.StartedAt = now;
+                    t.DeadlineAt = now.AddSeconds(t.DurationSec);
+                }, ct).ConfigureAwait(false);
+
+                // A sample is opened by its delivery; a URL is opened now.
+                if (command is not OpenSampleCommand) await channel.SendAsync(command, ct).ConfigureAwait(false);
+
+                var reason = await ControlLoopAsync(task.Id, reader, flusher, channel, ct).ConfigureAwait(false);
+
+                var ended = time.GetUtcNow();
+                await TransitionAsync(db, task, RunStatus.Collecting, reason, t => t.EndedAt = ended, ct).ConfigureAwait(false);
+
+                // Telemetry keeps flowing while files are pulled out, as long as the guest is still there.
+                if (!reader.IsCompleted) dropped = await CollectDroppedAsync(channel, inbox, task, ct).ConfigureAwait(false);
             }
-            catch
+            catch (Exception ex)
             {
-                // Never leave the flusher touching the DbContext while the caller records the failure.
+                // Never leave the reader or flusher running while the caller records the failure.
                 await readerCts.CancelAsync().ConfigureAwait(false);
                 await reader.ConfigureAwait(false);
                 try { await flusher.ConfigureAwait(false); } catch (Exception) { /* the original error wins */ }
+                // A stop during delivery ends like a stop during the ready wait: Cancelled from Preparing.
+                if (ex is DeliveryStoppedException) return AttemptOutcome.Stopped;
                 throw;
             }
 
@@ -212,14 +237,74 @@ public sealed class RunCoordinator(
             await reader.ConfigureAwait(false);
             await flusher.ConfigureAwait(false); // drains whatever the reader queued, then flushes it
 
-            var ended = time.GetUtcNow();
-            await TransitionAsync(db, task, RunStatus.Collecting, reason, t => t.EndedAt = ended, ct).ConfigureAwait(false);
+            await SaveDroppedArtifactsAsync(db, task, dropped, ct).ConfigureAwait(false);
             return AttemptOutcome.Completed;
         }
         finally
         {
             if (!disposed) await enumerator.DisposeAsync().ConfigureAwait(false);
         }
+    }
+
+    /// <summary>Streams the stored sample into the guest and has it opened. Any failure fails the run in Preparing (no retry).</summary>
+    private async Task DeliverSampleAsync(MaldexDbContext db, IAgentChannel channel, TransferInbox inbox, AnalysisTask task, OpenSampleCommand open, CancellationToken ct)
+    {
+        Stream blob;
+        try
+        {
+            blob = await artifacts.OpenReadAsync(open.BlobKey, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            logger.LogError(ex, "Reading the stored sample of task {TaskId} failed.", task.Id);
+            throw new SampleDeliveryException("the stored sample could not be read");
+        }
+
+        await using (blob.ConfigureAwait(false))
+        {
+            if (!blob.CanSeek || task.SampleSha256 is null) throw new SampleDeliveryException("the stored sample cannot be sized");
+            await new SampleDelivery(time, pollInterval: _options.ControlPollInterval)
+                .DeliverAsync(channel, inbox, open.BlobKey, open.FileName, blob, blob.Length, task.SampleSha256, ct, async token =>
+                    await db.Tasks.AsNoTracking().Where(t => t.Id == task.Id).Select(t => t.StopRequestedAt).SingleAsync(token).ConfigureAwait(false) is not null)
+                .ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Pulls the files the guest created out of it. Never throws for a bad or missing file; the run goes on.</summary>
+    private async Task<IReadOnlyList<DroppedFile>> CollectDroppedAsync(IAgentChannel channel, TransferInbox inbox, AnalysisTask task, CancellationToken ct)
+    {
+        try
+        {
+            return await new DroppedFileCollector(artifacts, time, logger)
+                .CollectAsync(channel, inbox, inbox.CreatedPaths, task.SampleSha256, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex, "Collecting dropped files of task {TaskId} failed; continuing without them.", task.Id);
+            return [];
+        }
+    }
+
+    private async Task SaveDroppedArtifactsAsync(MaldexDbContext db, AnalysisTask task, IReadOnlyList<DroppedFile> dropped, CancellationToken ct)
+    {
+        if (dropped.Count == 0) return;
+        var now = time.GetUtcNow();
+        foreach (var f in dropped)
+        {
+            db.Artifacts.Add(new Artifact
+            {
+                Id = Guid.NewGuid(),
+                TaskId = task.Id,
+                Kind = ArtifactKind.Dropped,
+                BlobKey = f.Blob.Key,
+                Sha256 = f.Blob.Sha256,
+                Size = f.Blob.Size,
+                // Artifact.GuestPath is nvarchar(1024); Clean adds a 12-character marker when it cuts.
+                GuestPath = GuestText.Clean(f.GuestPath, 1024 - 12),
+                CreatedAt = now,
+            });
+        }
+        await db.SaveChangesAsync(ct).ConfigureAwait(false);
     }
 
     private enum ReadyResult { Ready, NotReady, Stopped }
@@ -293,18 +378,23 @@ public sealed class RunCoordinator(
         }
     }
 
-    private static async Task ReadLoopAsync(IAsyncEnumerator<AgentMessage> enumerator, ChannelWriter<AgentMessage> writer, CancellationToken stop)
+    private static async Task ReadLoopAsync(IAsyncEnumerator<AgentMessage> enumerator, ChannelWriter<AgentMessage> writer, TransferInbox inbox, CancellationToken stop)
     {
         Exception? error = null;
         try
         {
             while (await enumerator.MoveNextAsync().ConfigureAwait(false))
+            {
+                // Transfer replies go to whoever is waiting for them; everything else is telemetry.
+                if (await inbox.OfferAsync(enumerator.Current, stop).ConfigureAwait(false)) continue;
                 await writer.WriteAsync(enumerator.Current, stop).ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { error = ex; }
         finally
         {
+            inbox.Complete();
             writer.TryComplete(error);
             await enumerator.DisposeAsync().ConfigureAwait(false);
         }

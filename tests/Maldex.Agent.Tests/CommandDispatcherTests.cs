@@ -51,10 +51,10 @@ public class CommandDispatcherTests
     }
 
     [Fact]
-    public async Task Dispatcher_OpenSample_IsUnsupportedUntilWired()
+    public async Task Dispatcher_OpenSample_WithoutDeliveredTransfer_Fails()
     {
         var res = await Make(new RecordingUrlOpener()).DispatchAsync(new OpenSampleCommand("c5", "a.exe", "k"), CancellationToken.None);
         Assert.False(res.Success);
-        Assert.Equal("unsupported command", res.Error);
+        Assert.Contains("incomplete transfer", res.Error);
     }
 }

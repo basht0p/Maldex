@@ -123,11 +123,12 @@ internal sealed class OrchestratorHarness : IAsyncDisposable
         await using var db = NewContext();
         var sha = Guid.NewGuid().ToString("N") + Guid.NewGuid().ToString("N");
         var blobKey = $"samples/{sha[..2]}/{sha[2..4]}/{sha}";
-        if (sampleContent is not null)
+        // A real blob in the artifact store, keyed by its real hash (what the submission endpoint does): the coordinator
+        // streams it into the guest, so it has to exist. Unique per call unless the test supplies its own bytes.
+        sampleContent ??= System.Text.Encoding.ASCII.GetBytes("benign sample " + Guid.NewGuid());
         {
-            // A real blob in the artifact store, keyed by its real hash (what the submission endpoint does).
             await using var content = new MemoryStream(sampleContent, writable: false);
-            var blob = await Get<IArtifactStore>().PutAsync("samples", content, 1_048_576, TestContext.Current.CancellationToken);
+            var blob = await Get<IArtifactStore>().PutAsync("samples", content, 33_554_432, TestContext.Current.CancellationToken);
             sha = blob.Sha256;
             blobKey = blob.Key;
         }
@@ -226,7 +227,9 @@ public class RunCoordinatorTests(SqlServerFixture sql)
 
         // The coordinator told the guest what to open.
         var channel = Assert.Single(h.Channels.Channels);
-        var open = Assert.IsType<OpenSampleCommand>(Assert.Single(channel.SentCommands));
+        // (chunks first, then the open command; Task 12)
+        var open = Assert.IsType<OpenSampleCommand>(channel.SentCommands[^1]);
+        Assert.All(channel.SentCommands.SkipLast(1), c => Assert.IsType<PutFileChunkCommand>(c));
         Assert.Equal("invoice.exe", open.FileName);
         Assert.StartsWith("samples/", open.BlobKey);
     }
