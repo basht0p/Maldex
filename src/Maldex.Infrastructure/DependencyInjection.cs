@@ -1,5 +1,6 @@
 using Maldex.Core.Abstractions;
 using Maldex.Infrastructure.Fakes;
+using Maldex.Infrastructure.Guacamole;
 using Maldex.Infrastructure.Scanning;
 using Maldex.Infrastructure.Storage;
 using Microsoft.Extensions.Configuration;
@@ -21,6 +22,8 @@ public static class DependencyInjection
         services.Configure<FakeHypervisorOptions>(configuration.GetSection(FakeHypervisorOptions.SectionName));
         services.Configure<FakeEgressOptions>(configuration.GetSection(FakeEgressOptions.SectionName));
         services.Configure<YaraOptions>(configuration.GetSection(YaraOptions.SectionName));
+        services.Configure<GuacamoleOptions>(configuration.GetSection(GuacamoleOptions.SectionName));
+        services.AddSingleton<GuacamoleTokenService>();
 
         if (!OperatingSystem.IsWindows()) services.AddSingleton<IArtifactStore, FileSystemArtifactStore>();
         services.AddSingleton<IDiskSpaceProbe, DiskSpaceProbe>();
@@ -34,6 +37,7 @@ public static class DependencyInjection
                 services.AddSingleton<IAgentChannelFactory, FakeAgentChannelFactory>();
                 services.AddSingleton<IEgressRouter, NoopEgressRouter>();
                 services.AddSingleton<ISuricataRunner, NoopSuricataRunner>();
+                services.AddSingleton<IVmConsoleLocator, FakeConsoleLocator>();
                 break;
             case "Real":
                 throw new NotSupportedException("Real mode is implemented in Plan 1b");

@@ -85,3 +85,4 @@ export const getProcesses = (id: string) => get<ProcessNodeDto[]>(`/api/tasks/${
 export const getEvents = (id: string, q: EventsQuery = {}) =>
   get<LiveEventDto[]>(`/api/tasks/${id}/events${query({ afterId: q.afterId, type: q.type, take: q.take })}`)
 export const listArtifacts = (id: string) => get<ArtifactDto[]>(`/api/tasks/${id}/artifacts`)
+export const getTunnelToken = (id: string) => get<{ token: string }>(`/api/tasks/${id}/tunnel-token`)
