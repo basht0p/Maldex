@@ -36,11 +36,17 @@ public sealed partial class NetnsEgressRouter(
     private readonly Dictionary<Guid, (int Index, string? Country)> _active = [];
 
     [GeneratedRegex("^mxn[0-9a-f]{12}$")] private static partial Regex NsName();
-    [GeneratedRegex("^mx[bvt]([0-9a-f]{12})$")] private static partial Regex HostLink();
+    [GeneratedRegex("^mx[bvtw]([0-9a-f]{12})$")] private static partial Regex HostLink();
     [GeneratedRegex("^[A-Za-z0-9_-]{1,32}$")] private static partial Regex CountryName();
     [GeneratedRegex("^[a-z_][a-z0-9_-]{0,31}$")] private static partial Regex UserName();
 
     private static string InetSimDir(string ns) => "/run/maldex/inetsim/" + ns;
+
+    /// <summary>
+    /// The per-run INetSim data directory (guest uploads land in <c>http/postdata</c>, <c>ftp/upload</c> and <c>smtp</c>
+    /// under it). Root-managed: read it with sudo. Removed by <see cref="ReleaseAsync"/>.
+    /// </summary>
+    public static string InetSimDataPath(Guid taskId) => InetSimDir(RunNetNames.For(taskId).Namespace) + "/data";
 
     private string RunNetDir(string ns) => Path.Combine(Path.GetFullPath(_o.RunDir), "net", ns);
 
@@ -67,6 +73,7 @@ public sealed partial class NetnsEgressRouter(
         var guard = await Run(PrivilegedCommands.Sudo("nft", "list", "table", "inet", "maldex_guard"), ct);
         if (guard.ExitCode != 0) throw new EgressUnavailableException("Host guard table 'inet maldex_guard' is not loaded.");
 
+        if (mode != NetworkMode.LiveVpn) exitCountry = null; // an exit country only means something for LiveVpn
         var names = RunNetNames.For(taskId);
         int index;
         await _gate.WaitAsync(ct);
@@ -149,11 +156,16 @@ public sealed partial class NetnsEgressRouter(
             $"--dhcp-range={subnet.GuestIp},{subnet.GuestIp},255.255.255.252,12h", $"--dhcp-option=3,{gw}", $"--dhcp-option=6,{gw}",
             $"--pid-file={Path.Combine(dir, "dnsmasq.pid")}", $"--log-facility={Path.Combine(dir, "dnsmasq.log")}", .. dnsArgs]), ct);
 
-        // 4. MITM proxy, TCP only, bound to the gateway address.
+        // 4. MITM proxy, TCP only, bound to the gateway address. It parses hostile traffic and runs our addon, so it
+        //    never runs as root: setpriv drops to the invoking user after the namespace is entered.
+        var uid = await IdAsync("-u", ct);
+        var gid = await IdAsync("-g", ct);
+        var confDir = Path.GetFullPath(_o.MitmConfDir);
+        Directory.CreateDirectory(confDir);
         var addon = Path.GetFullPath(Path.Combine(_o.DeployNetDir, "mitm", "maldex_jsonl.py"));
-        await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "mitmdump.log"), [_o.MitmdumpBinary,
+        await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "mitmdump.log"), ["setpriv", $"--reuid={uid}", $"--regid={gid}", "--init-groups", "--", _o.MitmdumpBinary,
             "--mode", "transparent", "--listen-host", gw, "--listen-port", _o.MitmPort.ToString(CultureInfo.InvariantCulture),
-            "--set", $"confdir={Path.GetFullPath(_o.MitmConfDir)}", "--set", "block_global=false", "--set", "http3=false",
+            "--set", $"confdir={confDir}", "--set", "block_global=false", "--set", "http3=false",
             "-s", addon, "--set", $"maldex_out={Path.Combine(dir, "flows.jsonl")}", "--set", $"maldex_enable_file={Path.Combine(dir, "capture.on")}"]), ct);
         await WaitFor(async () =>
         {
@@ -175,16 +187,26 @@ public sealed partial class NetnsEgressRouter(
 
     private async Task StartSimulatedAsync(string ns, string dir, CancellationToken ct)
     {
-        await Must(PrivilegedCommands.InNs(ns, "ip", "route", "add", "local", "0.0.0.0/0", "dev", "lo"), ct);
+        await Must(PrivilegedCommands.InNs(ns, "ip", "route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", "main"), ct);
         // INetSim's service processes drop to the unprivileged 'inetsim' user and demand group-owned logs, and that user
         // cannot traverse the (private) run directory or a home directory, so its log/report dir lives under /run.
         var isDir = InetSimDir(ns);
         await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0775", "-g", "inetsim", isDir), ct);
         foreach (var log in new[] { "main.log", "service.log", "debug.log" })
             await Must(PrivilegedCommands.Sudo("install", "-m", "0660", "-g", "inetsim", "/dev/null", Path.Combine(isDir, log)), ct);
+        // Per-run data dir: read-only content copied from the template, fresh empty writable dirs for guest-supplied data,
+        // so nothing a guest uploads is shared with (or visible to) another run.
+        var data = isDir + "/data";
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0750", "-o", "inetsim", "-g", "inetsim", data), ct);
+        await Must(PrivilegedCommands.Sudo("cp", "-a", _o.InetSimDataDir.TrimEnd('/') + "/.", data + "/"), ct);
+        foreach (var w in new[] { "http/postdata", "ftp/upload", "smtp" })
+        {
+            await Must(PrivilegedCommands.Sudo("rm", "-rf", "--", $"{data}/{w}"), ct);
+            await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0770", "-o", "inetsim", "-g", "inetsim", $"{data}/{w}"), ct);
+        }
         var conf = Path.GetFullPath(Path.Combine(_o.DeployNetDir, "inetsim", "inetsim.conf"));
         await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "inetsim.out"), [_o.InetSimBinary,
-            "--config", conf, "--data-dir", _o.InetSimDataDir, "--log-dir", isDir, "--report-dir", isDir, "--bind-address", "0.0.0.0"]), ct);
+            "--config", conf, "--data-dir", data, "--log-dir", isDir, "--report-dir", isDir, "--bind-address", "0.0.0.0"]), ct);
         await WaitFor(async () =>
         {
             var r = await Run(PrivilegedCommands.InNs(ns, "curl", "-s", "-o", "/dev/null", "-m", "2", "-w", "%{http_code}", $"http://{_o.SinkholeIp}/"), ct);
@@ -200,11 +222,14 @@ public sealed partial class NetnsEgressRouter(
         await Must(PrivilegedCommands.Sudo("ip", "link", "add", names.WgIface, "type", "wireguard"), ct);
         await Must(PrivilegedCommands.Sudo("ip", "link", "set", names.WgIface, "netns", ns), ct);
         var confFile = Path.Combine(dir, "wg.conf");
-        await File.WriteAllTextAsync(confFile, wg.SetConfText, ct);
-        Chmod(confFile, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        var fso = new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.Write, Share = FileShare.None };
+        if (!OperatingSystem.IsWindows()) fso.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite; // 0600 at creation, no chmod window
+        await using (var fs = new FileStream(confFile, fso))
+        await using (var w = new StreamWriter(fs))
+            await w.WriteAsync(wg.SetConfText.AsMemory(), ct);
         try
         {
-            await Must(PrivilegedCommands.InNs(ns, "wg", "setconf", names.WgIface, confFile), ct);
+            await Must(PrivilegedCommands.InNs(ns, "wg", "setconf", names.WgIface, confFile), ct, redactStderr: true);
         }
         finally { try { File.Delete(confFile); } catch (IOException) { } }
         await Must(PrivilegedCommands.InNs(ns, "ip", "addr", "add", wg.Address, "dev", names.WgIface), ct);
@@ -278,18 +303,25 @@ public sealed partial class NetnsEgressRouter(
     /// <summary>Deletes <c>mxb*</c>/<c>mxt*</c>/<c>mxv*</c> host links whose run namespace no longer exists.</summary>
     public async Task ReleaseOrphansAsync(CancellationToken ct)
     {
-        var live = (await NamespacesAsync(ct)).Select(n => n[3..]).ToHashSet();
-        var links = await Run(PrivilegedCommands.Sudo("ip", "-o", "link", "show"), ct);
-        if (links.ExitCode != 0) return;
-        foreach (var line in links.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        // Under the gate so a create in flight (links exist, namespace not yet listed) is never mistaken for an orphan.
+        await _gate.WaitAsync(ct);
+        try
         {
-            var parts = line.Split(':', 3);
-            if (parts.Length < 2) continue;
-            var name = parts[1].Trim().Split('@')[0];
-            var m = HostLink().Match(name);
-            if (!m.Success || live.Contains(m.Groups[1].Value)) continue;
-            await Run(PrivilegedCommands.Sudo("ip", "link", "del", name), ct);
+            var live = (await NamespacesAsync(ct)).Select(n => n[3..]).ToHashSet();
+            foreach (var id in _active.Keys) live.Add(id.ToString("N")[..12]);
+            var links = await Run(PrivilegedCommands.Sudo("ip", "-o", "link", "show"), ct);
+            if (links.ExitCode != 0) return;
+            foreach (var line in links.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var parts = line.Split(':', 3);
+                if (parts.Length < 2) continue;
+                var name = parts[1].Trim().Split('@')[0];
+                var m = HostLink().Match(name);
+                if (!m.Success || live.Contains(m.Groups[1].Value)) continue;
+                await Run(PrivilegedCommands.Sudo("ip", "link", "del", name), ct);
+            }
         }
+        finally { _gate.Release(); }
     }
 
     private async Task<List<string>> NamespacesAsync(CancellationToken ct)
@@ -340,11 +372,23 @@ public sealed partial class NetnsEgressRouter(
     private Task<ProcessResult> Run((string File, IReadOnlyList<string> Args) cmd, CancellationToken ct, string? stdin = null) =>
         runner.RunAsync(cmd.File, cmd.Args, ct, stdin);
 
-    private async Task Must((string File, IReadOnlyList<string> Args) cmd, CancellationToken ct, string? stdin = null)
+    /// <param name="redactStderr">Never echo stderr (commands that handle key material).</param>
+    private async Task Must((string File, IReadOnlyList<string> Args) cmd, CancellationToken ct, string? stdin = null, bool redactStderr = false)
     {
         var r = await Run(cmd, ct, stdin);
         if (r.ExitCode != 0)
-            throw new EgressUnavailableException($"'{string.Join(' ', cmd.Args.Take(8))}' failed ({r.ExitCode}): {r.Stderr.Trim()}");
+            throw new EgressUnavailableException(redactStderr
+                ? $"'{string.Join(' ', cmd.Args.Take(5))}' failed ({r.ExitCode}); output withheld"
+                : $"'{string.Join(' ', cmd.Args.Take(8))}' failed ({r.ExitCode}): {r.Stderr.Trim()}");
+    }
+
+    private async Task<string> IdAsync(string flag, CancellationToken ct)
+    {
+        var r = await Run(("id", [flag]), ct);
+        var v = r.Stdout.Trim();
+        if (r.ExitCode != 0 || !uint.TryParse(v, NumberStyles.None, CultureInfo.InvariantCulture, out _))
+            throw new EgressUnavailableException("Cannot determine the uid/gid to run mitmproxy as.");
+        return v;
     }
 
     private async Task WaitFor(Func<Task<bool>> probe, TimeSpan limit, Func<string> failure, CancellationToken ct)

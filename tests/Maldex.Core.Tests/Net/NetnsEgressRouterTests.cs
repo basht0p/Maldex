@@ -31,6 +31,7 @@ public sealed class NetnsEgressRouterTests : IDisposable
             if (line == "sudo -n ip netns list") { lock (Namespaces) return Ok(out_: string.Join('\n', Namespaces.Select(n => n + " (id: 0)"))); }
             if (line.StartsWith("sudo -n ip netns pids ")) return Ok(out_: Pids);
             if (line.Contains(" ss -ltn")) return Ok(out_: string.Join('\n', Enumerable.Range(0, 20).Select(i => $"LISTEN 0 128 10.213.{i / 64}.{i % 64 * 4 + 1}:8080 0.0.0.0:*")));
+            if (line == "id -u" || line == "id -g") return Ok(out_: "1000\n");
             if (line.Contains(" curl ")) return Ok(out_: "200");
             if (line.Contains("latest-handshakes")) return Ok(out_: Handshakes);
             return Ok();
@@ -47,14 +48,14 @@ public sealed class NetnsEgressRouterTests : IDisposable
     public NetnsEgressRouterTests() => Directory.CreateDirectory(_tmp);
     public void Dispose() { try { Directory.Delete(_tmp, true); } catch (IOException) { } }
 
-    private NetnsEgressRouter Router(Action<string>? warn = null) => new(Options.Create(new NetOptions
+    private NetnsEgressRouter Router(Action<string>? warn = null, IProcessRunner? runner = null) => new(Options.Create(new NetOptions
     {
         RunDir = Path.Combine(_tmp, "run"),
         WireGuardConfigDir = Path.Combine(_tmp, "wg"),
         MitmConfDir = Path.Combine(_tmp, "ca"),
         DeployNetDir = Path.Combine(_tmp, "deploy"),
         ControlPlaneIps = ["192.168.50.7"],
-    }), _r, warn, new NetnsRouterTuning
+    }), runner ?? _r, warn, new NetnsRouterTuning
     {
         PollInterval = TimeSpan.FromMilliseconds(5), MitmWait = TimeSpan.FromMilliseconds(100), InetSimWait = TimeSpan.FromMilliseconds(100),
         HandshakeWait = TimeSpan.FromMilliseconds(100), KillGrace = TimeSpan.FromMilliseconds(50),
@@ -250,12 +251,75 @@ public sealed class NetnsEgressRouterTests : IDisposable
         var id = Guid.NewGuid();
         var n = RunNetNames.For(id);
         await Router().CreateAsync(id, NetworkMode.Simulated, null, CancellationToken.None);
-        Assert.Contains(_r.Calls, c => c == $"sudo -n ip netns exec {n.Namespace} ip route add local 0.0.0.0/0 dev lo");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip netns exec {n.Namespace} ip route add local 0.0.0.0/0 dev lo table main");
         var inet = Assert.Single(_r.Where(c => c.Contains("inetsim ") && c.Contains("--config")));
         Assert.Contains("--bind-address 0.0.0.0", inet);
         Assert.Contains("setsid -f", inet);
         Assert.Contains(_r.Calls, c => c.Contains("--address=/#/198.18.0.10"));
         Assert.True(_r.IndexOf(c => c.Contains("route add local")) < _r.IndexOf(c => c.Contains("inetsim ")));
+    }
+
+    [Fact]
+    public async Task Mitm_RunsUnprivileged_ViaSetpriv_InsideTheNamespace()
+    {
+        var id = Guid.NewGuid();
+        await Router().CreateAsync(id, NetworkMode.None, null, CancellationToken.None);
+        var m = Assert.Single(_r.Where(c => c.Contains("mitmdump --mode transparent")));
+        Assert.Contains($"ip netns exec {RunNetNames.For(id).Namespace} setpriv --reuid=1000 --regid=1000 --init-groups -- ", m);
+        Assert.True(m.IndexOf("setpriv", StringComparison.Ordinal) < m.IndexOf("mitmdump --mode", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Mitm_UidLookupFailure_FailsClosed()
+    {
+        _r.Fail = c => c == "id -u";
+        await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None));
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("mitmdump --mode"));
+        Assert.Empty(_r.Namespaces);
+    }
+
+    [Fact]
+    public async Task Simulated_UsesPerRunInetSimData_AndReleaseRemovesIt()
+    {
+        var router = Router();
+        var id = Guid.NewGuid();
+        var n = RunNetNames.For(id);
+        var data = $"/run/maldex/inetsim/{n.Namespace}/data";
+        var lease = await router.CreateAsync(id, NetworkMode.Simulated, null, CancellationToken.None);
+        Assert.Equal(data, NetnsEgressRouter.InetSimDataPath(id));
+        Assert.Contains(_r.Calls, c => c == "sudo -n cp -a /var/lib/inetsim/. " + data + "/");
+        foreach (var w in new[] { "http/postdata", "ftp/upload", "smtp" })
+        {
+            var rm = _r.IndexOf(c => c == $"sudo -n rm -rf -- {data}/{w}");
+            var mk = _r.IndexOf(c => c.StartsWith("sudo -n install -d -m 0770 -o inetsim -g inetsim ") && c.EndsWith($"{data}/{w}"));
+            Assert.True(rm >= 0 && mk > rm, w);
+        }
+        var inet = Assert.Single(_r.Where(c => c.Contains("--config")));
+        Assert.Contains($"--data-dir {data} ", inet);
+        Assert.DoesNotContain("--data-dir /var/lib/inetsim", inet);
+        await router.ReleaseAsync(lease, CancellationToken.None);
+        Assert.Contains(_r.Calls, c => c == $"sudo -n rm -rf -- /run/maldex/inetsim/{n.Namespace}");
+    }
+
+    [Fact]
+    public async Task CountryIgnoredForNonVpnModes()
+    {
+        var router = Router();
+        await router.CreateAsync(Guid.NewGuid(), NetworkMode.None, "nl", CancellationToken.None);
+        await router.CreateAsync(Guid.NewGuid(), NetworkMode.Simulated, "nl", CancellationToken.None);
+        WriteWg("nl", GoodWg);
+        await router.CreateAsync(Guid.NewGuid(), NetworkMode.LiveVpn, "nl", CancellationToken.None); // not blocked by the two above
+    }
+
+    [Fact]
+    public async Task WgSetconfFailure_DoesNotLeakStderr()
+    {
+        WriteWg("nl", GoodWg);
+        _r.Fail = c => c.Contains("wg setconf");
+        var ex = await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(Guid.NewGuid(), NetworkMode.LiveVpn, "nl", CancellationToken.None));
+        Assert.DoesNotContain("scripted failure", ex.Message);
+        Assert.DoesNotContain("PrivateKey", ex.Message);
+        Assert.Empty(_r.Namespaces);
     }
 
     [Fact]
@@ -277,7 +341,7 @@ public sealed class NetnsEgressRouterTests : IDisposable
         WriteWg("nl", GoodWg);
         await Router().CreateAsync(Guid.NewGuid(), NetworkMode.Simulated, null, CancellationToken.None);
         await Router().CreateAsync(Guid.NewGuid(), NetworkMode.LiveVpn, "nl", CancellationToken.None);
-        Assert.All(_r.Calls, c => Assert.StartsWith("sudo -n ", c));
+        Assert.All(_r.Calls.Where(c => c is not ("id -u" or "id -g")), c => Assert.StartsWith("sudo -n ", c));
     }
 
     // ---- host-side invariants ----
@@ -382,6 +446,20 @@ public sealed class NetnsEgressRouterTests : IDisposable
     }
 
     [Fact]
+    public async Task ReleaseOrphans_SkipsActiveRuns_AndCoversWgLinks()
+    {
+        var id = Guid.Parse("00112233445566778899aabbccddeeff");
+        var h = id.ToString("N")[..12];
+        var router = Router(null, new LinkListingRunner(_r, $"5: mxt{h}: <NO-CARRIER> mtu 1500\n6: mxwdeadbeef0002: <NO-CARRIER> mtu 1500\n"));
+        await router.CreateAsync(id, NetworkMode.None, null, CancellationToken.None);
+        _r.Namespaces.Clear(); // namespace not listed, but the run is active in this process
+        _r.Calls.Clear();
+        await router.ReleaseOrphansAsync(CancellationToken.None);
+        Assert.DoesNotContain(_r.Calls, c => c == $"sudo -n ip link del mxt{h}");
+        Assert.Contains(_r.Calls, c => c == "sudo -n ip link del mxwdeadbeef0002");
+    }
+
+    [Fact]
     public async Task ReleaseOrphans_DeletesOnlyMxLinksWithoutNamespace()
     {
         var router = Router();
@@ -390,6 +468,7 @@ public sealed class NetnsEgressRouterTests : IDisposable
         var runner = new LinkListingRunner(_r, $"""
             1: lo: <LOOPBACK> mtu 65536
             2: eth0: <BROADCAST> mtu 1500
+            8: mxwdeadbeef0001: <NO-CARRIER> mtu 1500
             9: mxbdeadbeef0001: <NO-CARRIER> mtu 1500
             10: mxvdeadbeef0001@if3: <NO-CARRIER> mtu 1500
             11: mxtdeadbeef0001: <NO-CARRIER> mtu 1500
@@ -399,7 +478,7 @@ public sealed class NetnsEgressRouterTests : IDisposable
         var r2 = new NetnsEgressRouter(Options.Create(new NetOptions { RunDir = Path.Combine(_tmp, "run") }), runner, null, new NetnsRouterTuning());
         await r2.ReleaseOrphansAsync(CancellationToken.None);
         var dels = _r.Calls.Where(c => c.StartsWith("sudo -n ip link del ")).ToList();
-        Assert.Equal(["sudo -n ip link del mxbdeadbeef0001", "sudo -n ip link del mxvdeadbeef0001", "sudo -n ip link del mxtdeadbeef0001"], dels);
+        Assert.Equal(["sudo -n ip link del mxwdeadbeef0001", "sudo -n ip link del mxbdeadbeef0001", "sudo -n ip link del mxvdeadbeef0001", "sudo -n ip link del mxtdeadbeef0001"], dels);
     }
 
     private sealed class LinkListingRunner(ScriptedRunner inner, string linkOutput) : IProcessRunner

@@ -25,6 +25,6 @@ public sealed class NetOptions
     /// <summary>Directory holding the mitm addon (<c>mitm/maldex_jsonl.py</c>) and <c>inetsim/inetsim.conf</c>.</summary>
     public string DeployNetDir { get; set; } = "deploy/net";
 
-    /// <summary>INetSim's read-only service data (fake pages, binaries).</summary>
+    /// <summary>Template INetSim data (read-only content); each run gets its own copy.</summary>
     public string InetSimDataDir { get; set; } = "/var/lib/inetsim";
 }
