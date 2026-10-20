@@ -225,12 +225,30 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
             Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
         }
 
-        // Every refusal is audited as session.join.denied, and no token ever appears in the audit trail.
+        // Refusals of a KNOWN token (wrong task, task not running) are audited as session.join.denied; unknown, garbage or
+        // reused tokens are not (an anonymous upgrade must not be able to flood the audit trail). No token is ever logged.
         await using var scope = f.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
         var audit = await db.AuditLogs.ToListAsync(Ct);
-        Assert.Equal(4, audit.Count(a => a.Action == "session.join.denied"));
+        Assert.Equal(["task is not running", "token was issued for another task"],
+            audit.Where(a => a.Action == "session.join.denied").Select(a => a.Details).Order(StringComparer.Ordinal).ToArray());
         Assert.DoesNotContain(audit, a => a.Details is not null && (a.Details.Contains(token) || a.Details.Contains(otherToken) || a.Details.Contains(lateToken)));
+    }
+
+    [Fact]
+    public async Task Tunnel_AnonymousUpgradesWithoutAKnownToken_AreNotAudited()
+    {
+        var f = Factory(1);
+        var id = await CreateTaskAsync(f, RunStatus.Running);
+        for (var i = 0; i < 25; i++)
+        {
+            using var ws = await ConnectAsync(f, id, i % 2 == 0 ? "" : "forged-" + i);
+            Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
+        }
+
+        await using var scope = f.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        Assert.DoesNotContain(await db.AuditLogs.ToListAsync(Ct), a => a.Action.StartsWith("session.join", StringComparison.Ordinal));
     }
 
     private static async Task<Exception?> UpgradeWithOriginAsync(MaldexAppFactory f, Guid id, string token, string url, string origin)

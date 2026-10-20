@@ -69,7 +69,9 @@ public static class GuacamoleTunnelEndpoint
         {
             if (!tokens.TryConsume(token, out var taskId, out var userId))
             {
-                await AuditAsync(db, time, null, "session.join.denied", id, "invalid, reused or expired token", ct);
+                // Anonymous by nature (this route has no other credential): auditing every missing/forged/reused token would let
+                // anyone flood the audit trail. Only refusals of a token we issued (below) are audited.
+                log.LogDebug("Live-view tunnel for task {TaskId} refused: no valid token.", id);
                 await CloseAsync(ws, WebSocketCloseStatus.PolicyViolation, "Invalid tunnel token.");
                 return Results.Empty;
             }
