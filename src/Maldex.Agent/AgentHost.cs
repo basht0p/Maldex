@@ -25,7 +25,7 @@ public sealed class AgentHost(Stream channel, IEventSource source, CommandDispat
         Task? forwarder = null;
         try
         {
-            await SendAsync(new ReadyMessage(Version, Environment.MachineName), cts.Token).ConfigureAwait(false);
+            await SendAsync(new ReadyMessage(Version, Environment.MachineName, Environment.ProcessId), cts.Token).ConfigureAwait(false);
             forwarder = ForwardEventsAsync(cts);
             await ReadCommandsAsync(cts.Token).ConfigureAwait(false);
         }

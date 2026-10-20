@@ -7,7 +7,7 @@ public static class AgentMessageValidator
     /// <summary>Returns null when valid, otherwise the reason.</summary>
     public static string? Validate(AgentMessage message) => message switch
     {
-        ReadyMessage m => Req(m.AgentVersion, "AgentVersion") ?? Req(m.Hostname, "Hostname"),
+        ReadyMessage m => Req(m.AgentVersion, "AgentVersion") ?? Req(m.Hostname, "Hostname") ?? (m.Pid is <= 0 ? "Pid must be positive." : null),
         ProcessStartedMessage m => Pid(m.Pid) ?? (m.ParentPid < 0 ? "ParentPid is negative." : null)
             ?? Req(m.ImagePath, "ImagePath") ?? Req(m.CommandLine, "CommandLine"),
         ProcessExitedMessage m => Pid(m.Pid),

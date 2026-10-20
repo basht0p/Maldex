@@ -214,6 +214,9 @@ public sealed class ReplayAgentChannel : IAgentChannel
                     ? Encoding.UTF8.GetBytes(line)
                     : JsonSerializer.SerializeToUtf8Bytes(Stamp(message, _time.GetUtcNow()), AgentJson.Options);
                 _outbox.Writer.TryWrite(Frame(body));
+                // Like a real guest, a fake one runs the sample only once the host has opened it: everything after the ready
+                // line is the sample's behaviour (and is collected as such).
+                if (_guest is not null && message is ReadyMessage) await _opened.Task.WaitAsync(ct).ConfigureAwait(false);
             }
 
             if (_holdOpen) await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false);

@@ -40,7 +40,9 @@ public static class AgentJson
 [JsonDerivedType(typeof(SelfTestResultMessage), "self_test_result")]
 public abstract record AgentMessage;
 
-public sealed record ReadyMessage(string AgentVersion, string Hostname) : AgentMessage;
+/// <param name="Pid">The agent's own process id (additive; null from older agents). Processes it launches (the opened sample)
+/// have it as their parent, which is how the host scopes dropped-file collection to the sample's process tree.</param>
+public sealed record ReadyMessage(string AgentVersion, string Hostname, int? Pid = null) : AgentMessage;
 
 public sealed record ProcessStartedMessage(DateTimeOffset At, int Pid, int ParentPid, string ImagePath, string CommandLine, string? User = null, string? Integrity = null) : AgentMessage;
 

@@ -223,7 +223,7 @@ public sealed class RunCoordinator(
                 FullMode = BoundedChannelFullMode.Wait,
             });
 
-            var inbox = new TransferInbox();
+            var inbox = new TransferInbox((enumerator.Current as ReadyMessage)?.Pid);
             var reader = ReadLoopAsync(enumerator, messages.Writer, inbox, readerCts.Token);
             var flusher = FlushLoopAsync(messages.Reader, ingestor, ct);
             disposed = true; // the reader task now owns the enumerator
@@ -238,7 +238,10 @@ public sealed class RunCoordinator(
                 await StartCaptureAsync(lease, capture, ct).ConfigureAwait(false);
 
                 if (command is OpenSampleCommand open)
+                {
+                    inbox.MarkOpened(); // the delivery ends with the open command
                     await DeliverSampleAsync(db, channel, inbox, task, open, ct).ConfigureAwait(false);
+                }
 
                 var now = time.GetUtcNow();
                 await TransitionAsync(db, task, RunStatus.Running, "agent ready; isolation self-test passed", t =>
@@ -248,7 +251,11 @@ public sealed class RunCoordinator(
                 }, ct).ConfigureAwait(false);
 
                 // A sample is opened by its delivery; a URL is opened now.
-                if (command is not OpenSampleCommand) await channel.SendAsync(command, ct).ConfigureAwait(false);
+                if (command is not OpenSampleCommand)
+                {
+                    inbox.MarkOpened();
+                    await channel.SendAsync(command, ct).ConfigureAwait(false);
+                }
 
                 var reason = await ControlLoopAsync(task.Id, reader, flusher, channel, ct).ConfigureAwait(false);
 
