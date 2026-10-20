@@ -207,7 +207,7 @@ public class SampleDeliveryTests(SqlServerFixture sql)
 
         await using var db = h.NewContext();
         Assert.Equal(RunStatus.Processing, (await db.Tasks.SingleAsync(t => t.Id == id, Ct)).Status);
-        var sent = Assert.Single(h.Channels.Channels).SentCommands;
+        var sent = Assert.Single(h.Channels.Channels).SentCommands.Where(c => c is not SelfTestCommand).ToList();
         Assert.Equal(4, sent.Count);
         var chunks = sent.Take(3).Cast<PutFileChunkCommand>().ToList();
         Assert.Equal(data, chunks.SelectMany(c => Convert.FromBase64String(c.DataBase64)).ToArray());
@@ -244,7 +244,7 @@ public class SampleDeliveryTests(SqlServerFixture sql)
 
         await h.RunAsync(id, async () =>
         {
-            while (!h.Channels.Channels.Any(c => c.SentCommands.Count >= 2)) await Task.Delay(2, Ct);
+            while (!h.Channels.Channels.Any(c => c.SentCommands.Count(x => x is not SelfTestCommand) >= 2)) await Task.Delay(2, Ct);
             await using var api = h.NewContext();
             var t = await api.Tasks.SingleAsync(x => x.Id == id, Ct);
             t.StopRequestedAt = h.Time.GetUtcNow();
@@ -294,7 +294,7 @@ public class SampleDeliveryTests(SqlServerFixture sql)
 
         await h.RunAsync(id);
 
-        var sent = Assert.Single(Assert.Single(h.Channels.Channels).SentCommands);
+        var sent = Assert.Single(Assert.Single(h.Channels.Channels).SentCommands, c => c is not SelfTestCommand);
         Assert.Equal("http://example.test/", Assert.IsType<OpenUrlCommand>(sent).Url);
     }
 }

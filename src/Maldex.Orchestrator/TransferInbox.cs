@@ -4,7 +4,7 @@ using Maldex.Core.Agent;
 namespace Maldex.Orchestrator;
 
 /// <summary>
-/// Routes the control-plane replies of a bulk transfer (<see cref="CommandResultMessage"/> and <see cref="FileChunkMessage"/>)
+/// Routes the control-plane replies of a bulk transfer (<see cref="CommandResultMessage"/>, <see cref="FileChunkMessage"/> and <see cref="SelfTestResultMessage"/>)
 /// from the run's single read loop to whoever is waiting for them, and remembers which files the guest created.
 /// Only one transfer activity at a time opens the inbox. File chunks nobody asked for are swallowed, never ingested.
 /// </summary>
@@ -51,11 +51,11 @@ public sealed class TransferInbox
     public async ValueTask<bool> OfferAsync(AgentMessage message, CancellationToken ct)
     {
         if (message is FileEventMessage { Operation: "create" } f) Track(f.Path);
-        if (message is not (CommandResultMessage or FileChunkMessage)) return false;
+        if (message is not (CommandResultMessage or FileChunkMessage or SelfTestResultMessage)) return false;
 
         Channel<AgentMessage>? open;
         lock (_gate) open = _open;
-        if (open is null) return message is FileChunkMessage; // an unsolicited chunk is dropped; a stray result goes on to the ingestor
+        if (open is null) return message is FileChunkMessage or SelfTestResultMessage; // unsolicited chunks and self-test answers are dropped; a stray command result goes on to the ingestor
 
         try
         {

@@ -229,7 +229,8 @@ public class RunCoordinatorTests(SqlServerFixture sql)
         var channel = Assert.Single(h.Channels.Channels);
         // (chunks first, then the open command; Task 12)
         var open = Assert.IsType<OpenSampleCommand>(channel.SentCommands[^1]);
-        Assert.All(channel.SentCommands.SkipLast(1), c => Assert.IsType<PutFileChunkCommand>(c));
+        Assert.IsType<SelfTestCommand>(channel.SentCommands[0]); // the isolation self-test comes first
+        Assert.All(channel.SentCommands.Skip(1).SkipLast(1), c => Assert.IsType<PutFileChunkCommand>(c));
         Assert.Equal("invoice.exe", open.FileName);
         Assert.StartsWith("samples/", open.BlobKey);
     }

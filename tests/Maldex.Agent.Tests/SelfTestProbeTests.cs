@@ -1,0 +1,107 @@
+using System.Net;
+using System.Net.Sockets;
+using Maldex.Agent.Probes;
+using Maldex.Core.Agent;
+using Xunit;
+
+namespace Maldex.Agent.Tests;
+
+public class SelfTestProbeTests
+{
+    private static CancellationToken Ct => TestContext.Current.CancellationToken;
+
+    private static int FreeClosedPort()
+    {
+        var l = new TcpListener(IPAddress.Loopback, 0);
+        l.Start();
+        var port = ((IPEndPoint)l.LocalEndpoint).Port;
+        l.Stop();
+        return port;
+    }
+
+    [Fact]
+    public async Task Probes_ClosedPort_NotReachable()
+    {
+        var result = await new SelfTestProbes().RunAsync(new SelfTestCommand("c1", [new ProbeTarget("t", "127.0.0.1", [FreeClosedPort()])], ""), Ct);
+        Assert.Equal("c1", result.CommandId);
+        Assert.Equal([new ProbeResult("t", false)], result.Probes);
+        Assert.Null(result.EchoBody);
+    }
+
+    [Fact]
+    public async Task Probes_ListeningPort_Reachable()
+    {
+        using var l = new TcpListener(IPAddress.Loopback, 0);
+        l.Start();
+        var open = ((IPEndPoint)l.LocalEndpoint).Port;
+        var result = await new SelfTestProbes().RunAsync(new SelfTestCommand("c1",
+            [new ProbeTarget("any_open", "127.0.0.1", [FreeClosedPort(), open]), new ProbeTarget("none_open", "127.0.0.1", [FreeClosedPort()])], ""), Ct);
+        Assert.Equal([new ProbeResult("any_open", true), new ProbeResult("none_open", false)], result.Probes);
+    }
+
+    [Fact]
+    public async Task Probes_InvalidHostOrNoPorts_NotReachable()
+    {
+        var result = await new SelfTestProbes().RunAsync(new SelfTestCommand("c1",
+            [new ProbeTarget("bad", "not a host!", [80]), new ProbeTarget("noports", "127.0.0.1", [])], ""), Ct);
+        Assert.Equal(2, result.Probes.Count);
+        Assert.All(result.Probes, p => Assert.False(p.Reachable));
+    }
+
+    [Fact]
+    public async Task Probes_Timeout_NotReachable_AndBounded()
+    {
+        var probes = new SelfTestProbes(connectTimeout: TimeSpan.FromMilliseconds(100), connect: async (h, p, ct) => { await Task.Delay(Timeout.Infinite, ct); });
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = await probes.RunAsync(new SelfTestCommand("c1", [new ProbeTarget("t", "10.0.0.1", [80, 443])], ""), Ct);
+        Assert.False(result.Probes[0].Reachable);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task Echo_Success_TruncatesTo256()
+    {
+        using var server = new TcpListener(IPAddress.Loopback, 0);
+        server.Start();
+        var port = ((IPEndPoint)server.LocalEndpoint).Port;
+        var serve = Task.Run(async () =>
+        {
+            using var c = await server.AcceptTcpClientAsync(Ct);
+            var s = c.GetStream();
+            var buf = new byte[4096];
+            _ = await s.ReadAsync(buf, Ct);
+            var body = new string('a', 1000);
+            await s.WriteAsync(System.Text.Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n{body}"), Ct);
+        }, Ct);
+        var result = await new SelfTestProbes().RunAsync(new SelfTestCommand("c1", [], $"http://127.0.0.1:{port}/"), Ct);
+        await serve;
+        Assert.Equal(new string('a', 256), result.EchoBody);
+    }
+
+    [Fact]
+    public async Task Echo_Failure_IsNull()
+    {
+        var result = await new SelfTestProbes().RunAsync(new SelfTestCommand("c1", [], $"http://127.0.0.1:{FreeClosedPort()}/"), Ct);
+        Assert.Null(result.EchoBody);
+    }
+
+    [Fact]
+    public async Task Echo_NonHttpUrl_IsNull_NoThrow()
+    {
+        var result = await new SelfTestProbes().RunAsync(new SelfTestCommand("c1", [], "file:///c:/windows/win.ini"), Ct);
+        Assert.Null(result.EchoBody);
+    }
+
+    [Fact]
+    public async Task Dispatcher_SelfTest_EmitsResultThenAcknowledges()
+    {
+        var emitted = new List<AgentMessage>();
+        using var d = new Maldex.Agent.Commands.CommandDispatcher(new NoopSampleOpener(), new RecordingUrlOpener(), () => { });
+        var ack = await d.DispatchAsync(new SelfTestCommand("c9", [new ProbeTarget("t", "127.0.0.1", [FreeClosedPort()])], ""), Ct,
+            (m, _) => { emitted.Add(m); return Task.CompletedTask; });
+        Assert.True(ack.Success);
+        var r = Assert.IsType<SelfTestResultMessage>(Assert.Single(emitted));
+        Assert.Equal("c9", r.CommandId);
+        Assert.Null(AgentMessageValidator.Validate(r));
+    }
+}

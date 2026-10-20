@@ -37,6 +37,7 @@ public static class AgentJson
 [JsonDerivedType(typeof(ScreenshotMessage), "screenshot")]
 [JsonDerivedType(typeof(CommandResultMessage), "command_result")]
 [JsonDerivedType(typeof(FileChunkMessage), "file_chunk")]
+[JsonDerivedType(typeof(SelfTestResultMessage), "self_test_result")]
 public abstract record AgentMessage;
 
 public sealed record ReadyMessage(string AgentVersion, string Hostname) : AgentMessage;
@@ -78,6 +79,7 @@ public sealed record FileChunkMessage(
 [JsonDerivedType(typeof(ShutdownCommand), "shutdown")]
 [JsonDerivedType(typeof(PutFileChunkCommand), "put_file_chunk")]
 [JsonDerivedType(typeof(CollectFileCommand), "collect_file")]
+[JsonDerivedType(typeof(SelfTestCommand), "self_test")]
 public abstract record AgentCommand(string CommandId);
 
 public sealed record OpenSampleCommand(string CommandId, string FileName, string BlobKey) : AgentCommand(CommandId);
@@ -98,6 +100,18 @@ public sealed record PutFileChunkCommand(
 
 /// <summary>Asks the guest to send back the file at <c>Path</c> as <see cref="FileChunkMessage"/>s followed by a command result.</summary>
 public sealed record CollectFileCommand(string CommandId, string Path) : AgentCommand(CommandId);
+
+/// <summary>One thing the isolation self-test tries to reach: every port of <c>Ports</c> on <c>Host</c>.</summary>
+public sealed record ProbeTarget(string Name, string Host, IReadOnlyList<int> Ports);
+
+/// <summary>Asks the guest to try to reach each target (TCP connect) and to fetch <c>EchoUrl</c>, then answer with a <see cref="SelfTestResultMessage"/>.</summary>
+public sealed record SelfTestCommand(string CommandId, IReadOnlyList<ProbeTarget> Targets, string EchoUrl) : AgentCommand(CommandId);
+
+/// <summary><c>Reachable</c> = at least one port of the target accepted a connection.</summary>
+public sealed record ProbeResult(string Name, bool Reachable);
+
+/// <summary>The guest's answer to a <see cref="SelfTestCommand"/> (<c>CommandId</c> is the command's). UNTRUSTED. <c>EchoBody</c> is the first 256 characters of the echo response, null if it failed.</summary>
+public sealed record SelfTestResultMessage(DateTimeOffset At, string CommandId, IReadOnlyList<ProbeResult> Probes, string? EchoBody) : AgentMessage;
 
 /// <summary>Limits shared by both ends of a bulk transfer.</summary>
 public static class AgentLimits

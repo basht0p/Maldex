@@ -24,11 +24,29 @@ public static class AgentMessageValidator
         ScreenshotMessage m => OneOf(m.Format, "Format", "jpeg", "png") ?? Base64(m.ImageBase64),
         CommandResultMessage m => Req(m.CommandId, "CommandId"),
         FileChunkMessage m => ValidateFileChunk(m),
+        SelfTestResultMessage m => ValidateSelfTest(m),
         _ => "Unknown message type.",
     };
 
     private const int MaxPathChars = 32_768;
     private const int MaxIdChars = 256;
+
+    private const int MaxProbes = 64;
+    private const int MaxProbeNameChars = 64;
+    private const int MaxEchoChars = 256;
+
+    private static string? ValidateSelfTest(SelfTestResultMessage m)
+    {
+        if (string.IsNullOrEmpty(m.CommandId) || m.CommandId.Length > MaxIdChars) return "CommandId is missing or too long.";
+        if (m.Probes is null) return "Probes is missing.";
+        if (m.Probes.Count > MaxProbes) return "Too many probes.";
+        foreach (var p in m.Probes)
+        {
+            if (p is null) return "Probes contains null.";
+            if (string.IsNullOrEmpty(p.Name) || p.Name.Length > MaxProbeNameChars) return "Probe name is missing or too long.";
+        }
+        return m.EchoBody is { Length: > MaxEchoChars } ? "EchoBody is too long." : null;
+    }
 
     private static string? ValidateFileChunk(FileChunkMessage m)
     {
