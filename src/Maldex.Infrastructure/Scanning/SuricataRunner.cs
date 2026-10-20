@@ -36,10 +36,10 @@ public sealed class SuricataRunner(IOptions<SuricataOptions> options) : ISuricat
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeout.CancelAfter(_options.Timeout);
 
-            System.Diagnostics.Process process;
+            Process process;
             try
             {
-                process = System.Diagnostics.Process.Start(psi) ?? throw new InvalidOperationException($"could not start '{_options.Binary}'");
+                process = Process.Start(psi) ?? throw new InvalidOperationException($"could not start '{_options.Binary}'");
             }
             catch (Win32Exception ex)
             {

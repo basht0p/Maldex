@@ -1,6 +1,6 @@
 using System.Diagnostics;
 
-namespace Maldex.Infrastructure.Process;
+namespace Maldex.Infrastructure.Execution;
 
 public sealed class ProcessRunner : IProcessRunner
 {
@@ -38,6 +38,8 @@ public sealed class ProcessRunner : IProcessRunner
         try
         {
             await proc.WaitForExitAsync(linked.Token);
+            // Bounded by the same token: a grandchild holding the pipes open must not hang us past the timeout.
+            await Task.WhenAll(stdout, stderr).WaitAsync(linked.Token);
             return new ProcessResult(proc.ExitCode, await stdout, await stderr);
         }
         catch (OperationCanceledException)

@@ -3,7 +3,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using Maldex.Core.Abstractions;
-using Maldex.Infrastructure.Process;
+using Maldex.Infrastructure.Execution;
 using Microsoft.Extensions.Options;
 
 namespace Maldex.Infrastructure.Libvirt;
@@ -67,13 +67,20 @@ public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcess
                 await w.WriteAsync(password.AsMemory(), ct);
 
             var xmlPath = Path.Combine(runDir, "domain.xml");
+            var sockPath = Path.Combine(runDir, "agent.sock");
+            if (System.Text.Encoding.UTF8.GetByteCount(sockPath) > 107)
+                throw new VmStartException($"agent socket path is too long for a unix socket (max 107 bytes): {sockPath}");
             // Serialise port probing through to domain creation so concurrent starts cannot pick the same port.
             await StartLock.WaitAsync(ct);
             try
             {
                 var port = FindFreeVncPort();
-                var paths = new DomainPaths(overlay, nvram, Path.Combine(runDir, "agent.sock"), port, password);
-                await File.WriteAllTextAsync(xmlPath, DomainXmlBuilder.Build(spec, paths, _o), ct);
+                var paths = new DomainPaths(overlay, nvram, sockPath, port, password);
+                var xmlOptions = new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.Write };
+                if (!OperatingSystem.IsWindows()) xmlOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+                await using (var xfs = new FileStream(xmlPath, xmlOptions))
+                await using (var xw = new StreamWriter(xfs))
+                    await xw.WriteAsync(DomainXmlBuilder.Build(spec, paths, _o).AsMemory(), ct);
                 var r = await runner.RunAsync(_o.VirshBinary, ["-c", _o.Uri, "create", xmlPath], ct);
                 if (r.ExitCode != 0)
                     throw new VmStartException($"virsh create failed ({r.ExitCode}): {r.Stderr.Trim()}");
@@ -86,13 +93,15 @@ public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcess
             try { await DestroyAsync(handle, CancellationToken.None); } catch { /* best effort */ }
             if (ex is VmStartException) throw;
             if (ex is OperationCanceledException) throw;
-            throw new VmStartException($"failed to start {handle.Name}: {ex.Message}");
+            throw new VmStartException($"failed to start {handle.Name}: {ex.Message}", ex);
         }
     }
 
     public async Task DestroyAsync(VmHandle handle, CancellationToken ct)
     {
         var runDir = LibvirtPaths.RunDirFor(_o, handle);
+        try
+        {
         var r = await runner.RunAsync(_o.VirshBinary, ["-c", _o.Uri, "destroy", handle.Name], ct);
         if (r.ExitCode != 0
             && !r.Stderr.Contains("not found", StringComparison.OrdinalIgnoreCase)
@@ -100,7 +109,12 @@ public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcess
             && !r.Stderr.Contains("not active", StringComparison.OrdinalIgnoreCase)
             && !r.Stderr.Contains("failed to get domain", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException($"virsh destroy {handle.Name} failed ({r.ExitCode}): {r.Stderr.Trim()}");
-        if (Directory.Exists(runDir)) Directory.Delete(runDir, recursive: true);
+        }
+        finally
+        {
+            // Always remove the run dir (vnc.pass, overlay, NVRAM); the domain error, if any, still propagates.
+            try { if (Directory.Exists(runDir)) Directory.Delete(runDir, recursive: true); } catch { /* best effort */ }
+        }
     }
 
     public async Task<IReadOnlyList<VmHandle>> ListAsync(CancellationToken ct)

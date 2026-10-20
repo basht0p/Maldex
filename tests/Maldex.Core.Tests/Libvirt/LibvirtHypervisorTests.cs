@@ -1,6 +1,6 @@
 using Maldex.Core.Abstractions;
 using Maldex.Infrastructure.Libvirt;
-using Maldex.Infrastructure.Process;
+using Maldex.Infrastructure.Execution;
 using Microsoft.Extensions.Options;
 using Xunit;
 
@@ -66,6 +66,7 @@ public sealed class LibvirtHypervisorTests : IDisposable
         Assert.Contains($"passwd=\"{pass}\"", xml);
         Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(dir));
         Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(Path.Combine(dir, "vnc.pass")));
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(Path.Combine(dir, "domain.xml")));
     }
 
     [Fact]
@@ -93,6 +94,27 @@ public sealed class LibvirtHypervisorTests : IDisposable
         Assert.Contains("boom", ex.Message);
         Assert.False(Directory.Exists(RunDirOf(VmHandle.For(Id))));
         Assert.Contains(_runner.Calls, c => c.File == "virsh" && c.Args.Contains("destroy"));
+    }
+
+    [Fact]
+    public async Task StartFailure_DestroyAlsoFails_StillRemovesRunDir()
+    {
+        SeedBase();
+        _runner.Handler = (f, a) => a.Contains("create") ? new(1, "", "error: boom")
+            : a.Contains("destroy") ? new(1, "", "error: cannot connect") : new(0, "", "");
+        await Assert.ThrowsAsync<VmStartException>(() => Hv().StartAsync(Spec(), CancellationToken.None));
+        Assert.False(Directory.Exists(RunDirOf(VmHandle.For(Id))));
+    }
+
+    [Fact]
+    public async Task Start_AgentSocketPathTooLong_ThrowsVmStart()
+    {
+        SeedBase();
+        _opts.RunDir = Path.Combine(_root, new string('d', 90));
+        Directory.CreateDirectory(_opts.RunDir);
+        var ex = await Assert.ThrowsAsync<VmStartException>(() => Hv().StartAsync(Spec(), CancellationToken.None));
+        Assert.Contains("too long", ex.Message);
+        Assert.DoesNotContain(_runner.Calls, c => c.Args.Contains("create") && c.File == "virsh");
     }
 
     [Fact]

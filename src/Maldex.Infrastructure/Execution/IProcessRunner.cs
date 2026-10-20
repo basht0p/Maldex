@@ -1,4 +1,4 @@
-namespace Maldex.Infrastructure.Process;
+namespace Maldex.Infrastructure.Execution;
 
 public sealed record ProcessResult(int ExitCode, string Stdout, string Stderr);
 
