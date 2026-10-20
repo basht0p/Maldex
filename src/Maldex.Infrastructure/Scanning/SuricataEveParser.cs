@@ -5,14 +5,25 @@ using Maldex.Core.Verdicts;
 
 namespace Maldex.Infrastructure.Scanning;
 
-/// <summary>Turns Suricata's <c>eve.json</c> (JSON lines) into detections. Only <c>alert</c> events count.</summary>
+/// <summary>
+/// Turns Suricata's <c>eve.json</c> (JSON lines) into detections. Only <c>alert</c> events count. Guest traffic is
+/// hostile, so output is capped at <see cref="MaxAlerts"/> (1,000) alerts: parsing stops once the cap is reached and
+/// the remaining lines are ignored (no marker result is added).
+/// </summary>
 public static class SuricataEveParser
 {
-    public static IReadOnlyList<DetectionResult> Parse(string eveJsonl)
+    /// <summary>The most alerts a single parse returns.</summary>
+    public const int MaxAlerts = 1000;
+
+    public static IReadOnlyList<DetectionResult> Parse(string eveJsonl) => Parse(eveJsonl.Split('\n'), MaxAlerts);
+
+    /// <summary>Parses lazily; enumeration stops as soon as <paramref name="maxAlerts"/> alerts were found.</summary>
+    public static IReadOnlyList<DetectionResult> Parse(IEnumerable<string> lines, int maxAlerts = MaxAlerts)
     {
         var result = new List<DetectionResult>();
-        foreach (var raw in eveJsonl.Split('\n'))
+        foreach (var raw in lines)
         {
+            if (result.Count >= maxAlerts) break;
             var line = raw.Trim();
             if (line.Length == 0) continue;
             try
@@ -38,7 +49,7 @@ public static class SuricataEveParser
                     severity,
                     tags,
                     GuestText.Clean(target.Trim()),
-                    $"sid {Str(alert, "signature_id")} rev {Str(alert, "rev")}"));
+                    GuestText.Clean($"sid {Str(alert, "signature_id")} rev {Str(alert, "rev")}")));
             }
             catch (JsonException) { }
         }

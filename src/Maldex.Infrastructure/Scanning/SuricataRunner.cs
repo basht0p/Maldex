@@ -73,11 +73,27 @@ public sealed class SuricataRunner(IOptions<SuricataOptions> options) : ISuricat
 
             var eve = Path.Combine(tmp, "eve.json");
             if (!File.Exists(eve)) return [];
-            return SuricataEveParser.Parse(await File.ReadAllTextAsync(eve, ct).ConfigureAwait(false));
+            return SuricataEveParser.Parse(ReadLines(eve));
         }
         finally
         {
             try { Directory.Delete(tmp, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    /// <summary>
+    /// Streams eve.json line by line (never loading it whole). The parser stops after
+    /// <see cref="SuricataEveParser.MaxAlerts"/> alerts; reading also stops after 64 MiB of characters.
+    /// </summary>
+    private static IEnumerable<string> ReadLines(string path)
+    {
+        const long MaxChars = 64L * 1024 * 1024;
+        long read = 0;
+        foreach (var line in File.ReadLines(path, Encoding.UTF8))
+        {
+            read += line.Length + 1;
+            if (read > MaxChars) yield break;
+            yield return line;
         }
     }
 

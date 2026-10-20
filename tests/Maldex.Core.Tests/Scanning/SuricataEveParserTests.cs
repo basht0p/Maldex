@@ -48,6 +48,14 @@ public class SuricataEveParserTests
     }
 
     [Fact]
+    public void Parse_CapsAt1000Alerts()
+    {
+        var eve = string.Join("\n", Enumerable.Repeat(Alert, 1500));
+        Assert.Equal(1000, SuricataEveParser.Parse(eve).Count);
+        Assert.Equal(5, SuricataEveParser.Parse(eve.Split('\n'), 5).Count);
+    }
+
+    [Fact]
     public void Parse_NoCategory_EmptyTags()
     {
         var line = Alert.Replace("\"category\":\"A Network Trojan was detected\",", "");
