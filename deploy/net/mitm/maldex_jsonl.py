@@ -15,6 +15,9 @@ from mitmproxy import ctx
 
 BODY_CAP = 1024 * 1024
 
+# The flows file must be readable by the control plane, which is a different user.
+os.umask(0o022)
+
 
 def _body(msg):
     try:

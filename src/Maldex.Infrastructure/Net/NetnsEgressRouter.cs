@@ -40,7 +40,21 @@ public sealed partial class NetnsEgressRouter(
     [GeneratedRegex("^[A-Za-z0-9_-]{1,32}$")] private static partial Regex CountryName();
     [GeneratedRegex("^[a-z_][a-z0-9_-]{0,31}$")] private static partial Regex UserName();
 
+    /// <summary>Dedicated account mitmdump runs as: own group, no supplementary groups, no sudo (created by <c>./build.sh real-setup</c>).</summary>
+    public const string MitmUser = "maldex-mitm";
+
+    private static readonly string[] MitmCaFiles = ["mitmproxy-ca.pem", "mitmproxy-ca-cert.pem", "mitmproxy-dhparam.pem"];
+
     private static string InetSimDir(string ns) => "/run/maldex/inetsim/" + ns;
+
+    // mitmdump cannot traverse the owner's home (the repo and .data live there), so everything it touches is staged here.
+    private static string MitmDir(string ns) => "/run/maldex/mitm/" + ns;
+
+    /// <summary>Live flows file written by mitmdump (world-readable). After release it is copied to <c>{runNetDir}/flows.jsonl</c>.</summary>
+    public static string MitmFlowsPath(Guid taskId) => MitmDir(RunNetNames.For(taskId).Namespace) + "/out/flows.jsonl";
+
+    /// <summary>Capture is on while this file exists; the control plane owns the directory, mitmdump only stats it.</summary>
+    public static string MitmCaptureEnablePath(Guid taskId) => MitmDir(RunNetNames.For(taskId).Namespace) + "/ctl/capture.on";
 
     /// <summary>
     /// The per-run INetSim data directory (guest uploads land in <c>http/postdata</c>, <c>ftp/upload</c> and <c>smtp</c>
@@ -156,17 +170,31 @@ public sealed partial class NetnsEgressRouter(
             $"--dhcp-range={subnet.GuestIp},{subnet.GuestIp},255.255.255.252,12h", $"--dhcp-option=3,{gw}", $"--dhcp-option=6,{gw}",
             $"--pid-file={Path.Combine(dir, "dnsmasq.pid")}", $"--log-facility={Path.Combine(dir, "dnsmasq.log")}", .. dnsArgs]), ct);
 
-        // 4. MITM proxy, TCP only, bound to the gateway address. It parses hostile traffic and runs our addon, so it
-        //    never runs as root: setpriv drops to the invoking user after the namespace is entered.
-        var uid = await IdAsync("-u", ct);
-        var gid = await IdAsync("-g", ct);
-        var confDir = Path.GetFullPath(_o.MitmConfDir);
-        Directory.CreateDirectory(confDir);
+        // 4. MITM proxy, TCP only, bound to the gateway address. It parses hostile traffic and runs our addon, so it runs as
+        //    the dedicated powerless user with no groups, no new privileges and an empty capability bounding set.
+        //    Root stages its inputs (addon, a private CA copy) in root-owned directories; the user owns only conf/ and out/.
+        await IdAsync("-u", ct, MitmUser); // fails closed if the dedicated user is missing
+        var myUid = await IdAsync("-u", ct);
+        var myGid = await IdAsync("-g", ct);
+        var mdir = MitmDir(ns);
+        var caDir = Path.GetFullPath(_o.MitmConfDir);
+        foreach (var f in MitmCaFiles.Take(2))
+            if (!File.Exists(Path.Combine(caDir, f)))
+                throw new EgressUnavailableException($"mitmproxy CA file '{f}' is missing in {caDir}; run ./build.sh real-setup.");
         var addon = Path.GetFullPath(Path.Combine(_o.DeployNetDir, "mitm", "maldex_jsonl.py"));
-        await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "mitmdump.log"), ["setpriv", $"--reuid={uid}", $"--regid={gid}", "--init-groups", "--", _o.MitmdumpBinary,
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", "root", "-g", "root", "/run/maldex", "/run/maldex/mitm", mdir, mdir + "/addon"), ct);
+        await Must(PrivilegedCommands.Sudo("install", "-m", "0644", "-o", "root", "-g", "root", addon, mdir + "/addon/maldex_jsonl.py"), ct);
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0700", "-o", MitmUser, "-g", MitmUser, mdir + "/conf"), ct);
+        foreach (var f in MitmCaFiles)
+            if (File.Exists(Path.Combine(caDir, f)))
+                await Must(PrivilegedCommands.Sudo("install", "-m", "0600", "-o", MitmUser, "-g", MitmUser, Path.Combine(caDir, f), $"{mdir}/conf/{f}"), ct);
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", MitmUser, "-g", MitmUser, mdir + "/out"), ct);
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", myUid, "-g", myGid, mdir + "/ctl"), ct);
+        await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "mitmdump.log"), ["setpriv", $"--reuid={MitmUser}", $"--regid={MitmUser}",
+            "--clear-groups", "--no-new-privs", "--inh-caps=-all", "--bounding-set=-all", "--", _o.MitmdumpBinary,
             "--mode", "transparent", "--listen-host", gw, "--listen-port", _o.MitmPort.ToString(CultureInfo.InvariantCulture),
-            "--set", $"confdir={confDir}", "--set", "block_global=false", "--set", "http3=false",
-            "-s", addon, "--set", $"maldex_out={Path.Combine(dir, "flows.jsonl")}", "--set", $"maldex_enable_file={Path.Combine(dir, "capture.on")}"]), ct);
+            "--set", $"confdir={mdir}/conf", "--set", "block_global=false", "--set", "http3=false",
+            "-s", mdir + "/addon/maldex_jsonl.py", "--set", $"maldex_out={mdir}/out/flows.jsonl", "--set", $"maldex_enable_file={mdir}/ctl/capture.on"]), ct);
         await WaitFor(async () =>
         {
             var ss = await Run(PrivilegedCommands.InNs(ns, "ss", "-ltn"), ct);
@@ -188,25 +216,32 @@ public sealed partial class NetnsEgressRouter(
     private async Task StartSimulatedAsync(string ns, string dir, CancellationToken ct)
     {
         await Must(PrivilegedCommands.InNs(ns, "ip", "route", "add", "local", "0.0.0.0/0", "dev", "lo", "table", "main"), ct);
-        // INetSim's service processes drop to the unprivileged 'inetsim' user and demand group-owned logs, and that user
-        // cannot traverse the (private) run directory or a home directory, so its log/report dir lives under /run.
+        // INetSim's service processes drop to the unprivileged 'inetsim' user (a guest can take it over). Root therefore only
+        // ever follows paths whose every parent is root-owned: the template is verified (root-owned, not writable by others,
+        // no symlinks) and copied without following links, and 'inetsim' owns just the empty leaf directories below.
         var isDir = InetSimDir(ns);
-        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0775", "-g", "inetsim", isDir), ct);
-        foreach (var log in new[] { "main.log", "service.log", "debug.log" })
-            await Must(PrivilegedCommands.Sudo("install", "-m", "0660", "-g", "inetsim", "/dev/null", Path.Combine(isDir, log)), ct);
-        // Per-run data dir: read-only content copied from the template, fresh empty writable dirs for guest-supplied data,
-        // so nothing a guest uploads is shared with (or visible to) another run.
+        var tmpl = _o.InetSimDataDir.TrimEnd('/');
+        var bad = await Run(PrivilegedCommands.Sudo("find", tmpl, "(", "-type", "l", "-o", "!", "-user", "root", "-o", "-perm", "/022", ")", "-print", "-quit"), ct);
+        if (bad.ExitCode != 0 || bad.Stdout.Trim().Length > 0)
+            throw new EgressUnavailableException($"INetSim template {tmpl} is not root-owned/read-only/symlink-free ({bad.Stdout.Trim()}); run ./build.sh real-setup.");
         var data = isDir + "/data";
-        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0750", "-o", "inetsim", "-g", "inetsim", data), ct);
-        await Must(PrivilegedCommands.Sudo("cp", "-a", _o.InetSimDataDir.TrimEnd('/') + "/.", data + "/"), ct);
+        var log = isDir + "/log";
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", "root", "-g", "root", "/run/maldex", "/run/maldex/inetsim", isDir, data), ct);
+        await Must(PrivilegedCommands.Sudo("cp", "-rP", "--no-preserve=ownership", tmpl + "/.", data + "/"), ct);
+        // the TLS key must be readable by the dropped-privilege service user
+        await Must(PrivilegedCommands.Sudo("chgrp", "inetsim", data + "/certs/default_key.pem"), ct);
+        await Must(PrivilegedCommands.Sudo("chmod", "0640", data + "/certs/default_key.pem"), ct);
         foreach (var w in new[] { "http/postdata", "ftp/upload", "smtp" })
         {
             await Must(PrivilegedCommands.Sudo("rm", "-rf", "--", $"{data}/{w}"), ct);
-            await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0770", "-o", "inetsim", "-g", "inetsim", $"{data}/{w}"), ct);
+            await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0750", "-o", "inetsim", "-g", "inetsim", $"{data}/{w}"), ct);
         }
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0750", "-o", "inetsim", "-g", "inetsim", log), ct);
+        foreach (var lf in new[] { "main.log", "service.log", "debug.log" })
+            await Must(PrivilegedCommands.Sudo("install", "-m", "0660", "-o", "inetsim", "-g", "inetsim", "/dev/null", $"{log}/{lf}"), ct);
         var conf = Path.GetFullPath(Path.Combine(_o.DeployNetDir, "inetsim", "inetsim.conf"));
         await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "inetsim.out"), [_o.InetSimBinary,
-            "--config", conf, "--data-dir", data, "--log-dir", isDir, "--report-dir", isDir, "--bind-address", "0.0.0.0"]), ct);
+            "--config", conf, "--data-dir", data, "--log-dir", log, "--report-dir", log, "--bind-address", "0.0.0.0"]), ct);
         await WaitFor(async () =>
         {
             var r = await Run(PrivilegedCommands.InNs(ns, "curl", "-s", "-o", "/dev/null", "-m", "2", "-w", "%{http_code}", $"http://{_o.SinkholeIp}/"), ct);
@@ -274,6 +309,14 @@ public sealed partial class NetnsEgressRouter(
         await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.VethHost), ct);
         await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.WgIface), ct);
         await Run(PrivilegedCommands.Sudo("ip", "netns", "del", ns), ct);
+        // Keep the captured flows for collection (copied as the control-plane user, so a planted symlink gets no root help).
+        try
+        {
+            var flows = MitmFlowsPath(taskId);
+            if (File.Exists(flows) && Directory.Exists(RunNetDir(ns))) File.Copy(flows, Path.Combine(RunNetDir(ns), "flows.jsonl"), true);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { warn?.Invoke($"Could not keep flows for {taskId:N}: {e.Message}"); }
+        await Run(PrivilegedCommands.Sudo("rm", "-rf", "--", MitmDir(ns)), ct);
         await Run(PrivilegedCommands.Sudo("rm", "-rf", "--", InetSimDir(ns)), ct); // ns is mxn<12 hex>: derived from a Guid, never free text
         await _gate.WaitAsync(CancellationToken.None);
         try { _active.Remove(taskId); }
@@ -382,12 +425,12 @@ public sealed partial class NetnsEgressRouter(
                 : $"'{string.Join(' ', cmd.Args.Take(8))}' failed ({r.ExitCode}): {r.Stderr.Trim()}");
     }
 
-    private async Task<string> IdAsync(string flag, CancellationToken ct)
+    private async Task<string> IdAsync(string flag, CancellationToken ct, string? user = null)
     {
-        var r = await Run(("id", [flag]), ct);
+        var r = await Run(("id", user is null ? [flag] : [flag, user]), ct);
         var v = r.Stdout.Trim();
         if (r.ExitCode != 0 || !uint.TryParse(v, NumberStyles.None, CultureInfo.InvariantCulture, out _))
-            throw new EgressUnavailableException("Cannot determine the uid/gid to run mitmproxy as.");
+            throw new EgressUnavailableException(user is null ? "Cannot determine the control-plane uid/gid." : $"User '{user}' does not exist; run ./build.sh real-setup.");
         return v;
     }
 

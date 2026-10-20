@@ -47,6 +47,8 @@ public class RealEgressTests
             DeployNetDir = RepoDeployNet(),
             ControlPlaneIps = [hostIp],
         });
+        // seed the CA the guest image would trust (mitmdump writes it at start-up, then idles; stop it)
+        await Proc.RunAsync("timeout", ["8", "/opt/mitmproxy/mitmdump", "--set", $"confdir={Path.Combine(tmp, "ca")}", "-n", "-q"], CancellationToken.None, null, TimeSpan.FromSeconds(20));
         var router = new NetnsEgressRouter(opts, Proc);
         var id = Guid.NewGuid();
         var n = RunNetNames.For(id);
@@ -69,17 +71,26 @@ public class RealEgressTests
             Assert.Contains(n.Bridge, (await Sudo("ip", "-o", "link", "show", n.Bridge)).Stdout);
             Assert.Contains(n.Tap, (await Sudo("ip", "-o", "link", "show", n.Tap)).Stdout);
 
-            // mitmdump (hostile-traffic parser + our addon) must not be root: its process in the namespace runs as our uid
-            var myUid = (await Proc.RunAsync("id", ["-u"], CancellationToken.None)).Stdout.Trim();
+            // mitmdump (hostile-traffic parser + our addon) runs as the dedicated powerless user, fully de-privileged
+            var mitmUid = (await Proc.RunAsync("id", ["-u", "maldex-mitm"], CancellationToken.None)).Stdout.Trim();
+            var mitmGid = (await Proc.RunAsync("id", ["-g", "maldex-mitm"], CancellationToken.None)).Stdout.Trim();
             var pids = (await Sudo("ip", "netns", "pids", n.Namespace)).Stdout.Split([' ', '\n'], StringSplitOptions.RemoveEmptyEntries);
-            string? mitmUid = null;
+            string? mitmPid = null;
             foreach (var pid in pids)
-            {
-                var ps = (await Proc.RunAsync("ps", ["-o", "uid=,comm=", "-p", pid], CancellationToken.None)).Stdout.Trim();
-                if (ps.EndsWith("mitmdump", StringComparison.Ordinal)) mitmUid = ps.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0];
-            }
-            Assert.Equal(myUid, mitmUid);
-            Assert.NotEqual("0", mitmUid);
+                if ((await Proc.RunAsync("ps", ["-o", "comm=", "-p", pid], CancellationToken.None)).Stdout.Trim() == "mitmdump") mitmPid = pid;
+            Assert.NotNull(mitmPid);
+            var status = File.ReadAllLines($"/proc/{mitmPid}/status").ToDictionary(l => l.Split(':')[0], l => l.Split(':', 2)[1].Trim());
+            Assert.Equal([mitmUid, mitmUid, mitmUid, mitmUid], status["Uid"].Split('\t'));
+            Assert.Equal([mitmGid, mitmGid, mitmGid, mitmGid], status["Gid"].Split('\t'));
+            Assert.Equal("", status["Groups"]);
+            Assert.Equal("1", status["NoNewPrivs"]);
+            Assert.Equal("0000000000000000", status["CapBnd"]);
+            Assert.Equal("0000000000000000", status["CapEff"]);
+            Assert.Equal("0000000000000000", status["CapInh"]);
+            // the mitm user can read/write only its own conf/out (private CA copy 0600), nothing of ours
+            Assert.Equal("maldex-mitm", (await Sudo("stat", "-c", "%U", $"/run/maldex/mitm/{n.Namespace}/conf")).Stdout.Trim());
+            Assert.Equal("root", (await Sudo("stat", "-c", "%U", $"/run/maldex/mitm/{n.Namespace}")).Stdout.Trim());
+            Assert.Equal("root", (await Sudo("stat", "-c", "%U", $"/run/maldex/mitm/{n.Namespace}/addon/maldex_jsonl.py")).Stdout.Trim());
 
             // guest stand-in: scratch namespace + veth into the run bridge (in place of the tap)
             Assert.Equal(0, (await Sudo("ip", "netns", "add", scratchNs)).ExitCode);
@@ -123,6 +134,13 @@ public class RealEgressTests
                 Assert.Equal(0, (await Sudo("test", "-d", dataDir + "/http/postdata")).ExitCode);
                 Assert.Equal(0, (await Sudo("test", "-f", dataDir + "/http/mime.types")).ExitCode);
                 Assert.Equal("inetsim", (await Sudo("stat", "-c", "%U", dataDir + "/http/postdata")).Stdout.Trim());
+                // nothing under the run's inetsim tree is owned by (or writable for) inetsim except the leaves and the log dir
+                var iRoot = Path.GetDirectoryName(dataDir)!;
+                var owned = (await Sudo("find", iRoot, "-user", "inetsim", "-type", "d")).Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries).OrderBy(x => x).ToArray();
+                Assert.Equal(new[] { iRoot + "/log", dataDir + "/ftp/upload", dataDir + "/http/postdata", dataDir + "/smtp" }.OrderBy(x => x), owned);
+                Assert.Equal("", (await Sudo("find", iRoot, "-type", "l")).Stdout.Trim());
+                Assert.Equal("root", (await Sudo("stat", "-c", "%U", iRoot)).Stdout.Trim());
+                Assert.Equal("root", (await Sudo("stat", "-c", "%U", dataDir)).Stdout.Trim());
             }
             Assert.Contains(lease, await router.ListAsync(CancellationToken.None));
         }
@@ -137,6 +155,7 @@ public class RealEgressTests
         }
 
         Assert.DoesNotContain(h, (await Proc.RunAsync("ip", ["-o", "link"], CancellationToken.None)).Stdout);
+        Assert.False(Directory.Exists("/run/maldex/mitm/mxn" + h), "per-run mitm dir must be removed");
         Assert.False(Directory.Exists("/run/maldex/inetsim/mxn" + h), "per-run inetsim dir must be removed");
         Assert.DoesNotContain(h, (await Proc.RunAsync("ip", ["netns", "list"], CancellationToken.None)).Stdout);
     }

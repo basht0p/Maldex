@@ -19,6 +19,7 @@ public sealed class NetnsEgressRouterTests : IDisposable
         public string Handshakes = "pubkey\t1700000000\n";
         public string Pids = "";
         public bool GuardPresent = true;
+        public string TemplateOffender = "";
 
         public Task<ProcessResult> RunAsync(string file, IReadOnlyList<string> args, CancellationToken ct, string? stdin = null, TimeSpan? timeout = null)
         {
@@ -32,6 +33,8 @@ public sealed class NetnsEgressRouterTests : IDisposable
             if (line.StartsWith("sudo -n ip netns pids ")) return Ok(out_: Pids);
             if (line.Contains(" ss -ltn")) return Ok(out_: string.Join('\n', Enumerable.Range(0, 20).Select(i => $"LISTEN 0 128 10.213.{i / 64}.{i % 64 * 4 + 1}:8080 0.0.0.0:*")));
             if (line == "id -u" || line == "id -g") return Ok(out_: "1000\n");
+            if (line == "id -u maldex-mitm") return Ok(out_: "995\n");
+            if (line.Contains(" find ") && line.Contains("-type l")) return Ok(out_: TemplateOffender);
             if (line.Contains(" curl ")) return Ok(out_: "200");
             if (line.Contains("latest-handshakes")) return Ok(out_: Handshakes);
             return Ok();
@@ -45,7 +48,12 @@ public sealed class NetnsEgressRouterTests : IDisposable
     private readonly string _tmp = Path.Combine(Path.GetTempPath(), "mx-nsr-" + Guid.NewGuid().ToString("N"));
     private readonly ScriptedRunner _r = new();
 
-    public NetnsEgressRouterTests() => Directory.CreateDirectory(_tmp);
+    public NetnsEgressRouterTests()
+    {
+        Directory.CreateDirectory(Path.Combine(_tmp, "ca"));
+        foreach (var f in new[] { "mitmproxy-ca.pem", "mitmproxy-ca-cert.pem", "mitmproxy-dhparam.pem" })
+            File.WriteAllText(Path.Combine(_tmp, "ca", f), "x");
+    }
     public void Dispose() { try { Directory.Delete(_tmp, true); } catch (IOException) { } }
 
     private NetnsEgressRouter Router(Action<string>? warn = null, IProcessRunner? runner = null) => new(Options.Create(new NetOptions
@@ -265,16 +273,58 @@ public sealed class NetnsEgressRouterTests : IDisposable
         var id = Guid.NewGuid();
         await Router().CreateAsync(id, NetworkMode.None, null, CancellationToken.None);
         var m = Assert.Single(_r.Where(c => c.Contains("mitmdump --mode transparent")));
-        Assert.Contains($"ip netns exec {RunNetNames.For(id).Namespace} setpriv --reuid=1000 --regid=1000 --init-groups -- ", m);
+        Assert.Contains($"ip netns exec {RunNetNames.For(id).Namespace} setpriv --reuid=maldex-mitm --regid=maldex-mitm --clear-groups --no-new-privs --inh-caps=-all --bounding-set=-all -- ", m);
         Assert.True(m.IndexOf("setpriv", StringComparison.Ordinal) < m.IndexOf("mitmdump --mode", StringComparison.Ordinal));
     }
 
     [Fact]
     public async Task Mitm_UidLookupFailure_FailsClosed()
     {
-        _r.Fail = c => c == "id -u";
-        await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None));
+        _r.Fail = c => c == "id -u maldex-mitm";
+        var ex = await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None));
+        Assert.Contains("maldex-mitm", ex.Message);
         Assert.DoesNotContain(_r.Calls, c => c.Contains("mitmdump --mode"));
+        Assert.Empty(_r.Namespaces);
+    }
+
+    [Fact]
+    public async Task Mitm_InputsStagedByRoot_InRootOwnedDirs_WithPrivateCaCopy()
+    {
+        var id = Guid.NewGuid();
+        var n = RunNetNames.For(id);
+        var d = $"/run/maldex/mitm/{n.Namespace}";
+        await Router().CreateAsync(id, NetworkMode.None, null, CancellationToken.None);
+        Assert.Contains(_r.Calls, c => c.StartsWith("sudo -n install -d -m 0755 -o root -g root /run/maldex /run/maldex/mitm " + d));
+        Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0700 -o maldex-mitm -g maldex-mitm {d}/conf");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n install -m 0600 -o maldex-mitm -g maldex-mitm {Path.Combine(_tmp, "ca", "mitmproxy-ca.pem")} {d}/conf/mitmproxy-ca.pem");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0755 -o maldex-mitm -g maldex-mitm {d}/out");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0755 -o 1000 -g 1000 {d}/ctl");
+        var m = Assert.Single(_r.Where(c => c.Contains("mitmdump --mode transparent")));
+        Assert.Contains($"--set confdir={d}/conf", m);
+        Assert.Contains($"-s {d}/addon/maldex_jsonl.py", m);
+        Assert.Contains($"maldex_out={d}/out/flows.jsonl", m);
+        Assert.Contains($"maldex_enable_file={d}/ctl/capture.on", m);
+        // staged before it is launched
+        Assert.True(_r.IndexOf(c => c.Contains(d + "/conf/mitmproxy-ca.pem")) < _r.IndexOf(c => c.Contains("mitmdump --mode")));
+        Assert.Equal(d + "/out/flows.jsonl", NetnsEgressRouter.MitmFlowsPath(id));
+    }
+
+    [Fact]
+    public async Task Mitm_MissingCa_FailsClosed()
+    {
+        File.Delete(Path.Combine(_tmp, "ca", "mitmproxy-ca.pem"));
+        var ex = await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None));
+        Assert.Contains("CA", ex.Message);
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("mitmdump --mode"));
+    }
+
+    [Fact]
+    public async Task Simulated_DirtyInetSimTemplate_FailsClosed_BeforeAnyCopy()
+    {
+        _r.TemplateOffender = "/var/lib/inetsim/http/evil-link\n";
+        await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(Guid.NewGuid(), NetworkMode.Simulated, null, CancellationToken.None));
+        Assert.DoesNotContain(_r.Calls, c => c.Contains(" cp "));
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("inetsim --config"));
         Assert.Empty(_r.Namespaces);
     }
 
@@ -287,15 +337,23 @@ public sealed class NetnsEgressRouterTests : IDisposable
         var data = $"/run/maldex/inetsim/{n.Namespace}/data";
         var lease = await router.CreateAsync(id, NetworkMode.Simulated, null, CancellationToken.None);
         Assert.Equal(data, NetnsEgressRouter.InetSimDataPath(id));
-        Assert.Contains(_r.Calls, c => c == "sudo -n cp -a /var/lib/inetsim/. " + data + "/");
+        var iDir = $"/run/maldex/inetsim/{n.Namespace}";
+        var check = _r.IndexOf(c => c.StartsWith("sudo -n find /var/lib/inetsim ( -type l -o ! -user root -o -perm /022 )"));
+        var root = _r.IndexOf(c => c == $"sudo -n install -d -m 0755 -o root -g root /run/maldex /run/maldex/inetsim {iDir} {data}");
+        var cp = _r.IndexOf(c => c == "sudo -n cp -rP --no-preserve=ownership /var/lib/inetsim/. " + data + "/");
+        Assert.True(check >= 0 && root > check && cp > root, "template check, then root-owned dirs, then copy");
         foreach (var w in new[] { "http/postdata", "ftp/upload", "smtp" })
         {
             var rm = _r.IndexOf(c => c == $"sudo -n rm -rf -- {data}/{w}");
-            var mk = _r.IndexOf(c => c.StartsWith("sudo -n install -d -m 0770 -o inetsim -g inetsim ") && c.EndsWith($"{data}/{w}"));
-            Assert.True(rm >= 0 && mk > rm, w);
+            var mk = _r.IndexOf(c => c == $"sudo -n install -d -m 0750 -o inetsim -g inetsim {data}/{w}");
+            Assert.True(rm > cp && mk > rm, w);
         }
+        Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0750 -o inetsim -g inetsim {iDir}/log");
+        // the only inetsim-owned directories are the three leaves and the log dir
+        var owned = _r.Where(c => c.Contains("-o inetsim") && c.Contains("install -d")).Select(c => c.Split(' ')[^1]).OrderBy(x => x).ToList();
+        Assert.Equal(new[] { $"{iDir}/log", $"{data}/ftp/upload", $"{data}/http/postdata", $"{data}/smtp" }.OrderBy(x => x), owned);
         var inet = Assert.Single(_r.Where(c => c.Contains("--config")));
-        Assert.Contains($"--data-dir {data} ", inet);
+        Assert.Contains($"--data-dir {data} --log-dir {iDir}/log --report-dir {iDir}/log", inet);
         Assert.DoesNotContain("--data-dir /var/lib/inetsim", inet);
         await router.ReleaseAsync(lease, CancellationToken.None);
         Assert.Contains(_r.Calls, c => c == $"sudo -n rm -rf -- /run/maldex/inetsim/{n.Namespace}");
@@ -330,7 +388,8 @@ public sealed class NetnsEgressRouterTests : IDisposable
         var m = Assert.Single(_r.Where(c => c.Contains("mitmdump --mode transparent")));
         Assert.Contains("--listen-host 10.213.0.1", m);
         Assert.Contains("--set http3=false", m);
-        Assert.Contains($"--set confdir={Path.Combine(_tmp, "ca")}", m);
+        Assert.Contains("--set confdir=/run/maldex/mitm/mxn", m);
+        Assert.Contains("/conf ", m);
         Assert.DoesNotContain("udp", m, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("--mode wireguard", m);
     }
@@ -341,7 +400,7 @@ public sealed class NetnsEgressRouterTests : IDisposable
         WriteWg("nl", GoodWg);
         await Router().CreateAsync(Guid.NewGuid(), NetworkMode.Simulated, null, CancellationToken.None);
         await Router().CreateAsync(Guid.NewGuid(), NetworkMode.LiveVpn, "nl", CancellationToken.None);
-        Assert.All(_r.Calls.Where(c => c is not ("id -u" or "id -g")), c => Assert.StartsWith("sudo -n ", c));
+        Assert.All(_r.Calls.Where(c => c is not ("id -u" or "id -g" or "id -u maldex-mitm")), c => Assert.StartsWith("sudo -n ", c));
     }
 
     // ---- host-side invariants ----
@@ -403,7 +462,7 @@ public sealed class NetnsEgressRouterTests : IDisposable
         Assert.Contains(_r.Calls, c => c == $"sudo -n ip netns del {n.Namespace}");
 
         _r.Pids = "";
-        _r.Fail = c => c.Contains("ip link del") || c.Contains("ip netns del") || c.Contains("netns pids");
+        _r.Fail = c => c.Contains("ip link del") || c.Contains("ip netns del") || c.Contains("netns pids") || c.Contains("rm -rf");
         await router.ReleaseAsync(lease, CancellationToken.None); // second release tolerates "does not exist"
         await router.ReleaseAsync(new NetworkLease(Guid.NewGuid(), "mxt000000000000"), CancellationToken.None);
     }
@@ -427,7 +486,7 @@ public sealed class NetnsEgressRouterTests : IDisposable
     [Fact]
     public async Task Create_FailsWhenAllSlotsTaken()
     {
-        var router = new NetnsEgressRouter(Options.Create(new NetOptions { RunDir = Path.Combine(_tmp, "run"), MaxRuns = 1 }), _r, null,
+        var router = new NetnsEgressRouter(Options.Create(new NetOptions { RunDir = Path.Combine(_tmp, "run"), MaxRuns = 1, MitmConfDir = Path.Combine(_tmp, "ca"), DeployNetDir = Path.Combine(_tmp, "deploy") }), _r, null,
             new NetnsRouterTuning { PollInterval = TimeSpan.FromMilliseconds(5), MitmWait = TimeSpan.FromMilliseconds(100), BrNetfilterPath = Path.Combine(_tmp, "x") });
         await router.CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None);
         await Assert.ThrowsAsync<EgressUnavailableException>(() => router.CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None));
