@@ -48,6 +48,6 @@ public sealed class SysmonEventSource : IEventSource
         }
 
         var at = record.TimeCreated is { } t ? new DateTimeOffset(t.ToUniversalTime(), TimeSpan.Zero) : DateTimeOffset.UtcNow;
-        return SysmonEventMapper.Map(record.Id, at, fields);
+        return SysmonEventMapper.Map(record.Id, at, fields, Environment.ProcessId);
     }
 }

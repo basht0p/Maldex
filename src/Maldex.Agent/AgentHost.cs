@@ -44,7 +44,17 @@ public sealed class AgentHost(Stream channel, IEventSource source, CommandDispat
         try
         {
             await foreach (var m in source.Events(cts.Token).ConfigureAwait(false))
-                await SendAsync(m, cts.Token).ConfigureAwait(false);
+            {
+                try
+                {
+                    await SendAsync(m, cts.Token).ConfigureAwait(false);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    // Oversize frame: nothing was written, so drop just this message and keep running.
+                    Log($"Dropped {m.GetType().Name}: {ex.Message}");
+                }
+            }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)

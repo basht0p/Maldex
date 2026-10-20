@@ -6,14 +6,16 @@ using Maldex.Core.Agent;
 namespace Maldex.Agent.Collectors;
 
 /// <summary>
-/// Fallback process telemetry for guests without Sysmon: diffs the process table every 500 ms.
-/// Parent PID and exit code are not available this way (reported as 0). Windows only.
+/// Best-effort fallback process telemetry for guests without Sysmon: diffs the process table every 500 ms.
+/// Short-lived processes between polls are missed; command line, parent PID and exit code are not available
+/// this way (empty / 0). Windows only.
 /// </summary>
 [SupportedOSPlatform("windows")]
-public sealed class EtwProcessSource(TimeProvider time) : IEventSource
+public sealed class ProcessPollingSource(TimeProvider time) : IEventSource
 {
     public async IAsyncEnumerable<AgentMessage> Events([EnumeratorCancellation] CancellationToken ct)
     {
+        var self = Environment.ProcessId;
         var known = new Dictionary<int, string>();
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500), time);
         var first = true;
@@ -25,10 +27,11 @@ public sealed class EtwProcessSource(TimeProvider time) : IEventSource
             {
                 using (p)
                 {
+                    if (p.Id == self) continue;
                     var path = SafePath(p);
                     current[p.Id] = path;
                     if (!first && !known.ContainsKey(p.Id))
-                        started.Add(new ProcessStartedMessage(time.GetUtcNow(), p.Id, 0, path, path));
+                        started.Add(new ProcessStartedMessage(time.GetUtcNow(), p.Id, 0, path, ""));
                 }
             }
 

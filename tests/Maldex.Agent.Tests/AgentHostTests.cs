@@ -76,7 +76,7 @@ public class AgentHostTests
     public async Task Host_Shutdown_ReportsResult_ThenStops()
     {
         var pair = new ChannelPair();
-        var stop = new CancellationTokenSource();
+        using var stop = new CancellationTokenSource();
         using var cts = new CancellationTokenSource(Limit);
         var run = MakeHost(pair, new NullEventSource(), stopCts: stop).RunAsync(cts.Token);
         Assert.IsType<ReadyMessage>(await pair.NextAsync());

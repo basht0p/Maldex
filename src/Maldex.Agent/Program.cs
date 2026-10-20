@@ -1,6 +1,4 @@
 using Maldex.Agent.Windows;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 
 if (!OperatingSystem.IsWindows())
 {
@@ -8,8 +6,6 @@ if (!OperatingSystem.IsWindows())
     return 1;
 }
 
-var builder = Host.CreateApplicationBuilder(args);
-builder.Services.AddWindowsService(o => o.ServiceName = "MaldexAgent");
-builder.Services.AddHostedService<AgentService>();
-await builder.Build().RunAsync();
-return 0;
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+return await AgentRunner.RunAsync(cts.Token);
