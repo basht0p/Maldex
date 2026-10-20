@@ -16,6 +16,9 @@ public sealed class FakeGuest
     /// <summary>When set, the chunk with this index is answered with a failure (the agent "refusing" the delivery).</summary>
     public int? RejectSampleChunkIndex { get; set; }
 
+    /// <summary>When set, the chunk with this index is never answered (a guest that hangs mid-delivery).</summary>
+    public int? SilentSampleChunkIndex { get; set; }
+
     public void AddFile(string path, byte[] data) => _files[path] = new FakeGuestFile(data);
 
     public void AddFile(string path, FakeGuestFile file) => _files[path] = file;

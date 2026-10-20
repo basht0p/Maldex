@@ -202,7 +202,7 @@ public sealed class RunCoordinator(
                 // SEAM (Task 13): the isolation self-test runs here, after the agent is ready and before anything is delivered.
 
                 if (command is OpenSampleCommand open)
-                    await DeliverSampleAsync(channel, inbox, task, open, ct).ConfigureAwait(false);
+                    await DeliverSampleAsync(db, channel, inbox, task, open, ct).ConfigureAwait(false);
 
                 var now = time.GetUtcNow();
                 await TransitionAsync(db, task, RunStatus.Running, "agent ready", t =>
@@ -222,12 +222,14 @@ public sealed class RunCoordinator(
                 // Telemetry keeps flowing while files are pulled out, as long as the guest is still there.
                 if (!reader.IsCompleted) dropped = await CollectDroppedAsync(channel, inbox, task, ct).ConfigureAwait(false);
             }
-            catch
+            catch (Exception ex)
             {
                 // Never leave the reader or flusher running while the caller records the failure.
                 await readerCts.CancelAsync().ConfigureAwait(false);
                 await reader.ConfigureAwait(false);
                 try { await flusher.ConfigureAwait(false); } catch (Exception) { /* the original error wins */ }
+                // A stop during delivery ends like a stop during the ready wait: Cancelled from Preparing.
+                if (ex is DeliveryStoppedException) return AttemptOutcome.Stopped;
                 throw;
             }
 
@@ -245,7 +247,7 @@ public sealed class RunCoordinator(
     }
 
     /// <summary>Streams the stored sample into the guest and has it opened. Any failure fails the run in Preparing (no retry).</summary>
-    private async Task DeliverSampleAsync(IAgentChannel channel, TransferInbox inbox, AnalysisTask task, OpenSampleCommand open, CancellationToken ct)
+    private async Task DeliverSampleAsync(MaldexDbContext db, IAgentChannel channel, TransferInbox inbox, AnalysisTask task, OpenSampleCommand open, CancellationToken ct)
     {
         Stream blob;
         try
@@ -261,8 +263,9 @@ public sealed class RunCoordinator(
         await using (blob.ConfigureAwait(false))
         {
             if (!blob.CanSeek || task.SampleSha256 is null) throw new SampleDeliveryException("the stored sample cannot be sized");
-            await new SampleDelivery(time)
-                .DeliverAsync(channel, inbox, open.BlobKey, open.FileName, blob, blob.Length, task.SampleSha256, ct)
+            await new SampleDelivery(time, pollInterval: _options.ControlPollInterval)
+                .DeliverAsync(channel, inbox, open.BlobKey, open.FileName, blob, blob.Length, task.SampleSha256, ct, async token =>
+                    await db.Tasks.AsNoTracking().Where(t => t.Id == task.Id).Select(t => t.StopRequestedAt).SingleAsync(token).ConfigureAwait(false) is not null)
                 .ConfigureAwait(false);
         }
     }

@@ -28,7 +28,7 @@ public sealed class DroppedFileCollector(IArtifactStore artifacts, TimeProvider 
         IAgentChannel ch, TransferInbox inbox, IEnumerable<string> candidatePaths, string? excludeSha256, CancellationToken ct)
     {
         var paths = candidatePaths
-            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Where(p => !string.IsNullOrWhiteSpace(p) && p.Length <= TransferInbox.MaxPathChars)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Take(MaxPaths)
             .ToList();
@@ -50,8 +50,14 @@ public sealed class DroppedFileCollector(IArtifactStore artifacts, TimeProvider 
                     break;
                 }
 
-                var outcome = await CollectOneAsync(ch, lease.Reader, path, excludeSha256, overallLinked.Token).ConfigureAwait(false);
+                var outcome = await CollectOneAsync(ch, lease.Reader, path, excludeSha256, received, overallLinked.Token).ConfigureAwait(false);
                 received += outcome.BytesReceived;
+                if (received > MaxTotalBytes)
+                {
+                    // This file pushed the total past the budget: do not keep it, and ask for nothing more.
+                    logger.LogWarning("Dropped-file collection stopped: the {Limit}-byte budget was exceeded.", MaxTotalBytes);
+                    break;
+                }
                 if (outcome.File is not null) kept.Add(outcome.File);
                 if (outcome.Stop) break;
             }
@@ -66,7 +72,7 @@ public sealed class DroppedFileCollector(IArtifactStore artifacts, TimeProvider 
 
     private sealed record Outcome(DroppedFile? File, long BytesReceived, bool Stop = false);
 
-    private async Task<Outcome> CollectOneAsync(IAgentChannel ch, ChannelReader<AgentMessage> replies, string path, string? excludeSha256, CancellationToken ct)
+    private async Task<Outcome> CollectOneAsync(IAgentChannel ch, ChannelReader<AgentMessage> replies, string path, string? excludeSha256, long receivedSoFar, CancellationToken ct)
     {
         var id = Guid.NewGuid().ToString("N");
         var shown = GuestText.Clean(path, 256);
@@ -120,6 +126,7 @@ public sealed class DroppedFileCollector(IArtifactStore artifacts, TimeProvider 
             logger.LogWarning("Dropped file {Path} rejected: {Problem}", shown, problem);
             return new Outcome(null, transfer.BytesReceived);
         }
+        if (receivedSoFar + transfer.BytesReceived > MaxTotalBytes) return new Outcome(null, transfer.BytesReceived); // over budget: never stored
         if (content!.Length == 0 || string.Equals(transfer.Sha256, excludeSha256, StringComparison.OrdinalIgnoreCase))
             return new Outcome(null, transfer.BytesReceived);
 

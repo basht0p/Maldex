@@ -126,6 +126,41 @@ public class SampleDeliveryProtocolTests
         Assert.Contains("disconnected", ex.Message);
     }
 
+    [Fact]
+    public async Task Deliver_ChannelEndedByViolations_ReportsViolations()
+    {
+        var data = Data(100);
+        var inbox = new TransferInbox();
+        var channel = new ScriptedChannel(inbox, c => { inbox.Complete(); return []; }) { Violations = 10 };
+
+        var ex = await Assert.ThrowsAsync<SampleDeliveryException>(() => new SampleDelivery(new FakeTimeProvider())
+            .DeliverAsync(channel, inbox, "k", "a.exe", new MemoryStream(data), data.Length, ScriptedChannel.Sha(data), Ct));
+        Assert.Equal("sample delivery failed: agent protocol violations", ex.Message);
+    }
+
+    [Fact]
+    public async Task Deliver_StopRequestedWhileWaitingForAnAck_EndsPromptly()
+    {
+        var time = new FakeTimeProvider();
+        var data = Data(AgentLimits.ChunkBytes * 3);
+        var inbox = new TransferInbox();
+        var channel = new ScriptedChannel(inbox, c => c is PutFileChunkCommand { Index: 1 } ? [] : Ack(c)); // chunk 2 is never acked
+        var stop = false;
+        var delivery = Task.Run(() => new SampleDelivery(time, pollInterval: TimeSpan.FromSeconds(1)).DeliverAsync(
+            channel, inbox, "k", "a.exe", new MemoryStream(data), data.Length, ScriptedChannel.Sha(data), Ct, _ => Task.FromResult(stop)), Ct);
+
+        while (channel.Sent.Count < 2) await Task.Delay(1, Ct);
+        stop = true;
+        for (var i = 0; i < 5 && !delivery.IsCompleted; i++)
+        {
+            time.Advance(TimeSpan.FromSeconds(1)); // well short of the 30 s chunk timeout
+            await Task.Delay(20, Ct);
+        }
+
+        await Assert.ThrowsAsync<DeliveryStoppedException>(() => delivery);
+        Assert.Equal(2, channel.Sent.Count);
+    }
+
     [Theory]
     [InlineData(0L)]
     [InlineData(32L * 1024 * 1024 + 1)]
@@ -198,6 +233,30 @@ public class SampleDeliveryTests(SqlServerFixture sql)
         Assert.Null(task.StartedAt);
         Assert.Single(h.Channels.Channels);
         Assert.DoesNotContain(h.Channels.Channels[0].SentCommands, c => c is OpenSampleCommand);
+    }
+
+    [Fact]
+    public async Task Deliver_StopWhileAgentIsSlowToAck_CancelsFromPreparing()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        h.Get<FakeGuest>().SilentSampleChunkIndex = 1;
+        var id = await h.SeedPreparingTaskAsync(sampleContent: Sample(1_258_291));
+
+        await h.RunAsync(id, async () =>
+        {
+            while (!h.Channels.Channels.Any(c => c.SentCommands.Count >= 2)) await Task.Delay(2, Ct);
+            await using var api = h.NewContext();
+            var t = await api.Tasks.SingleAsync(x => x.Id == id, Ct);
+            t.StopRequestedAt = h.Time.GetUtcNow();
+            await api.SaveChangesAsync(Ct);
+        });
+
+        await using var db = h.NewContext();
+        var task = await db.Tasks.SingleAsync(t => t.Id == id, Ct);
+        Assert.Equal(RunStatus.Cancelled, task.Status);
+        var history = (await db.TaskStatusHistory.Where(x => x.TaskId == id).ToListAsync(Ct)).OrderBy(x => x.Id).Select(x => x.To).ToList();
+        Assert.Equal([RunStatus.Preparing, RunStatus.Cancelled], history);
+        Assert.Null(task.StartedAt);
     }
 
     [Fact]

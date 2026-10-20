@@ -157,11 +157,35 @@ public class DroppedFileCollectorProtocolTests
     [Fact]
     public async Task Collect_StopsWhenTheTotalBudgetIsSpent()
     {
-        // 13 files of 5 MiB each: the 64 MiB budget is spent after the 13th, so a 14th is never requested.
+        // 20 files of 5 MiB: 12 fit in 64 MiB; the 13th would make 65 MiB, so it is neither stored nor followed by a 14th request.
         var files = Enumerable.Range(0, 20).ToDictionary(i => $"f{i}", i => Data(5 * 1024 * 1024, seed: i));
-        var (kept, channel, _) = await RunAsync(Guest(files), files.Keys);
+        var (kept, channel, store) = await RunAsync(Guest(files), files.Keys);
         Assert.Equal(13, channel.Sent.Count);
-        Assert.Equal(13, kept.Count);
+        Assert.Equal(12, kept.Count);
+        Assert.Equal(12, store.Blobs.Count);
+        Assert.True(kept.Sum(k => k.Blob.Size) <= DroppedFileCollector.MaxTotalBytes);
+    }
+
+    [Fact]
+    public async Task Collect_OverlongCandidatePaths_AreNeverRequested()
+    {
+        var huge = new string('a', 40_000);
+        var edge = new string('b', TransferInbox.MaxPathChars);
+        var (_, channel, _) = await RunAsync(Guest([]), [huge, "  ", "", edge, "ok"]);
+        Assert.Equal([edge, "ok"], channel.Sent.Cast<CollectFileCommand>().Select(c => c.Path));
+        Assert.All(channel.Sent, c => Assert.True(
+            System.Text.Json.JsonSerializer.SerializeToUtf8Bytes<AgentCommand>(c, AgentJson.Options).Length <= AgentFrameReader.MaxFrameBytes));
+    }
+
+    [Fact]
+    public async Task Inbox_DoesNotTrackOverlongOrBlankPaths()
+    {
+        var inbox = new TransferInbox();
+        var t = DateTimeOffset.UnixEpoch;
+        await inbox.OfferAsync(new FileEventMessage(t, 1, "create", new string('a', 1_000_000)), Ct);
+        await inbox.OfferAsync(new FileEventMessage(t, 1, "create", "   "), Ct);
+        await inbox.OfferAsync(new FileEventMessage(t, 1, "create", @"C:\ok.exe"), Ct);
+        Assert.Equal([@"C:\ok.exe"], inbox.CreatedPaths);
     }
 
     [Fact]

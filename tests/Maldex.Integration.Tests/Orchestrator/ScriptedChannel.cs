@@ -19,7 +19,7 @@ internal sealed class ScriptedChannel(TransferInbox inbox, Func<AgentCommand, IE
         get { lock (_gate) return _sent.ToArray(); }
     }
 
-    public int Violations => 0;
+    public int Violations { get; set; }
 
     public IAsyncEnumerable<AgentMessage> ReadAsync(CancellationToken ct) => throw new NotSupportedException();
 

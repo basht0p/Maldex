@@ -14,6 +14,9 @@ public sealed class TransferInbox
     private const int Capacity = 8;
     private const int MaxTrackedPaths = 1000;
 
+    /// <summary>Longer paths are never asked for: the <c>collect_file</c> command must fit one frame (a compromised agent can report a path of any length).</summary>
+    public const int MaxPathChars = 32_767;
+
     private readonly object _gate = new();
     private readonly HashSet<string> _seen = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<string> _created = [];
@@ -81,7 +84,7 @@ public sealed class TransferInbox
     {
         lock (_gate)
         {
-            if (_created.Count < MaxTrackedPaths && !string.IsNullOrWhiteSpace(path) && _seen.Add(path)) _created.Add(path);
+            if (_created.Count < MaxTrackedPaths && !string.IsNullOrWhiteSpace(path) && path.Length <= MaxPathChars && _seen.Add(path)) _created.Add(path);
         }
     }
 

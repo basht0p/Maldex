@@ -134,6 +134,7 @@ public sealed class ReplayAgentChannel : IAgentChannel
         switch (command)
         {
             case PutFileChunkCommand c:
+                if (_guest!.SilentSampleChunkIndex == c.Index) break;
                 Enqueue(_guest!.RejectSampleChunkIndex == c.Index
                     ? new CommandResultMessage(c.CommandId, false, "chunk rejected by the fake guest")
                     : new CommandResultMessage(c.CommandId, true));
