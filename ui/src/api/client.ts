@@ -70,18 +70,19 @@ export const getMe = () => get<MeDto>('/api/me')
 
 export const listOrgs = () => get<OrgDto[]>('/api/orgs')
 export const createOrg = (req: OrgRequest) => request<OrgDto>('POST', '/api/orgs', undefined, req)
-export const updateOrg = (id: string, req: OrgRequest) => request<OrgDto>('PUT', `/api/orgs/${id}`, undefined, req)
+export const updateOrg = (id: string, req: OrgRequest) => request<OrgDto>('PUT', `/api/orgs/${encodeURIComponent(id)}`, undefined, req)
 
 /** `form` is multipart: orgId, one of file/url, and optionally networkMode, durationSec, interactive, exitCountry, image. */
 export const submitTask = (form: FormData) => request<TaskDto>('POST', '/api/tasks', form)
 export const listTasks = (q: TaskListQuery = {}) =>
   get<TaskListDto>(`/api/tasks${query({ orgId: q.orgId, status: q.status, skip: q.skip, take: q.take })}`)
-export const getTask = (id: string) => get<TaskDto>(`/api/tasks/${id}`)
-export const cancelTask = (id: string) => post<void>(`/api/tasks/${id}/cancel`)
-export const extendTask = (id: string, seconds: number) => post<TaskDto>(`/api/tasks/${id}/extend`, { seconds })
-export const stopTask = (id: string) => post<void>(`/api/tasks/${id}/stop`)
+export const getTask = (id: string) => get<TaskDto>(`/api/tasks/${encodeURIComponent(id)}`)
+export const cancelTask = (id: string) => post<void>(`/api/tasks/${encodeURIComponent(id)}/cancel`)
+export const extendTask = (id: string, seconds: number) => post<TaskDto>(`/api/tasks/${encodeURIComponent(id)}/extend`, { seconds })
+export const stopTask = (id: string) => post<void>(`/api/tasks/${encodeURIComponent(id)}/stop`)
 
-export const getProcesses = (id: string) => get<ProcessNodeDto[]>(`/api/tasks/${id}/processes`)
+export const getProcesses = (id: string) => get<ProcessNodeDto[]>(`/api/tasks/${encodeURIComponent(id)}/processes`)
 export const getEvents = (id: string, q: EventsQuery = {}) =>
-  get<LiveEventDto[]>(`/api/tasks/${id}/events${query({ afterId: q.afterId, type: q.type, take: q.take })}`)
-export const listArtifacts = (id: string) => get<ArtifactDto[]>(`/api/tasks/${id}/artifacts`)
+  get<LiveEventDto[]>(`/api/tasks/${encodeURIComponent(id)}/events${query({ afterId: q.afterId, type: q.type, take: q.take })}`)
+export const listArtifacts = (id: string) => get<ArtifactDto[]>(`/api/tasks/${encodeURIComponent(id)}/artifacts`)
+export const getTunnelToken = (id: string) => get<{ token: string }>(`/api/tasks/${encodeURIComponent(id)}/tunnel-token`)

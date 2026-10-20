@@ -71,7 +71,23 @@ BACKEND_PID=""
 VITE_PID=""
 BACKEND_LOG=".data/backend.log"
 
+GUACD_STARTED=0
+
+# Real mode only (MALDEX_MODE=Real): guacd proxies the live view to the VM's VNC console, on 127.0.0.1:4822.
+start_guacd() {
+  [ "${MALDEX_MODE:-${Maldex__Mode:-Fake}}" = "Real" ] || return 0
+  docker rm -f maldex-guacd >/dev/null 2>&1 || true
+  docker run -d --rm --name maldex-guacd --network host guacamole/guacd:1.5.5 /opt/guacamole/sbin/guacd -b 127.0.0.1 -L info -f >/dev/null
+  GUACD_STARTED=1
+  export Maldex__Mode=Real
+}
+
+stop_guacd() {
+  if [ "$GUACD_STARTED" = "1" ]; then docker stop maldex-guacd >/dev/null 2>&1 || true; GUACD_STARTED=0; fi
+}
+
 stop_children() {
+  stop_guacd
   for pid in "$VITE_PID" "$BACKEND_PID"; do
     if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
   done
@@ -118,6 +134,7 @@ cmd_run() {
   cmd_dev_db
   [ -d ui/node_modules ] || npm --prefix ui ci
   trap stop_children EXIT INT TERM
+  start_guacd
   start_backend
   wait_for_api
   echo "Backend on http://localhost:5080 (log: $BACKEND_LOG). Starting Vite..."
@@ -291,6 +308,8 @@ real_verify() {
   real_check "xmllint" "apt install libxml2-utils" xmllint --version
   real_check "pwsh" "sudo snap install powershell --classic" pwsh -v
   real_check "host guard table loaded" "./build.sh real-setup" sudo -n nft list table inet maldex_guard
+  real_check "br_netfilter not filtering bridged traffic (host guard assumes this)" "sudo sysctl -w net.bridge.bridge-nf-call-iptables=0 and do not load br_netfilter" \
+    bash -c '[ ! -e /proc/sys/net/bridge/bridge-nf-call-iptables ] || [ "$(cat /proc/sys/net/bridge/bridge-nf-call-iptables)" != 1 ]'
   real_check "host guard enabled at boot" "./build.sh real-setup" systemctl is-enabled maldex-host-guard
   return "$REAL_FAILED"
 }
@@ -344,6 +363,22 @@ cmd_real_smoke() {
   echo "real-smoke OK: OVMF + TPM 2.0 + KVM work under $LIBVIRT_URI"
 }
 
+# Unattended Windows 11 26H2 guest image (needs MALDEX_WIN_ISO; see deploy/guest/README.md).
+# Sysmon.zip is pinned by the SHA-256 of a download on 2026-10-20 (Sysinternals publishes no checksum file).
+SYSMON_URL="https://download.sysinternals.com/files/Sysmon.zip"
+SYSMON_SHA256="00ecf1b46aec99299d3ae0bca79dc621458bd014b20b509d7c5c8e8c8611aa54"
+
+cmd_build_guest() {
+  if [ -z "${MALDEX_WIN_ISO:-}" ] || [ ! -f "${MALDEX_WIN_ISO:-}" ]; then
+    echo "MALDEX_WIN_ISO must point to a Windows 11 x64 Enterprise (evaluation) ISO (got: '${MALDEX_WIN_ISO:-}')." >&2
+    return 2
+  fi
+  mkdir -p "$VM_DIR/iso"
+  fetch_cached "$SYSMON_URL" "$VM_DIR/iso/Sysmon.zip" "$SYSMON_SHA256"
+  SYSMON_ZIP="$PWD/$VM_DIR/iso/Sysmon.zip" VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" \
+    deploy/guest/build-guest.sh
+}
+
 case "${1:-}" in
   setup)  cmd_setup ;;
   dev-db) cmd_dev_db ;;
@@ -353,6 +388,7 @@ case "${1:-}" in
   build)  cmd_build ;;
   real-setup) cmd_real_setup ;;
   real-smoke) cmd_real_smoke ;;
+  build-guest) cmd_build_guest ;;
   e2e)    echo "Real-VM E2E is implemented in Plan 1b"; exit 2 ;;
-  *) echo "usage: $0 setup|dev-db|run|test|smoke|build|real-setup|real-smoke|e2e" >&2; exit 64 ;;
+  *) echo "usage: $0 setup|dev-db|run|test|smoke|build|real-setup|real-smoke|build-guest|e2e" >&2; exit 64 ;;
 esac

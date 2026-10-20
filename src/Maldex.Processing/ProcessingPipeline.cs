@@ -20,10 +20,11 @@ public sealed class ProcessingPipeline(
     IServiceScopeFactory scopes,
     IYaraScanner yara,
     ISuricataRunner suricata,
+    HttpFlowIndexer httpFlows,
     IArtifactStore artifacts,
     ITaskEventPublisher publisher,
     TimeProvider time,
-    ILogger<ProcessingPipeline> logger)
+    ILogger<ProcessingPipeline> logger) : IProcessingPipeline
 {
     private const int MaxSaveAttempts = 5;
     private const int RuleMax = 256;
@@ -56,6 +57,12 @@ public sealed class ProcessingPipeline(
 
         await RunStepAsync("yara", warnings, ct, async () => results.AddRange(await ScanSampleAsync(task, ct).ConfigureAwait(false))).ConfigureAwait(false);
         await RunStepAsync("suricata", warnings, ct, async () => results.AddRange(await RunSuricataAsync(db, taskId, ct).ConfigureAwait(false))).ConfigureAwait(false);
+        await RunStepAsync("http indexing", warnings, ct, async () =>
+        {
+            var indexed = await httpFlows.IndexAsync(taskId, ct).ConfigureAwait(false);
+            if (indexed.Ignored > 0) warnings.Add($"http indexing: {indexed.Ignored} flows beyond the per-task limit were ignored");
+            if (indexed.BodiesDropped > 0) warnings.Add($"http indexing: {indexed.BodiesDropped} response bodies were too large or over the per-task budget and were not stored");
+        }).ConfigureAwait(false);
         await RunStepAsync("heuristics", warnings, ct, async () => results.AddRange(await EvaluateHeuristicsAsync(db, taskId, ct).ConfigureAwait(false))).ConfigureAwait(false);
 
         var verdict = VerdictEngine.Compute(results);
@@ -173,29 +180,12 @@ public sealed class ProcessingPipeline(
     /// Stores detections, warnings and verdict and moves the task to <c>Completed</c> in one save. The task row is also
     /// written by the API, so it is reloaded first and the save retried on a concurrency conflict.
     /// </summary>
-    private async Task CompleteAsync(MaldexDbContext db, AnalysisTask task, Verdict verdict, List<string> warnings, CancellationToken ct)
-    {
-        for (var attempt = 1; ; attempt++)
+    private Task CompleteAsync(MaldexDbContext db, AnalysisTask task, Verdict verdict, List<string> warnings, CancellationToken ct) =>
+        TaskTransitions.TransitionWithRetryAsync(db, task, RunStatus.Completed, "processing complete", time.GetUtcNow(), t =>
         {
-            await db.Entry(task).ReloadAsync(ct).ConfigureAwait(false);
-            task.ProcessingWarnings = warnings;
-            task.Verdict = verdict;
-            task.TransitionTo(RunStatus.Completed, "processing complete", time.GetUtcNow());
-            try
-            {
-                await db.SaveChangesAsync(ct).ConfigureAwait(false);
-                return;
-            }
-            catch (DbUpdateConcurrencyException) when (attempt < MaxSaveAttempts)
-            {
-                foreach (var h in task.StatusHistory.Where(h => db.Entry(h).State == EntityState.Added).ToList())
-                {
-                    db.Entry(h).State = EntityState.Detached;
-                    task.StatusHistory.Remove(h);
-                }
-            }
-        }
-    }
+            t.ProcessingWarnings = warnings;
+            t.Verdict = verdict;
+        }, ct);
 
     /// <summary>A read-only (0400) temporary copy of a stored blob, because the scanners need a filesystem path. Deleted on dispose.</summary>
     private sealed class TempCopy : IDisposable

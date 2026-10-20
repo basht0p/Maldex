@@ -1,0 +1,58 @@
+<Sysmon schemaversion="4.90">
+  <!--
+    Maldex analysis-guest Sysmon configuration.
+    Logs: 1 ProcessCreate, 3 NetworkConnect, 5 ProcessTerminate, 11 FileCreate, 12/13/14 Registry,
+    22 DNSQuery, 23 FileDelete (archived). All other event IDs are left unconfigured, so they stay off.
+    The Maldex agent and Sysmon itself are excluded so the telemetry stream stays about the sample.
+    The agent's own virtio-serial traffic never touches the guest network, so it needs no network exclusion.
+  -->
+  <HashAlgorithms>sha256</HashAlgorithms>
+  <CheckRevocation>False</CheckRevocation>
+  <EventFiltering>
+    <RuleGroup name="process-create" groupRelation="or">
+      <ProcessCreate onmatch="exclude">
+        <Image condition="is">C:\Program Files\Maldex\Maldex.Agent.exe</Image>
+        <Image condition="is">C:\Windows\Sysmon64.exe</Image>
+        <ParentImage condition="is">C:\Windows\Sysmon64.exe</ParentImage>
+      </ProcessCreate>
+    </RuleGroup>
+    <RuleGroup name="network-connect" groupRelation="or">
+      <NetworkConnect onmatch="exclude">
+        <Image condition="is">C:\Program Files\Maldex\Maldex.Agent.exe</Image>
+        <Image condition="is">C:\Windows\Sysmon64.exe</Image>
+      </NetworkConnect>
+    </RuleGroup>
+    <RuleGroup name="process-terminate" groupRelation="or">
+      <ProcessTerminate onmatch="exclude">
+        <Image condition="is">C:\Program Files\Maldex\Maldex.Agent.exe</Image>
+        <Image condition="is">C:\Windows\Sysmon64.exe</Image>
+      </ProcessTerminate>
+    </RuleGroup>
+    <RuleGroup name="file-create" groupRelation="or">
+      <FileCreate onmatch="exclude">
+        <Image condition="is">C:\Program Files\Maldex\Maldex.Agent.exe</Image>
+        <Image condition="is">C:\Windows\Sysmon64.exe</Image>
+        <TargetFilename condition="begin with">C:\ProgramData\Maldex\</TargetFilename>
+      </FileCreate>
+    </RuleGroup>
+    <RuleGroup name="registry-create-delete" groupRelation="or">
+      <RegistryEvent onmatch="exclude">
+        <Image condition="is">C:\Program Files\Maldex\Maldex.Agent.exe</Image>
+        <Image condition="is">C:\Windows\Sysmon64.exe</Image>
+      </RegistryEvent>
+    </RuleGroup>
+    <RuleGroup name="dns-query" groupRelation="or">
+      <DnsQuery onmatch="exclude">
+        <Image condition="is">C:\Program Files\Maldex\Maldex.Agent.exe</Image>
+        <Image condition="is">C:\Windows\Sysmon64.exe</Image>
+      </DnsQuery>
+    </RuleGroup>
+    <RuleGroup name="file-delete" groupRelation="or">
+      <FileDelete onmatch="exclude">
+        <Image condition="is">C:\Program Files\Maldex\Maldex.Agent.exe</Image>
+        <Image condition="is">C:\Windows\Sysmon64.exe</Image>
+        <TargetFilename condition="begin with">C:\ProgramData\Maldex\</TargetFilename>
+      </FileDelete>
+    </RuleGroup>
+  </EventFiltering>
+</Sysmon>

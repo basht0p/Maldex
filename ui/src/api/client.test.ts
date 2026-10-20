@@ -1,7 +1,7 @@
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import { ApiError, extendTask, getMe, listTasks, stopTask } from './client'
+import { ApiError, cancelTask, extendTask, getMe, listTasks, stopTask } from './client'
 
 vi.mock('../auth/auth', () => ({ getAccessToken: vi.fn(async () => null) }))
 import { getAccessToken } from '../auth/auth'
@@ -84,5 +84,12 @@ describe('client', () => {
     await extendTask('t1', 120)
     expect(body).toEqual({ seconds: 120 })
     await expect(stopTask('t1')).resolves.toBeUndefined()
+  })
+
+  it('encodes ids in the path', async () => {
+    let url = ''
+    server.use(http.post('*/api/tasks/*/cancel', ({ request }) => { url = new URL(request.url).pathname; return new HttpResponse(null, { status: 204 }) }))
+    await cancelTask('a/b?c#d')
+    expect(url).toBe('/api/tasks/a%2Fb%3Fc%23d/cancel')
   })
 })

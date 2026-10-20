@@ -7,7 +7,11 @@ public sealed record VmHandle(Guid TaskId, string Name)
     public static VmHandle For(Guid taskId) => new(taskId, $"maldex-{taskId:N}");
 }
 
-public sealed class VmStartException(string message) : Exception(message);
+public sealed class VmStartException : Exception
+{
+    public VmStartException(string message) : base(message) { }
+    public VmStartException(string message, Exception? inner) : base(message, inner) { }
+}
 
 public interface IHypervisor
 {
