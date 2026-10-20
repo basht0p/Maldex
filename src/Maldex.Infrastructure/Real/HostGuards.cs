@@ -187,6 +187,7 @@ public sealed class HostGuardProbe(IProcessRunner runner, IOptions<LibvirtOption
             results.Add(await RunAsync($"system user {user}", "id", ["-u", user], ct));
 
         results.Add(CheckKvm());
+        results.Add(CheckConcurrency());
 
         var o = libvirt.Value;
         results.Add(await RunAsync($"virsh -c {o.Uri} version", o.VirshBinary, ["-c", o.Uri, "version"], ct));
@@ -222,6 +223,23 @@ public sealed class HostGuardProbe(IProcessRunner runner, IOptions<LibvirtOption
             }
         }
         return new GuardResult(name, GuardSeverity.Ok, seen.Count == 0 ? "br_netfilter not loaded" : string.Join(", ", seen));
+    }
+
+    /// <summary>
+    /// Real mode runs one VM at a time: every run's INetSim shares the same unprivileged mapped host ids and has no PID
+    /// namespace of its own, so a guest that took over one run's INetSim could tamper with another run's evidence.
+    /// </summary>
+    private GuardResult CheckConcurrency()
+    {
+        const string name = "MaxConcurrentVms is 1 in real mode";
+        var raw = configuration["Maldex:Orchestrator:MaxConcurrentVms"];
+        if (string.IsNullOrWhiteSpace(raw)) return new GuardResult(name, GuardSeverity.Ok, "default (1)");
+        if (!int.TryParse(raw, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var max))
+            return new GuardResult(name, GuardSeverity.Fail, $"Maldex:Orchestrator:MaxConcurrentVms '{raw}' is not a number");
+        return max <= 1
+            ? new GuardResult(name, GuardSeverity.Ok, max.ToString(System.Globalization.CultureInfo.InvariantCulture))
+            : new GuardResult(name, GuardSeverity.Fail,
+                $"Maldex:Orchestrator:MaxConcurrentVms is {max}; real mode supports 1 until INetSim runs in a per-run PID namespace (concurrent runs' INetSim instances could tamper with each other's evidence). Set it to 1.");
     }
 
     private static GuardResult CheckKvm()
