@@ -14,7 +14,7 @@ public static class NftRulesetBuilder
 {
     /// <summary>Never reachable by a guest, and never an accepted input destination other than the gateway.</summary>
     private static readonly string[] PrivateRanges =
-        ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "224.0.0.0/4"];
+        ["0.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "224.0.0.0/4", "240.0.0.0/4"];
 
     public static string Build(EgressTopology t)
     {
@@ -36,6 +36,8 @@ public static class NftRulesetBuilder
         Ip(t.SinkholeIp, nameof(t.SinkholeIp));
         if (t.MitmPort is < 1 or > 65535) throw new ArgumentException("MitmPort out of range.", nameof(t));
         var cp = t.ControlPlaneIps.Select(ip => Ip(ip, "ControlPlaneIps")).Distinct().ToList();
+        var dns = t.VpnDnsIp is null ? null : Ip(t.VpnDnsIp, nameof(t.VpnDnsIp));
+        if (dns is not null && cp.Contains(dns)) throw new ArgumentException("VpnDnsIp must not be a control-plane IP.", nameof(t));
 
         // Everything a guest must never reach: private ranges (incl. the control plane's own LAN) and the control-plane IPs.
         var blocked = string.Join(", ", PrivateRanges.Concat(cp));
@@ -52,6 +54,8 @@ public static class NftRulesetBuilder
         L("\t\tmeta nfproto ipv6 drop");
         L("\t\tct state established,related accept");
         L("\t\tiifname \"lo\" accept");
+        // Every path to the MITM port must have been DNAT'd/redirected; a direct hit (e.g. via the Simulated any-IP route) is dropped.
+        L($"\t\tiifname \"{ns}\" tcp dport {t.MitmPort} ct status != dnat drop");
         L($"\t\tiifname \"{ns}\" udp dport 67 accept");
         L($"\t\tiifname \"{ns}\" ip daddr {gw} udp dport 53 accept");
         L($"\t\tiifname \"{ns}\" ip daddr {gw} tcp dport 53 accept");
@@ -59,7 +63,7 @@ public static class NftRulesetBuilder
         if (t.Mode == NetworkMode.Simulated)
         {
             // INetSim answers on any public address; never to the control plane or private ranges (which include the gateway).
-            L($"\t\tiifname \"{ns}\" ip daddr != {{ {blocked} }} meta l4proto {{ tcp, udp }} accept");
+            L($"\t\tiifname \"{ns}\" ip daddr != {{ {blocked} }} ct status != dnat meta l4proto {{ tcp, udp }} accept");
         }
         L("\t}");
 
@@ -82,7 +86,16 @@ public static class NftRulesetBuilder
         L("\t\tmeta nfproto ipv6 drop");
         L("\t\toifname \"lo\" accept");
         L($"\t\toifname \"{ns}\" accept");
-        if (vpn) L($"\t\toifname \"{wg}\" accept");
+        if (vpn)
+        {
+            if (dns is not null)
+            {
+                L($"\t\toifname \"{wg}\" ip daddr {dns} udp dport 53 accept");
+                L($"\t\toifname \"{wg}\" ip daddr {dns} tcp dport 53 accept");
+            }
+            L($"\t\toifname \"{wg}\" ip daddr {{ {blocked} }} drop");
+            L($"\t\toifname \"{wg}\" accept");
+        }
         L("\t}");
 
         L("\tchain prerouting {");

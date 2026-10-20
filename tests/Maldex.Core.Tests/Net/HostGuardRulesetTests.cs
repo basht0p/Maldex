@@ -24,6 +24,35 @@ public class HostGuardRulesetTests
     }
 
     [Fact]
+    public void HostGuard_BridgeTable_DropsLocalDeliveryFromRunBridges()
+    {
+        var t = HostGuardRuleset.Build();
+        var bridge = t[t.IndexOf("table bridge maldex_guard {", StringComparison.Ordinal)..];
+        Assert.Contains("chain input {", bridge);
+        Assert.Contains("ibrname \"mxb*\" drop", bridge);
+    }
+
+    [Fact]
+    public void HostGuard_AssumesBrNetfilterIsNotLoaded()
+    {
+        // The guard filters bridged L2 frames in the 'bridge' family. If br_netfilter were loaded (and
+        // bridge-nf-call-iptables=1), bridged IP traffic would instead traverse the inet hooks and the 'ibrname'
+        // matches here, so the guard assumes it is NOT loaded; build.sh real_verify enforces that.
+        var t = HostGuardRuleset.Build();
+        Assert.Contains("table bridge maldex_guard", t);
+        Assert.DoesNotContain("br_netfilter", t);
+        Assert.DoesNotContain("meta ibrname", t); // inet-family bridge-port matching is not relied on
+        Assert.Contains("br_netfilter", File.ReadAllText(FindRepoFile("build.sh")));
+    }
+
+    private static string FindRepoFile(string rel)
+    {
+        for (var d = new DirectoryInfo(AppContext.BaseDirectory); d is not null; d = d.Parent)
+            if (File.Exists(Path.Combine(d.FullName, rel))) return Path.Combine(d.FullName, rel);
+        throw new FileNotFoundException(rel);
+    }
+
+    [Fact]
     public void HostGuard_FileMatchesBuilder()
     {
         string? path = null;

@@ -9,7 +9,7 @@ public class NftRulesetBuilderTests
 {
     private static readonly Guid Id = Guid.Parse("0123456789abcdef0123456789abcdef");
     private static readonly string[] Ranges =
-        ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "224.0.0.0/4"];
+        ["0.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "224.0.0.0/4", "240.0.0.0/4"];
     private static readonly string[] Cp = ["192.168.50.7", "203.0.113.9"];
     private const string Ns = "mxg0123456789ab";
     private const string Wg = "mxw0123456789ab";
@@ -85,7 +85,7 @@ public class NftRulesetBuilderTests
     {
         var r = NftRulesetBuilder.Build(Topo(NetworkMode.None));
         Assert.DoesNotContain(Chain(r, "forward"), l => l.EndsWith(" accept"));
-        Assert.DoesNotContain(Chain(r, "input"), l => l.Contains("!="));
+        Assert.DoesNotContain(Chain(r, "input"), l => l.Contains("ip daddr !="));
         Assert.DoesNotContain("masquerade", r);
         Assert.DoesNotContain(Wg, r);
     }
@@ -118,6 +118,48 @@ public class NftRulesetBuilderTests
                 Assert.Contains($"ip daddr {t.Subnet.GatewayIp} ", l);
             Assert.DoesNotContain($"ip daddr {t.Subnet.GuestIp}", l);
         }
+    }
+
+    [Theory, MemberData(nameof(AllModes))]
+    public void Input_EveryPathToMitmPort_RequiresDnat(NetworkMode mode)
+    {
+        var t = Topo(mode, mitm: 8123);
+        var input = Chain(NftRulesetBuilder.Build(t), "input");
+        var port = "tcp dport 8123";
+        // A non-dnat'd hit on the mitm port is dropped, and that drop precedes every accept that could match it.
+        var gate = input.FindIndex(l => l == $"iifname \"{Ns}\" tcp dport 8123 ct status != dnat drop");
+        Assert.True(gate >= 0, "missing mitm dnat gate");
+        var firstAccept = input.FindIndex(l => l.StartsWith($"iifname \"{Ns}\"") && l.EndsWith(" accept"));
+        Assert.True(gate < firstAccept, "gate must precede every accept of guest traffic");
+        // Every accept for guest traffic that is not port-restricted elsewhere must itself exclude dnat'd/direct mitm access.
+        foreach (var l in input.Where(l => l.StartsWith($"iifname \"{Ns}\"") && l.EndsWith(" accept")))
+        {
+            if (l.Contains(port)) Assert.Contains("ct status dnat", l);
+            else if (!l.Contains("dport")) Assert.Contains("ct status != dnat", l); // generic accepts
+        }
+        // The only generic accept (Simulated any-IP) is never reachable by a direct mitm hit.
+        Assert.Equal(mode == NetworkMode.Simulated, input.Any(l => l.Contains("meta l4proto")));
+    }
+
+    [Fact]
+    public void Vpn_OutputDropsPrivateAndControlPlane_BeforeWgAccept_WithDnsCarveOut()
+    {
+        var r = NftRulesetBuilder.Build(Topo(NetworkMode.LiveVpn) with { VpnDnsIp = "10.2.0.1" });
+        var o = Chain(r, "output");
+        var drop = o.FindIndex(l => l.StartsWith($"oifname \"{Wg}\" ip daddr {{") && l.EndsWith(" drop"));
+        var accept = o.FindIndex(l => l == $"oifname \"{Wg}\" accept");
+        var udp = o.FindIndex(l => l == $"oifname \"{Wg}\" ip daddr 10.2.0.1 udp dport 53 accept");
+        var tcp = o.FindIndex(l => l == $"oifname \"{Wg}\" ip daddr 10.2.0.1 tcp dport 53 accept");
+        Assert.True(udp >= 0 && tcp >= 0);
+        Assert.True(Math.Max(udp, tcp) < drop && drop < accept);
+        foreach (var range in Ranges) Assert.Contains(range, o[drop]);
+        foreach (var ip in Cp) Assert.Contains(ip, o[drop]);
+
+        var noDns = Chain(NftRulesetBuilder.Build(Topo(NetworkMode.LiveVpn)), "output");
+        Assert.DoesNotContain(noDns, l => l.Contains("dport 53"));
+        Assert.Contains(noDns, l => l.StartsWith($"oifname \"{Wg}\" ip daddr {{") && l.EndsWith(" drop"));
+        Assert.Throws<ArgumentException>(() => NftRulesetBuilder.Build(Topo(NetworkMode.LiveVpn) with { VpnDnsIp = "bad" }));
+        Assert.Throws<ArgumentException>(() => NftRulesetBuilder.Build(Topo(NetworkMode.LiveVpn) with { VpnDnsIp = Cp[0] }));
     }
 
     [Fact]

@@ -29,4 +29,4 @@ public sealed record RunSubnet(int Index, string GatewayIp, string GuestIp, stri
 
 public sealed record EgressTopology(
     RunNetNames Names, RunSubnet Subnet, NetworkMode Mode,
-    IReadOnlyList<string> ControlPlaneIps, string SinkholeIp, int MitmPort);
+    IReadOnlyList<string> ControlPlaneIps, string SinkholeIp, int MitmPort, string? VpnDnsIp = null);

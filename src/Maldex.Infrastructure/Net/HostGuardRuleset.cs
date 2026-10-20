@@ -31,6 +31,10 @@ public static class HostGuardRuleset
         		type filter hook forward priority -10; policy accept;
         		ibrname "mxb*" ether type != { ip, arp } drop
         	}
+        	chain input {
+        		type filter hook input priority -10; policy accept;
+        		ibrname "mxb*" drop
+        	}
         }
 
         """.ReplaceLineEndings("\n");

@@ -291,6 +291,8 @@ real_verify() {
   real_check "xmllint" "apt install libxml2-utils" xmllint --version
   real_check "pwsh" "sudo snap install powershell --classic" pwsh -v
   real_check "host guard table loaded" "./build.sh real-setup" sudo -n nft list table inet maldex_guard
+  real_check "br_netfilter not filtering bridged traffic (host guard assumes this)" "sudo sysctl -w net.bridge.bridge-nf-call-iptables=0 and do not load br_netfilter" \
+    bash -c '[ ! -e /proc/sys/net/bridge/bridge-nf-call-iptables ] || [ "$(cat /proc/sys/net/bridge/bridge-nf-call-iptables)" != 1 ]'
   real_check "host guard enabled at boot" "./build.sh real-setup" systemctl is-enabled maldex-host-guard
   return "$REAL_FAILED"
 }
