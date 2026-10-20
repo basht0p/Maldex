@@ -16,7 +16,7 @@ public sealed record CaptureTuning
     /// <summary>How long tcpdump has to flush and exit after SIGINT before it is killed.</summary>
     public TimeSpan StopWait { get; init; } = TimeSpan.FromSeconds(5);
     /// <summary>RLIMIT_FSIZE for tcpdump: a flooding guest cannot fill the disk; the file ends as a valid prefix.</summary>
-    public long MaxPcapBytes { get; init; } = 1L << 30;
+    public long MaxPcapBytes { get; init; } = CaptureService.DefaultMaxPcapBytes;
     public long MaxFlowsBytes { get; init; } = NetnsEgressRouter.MaxFlowsBytes;
     /// <summary>The unprivileged account tcpdump drops to; it must be the one that owns the capture directory.</summary>
     public string? RunAs { get; init; }
@@ -41,6 +41,9 @@ public sealed partial class CaptureService(
 {
     /// <summary>A pcap with only its 24-byte global header holds no packets.</summary>
     internal const int PcapHeaderBytes = 24;
+
+    /// <summary>Default size limit of a run's pcap (also the largest pcap the coordinator stores).</summary>
+    public const long DefaultMaxPcapBytes = 1L << 30;
 
     private readonly NetOptions _o = options.Value;
     private readonly IProcessRunner _runner = runner;
@@ -129,20 +132,24 @@ public sealed partial class CaptureService(
     {
         var (f, a) = PrivilegedCommands.Sudo("ip", "netns", "pids", ns);
         var pids = await _runner.RunAsync(f, a, ct).ConfigureAwait(false);
-        var list = pids.Stdout.Split([' ', '\n', '\t'], StringSplitOptions.RemoveEmptyEntries)
-            .Where(p => int.TryParse(p, NumberStyles.None, CultureInfo.InvariantCulture, out _)).ToArray();
-        if (pids.ExitCode != 0 || list.Length == 0) return [];
-
-        var ps = await _runner.RunAsync("ps", ["-o", "pid=,args=", "-p", string.Join(',', list)], ct).ConfigureAwait(false);
+        if (pids.ExitCode != 0) return [];
         var found = new List<int>();
-        foreach (var line in ps.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-        {
-            var parts = line.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length != 2 || !int.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out var pid)) continue;
-            var argv = parts[1].Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (Path.GetFileName(argv[0]) == "tcpdump" && argv.Contains(pcap, StringComparer.Ordinal)) found.Add(pid);
-        }
+        foreach (var token in pids.Stdout.Split([' ', '\n', '\t'], StringSplitOptions.RemoveEmptyEntries))
+            if (int.TryParse(token, NumberStyles.None, CultureInfo.InvariantCulture, out var pid) && await IsOurTcpdumpAsync(pid, pcap, ct).ConfigureAwait(false))
+                found.Add(pid);
         return found;
+    }
+
+    /// <summary>
+    /// True when the process still is our tcpdump. Matches on the NUL-separated argv from /proc (a path with spaces cannot
+    /// confuse it) and requires the exact pcap path, so a recycled PID is never mistaken for it.
+    /// </summary>
+    private async Task<bool> IsOurTcpdumpAsync(int pid, string pcap, CancellationToken ct)
+    {
+        var r = await _runner.RunAsync("cat", [$"/proc/{pid.ToString(CultureInfo.InvariantCulture)}/cmdline"], ct).ConfigureAwait(false);
+        if (r.ExitCode != 0) return false;
+        var argv = r.Stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries);
+        return argv.Length > 0 && Path.GetFileName(argv[0]) == "tcpdump" && argv.Contains(pcap, StringComparer.Ordinal);
     }
 
     private sealed class Handle(CaptureService svc, Guid taskId, string capDir, string pcap) : ICaptureHandle
@@ -151,6 +158,10 @@ public sealed partial class CaptureService(
         private IReadOnlyList<CapturedFile>? _result;
         private bool _disposed;
 
+        private readonly List<string> _warnings = [];
+        private bool _exitedEarly;
+
+        public IReadOnlyList<string> Warnings { get { lock (_warnings) return _warnings.ToArray(); } }
         public IReadOnlyList<int> Pids { get; set; } = [];
         public bool FlowsEnabled { get; set; }
 
@@ -172,21 +183,24 @@ public sealed partial class CaptureService(
             await StopTcpdumpAsync(ct).ConfigureAwait(false);
 
             var files = new List<CapturedFile>();
-            if (File.Exists(pcap) && new FileInfo(pcap).Length > PcapHeaderBytes) files.Add(new CapturedFile(ArtifactKind.Pcap, pcap));
+            var pcapLength = File.Exists(pcap) ? new FileInfo(pcap).Length : 0;
+            if (pcapLength > PcapHeaderBytes) files.Add(new CapturedFile(ArtifactKind.Pcap, pcap));
+            if (pcapLength >= t.MaxPcapBytes) Warn("pcap truncated at the size limit");
+            else if (_exitedEarly) Warn("tcpdump exited early; the pcap may be incomplete");
 
             var flows = Path.Combine(capDir, "flows.jsonl");
             try
             {
                 // Written by the mitm user: never opened in place, only copied by UntrustedFile.
                 var res = await UntrustedFile.CopyRegularFileAsync(t.FlowsPath(taskId), flows, t.MaxFlowsBytes, ct).ConfigureAwait(false);
-                if (res.Truncated) svc._warn?.Invoke($"Flows for {taskId:N} truncated at {t.MaxFlowsBytes} bytes.");
+                if (res.Truncated) Warn($"flows truncated at {t.MaxFlowsBytes} bytes");
                 if (res.BytesCopied > 0) files.Add(new CapturedFile(ArtifactKind.MitmFlows, flows));
                 else File.Delete(flows);
             }
             catch (FileNotFoundException) { /* no flow was logged */ }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                svc._warn?.Invoke($"Could not copy the flows of {taskId:N}: {ex.Message}");
+                Warn($"could not copy the flows: {ex.Message}");
                 try { File.Delete(flows); } catch (IOException) { }
             }
             return files;
@@ -203,39 +217,49 @@ public sealed partial class CaptureService(
             }
         }
 
-        /// <summary>SIGINT lets tcpdump flush and exit; whatever is still there after the grace period is killed.</summary>
+        /// <summary>
+        /// SIGINT lets tcpdump flush and exit; whatever is still there after the grace period is killed. Every signal is sent
+        /// only after the PID has been re-verified as our tcpdump (it may have died early and the PID been recycled).
+        /// </summary>
         private async Task StopTcpdumpAsync(CancellationToken ct)
         {
             if (Pids.Count == 0) return;
-            foreach (var pid in Pids) await Kill("-INT", pid).ConfigureAwait(false);
+            var running = await VerifiedAsync().ConfigureAwait(false);
+            _exitedEarly = running.Count == 0;
+            foreach (var pid in running) await SignalAsync("-INT", pid).ConfigureAwait(false);
 
             var deadline = DateTime.UtcNow + svc._t.StopWait;
             List<int> alive;
-            while ((alive = await AliveAsync().ConfigureAwait(false)).Count > 0 && DateTime.UtcNow < deadline)
+            while ((alive = await VerifiedAsync().ConfigureAwait(false)).Count > 0 && DateTime.UtcNow < deadline)
                 await Task.Delay(svc._t.PollInterval, ct).ConfigureAwait(false);
             foreach (var pid in alive)
             {
-                svc._warn?.Invoke($"tcpdump {pid} for {taskId:N} did not exit after SIGINT; killed.");
-                await Kill("-KILL", pid).ConfigureAwait(false);
+                Warn($"tcpdump {pid} did not exit after SIGINT and was killed");
+                await SignalAsync("-KILL", pid).ConfigureAwait(false);
             }
             Pids = [];
         }
 
-        private async Task<List<int>> AliveAsync()
+        private async Task<List<int>> VerifiedAsync()
         {
-            var alive = new List<int>();
+            var ok = new List<int>();
             foreach (var pid in Pids)
-            {
-                var r = await svc._runner.RunAsync("ps", ["-o", "pid=", "-p", pid.ToString(CultureInfo.InvariantCulture)], CancellationToken.None).ConfigureAwait(false);
-                if (r.ExitCode == 0 && r.Stdout.Trim().Length > 0) alive.Add(pid);
-            }
-            return alive;
+                if (await svc.IsOurTcpdumpAsync(pid, pcap, CancellationToken.None).ConfigureAwait(false)) ok.Add(pid);
+            return ok;
         }
 
-        private async Task Kill(string signal, int pid)
+        private async Task SignalAsync(string signal, int pid)
         {
+            // Re-verify immediately before the root signal.
+            if (!await svc.IsOurTcpdumpAsync(pid, pcap, CancellationToken.None).ConfigureAwait(false)) return;
             var (f, a) = PrivilegedCommands.Sudo("kill", signal, pid.ToString(CultureInfo.InvariantCulture));
             await svc._runner.RunAsync(f, a, CancellationToken.None).ConfigureAwait(false);
+        }
+
+        private void Warn(string message)
+        {
+            lock (_warnings) _warnings.Add(message);
+            svc._warn?.Invoke($"{message} (task {taskId:N})");
         }
 
         public async ValueTask DisposeAsync()

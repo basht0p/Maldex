@@ -12,11 +12,13 @@ using Xunit;
 namespace Maldex.Integration.Tests.Orchestrator;
 
 /// <summary>Records when the coordinator starts/stops the capture and what the rest of the run looked like at that moment.</summary>
-internal sealed class RecordingCapture(Func<IServiceProvider> services) : ICaptureService
+internal sealed class RecordingCapture(Func<IServiceProvider> services) : ICaptureService, IDisposable
 
 {
     public Func<IServiceProvider> Services { get; } = services;
     public string Dir { get; } = Directory.CreateTempSubdirectory("maldex-cap-test-").FullName;
+    public List<string> HandleWarnings { get; } = [];
+    public void Dispose() { try { Directory.Delete(Dir, true); } catch (IOException) { } }
     public Exception? StartFails { get; set; }
     public Exception? StopFails { get; set; }
     public bool Disposed { get; private set; }
@@ -51,6 +53,8 @@ internal sealed class RecordingCapture(Func<IServiceProvider> services) : ICaptu
             return [new CapturedFile(ArtifactKind.Pcap, pcap), new CapturedFile(ArtifactKind.MitmFlows, flows)];
         }
 
+        public IReadOnlyList<string> Warnings => owner.HandleWarnings;
+
         public ValueTask DisposeAsync()
         {
             owner.Disposed = true;
@@ -81,6 +85,7 @@ public class CaptureWiringTests(SqlServerFixture sql)
     {
         var (h, cap) = await HarnessAsync(sql);
         await using var _ = h;
+        using var __ = cap;
         var id = await h.SeedPreparingTaskAsync();
 
         await h.RunAsync(id);
@@ -114,6 +119,7 @@ public class CaptureWiringTests(SqlServerFixture sql)
     {
         var (h, cap) = await HarnessAsync(sql);
         await using var _ = h;
+        using var __ = cap;
         var id = await h.SeedPreparingTaskAsync();
 
         await h.RunAsync(id);
@@ -131,6 +137,7 @@ public class CaptureWiringTests(SqlServerFixture sql)
     {
         var (h, cap) = await HarnessAsync(sql);
         await using var _ = h;
+        using var __ = cap;
         cap.StartFails = new CaptureStartException("tcpdump did not start capturing in time");
         var id = await h.SeedPreparingTaskAsync();
 
@@ -154,6 +161,7 @@ public class CaptureWiringTests(SqlServerFixture sql)
     {
         var (h, cap) = await HarnessAsync(sql);
         await using var _ = h;
+        using var __ = cap;
         cap.StopFails = new IOException("disk full");
         var id = await h.SeedPreparingTaskAsync();
 
@@ -174,5 +182,23 @@ public class CaptureWiringTests(SqlServerFixture sql)
         var done = await db2.Tasks.SingleAsync(t => t.Id == id, Ct);
         Assert.Equal(RunStatus.Completed, done.Status);
         Assert.Contains("capture: the capture could not be stopped cleanly: disk full", done.ProcessingWarnings);
+    }
+
+    [Fact]
+    public async Task Coordinator_HandleWarnings_BecomeProcessingWarnings_ArtifactsStillStored()
+    {
+        var (h, cap) = await HarnessAsync(sql);
+        await using var _ = h;
+        using var __ = cap;
+        cap.HandleWarnings.Add("pcap truncated at the size limit");
+        var id = await h.SeedPreparingTaskAsync();
+
+        await h.RunAsync(id);
+
+        await using var db = h.NewContext();
+        var task = await db.Tasks.SingleAsync(t => t.Id == id, Ct);
+        Assert.Equal(RunStatus.Processing, task.Status);
+        Assert.Equal(["capture: pcap truncated at the size limit"], task.ProcessingWarnings);
+        Assert.Equal(2, await db.Artifacts.CountAsync(a => a.TaskId == id && (a.Kind == ArtifactKind.Pcap || a.Kind == ArtifactKind.MitmFlows), Ct));
     }
 }

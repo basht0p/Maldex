@@ -38,8 +38,6 @@ public sealed class RunCoordinator(
     private const int MaxViolations = 10;
     private const int MaxTransitionAttempts = 5;
 
-    private const long MaxPcapBytes = 1L << 30;
-
     private readonly OrchestratorOptions _options = options.Value;
 
     /// <summary>The run's capture, started after the isolation self-test and finished after the VM is gone.</summary>
@@ -322,7 +320,7 @@ public sealed class RunCoordinator(
             {
                 try
                 {
-                    var (category, max) = file.Kind == ArtifactKind.Pcap ? ("pcap", MaxPcapBytes) : ("flows", NetnsEgressRouter.MaxFlowsBytes);
+                    var (category, max) = file.Kind == ArtifactKind.Pcap ? ("pcap", CaptureService.DefaultMaxPcapBytes) : ("flows", NetnsEgressRouter.MaxFlowsBytes);
                     await using var stream = new FileStream(file.Path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
                     var blob = await artifacts.PutAsync(category, stream, max, none).ConfigureAwait(false);
                     db.Artifacts.Add(new Artifact
@@ -336,7 +334,8 @@ public sealed class RunCoordinator(
                     problems.Add($"the {file.Kind} capture could not be stored: {ex.Message}");
                 }
             }
-            if (db.ChangeTracker.HasChanges()) await db.SaveChangesAsync(none).ConfigureAwait(false);
+            // Only our own rows: unrelated pending changes are not flushed here.
+            if (db.ChangeTracker.Entries<Artifact>().Any(e => e.State == EntityState.Added)) await db.SaveChangesAsync(none).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -351,8 +350,9 @@ public sealed class RunCoordinator(
             catch (Exception ex) { logger.LogWarning(ex, "Cleaning up the capture of task {TaskId} failed.", task.Id); }
         }
 
+        capture.Stored = problems.Count == 0;
+        problems.AddRange(handle.Warnings); // truncation etc.: reported, but nothing was lost by storing
         if (problems.Count == 0) return;
-        capture.Stored = false;
         try { await AddWarningsAsync(db, task, problems).ConfigureAwait(false); }
         catch (Exception ex) { logger.LogError(ex, "Could not record the capture warnings of task {TaskId}.", task.Id); }
     }

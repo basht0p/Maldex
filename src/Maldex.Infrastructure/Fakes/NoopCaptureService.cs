@@ -10,6 +10,7 @@ public sealed class NoopCaptureService : ICaptureService
     private sealed class Handle : ICaptureHandle
     {
         public Task<IReadOnlyList<CapturedFile>> StopAsync(CancellationToken ct) => Task.FromResult<IReadOnlyList<CapturedFile>>([]);
+        public IReadOnlyList<string> Warnings => [];
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }

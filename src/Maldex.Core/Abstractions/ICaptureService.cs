@@ -22,4 +22,7 @@ public interface ICaptureService
 public interface ICaptureHandle : IAsyncDisposable
 {
     Task<IReadOnlyList<CapturedFile>> StopAsync(CancellationToken ct);
+
+    /// <summary>Problems found while capturing/stopping (e.g. a truncated pcap). Complete once <see cref="StopAsync"/> has returned.</summary>
+    IReadOnlyList<string> Warnings { get; }
 }
