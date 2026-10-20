@@ -10,23 +10,30 @@ public class IsolationVerifierTests
 {
     private static readonly string[] Names = ["gateway", "control_plane_0", "rfc1918_10", "rfc1918_172", "rfc1918_192", "link_local"];
 
-    private static SelfTestResultMessage Result(string? echo, IEnumerable<string>? reachable = null, IEnumerable<string>? names = null)
+    private const string GuestIp = "10.213.0.2";
+    private const string InetSimPage = "<html><body>This is the default HTML page for INetSim HTTP server fake mode.</body></html>";
+
+    private static SelfTestResultMessage Result(string? echo, IEnumerable<string>? reachable = null, IEnumerable<string>? names = null, IReadOnlyList<string>? addresses = null)
     {
         var r = new HashSet<string>(reachable ?? []);
-        return new SelfTestResultMessage(DateTimeOffset.UnixEpoch, "c1", (names ?? Names).Select(n => new ProbeResult(n, r.Contains(n))).ToList(), echo);
+        return new SelfTestResultMessage(DateTimeOffset.UnixEpoch, "c1", (names ?? Names).Select(n => new ProbeResult(n, r.Contains(n))).ToList(), echo,
+            addresses ?? [GuestIp]);
     }
+
+    private static IsolationVerdict V(NetworkMode mode, IReadOnlyList<string> names, string? egress, SelfTestResultMessage? result, string? guestIp = GuestIp) =>
+        IsolationVerifier.Verify(mode, names, egress, result, guestIp);
 
     [Fact]
     public void SelfTest_AllBlocked_None_NoEcho_Passes()
     {
-        var v = IsolationVerifier.Verify(NetworkMode.None, Names, null, Result(null));
+        var v = V(NetworkMode.None, Names, null, Result(null));
         Assert.True(v.Isolated);
         Assert.Null(v.Reason);
     }
 
     [Fact]
     public void SelfTest_None_AnyEcho_Fails() =>
-        Assert.False(IsolationVerifier.Verify(NetworkMode.None, Names, null, Result("203.0.113.9")).Isolated);
+        Assert.False(V(NetworkMode.None, Names, null, Result("203.0.113.9")).Isolated);
 
     [Theory]
     [InlineData("gateway")]
@@ -35,7 +42,7 @@ public class IsolationVerifierTests
     [InlineData("link_local")]
     public void SelfTest_InternalReachable_Fails(string probe)
     {
-        var v = IsolationVerifier.Verify(NetworkMode.None, Names, null, Result(null, [probe]));
+        var v = V(NetworkMode.None, Names, null, Result(null, [probe]));
         Assert.False(v.Isolated);
         Assert.Contains(probe, v.Reason);
     }
@@ -43,22 +50,53 @@ public class IsolationVerifierTests
     [Fact]
     public void SelfTest_Simulated_ParseablePublicIp_Fails()
     {
-        Assert.False(IsolationVerifier.Verify(NetworkMode.Simulated, Names, null, Result("203.0.113.77\n")).Isolated);
-        Assert.False(IsolationVerifier.Verify(NetworkMode.Simulated, Names, null, Result("8.8.8.8")).Isolated);
-        Assert.False(IsolationVerifier.Verify(NetworkMode.Simulated, Names, null, Result("2606:4700:4700::1111")).Isolated);
+        Assert.False(V(NetworkMode.Simulated, Names, null, Result("203.0.113.77\n")).Isolated);
+        Assert.False(V(NetworkMode.Simulated, Names, null, Result("8.8.8.8")).Isolated);
+        Assert.False(V(NetworkMode.Simulated, Names, null, Result("2606:4700:4700::1111")).Isolated);
     }
 
     [Fact]
     public void SelfTest_Simulated_InetSimPage_Passes()
     {
-        Assert.True(IsolationVerifier.Verify(NetworkMode.Simulated, Names, null, Result("<html><body>This is the default HTML page for INetSim HTTP server fake mode.</body></html>")).Isolated);
-        Assert.True(IsolationVerifier.Verify(NetworkMode.Simulated, Names, null, Result(null)).Isolated);
-        Assert.True(IsolationVerifier.Verify(NetworkMode.Simulated, Names, null, Result("198.18.0.10")).Isolated); // the sinkhole itself
+        Assert.True(V(NetworkMode.Simulated, Names, null, Result(InetSimPage)).Isolated);
+    }
+
+    /// <summary>Simulated must prove INetSim answered: no echo, or a bare IP (an echo service, even the sinkhole's), is a failure.</summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("198.18.0.10")]
+    [InlineData(" 10.213.0.1\n")]
+    public void SelfTest_Simulated_NoInetSimAnswer_Fails(string? echo)
+    {
+        var v = V(NetworkMode.Simulated, Names, null, Result(echo));
+        Assert.False(v.Isolated);
+        Assert.NotNull(v.Reason);
+    }
+
+    /// <summary>The guest must hold the run's lease address: a guest on another network (or none) proves nothing.</summary>
+    [Theory]
+    [InlineData(NetworkMode.None, null)]
+    [InlineData(NetworkMode.Simulated, InetSimPage)]
+    [InlineData(NetworkMode.LiveVpn, "203.0.113.5")]
+    public void SelfTest_GuestWithoutLeaseAddress_Fails(NetworkMode mode, string? echo)
+    {
+        const string egress = "203.0.113.5";
+        Assert.True(V(mode, Names, egress, Result(echo)).Isolated); // control: with the lease address it passes
+        foreach (var addrs in new IReadOnlyList<string>?[] { null, [], ["169.254.10.20"], ["10.213.0.6", "192.168.1.50"] })
+        {
+            var r = new SelfTestResultMessage(DateTimeOffset.UnixEpoch, "c1", Names.Select(n => new ProbeResult(n, false)).ToList(), echo, addrs);
+            var v = V(mode, Names, egress, r);
+            Assert.False(v.Isolated);
+            Assert.Contains("10.213.0.2", v.Reason);
+        }
+        Assert.False(V(mode, Names, egress, Result(echo), guestIp: null).Isolated); // unknown lease address: fail closed
+        Assert.True(V(mode, Names, egress, Result(echo, addresses: ["fe80::1", "10.213.0.2"])).Isolated);
     }
 
     [Fact]
     public void SelfTest_Vpn_MatchingEgressIp_Passes() =>
-        Assert.True(IsolationVerifier.Verify(NetworkMode.LiveVpn, Names, "203.0.113.5", Result(" 203.0.113.5\r\n")).Isolated);
+        Assert.True(V(NetworkMode.LiveVpn, Names, "203.0.113.5", Result(" 203.0.113.5\r\n")).Isolated);
 
     [Theory]
     [InlineData("203.0.113.6")]
@@ -66,31 +104,31 @@ public class IsolationVerifierTests
     [InlineData("not an ip")]
     [InlineData("")]
     public void SelfTest_Vpn_WrongEgressIp_Fails(string? echo) =>
-        Assert.False(IsolationVerifier.Verify(NetworkMode.LiveVpn, Names, "203.0.113.5", Result(echo)).Isolated);
+        Assert.False(V(NetworkMode.LiveVpn, Names, "203.0.113.5", Result(echo)).Isolated);
 
     [Theory]
     [InlineData(null)]
     [InlineData("")]
     [InlineData("garbage")]
     public void SelfTest_Vpn_NoExpectedEgress_Fails(string? expected) =>
-        Assert.False(IsolationVerifier.Verify(NetworkMode.LiveVpn, Names, expected, Result("203.0.113.5")).Isolated);
+        Assert.False(V(NetworkMode.LiveVpn, Names, expected, Result("203.0.113.5")).Isolated);
 
     [Fact]
     public void SelfTest_LiveTor_FailsClosed() =>
-        Assert.False(IsolationVerifier.Verify(NetworkMode.LiveTor, Names, null, Result("203.0.113.5")).Isolated);
+        Assert.False(V(NetworkMode.LiveTor, Names, null, Result("203.0.113.5")).Isolated);
 
     [Fact]
     public void SelfTest_MissingProbe_IsFailure() =>
-        Assert.False(IsolationVerifier.Verify(NetworkMode.None, Names, null, Result(null, names: Names.Skip(1))).Isolated);
+        Assert.False(V(NetworkMode.None, Names, null, Result(null, names: Names.Skip(1))).Isolated);
 
     [Fact]
     public void SelfTest_ExtraProbe_IsFailure() =>
-        Assert.False(IsolationVerifier.Verify(NetworkMode.None, Names, null, Result(null, names: Names.Append("surprise"))).Isolated);
+        Assert.False(V(NetworkMode.None, Names, null, Result(null, names: Names.Append("surprise"))).Isolated);
 
     [Fact]
     public void SelfTest_NoResult_IsFailure()
     {
-        var v = IsolationVerifier.Verify(NetworkMode.None, Names, null, null);
+        var v = V(NetworkMode.None, Names, null, null);
         Assert.False(v.Isolated);
         Assert.NotNull(v.Reason);
     }
@@ -100,14 +138,14 @@ public class IsolationVerifierTests
     {
         // The duplicate hides a reachable entry behind an unreachable one of the same name.
         var probes = Names.Select(n => new ProbeResult(n, false)).Append(new ProbeResult("gateway", true)).ToList();
-        Assert.False(IsolationVerifier.Verify(NetworkMode.None, Names, null, new SelfTestResultMessage(DateTimeOffset.UnixEpoch, "c1", probes, null)).Isolated);
+        Assert.False(V(NetworkMode.None, Names, null, new SelfTestResultMessage(DateTimeOffset.UnixEpoch, "c1", probes, null)).Isolated);
         var dupOnlyUnreachable = Names.Select(n => new ProbeResult(n, false)).Append(new ProbeResult("gateway", false)).ToList();
-        Assert.False(IsolationVerifier.Verify(NetworkMode.None, Names, null, new SelfTestResultMessage(DateTimeOffset.UnixEpoch, "c1", dupOnlyUnreachable, null)).Isolated);
+        Assert.False(V(NetworkMode.None, Names, null, new SelfTestResultMessage(DateTimeOffset.UnixEpoch, "c1", dupOnlyUnreachable, null)).Isolated);
     }
 
     [Fact]
     public void SelfTest_EmptyExpectedList_IsFailure() =>
-        Assert.False(IsolationVerifier.Verify(NetworkMode.None, [], null, Result(null, names: [])).Isolated);
+        Assert.False(V(NetworkMode.None, [], null, Result(null, names: [])).Isolated);
 
     [Fact]
     public void Validator_RejectsOversizeResult()
@@ -118,6 +156,12 @@ public class IsolationVerifierTests
         Assert.NotNull(AgentMessageValidator.Validate(ok with { Probes = Enumerable.Range(0, 65).Select(i => new ProbeResult("p" + i, false)).ToList() }));
         Assert.NotNull(AgentMessageValidator.Validate(ok with { Probes = [new ProbeResult(new string('n', 65), false)] }));
         Assert.NotNull(AgentMessageValidator.Validate(ok with { CommandId = null! }));
+        Assert.Null(AgentMessageValidator.Validate(ok with { GuestAddresses = null }));
+        Assert.Null(AgentMessageValidator.Validate(ok with { GuestAddresses = Enumerable.Range(1, 16).Select(i => "10.0.0." + i).Append("fe80::1").Take(16).ToList() }));
+        Assert.NotNull(AgentMessageValidator.Validate(ok with { GuestAddresses = Enumerable.Range(1, 17).Select(i => "10.0.0." + i).ToList() }));
+        Assert.NotNull(AgentMessageValidator.Validate(ok with { GuestAddresses = ["10.213.0.2", "not-an-ip"] }));
+        Assert.NotNull(AgentMessageValidator.Validate(ok with { GuestAddresses = [null!] }));
+        Assert.NotNull(AgentMessageValidator.Validate(ok with { GuestAddresses = [new string('1', 100)] }));
     }
 
     [Fact]
@@ -129,7 +173,11 @@ public class IsolationVerifierTests
         Assert.Equal(cmd.Targets[0].Host, ((SelfTestCommand)System.Text.Json.JsonSerializer.Deserialize<AgentCommand>(json, AgentJson.Options)!).Targets[0].Host);
         var msg = System.Text.Json.JsonSerializer.Serialize<AgentMessage>(Result("1.2.3.4"), AgentJson.Options);
         Assert.Contains("\"type\":\"self_test_result\"", msg);
-        Assert.IsType<SelfTestResultMessage>(System.Text.Json.JsonSerializer.Deserialize<AgentMessage>(msg, AgentJson.Options));
+        Assert.Equal(["10.213.0.2"], Assert.IsType<SelfTestResultMessage>(System.Text.Json.JsonSerializer.Deserialize<AgentMessage>(msg, AgentJson.Options)).GuestAddresses!);
+        Assert.Contains("\"guestAddresses\":[\"10.213.0.2\"]", msg);
+        // additive: an older agent's answer without the field still parses (and then fails the lease-address check)
+        var old = System.Text.Json.JsonSerializer.Deserialize<AgentMessage>("""{"type":"self_test_result","at":"2026-01-01T00:00:00Z","commandId":"c1","probes":[],"echoBody":null}""", AgentJson.Options);
+        Assert.Null(Assert.IsType<SelfTestResultMessage>(old).GuestAddresses);
     }
 
     [Fact]
@@ -137,6 +185,7 @@ public class IsolationVerifierTests
     {
         var net = new NetOptions { ControlPlaneIps = ["192.168.1.10", "192.168.1.11"] };
         var plan = IsolationProbePlan.Build(net, new RunNetworkInfo("10.213.0.5", "10.213.0.6", NetworkMode.None));
+        Assert.Equal("10.213.0.6", plan.GuestIp);
         Assert.Equal(["gateway", "control_plane_0", "control_plane_1", "rfc1918_10", "rfc1918_172", "rfc1918_192", "link_local"], plan.Targets.Select(t => t.Name));
         Assert.Equal("10.213.0.5", plan.Targets[0].Host);
         Assert.Equal([22, 80, 135, 139, 443, 445, 3389, 5000, 5900, 8080, 8443], plan.Targets[0].Ports);

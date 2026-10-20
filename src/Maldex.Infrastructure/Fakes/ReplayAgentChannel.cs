@@ -132,8 +132,9 @@ public sealed class ReplayAgentChannel : IAgentChannel
     }
 
     /// <summary>
-    /// A fake guest is perfectly isolated unless a test says otherwise: every probe blocked, no echo. Without a <see cref="FakeGuest"/>
-    /// the channel answers exactly that. Fake LiveVpn runs echo the configured exit IP (see <see cref="FakeEgressOptions.LiveEgressIp"/>).
+    /// A fake guest is perfectly isolated unless a test says otherwise: it holds its lease address (10.213.0.2), every probe is
+    /// blocked, no echo. Without a <see cref="FakeGuest"/> the channel answers exactly that. Fake LiveVpn runs echo the configured
+    /// exit IP (see <see cref="FakeEgressOptions.LiveEgressIp"/>), fake Simulated runs INetSim's default page.
     /// </summary>
     private void RespondSelfTest(SelfTestCommand c)
     {
@@ -141,7 +142,8 @@ public sealed class ReplayAgentChannel : IAgentChannel
         var reachable = _guest is null ? [] : _guest.ReachableProbes.ToHashSet(StringComparer.Ordinal);
         var echo = _guest is not null && _taskId is { } id ? _guest.EchoFor(id) : null;
         Enqueue(new SelfTestResultMessage(_time.GetUtcNow(), c.CommandId,
-            c.Targets.Select(t => new ProbeResult(t.Name, reachable.Contains(t.Name))).ToList(), echo));
+            c.Targets.Select(t => new ProbeResult(t.Name, reachable.Contains(t.Name))).ToList(), echo,
+            _guest?.SelfTestGuestAddresses ?? [FakeGuest.LeaseAddress]));
         Enqueue(new CommandResultMessage(c.CommandId, true));
     }
 

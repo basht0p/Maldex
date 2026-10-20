@@ -110,8 +110,13 @@ public sealed record SelfTestCommand(string CommandId, IReadOnlyList<ProbeTarget
 /// <summary><c>Reachable</c> = at least one port of the target accepted a connection.</summary>
 public sealed record ProbeResult(string Name, bool Reachable);
 
-/// <summary>The guest's answer to a <see cref="SelfTestCommand"/> (<c>CommandId</c> is the command's). UNTRUSTED. <c>EchoBody</c> is the first 256 characters of the echo response, null if it failed.</summary>
-public sealed record SelfTestResultMessage(DateTimeOffset At, string CommandId, IReadOnlyList<ProbeResult> Probes, string? EchoBody) : AgentMessage;
+/// <summary>
+/// The guest's answer to a <see cref="SelfTestCommand"/> (<c>CommandId</c> is the command's). UNTRUSTED. <c>EchoBody</c> is the
+/// first 256 characters of the echo response, null if it failed. <c>GuestAddresses</c> (additive; null from older agents) are
+/// the guest's IP addresses on the interface(s) with a default gateway, or every non-loopback address if none got one in time.
+/// </summary>
+public sealed record SelfTestResultMessage(DateTimeOffset At, string CommandId, IReadOnlyList<ProbeResult> Probes, string? EchoBody,
+    IReadOnlyList<string>? GuestAddresses = null) : AgentMessage;
 
 /// <summary>Limits shared by both ends of a bulk transfer.</summary>
 public static class AgentLimits

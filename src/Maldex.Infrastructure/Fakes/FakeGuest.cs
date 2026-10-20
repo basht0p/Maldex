@@ -29,6 +29,15 @@ public sealed class FakeGuest
     /// <summary>When set, the self-test echo body for every run (wins over the per-run value). Null = the echo fails.</summary>
     public string? SelfTestEchoBody { get; set; }
 
+    /// <summary>The fake run's lease address (matches <see cref="FakeRunNetworkInfo"/>).</summary>
+    public const string LeaseAddress = "10.213.0.2";
+
+    /// <summary>What a fake Simulated run's echo request gets back: INetSim's default page, as the real gateway serves it.</summary>
+    public const string InetSimEchoPage = "<html>\n  <head>\n    <title>INetSim default HTML page</title>\n  </head>\n  <body>\n    <p>This is the default HTML page for INetSim HTTP server fake mode.</p>\n  </body>\n</html>\n";
+
+    /// <summary>The addresses the fake guest reports in its self-test (default: it holds its lease address).</summary>
+    public IReadOnlyList<string> SelfTestGuestAddresses { get; set; } = [LeaseAddress];
+
     /// <summary>When true, the fake guest never answers a self-test.</summary>
     public bool SilentSelfTest { get; set; }
 

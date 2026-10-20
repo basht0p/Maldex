@@ -59,7 +59,7 @@ public sealed class SelfTestGate(TimeProvider time, TimeSpan? timeout = null, Ti
                 switch (await read.ConfigureAwait(false))
                 {
                     case SelfTestResultMessage r when r.CommandId == command.CommandId:
-                        return IsolationVerifier.Verify(mode, plan.ExpectedNames, expectedEgressIp, r);
+                        return IsolationVerifier.Verify(mode, plan.ExpectedNames, expectedEgressIp, r, plan.GuestIp);
                     case CommandResultMessage { Success: false } refused when refused.CommandId == command.CommandId:
                         return IsolationVerdict.Fail($"the agent refused the self-test ({GuestText.Clean(refused.Error, 200)})");
                 }
