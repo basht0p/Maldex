@@ -8,11 +8,15 @@ namespace Maldex.Orchestrator;
 /// <summary>A sample could not be delivered into the guest. The message is safe to store as the task's failure reason.</summary>
 public sealed class SampleDeliveryException(string message) : Exception("sample delivery failed: " + message);
 
+/// <summary>The delivered sample could not be opened (the run is already Running). The message is safe to store.</summary>
+public sealed class SampleOpenException(string message) : Exception("sample open failed: " + message);
+
 /// <summary>The analyst asked to stop while the sample was being delivered.</summary>
 public sealed class DeliveryStoppedException() : Exception("stopped by analyst during sample delivery");
 
 /// <summary>
-/// Sends a sample into the guest as 512 KiB chunks (each acknowledged before the next is sent), then asks the agent to open it.
+/// Sends a sample into the guest as 512 KiB chunks (each acknowledged before the next is sent) in Preparing; once the run is
+/// Running, <see cref="OpenAsync"/> asks the agent to open it (so the live view sees the start).
 /// </summary>
 public sealed class SampleDelivery(TimeProvider time, TimeSpan? chunkTimeout = null, TimeSpan? pollInterval = null)
 {
@@ -24,7 +28,7 @@ public sealed class SampleDelivery(TimeProvider time, TimeSpan? chunkTimeout = n
 
     /// <param name="ch">The agent channel; only <see cref="IAgentChannel.SendAsync"/> (and <c>Violations</c>) is used.</param>
     /// <param name="inbox">Where the run's read loop delivers the agent's replies. Opened here, so nothing else may hold it.</param>
-    /// <param name="blobKey">Becomes the transfer id and the <c>open_sample</c> blob key.</param>
+    /// <param name="blobKey">Becomes the transfer id (and later the <c>open_sample</c> blob key).</param>
     /// <param name="size">Exact length of <paramref name="blob"/>.</param>
     /// <param name="sha256">Hex SHA-256 of the whole sample; the agent verifies it before opening anything.</param>
     /// <param name="stopRequested">Polled about once per poll interval, also while waiting for an answer; true ends delivery with <see cref="DeliveryStoppedException"/>.</param>
@@ -52,14 +56,20 @@ public sealed class SampleDelivery(TimeProvider time, TimeSpan? chunkTimeout = n
             }
 
             var command = new PutFileChunkCommand(NewId(), blobKey, i, count, size, sha, Convert.ToBase64String(buffer.AsSpan(0, length)));
-            await SendAndAwaitAsync(ch, lease.Reader, command, $"chunk {i + 1} of {count}", stopRequested, ct).ConfigureAwait(false);
+            await SendAndAwaitAsync(ch, lease.Reader, command, $"chunk {i + 1} of {count}", stopRequested, m => new SampleDeliveryException(m), ct).ConfigureAwait(false);
         }
+    }
 
-        await SendAndAwaitAsync(ch, lease.Reader, new OpenSampleCommand(NewId(), fileName, blobKey), "open", stopRequested, ct).ConfigureAwait(false);
+    /// <summary>Asks the agent to open the delivered sample and waits for its answer.</summary>
+    /// <exception cref="SampleOpenException">Refused, timed out or disconnected.</exception>
+    public async Task OpenAsync(IAgentChannel ch, TransferInbox inbox, string blobKey, string fileName, CancellationToken ct)
+    {
+        using var lease = inbox.Open();
+        await SendAndAwaitAsync(ch, lease.Reader, new OpenSampleCommand(NewId(), fileName, blobKey), "open", null, m => new SampleOpenException(m), ct).ConfigureAwait(false);
     }
 
     private async Task SendAndAwaitAsync(IAgentChannel ch, ChannelReader<AgentMessage> replies, AgentCommand command, string what,
-        Func<CancellationToken, Task<bool>>? stopRequested, CancellationToken ct)
+        Func<CancellationToken, Task<bool>>? stopRequested, Func<string, Exception> fail, CancellationToken ct)
     {
         using var timeout = new CancellationTokenSource(_chunkTimeout, time);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
@@ -87,21 +97,21 @@ public sealed class SampleDelivery(TimeProvider time, TimeSpan? chunkTimeout = n
                 var message = await read.ConfigureAwait(false);
                 if (message is not CommandResultMessage result || result.CommandId != command.CommandId) continue;
                 if (!result.Success)
-                    throw new SampleDeliveryException($"{what}: the agent refused it ({GuestText.Clean(result.Error, 200)})");
+                    throw fail($"{what}: the agent refused it ({GuestText.Clean(result.Error, 200)})");
                 return;
             }
         }
         catch (OperationCanceledException) when (timeout.IsCancellationRequested && !ct.IsCancellationRequested)
         {
-            throw new SampleDeliveryException($"{what}: no answer from the agent within {_chunkTimeout.TotalSeconds:0} s");
+            throw fail($"{what}: no answer from the agent within {_chunkTimeout.TotalSeconds:0} s");
         }
         catch (ChannelClosedException)
         {
-            throw new SampleDeliveryException(ch.Violations >= MaxViolations ? "agent protocol violations" : $"{what}: the agent disconnected");
+            throw fail(ch.Violations >= MaxViolations ? "agent protocol violations" : $"{what}: the agent disconnected");
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
         {
-            throw new SampleDeliveryException($"{what}: {GuestText.Clean(ex.Message, 200)}");
+            throw fail($"{what}: {GuestText.Clean(ex.Message, 200)}");
         }
     }
 

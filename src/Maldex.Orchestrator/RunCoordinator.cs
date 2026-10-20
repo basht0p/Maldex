@@ -239,11 +239,9 @@ public sealed class RunCoordinator(
                 // Recording starts before anything is delivered; if it cannot start, the sample is never sent.
                 await StartCaptureAsync(lease, capture, ct).ConfigureAwait(false);
 
+                // The sample is delivered in Preparing (a failure or stop here never reaches Running)...
                 if (command is OpenSampleCommand open)
-                {
-                    inbox.MarkOpened(); // the delivery ends with the open command
                     await DeliverSampleAsync(db, channel, inbox, task, open, ct).ConfigureAwait(false);
-                }
 
                 var now = time.GetUtcNow();
                 await TransitionAsync(db, task, RunStatus.Running, "agent ready; isolation self-test passed", t =>
@@ -252,12 +250,14 @@ public sealed class RunCoordinator(
                     t.DeadlineAt = now.AddSeconds(t.DurationSec);
                 }, ct).ConfigureAwait(false);
 
-                // A sample is opened by its delivery; a URL is opened now.
-                if (command is not OpenSampleCommand)
-                {
-                    inbox.MarkOpened();
+                // ...and opened only once the run is Running, so the live view sees it start. From here a failed open is a
+                // run error (Running -> Failed), not a Preparing failure.
+                inbox.MarkOpened();
+                if (command is OpenSampleCommand sample)
+                    await new SampleDelivery(time, pollInterval: _options.ControlPollInterval)
+                        .OpenAsync(channel, inbox, sample.BlobKey, sample.FileName, ct).ConfigureAwait(false);
+                else
                     await channel.SendAsync(command, ct).ConfigureAwait(false);
-                }
 
                 var reason = await ControlLoopAsync(task.Id, reader, flusher, channel, ct).ConfigureAwait(false);
 
@@ -456,7 +456,7 @@ public sealed class RunCoordinator(
             .ConfigureAwait(false);
     }
 
-    /// <summary>Streams the stored sample into the guest and has it opened. Any failure fails the run in Preparing (no retry).</summary>
+    /// <summary>Streams the stored sample into the guest (it is opened later, once Running). Any failure fails the run in Preparing (no retry).</summary>
     private async Task DeliverSampleAsync(MaldexDbContext db, IAgentChannel channel, TransferInbox inbox, AnalysisTask task, OpenSampleCommand open, CancellationToken ct)
     {
         Stream blob;
