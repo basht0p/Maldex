@@ -109,6 +109,14 @@ try {
         }
     }
 
+    Step '.ps1 opens with PowerShell, not Notepad' -BestEffort {
+        # The agent opens samples with ShellExecute; Windows 11 associates .ps1 with Notepad unless told otherwise.
+        $key = 'HKLM:\SOFTWARE\Classes\Microsoft.PowerShellScript.1\Shell'
+        New-Item -Path "$key\Open\Command" -Force | Out-Null
+        Set-ItemProperty -Path $key -Name '(default)' -Value 'Open'
+        Set-ItemProperty -Path "$key\Open\Command" -Name '(default)' -Value '"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%1"'
+    }
+
     Step 'Power plan: never sleep' -BestEffort {
         powercfg /x -standby-timeout-ac 0
         powercfg /x -standby-timeout-dc 0

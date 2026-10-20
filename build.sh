@@ -436,6 +436,17 @@ cmd_build_guest() {
     deploy/guest/build-guest.sh
 }
 
+# Harmless real-VM end-to-end suite (needs the built guest image; see deploy/guest/README.md "Running the E2E suite").
+cmd_e2e() {
+  local base="$VM_DIR/base"
+  if [ ! -f "$base/win11-26h2.qcow2" ] || [ ! -f "$base/win11-26h2.vars.fd" ]; then
+    echo "The Windows 11 26H2 base image is missing ($base/win11-26h2.qcow2 and .vars.fd)." >&2
+    echo "Build it first:  MALDEX_WIN_ISO=/path/to/Win11_26H2.iso ./build.sh build-guest" >&2
+    return 2
+  fi
+  MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 dotnet test --project tests/Maldex.Integration.Tests --filter-class "*RealVmE2ETests"
+}
+
 case "${1:-}" in
   setup)  cmd_setup ;;
   dev-db) cmd_dev_db ;;
@@ -446,6 +457,6 @@ case "${1:-}" in
   real-setup) cmd_real_setup ;;
   real-smoke) cmd_real_smoke ;;
   build-guest) cmd_build_guest ;;
-  e2e)    echo "Real-VM E2E is implemented in Plan 1b"; exit 2 ;;
+  e2e)    cmd_e2e ;;
   *) echo "usage: $0 setup|dev-db|run|test|smoke|build|real-setup|real-smoke|build-guest|e2e" >&2; exit 64 ;;
 esac

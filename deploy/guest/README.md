@@ -35,3 +35,14 @@ media, fully unattended and offline.
 - On any failure the build VM (including its NVRAM and TPM state) and the intermediate files are removed. Set `MALDEX_KEEP_FAILED_BUILD=1` to keep them; the script then prints the `virsh vncdisplay` command.
 - The event logs are cleared by `Provision.ps1`, but the verification boot afterwards writes new entries, so the finished image does NOT have pristine logs. This is deliberate and harmless; the per-run overlay is what matters.
 - The build has not been run against real media yet (it needs `MALDEX_WIN_ISO`); only static validation was possible.
+
+## Running the E2E suite
+
+`./build.sh e2e` detonates the **harmless** files in `deploy/guest/samples/` (EICAR, a registry-write script, the controlled URL `http://maldex-test.invalid/`) against the real stack: real libvirt VM, namespace networking, agent channel, capture and processing, in `Simulated` network mode through the real DI (`Maldex:Mode=Real`). It never runs malware.
+
+1. Build the image once: `MALDEX_WIN_ISO=/path/to/Win11_26H2.iso ./build.sh build-guest` (and `./build.sh real-setup` for the host toolchain). If `.data/vm/base/win11-26h2.qcow2` or `.vars.fd` is missing, `./build.sh e2e` prints this and exits 2.
+2. Run `./build.sh e2e`. It sets `MALDEX_REAL_VM=1` and `MALDEX_REAL_NET=1` and runs only `RealVmE2ETests` (needs Docker for the SQL container, and the passwordless sudo that real mode uses). Without those variables and the image the tests skip with a message.
+3. The test output records the time from `Preparing` to agent Ready for every run (measured, not asserted), and each run is followed by a check that no `maldex-*` libvirt domain and no `mx*` link or namespace survived.
+4. Calc-macro test: needs Office in the image (`MALDEX_OFFICE_ISO` at build time) and a macro-enabled document whose AutoOpen starts `calc.exe`, which is not stored in the repository. Opt in with `MALDEX_E2E_OFFICE=1 MALDEX_E2E_OFFICE_SAMPLE=/path/to/calc-macro.doc`; otherwise the test skips with a message.
+
+The registry-write sample is a `.ps1`; the agent opens samples with ShellExecute, so `Provision.ps1` re-points the `.ps1` Open verb at PowerShell (Windows 11 otherwise opens it in Notepad).
