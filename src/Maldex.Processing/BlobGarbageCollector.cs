@@ -20,9 +20,30 @@ public sealed class BlobGarbageCollector(IServiceScopeFactory scopes, IArtifactS
     public static readonly TimeSpan DefaultGrace = TimeSpan.FromHours(1);
     private static readonly string[] TempPrefixes = ["maldex-scan-", "maldex-suricata-"];
 
-    private TimeSpan Grace =>
-        TimeSpan.TryParse(configuration["Maldex:Retention:BlobGcGrace"], CultureInfo.InvariantCulture, out var g) && g >= TimeSpan.Zero ? g : DefaultGrace;
+    public static readonly TimeSpan MinGrace = TimeSpan.FromMinutes(5);
 
+    private TimeSpan Grace
+    {
+        get
+        {
+            var raw = configuration["Maldex:Retention:BlobGcGrace"];
+            if (string.IsNullOrWhiteSpace(raw)) return DefaultGrace;
+            if (!TimeSpan.TryParse(raw, CultureInfo.InvariantCulture, out var g))
+            {
+                logger.LogWarning("Maldex:Retention:BlobGcGrace '{Value}' is not a valid time span; using {Default}.", raw, DefaultGrace);
+                return DefaultGrace;
+            }
+            if (g < MinGrace)
+            {
+                logger.LogWarning("Maldex:Retention:BlobGcGrace {Value} is below the {Min} floor; using the floor.", g, MinGrace);
+                return MinGrace;
+            }
+            return g;
+        }
+    }
+
+    /// <summary>Test hook (<c>Maldex:Retention:TempPath</c>): producers of maldex-scan-*/maldex-suricata-* always use
+    /// <see cref="Path.GetTempPath"/>, so production leaves this unset.</summary>
     private string TempPath =>
         configuration["Maldex:Retention:TempPath"] is { Length: > 0 } p ? p : Path.GetTempPath();
 
@@ -47,8 +68,15 @@ public sealed class BlobGarbageCollector(IServiceScopeFactory scopes, IArtifactS
                 .ToListAsync(ct).ConfigureAwait(false));
             foreach (var key in candidates.Where(k => !referenced.Contains(k)))
             {
-                await artifacts.DeleteAsync(key, ct).ConfigureAwait(false);
-                blobs++;
+                try
+                {
+                    await artifacts.DeleteAsync(key, ct).ConfigureAwait(false);
+                    blobs++;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    logger.LogWarning(ex, "Could not delete unreferenced blob {Key}.", key);
+                }
             }
         }
 
@@ -82,16 +110,14 @@ public sealed class BlobGarbageCollector(IServiceScopeFactory scopes, IArtifactS
             {
                 try
                 {
-                    if (Directory.Exists(entry))
-                    {
-                        if (new DateTimeOffset(Directory.GetLastWriteTimeUtc(entry), TimeSpan.Zero) >= cutoff) continue;
+                    var info = new FileInfo(entry); // reports the entry itself, not a symlink target
+                    if (new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero) >= cutoff) continue;
+                    if (info.LinkTarget is not null)
+                        info.Delete(); // remove the link only; never follow it
+                    else if (Directory.Exists(entry))
                         Directory.Delete(entry, recursive: true);
-                    }
                     else
-                    {
-                        if (new DateTimeOffset(File.GetLastWriteTimeUtc(entry), TimeSpan.Zero) >= cutoff) continue;
                         File.Delete(entry);
-                    }
                     deleted++;
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

@@ -151,4 +151,59 @@ public class BlobGcTests(SqlServerFixture sql)
         }
         finally { Directory.Delete(temp, true); }
     }
+
+    [Fact]
+    public async Task Sweep_KeepsOrphanRefreshedByDedupedReupload()
+    {
+        var temp = NewTempDir();
+        try
+        {
+            await using var h = await OrchestratorHarness.CreateAsync(sql, Settings(temp));
+            var bytes = Encoding.ASCII.GetBytes("dedup " + Guid.NewGuid());
+            var store = h.Get<IArtifactStore>();
+            await using var first = new MemoryStream(bytes);
+            var key = (await store.PutAsync("screenshots", first, 1_048_576, Ct)).Key;
+            Age(h, key, TimeSpan.FromHours(5));
+            await using var second = new MemoryStream(bytes);
+            Assert.Equal(key, (await store.PutAsync("screenshots", second, 1_048_576, Ct)).Key);
+
+            var result = await h.Get<BlobGarbageCollector>().SweepAsync(DateTimeOffset.UtcNow, Ct);
+
+            Assert.Equal(new GcResult(0, 0), result);
+            Assert.True(store.Exists(key));
+        }
+        finally { Directory.Delete(temp, true); }
+    }
+
+    [Fact]
+    public async Task Sweep_RemovesScanSymlinkButNotItsTarget()
+    {
+        var temp = NewTempDir();
+        var outside = NewTempDir();
+        try
+        {
+            await using var h = await OrchestratorHarness.CreateAsync(sql, Settings(temp));
+            var outFile = Path.Combine(outside, "keep.txt");
+            File.WriteAllText(outFile, "x");
+            var fileLink = Path.Combine(temp, "maldex-scan-" + Guid.NewGuid().ToString("N"));
+            var dirLink = Path.Combine(temp, "maldex-suricata-" + Guid.NewGuid().ToString("N"));
+            File.CreateSymbolicLink(fileLink, outFile);
+            Directory.CreateSymbolicLink(dirLink, outside);
+            // Age the links and targets.
+            var old = DateTime.UtcNow.AddHours(-5);
+            File.SetLastWriteTimeUtc(outFile, old);
+            Directory.SetLastWriteTimeUtc(outside, old);
+            new FileInfo(fileLink).LastWriteTimeUtc = old;
+            new FileInfo(dirLink).LastWriteTimeUtc = old;
+
+            var result = await h.Get<BlobGarbageCollector>().SweepAsync(DateTimeOffset.UtcNow, Ct);
+
+            Assert.Equal(2, result.TempFilesDeleted);
+            Assert.False(Path.Exists(fileLink));
+            Assert.False(Path.Exists(dirLink));
+            Assert.True(File.Exists(outFile));
+            Assert.True(Directory.Exists(outside));
+        }
+        finally { Directory.Delete(temp, true); Directory.Delete(outside, true); }
+    }
 }

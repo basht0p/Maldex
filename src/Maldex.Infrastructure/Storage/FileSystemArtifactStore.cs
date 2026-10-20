@@ -118,6 +118,8 @@ public sealed partial class FileSystemArtifactStore : IArtifactStore
             if (File.Exists(dest))
             {
                 File.Delete(tempPath);
+                // Refresh the age so a concurrent garbage-collection sweep can't delete an old orphan this upload now relies on.
+                TryTouch(dest);
             }
             else
             {
@@ -130,6 +132,7 @@ public sealed partial class FileSystemArtifactStore : IArtifactStore
                 {
                     // Another writer stored identical content between our check and the move.
                     File.Delete(tempPath);
+                    TryTouch(dest);
                 }
             }
 
@@ -142,6 +145,12 @@ public sealed partial class FileSystemArtifactStore : IArtifactStore
             try { File.Delete(tempPath); } catch (IOException) { }
             throw;
         }
+    }
+
+    private static void TryTouch(string path)
+    {
+        try { File.SetLastWriteTimeUtc(path, DateTime.UtcNow); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
     }
 
     /// <summary>Creates <paramref name="dir"/> and every missing ancestor at or below the root with owner+group-only mode.
