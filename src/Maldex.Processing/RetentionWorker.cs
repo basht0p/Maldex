@@ -4,7 +4,7 @@ using Microsoft.Extensions.Logging;
 namespace Maldex.Processing;
 
 /// <summary>Runs <see cref="RetentionService"/> five minutes after startup, then every 24 hours.</summary>
-public sealed class RetentionWorker(RetentionService retention, TimeProvider time, ILogger<RetentionWorker> logger) : BackgroundService
+public sealed class RetentionWorker(RetentionService retention, BlobGarbageCollector blobGc, TimeProvider time, ILogger<RetentionWorker> logger) : BackgroundService
 {
     public static readonly TimeSpan StartupDelay = TimeSpan.FromMinutes(5);
     public static readonly TimeSpan Interval = TimeSpan.FromHours(24);
@@ -24,6 +24,14 @@ public sealed class RetentionWorker(RetentionService retention, TimeProvider tim
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     logger.LogError(ex, "Retention purge failed; will retry at the next interval.");
+                }
+                try
+                {
+                    await blobGc.SweepAsync(time.GetUtcNow(), stoppingToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    logger.LogError(ex, "Blob GC sweep failed; will retry at the next interval.");
                 }
             }
             while (await timer.WaitForNextTickAsync(stoppingToken).ConfigureAwait(false));

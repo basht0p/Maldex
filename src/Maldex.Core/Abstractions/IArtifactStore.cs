@@ -18,4 +18,7 @@ public interface IArtifactStore
     Task DeleteAsync(string key, CancellationToken ct);
 
     bool Exists(string key);
+
+    /// <summary>Enumerates every stored blob with its last-write time (in-flight temp files are excluded).</summary>
+    IAsyncEnumerable<(string Key, DateTimeOffset LastWrite)> ListAsync(CancellationToken ct);
 }

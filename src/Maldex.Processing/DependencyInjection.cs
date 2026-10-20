@@ -17,6 +17,7 @@ public static class DependencyInjection
         // Hosted by Maldex.Web only when Maldex:Workers:Enabled: AddHostedService(sp => sp.GetRequiredService<ProcessingWorker>()).
         services.AddSingleton<ProcessingWorker>();
         services.AddSingleton<RetentionService>();
+        services.AddSingleton(sp => ActivatorUtilities.CreateInstance<BlobGarbageCollector>(sp, configuration));
         // Hosted alongside the others: AddHostedService(sp => sp.GetRequiredService<RetentionWorker>()).
         services.AddSingleton<RetentionWorker>();
         return services;

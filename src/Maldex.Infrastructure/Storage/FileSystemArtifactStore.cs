@@ -45,6 +45,20 @@ public sealed partial class FileSystemArtifactStore : IArtifactStore
 
     public bool Exists(string key) => File.Exists(GetPath(key));
 
+    public async IAsyncEnumerable<(string Key, DateTimeOffset LastWrite)> ListAsync(
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+    {
+        await Task.CompletedTask.ConfigureAwait(false);
+        if (!Directory.Exists(_root)) yield break;
+        foreach (var path in Directory.EnumerateFiles(_root, "*", SearchOption.AllDirectories))
+        {
+            ct.ThrowIfCancellationRequested();
+            var key = Path.GetRelativePath(_root, path).Replace(Path.DirectorySeparatorChar, '/');
+            if (!KeyRegex().IsMatch(key)) continue; // skips tmp/ and anything foreign
+            yield return (key, new DateTimeOffset(File.GetLastWriteTimeUtc(path), TimeSpan.Zero));
+        }
+    }
+
     public Task<Stream> OpenReadAsync(string key, CancellationToken ct)
     {
         var path = GetPath(key);
@@ -104,6 +118,8 @@ public sealed partial class FileSystemArtifactStore : IArtifactStore
             if (File.Exists(dest))
             {
                 File.Delete(tempPath);
+                // Refresh the age so a concurrent garbage-collection sweep can't delete an old orphan this upload now relies on.
+                TryTouch(dest);
             }
             else
             {
@@ -116,6 +132,7 @@ public sealed partial class FileSystemArtifactStore : IArtifactStore
                 {
                     // Another writer stored identical content between our check and the move.
                     File.Delete(tempPath);
+                    TryTouch(dest);
                 }
             }
 
@@ -128,6 +145,12 @@ public sealed partial class FileSystemArtifactStore : IArtifactStore
             try { File.Delete(tempPath); } catch (IOException) { }
             throw;
         }
+    }
+
+    private static void TryTouch(string path)
+    {
+        try { File.SetLastWriteTimeUtc(path, DateTime.UtcNow); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
     }
 
     /// <summary>Creates <paramref name="dir"/> and every missing ancestor at or below the root with owner+group-only mode.
