@@ -79,7 +79,7 @@ start_guacd() {
   docker rm -f maldex-guacd >/dev/null 2>&1 || true
   docker run -d --rm --name maldex-guacd --network host guacamole/guacd:1.5.5 /opt/guacamole/sbin/guacd -b 127.0.0.1 -L info -f >/dev/null
   GUACD_STARTED=1
-  export Maldex__Mode=Real
+  export Maldex__Mode=Real   # the backend then layers src/Maldex.Web/appsettings.Real.json over appsettings.json
 }
 
 stop_guacd() {

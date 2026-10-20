@@ -2,6 +2,7 @@ using System.Text.Json.Serialization;
 using Maldex.Core.Abstractions;
 using Maldex.Data;
 using Maldex.Infrastructure;
+using Maldex.Infrastructure.Real;
 using Maldex.Orchestrator;
 using Maldex.Processing;
 using Maldex.Web;
@@ -18,6 +19,11 @@ if (args.Contains("--install-browsers"))
     Environment.Exit(Microsoft.Playwright.Program.Main(["install", "--with-deps", "chromium"]));
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Real mode (Maldex__Mode=Real, as ./build.sh run sets it, or --Maldex:Mode=Real) layers appsettings.Real.json over
+// appsettings.json / appsettings.{Environment}.json but under the unprefixed environment variables and the command line.
+if (builder.Configuration["Maldex:Mode"] == "Real")
+    RealSettings.Insert(builder.Configuration.Sources, builder.Environment.ContentRootFileProvider);
 
 builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddDbContext<MaldexDbContext>(o => o.UseSqlServer(
@@ -43,7 +49,8 @@ builder.Services.AddMaldexProcessing(builder.Configuration);
 // The orchestrator and processing workers run inside the web host only when Maldex:Workers:Enabled (default true).
 if ((builder.Configuration.GetSection(WorkersOptions.SectionName).Get<WorkersOptions>() ?? new WorkersOptions()).Enabled)
 {
-    builder.Services.AddHostedService(sp => sp.GetRequiredService<OrchestratorWorker>());
+    // Real mode: the orchestrator only starts when the host guards pass (fail closed; the web app stays up either way).
+    builder.Services.AddGatedHostedService<OrchestratorWorker>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<ProcessingWorker>());
     builder.Services.AddHostedService(sp => sp.GetRequiredService<RetentionWorker>());
 }

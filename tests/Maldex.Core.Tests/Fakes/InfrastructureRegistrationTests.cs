@@ -33,10 +33,6 @@ public class InfrastructureRegistrationTests
     }
 
     [Fact]
-    public void RealMode_NotSupported() =>
-        Assert.Equal("Real mode is implemented in Plan 1b", Assert.Throws<NotSupportedException>(() => Add("Real")).Message);
-
-    [Fact]
     public void UnknownMode_Throws() => Assert.Throws<InvalidOperationException>(() => Add("Bogus"));
 
     [Fact]
