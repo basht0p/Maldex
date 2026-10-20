@@ -23,6 +23,7 @@ public sealed class RunCoordinator(
     IHypervisor hypervisor,
     IAgentChannelFactory channels,
     IEgressRouter egress,
+    ICaptureService captureService,
     IRunNetworkInfo networkInfo,
     IExpectedEgress expectedEgress,
     IOptions<NetOptions> netOptions,
@@ -38,6 +39,15 @@ public sealed class RunCoordinator(
     private const int MaxTransitionAttempts = 5;
 
     private readonly OrchestratorOptions _options = options.Value;
+
+    /// <summary>The run's capture, started after the isolation self-test and finished after the VM is gone.</summary>
+    private sealed class CaptureSession
+    {
+        public ICaptureHandle? Handle { get; set; }
+        public bool Used { get; set; }
+        /// <summary>True when everything captured was stored, so the run's leftover network files can go.</summary>
+        public bool Stored { get; set; } = true;
+    }
 
     /// <summary>
     /// Runs one task that the worker has already moved to <c>Preparing</c>. Returns once the task is
@@ -56,6 +66,7 @@ public sealed class RunCoordinator(
         }
 
         NetworkLease? lease = null;
+        var capture = new CaptureSession();
         try
         {
             try
@@ -80,7 +91,7 @@ public sealed class RunCoordinator(
             for (var attempt = 1; attempt <= MaxAttempts; attempt++)
             {
                 await SetAttemptAsync(db, task, attempt, ct).ConfigureAwait(false);
-                var outcome = await AttemptAsync(db, task, lease, command, ct).ConfigureAwait(false);
+                var outcome = await AttemptAsync(db, task, lease, command, capture, ct).ConfigureAwait(false);
                 if (outcome == AttemptOutcome.Completed) break;
 
                 if (outcome == AttemptOutcome.Stopped)
@@ -111,6 +122,12 @@ public sealed class RunCoordinator(
             logger.LogWarning("Run {TaskId}: {Reason}", taskId, ex.Message);
             await FailAsync(db, task, ex.Message).ConfigureAwait(false);
         }
+        catch (CaptureStartException ex)
+        {
+            // Not retried, and nothing was delivered: the sample never runs without a recording.
+            logger.LogError(ex, "Run {TaskId}: capture failed to start.", taskId);
+            await FailAsync(db, task, $"capture failed to start: {GuestText.Clean(ex.Message, 500)}").ConfigureAwait(false);
+        }
         catch (SampleDeliveryException ex)
         {
             // Not retried: a second VM would receive the same sample the same way.
@@ -125,6 +142,7 @@ public sealed class RunCoordinator(
         finally
         {
             await ReleaseLeaseAsync(taskId, lease).ConfigureAwait(false);
+            if (capture.Used && capture.Stored) CleanupRunNetDir(taskId);
         }
 
         if (task.Status == RunStatus.Collecting)
@@ -134,7 +152,7 @@ public sealed class RunCoordinator(
     private enum AttemptOutcome { Completed, VmStartFailed, AgentNotReady, Stopped }
 
     /// <summary>One try on a fresh VM. The VM and agent channel are always released before this returns.</summary>
-    private async Task<AttemptOutcome> AttemptAsync(MaldexDbContext db, AnalysisTask task, NetworkLease lease, AgentCommand command, CancellationToken ct)
+    private async Task<AttemptOutcome> AttemptAsync(MaldexDbContext db, AnalysisTask task, NetworkLease lease, AgentCommand command, CaptureSession capture, CancellationToken ct)
     {
         VmHandle? vm = null;
         IAgentChannel? channel = null;
@@ -152,11 +170,13 @@ public sealed class RunCoordinator(
             }
 
             channel = await channels.ConnectAsync(vm, ct).ConfigureAwait(false);
-            return await RunGuestAsync(db, task, lease, channel, command, ct).ConfigureAwait(false);
+            return await RunGuestAsync(db, task, lease, channel, command, capture, ct).ConfigureAwait(false);
         }
         finally
         {
             await ReleaseGuestAsync(task.Id, channel, vm).ConfigureAwait(false);
+            // The VM is gone, so no more traffic: stop the capture and keep what it recorded (before the lease is released).
+            await FinishCaptureAsync(db, task, capture).ConfigureAwait(false);
         }
     }
 
@@ -181,7 +201,7 @@ public sealed class RunCoordinator(
     /// Returns <c>AgentNotReady</c> (without touching the task) if the agent never became ready, or <c>Stopped</c>
     /// if the analyst asked to stop while the VM was still preparing.
     /// </summary>
-    private async Task<AttemptOutcome> RunGuestAsync(MaldexDbContext db, AnalysisTask task, NetworkLease lease, IAgentChannel channel, AgentCommand command, CancellationToken ct)
+    private async Task<AttemptOutcome> RunGuestAsync(MaldexDbContext db, AnalysisTask task, NetworkLease lease, IAgentChannel channel, AgentCommand command, CaptureSession capture, CancellationToken ct)
     {
         using var readerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var enumerator = channel.ReadAsync(readerCts.Token).GetAsyncEnumerator(readerCts.Token);
@@ -213,6 +233,9 @@ public sealed class RunCoordinator(
             {
                 // The isolation self-test runs after the agent is ready and before anything is delivered or opened: no sample reaches a guest that failed it.
                 await RunSelfTestAsync(db, task, lease, channel, inbox, ct).ConfigureAwait(false);
+
+                // Recording starts before anything is delivered; if it cannot start, the sample is never sent.
+                await StartCaptureAsync(lease, capture, ct).ConfigureAwait(false);
 
                 if (command is OpenSampleCommand open)
                     await DeliverSampleAsync(db, channel, inbox, task, open, ct).ConfigureAwait(false);
@@ -256,6 +279,111 @@ public sealed class RunCoordinator(
         finally
         {
             if (!disposed) await enumerator.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private async Task StartCaptureAsync(NetworkLease lease, CaptureSession capture, CancellationToken ct)
+    {
+        try
+        {
+            capture.Handle = await captureService.StartAsync(lease, ct).ConfigureAwait(false);
+            capture.Used = true;
+        }
+        catch (Exception ex) when (ex is not (OperationCanceledException or CaptureStartException))
+        {
+            throw new CaptureStartException(ex.Message, ex);
+        }
+    }
+
+    /// <summary>
+    /// Stops the capture and stores its files as artifacts. Never throws: a problem becomes a processing warning on the task.
+    /// Not cancellable, so a host shutdown cannot leave a tcpdump running.
+    /// </summary>
+    private async Task FinishCaptureAsync(MaldexDbContext db, AnalysisTask task, CaptureSession capture)
+    {
+        if (capture.Handle is not { } handle) return;
+        capture.Handle = null;
+        var none = CancellationToken.None;
+        var problems = new List<string>();
+        try
+        {
+            IReadOnlyList<CapturedFile> files = [];
+            try { files = await handle.StopAsync(none).ConfigureAwait(false); }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Stopping the capture of task {TaskId} failed.", task.Id);
+                problems.Add($"the capture could not be stopped cleanly: {ex.Message}");
+            }
+
+            var now = time.GetUtcNow();
+            foreach (var file in files)
+            {
+                try
+                {
+                    var (category, max) = file.Kind == ArtifactKind.Pcap ? ("pcap", CaptureService.DefaultMaxPcapBytes) : ("flows", NetnsEgressRouter.MaxFlowsBytes);
+                    await using var stream = new FileStream(file.Path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
+                    var blob = await artifacts.PutAsync(category, stream, max, none).ConfigureAwait(false);
+                    db.Artifacts.Add(new Artifact
+                    {
+                        Id = Guid.NewGuid(), TaskId = task.Id, Kind = file.Kind, BlobKey = blob.Key, Sha256 = blob.Sha256, Size = blob.Size, CreatedAt = now,
+                    });
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Storing the {Kind} capture of task {TaskId} failed.", file.Kind, task.Id);
+                    problems.Add($"the {file.Kind} capture could not be stored: {ex.Message}");
+                }
+            }
+            // Only our own rows: unrelated pending changes are not flushed here.
+            if (db.ChangeTracker.Entries<Artifact>().Any(e => e.State == EntityState.Added)) await db.SaveChangesAsync(none).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Saving the capture artifacts of task {TaskId} failed.", task.Id);
+            // Never leave the rejected rows pending: they would fail the next save of this run too.
+            foreach (var entry in db.ChangeTracker.Entries<Artifact>().Where(e => e.State == EntityState.Added).ToList()) entry.State = EntityState.Detached;
+            problems.Add($"the capture artifacts could not be saved: {ex.Message}");
+        }
+        finally
+        {
+            try { await handle.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception ex) { logger.LogWarning(ex, "Cleaning up the capture of task {TaskId} failed.", task.Id); }
+        }
+
+        capture.Stored = problems.Count == 0;
+        problems.AddRange(handle.Warnings); // truncation etc.: reported, but nothing was lost by storing
+        if (problems.Count == 0) return;
+        try { await AddWarningsAsync(db, task, problems).ConfigureAwait(false); }
+        catch (Exception ex) { logger.LogError(ex, "Could not record the capture warnings of task {TaskId}.", task.Id); }
+    }
+
+    /// <summary>Appends warnings that processing keeps (see <see cref="AnalysisTask.CaptureWarningPrefix"/>). The task row is also written by the API, so reload and retry.</summary>
+    private async Task AddWarningsAsync(MaldexDbContext db, AnalysisTask task, List<string> problems)
+    {
+        for (var tries = 1; ; tries++)
+        {
+            await db.Entry(task).ReloadAsync(CancellationToken.None).ConfigureAwait(false);
+            task.ProcessingWarnings = [.. task.ProcessingWarnings, .. problems.Select(p => GuestText.Clean(AnalysisTask.CaptureWarningPrefix + p, 2000))];
+            try
+            {
+                await db.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+                return;
+            }
+            catch (DbUpdateConcurrencyException) when (tries < MaxTransitionAttempts) { }
+        }
+    }
+
+    /// <summary>The run's leftovers (lease record, logs, the router's own copy of the flows) once everything is stored. Best effort.</summary>
+    private void CleanupRunNetDir(Guid taskId)
+    {
+        try
+        {
+            var dir = Path.Combine(Path.GetFullPath(netOptions.Value.RunDir), "net", RunNetNames.For(taskId).Namespace);
+            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogWarning(ex, "Could not delete the network run directory of task {TaskId}.", taskId);
         }
     }
 

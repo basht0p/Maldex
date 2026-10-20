@@ -26,6 +26,7 @@ public class InfrastructureRegistrationTests
         using var sp = Add(mode).BuildServiceProvider();
         Assert.IsType<FakeHypervisor>(sp.GetRequiredService<IHypervisor>());
         Assert.IsType<NoopEgressRouter>(sp.GetRequiredService<IEgressRouter>());
+        Assert.IsType<NoopCaptureService>(sp.GetRequiredService<ICaptureService>());
         Assert.IsType<FakeAgentChannelFactory>(sp.GetRequiredService<IAgentChannelFactory>());
         Assert.NotNull(sp.GetRequiredService<IDiskSpaceProbe>());
         Assert.Same(sp.GetRequiredService<IHypervisor>(), sp.GetRequiredService<IHypervisor>());

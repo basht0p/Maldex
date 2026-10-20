@@ -28,6 +28,9 @@ public class AnalysisTask
     public DateTimeOffset? CompletedAt { get; set; }
 
     public string? FailureReason { get; set; }
+    /// <summary>Warnings the run itself recorded start with this; processing keeps them when it rewrites the list.</summary>
+    public const string CaptureWarningPrefix = "capture: ";
+
     public List<string> ProcessingWarnings { get; set; } = [];
     public byte[] RowVersion { get; set; } = [];
     public List<TaskStatusHistory> StatusHistory { get; set; } = [];
