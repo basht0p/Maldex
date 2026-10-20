@@ -55,7 +55,7 @@ public static class NftRulesetBuilder
         L("\t\tct state established,related accept");
         L("\t\tiifname \"lo\" accept");
         // Every path to the MITM port must have been DNAT'd/redirected; a direct hit (e.g. via the Simulated any-IP route) is dropped.
-        L($"\t\tiifname \"{ns}\" tcp dport {t.MitmPort} ct status != dnat drop");
+        L($"\t\tiifname \"{ns}\" tcp dport {t.MitmPort} ct status & dnat == 0 drop");
         L($"\t\tiifname \"{ns}\" udp dport 67 accept");
         L($"\t\tiifname \"{ns}\" ip daddr {gw} udp dport 53 accept");
         L($"\t\tiifname \"{ns}\" ip daddr {gw} tcp dport 53 accept");
@@ -63,7 +63,7 @@ public static class NftRulesetBuilder
         if (t.Mode == NetworkMode.Simulated)
         {
             // INetSim answers on any public address; never to the control plane or private ranges (which include the gateway).
-            L($"\t\tiifname \"{ns}\" ip daddr != {{ {blocked} }} ct status != dnat meta l4proto {{ tcp, udp }} accept");
+            L($"\t\tiifname \"{ns}\" ip daddr != {{ {blocked} }} ct status & dnat == 0 meta l4proto {{ tcp, udp }} accept");
         }
         L("\t}");
 
