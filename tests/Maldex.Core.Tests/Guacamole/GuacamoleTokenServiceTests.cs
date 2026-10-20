@@ -18,25 +18,28 @@ public sealed class GuacamoleTokenServiceTests
     {
         var svc = Service();
 
-        // Valid once, bound to the task it was issued for; the second use is rejected.
+        // Valid once; it yields the task and user it was issued to. The second use is rejected.
         var t1 = svc.Issue(_task, _user);
-        Assert.True(svc.TryConsume(t1, _user, out var task));
+        Assert.True(svc.TryConsume(t1, out var task, out var user));
         Assert.Equal(_task, task);
-        Assert.False(svc.TryConsume(t1, _user, out _));
+        Assert.Equal(_user, user);
+        Assert.False(svc.TryConsume(t1, out _, out _));
 
         // Expired after the lifetime (60 s default).
         var t2 = svc.Issue(_task, _user);
         _time.Advance(TimeSpan.FromSeconds(61));
-        Assert.False(svc.TryConsume(t2, _user, out _));
+        Assert.False(svc.TryConsume(t2, out _, out _));
 
-        // Wrong user is rejected, and burns the token.
-        var t3 = svc.Issue(_task, _user);
-        Assert.False(svc.TryConsume(t3, Guid.NewGuid(), out _));
-        Assert.False(svc.TryConsume(t3, _user, out _));
+        // Each token stays bound to its own task.
+        var other = Guid.NewGuid();
+        var t3 = svc.Issue(other, _user);
+        Assert.True(svc.TryConsume(t3, out var task3, out _));
+        Assert.Equal(other, task3);
 
         // Unknown / empty tokens.
-        Assert.False(svc.TryConsume("nope", _user, out _));
-        Assert.False(svc.TryConsume("", _user, out _));
+        Assert.False(svc.TryConsume("nope", out _, out _));
+        Assert.False(svc.TryConsume("", out _, out _));
+        Assert.False(svc.TryConsume(null, out _, out _));
     }
 
     [Fact]

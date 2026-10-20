@@ -86,6 +86,26 @@ describe('SessionPane', () => {
     expect(guac.state.tunnelUrls).toHaveLength(0)
   })
 
+  it('clears the error when the task leaves Running', async () => {
+    const { rerender } = render(<SessionPane taskId="t1" status="Running" />)
+    await screen.findByTestId('guac-display')
+    guac.state.clients[0].onerror?.({ message: 'boom' })
+    expect(await screen.findByRole('alert')).toBeInTheDocument()
+    rerender(<SessionPane taskId="t1" status="Completed" />)
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
+  })
+
+  it('does not touch state or connect when the status changes before the token arrives', async () => {
+    let resolve!: (v: { token: string }) => void
+    getTunnelToken.mockReturnValue(new Promise((r) => (resolve = r)))
+    const { rerender } = render(<SessionPane taskId="t1" status="Running" />)
+    rerender(<SessionPane taskId="t1" status="Completed" />)
+    resolve({ token: 'late' })
+    await Promise.resolve()
+    expect(guac.state.tunnelUrls).toHaveLength(0)
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
   it('shows a tunnel error from the client', async () => {
     render(<SessionPane taskId="t1" status="Running" />)
     await screen.findByTestId('guac-display')

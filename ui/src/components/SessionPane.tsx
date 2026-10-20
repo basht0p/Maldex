@@ -43,14 +43,16 @@ export function SessionPane({ taskId, status }: { taskId: string; status: RunSta
 
     getTunnelToken(taskId).then(
       ({ token }) => {
-        setError(null)
         const host = displayRef.current
         if (cancelled || !host) return
+        setError(null)
         const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
         const tunnel = new Guacamole.WebSocketTunnel(`${proto}//${window.location.host}/api/tasks/${encodeURIComponent(taskId)}/tunnel`)
         const c = new Guacamole.Client(tunnel)
         client = c
-        c.onerror = () => setError('The live view connection failed.')
+        c.onerror = () => {
+          if (!cancelled) setError('The live view connection failed.')
+        }
         const display = c.getDisplay()
         const element = display.getElement()
         host.replaceChildren(element)
@@ -84,6 +86,7 @@ export function SessionPane({ taskId, status }: { taskId: string; status: RunSta
       }
       client?.disconnect()
       host?.replaceChildren()
+      setError(null) // a failure belongs to one session: do not carry it into the next status
     }
   }, [taskId, running])
 

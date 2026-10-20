@@ -35,11 +35,15 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
         public Task<VncEndpoint?> GetAsync(VmHandle vm, CancellationToken ct) => Task.FromResult(endpoint);
     }
 
-    private sealed class TunnelFactory(SqlServerFixture sql, int guacdPort, VncEndpoint? endpoint)
-        : MaldexAppFactory(sql, settings: new Dictionary<string, string?>
+    private sealed class TunnelFactory(SqlServerFixture sql, int guacdPort, VncEndpoint? endpoint, string authMode = "Dev")
+        : MaldexAppFactory(sql, authMode: authMode, settings: new Dictionary<string, string?>
         {
             ["Maldex:Guacamole:GuacdPort"] = guacdPort.ToString(),
             ["Maldex:Guacamole:StatusPollInterval"] = "00:00:00.100",
+            // Only read in Entra mode: placeholders so the JWT bearer scheme can be built (no token is ever validated here).
+            ["AzureAd:Instance"] = "https://login.microsoftonline.com/",
+            ["AzureAd:TenantId"] = "00000000-0000-0000-0000-000000000000",
+            ["AzureAd:ClientId"] = "00000000-0000-0000-0000-000000000001",
         })
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -126,7 +130,14 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
     {
         private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
         public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
-        public List<string[]> Received { get; } = [];
+        private readonly object _gate = new();
+        private readonly List<string[]> _received = [];
+
+        /// <summary>A snapshot of what guacd has received so far (written by the server task, read by the test).</summary>
+        public List<string[]> Received { get { lock (_gate) return [.. _received]; } }
+
+        private void Record(string[] instruction) { lock (_gate) _received.Add(instruction); }
+
         public TaskCompletionSource<NetworkStream> Connected { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public Task Run { get; private set; } = Task.CompletedTask;
 
@@ -140,12 +151,12 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
                 var reader = new GuacamoleInstructionReader(new StreamReader(stream, new UTF8Encoding(false)));
                 async Task Send(params string[] e) => await stream.WriteAsync(Encoding.UTF8.GetBytes(GuacamoleProtocol.Encode(e)), Ct);
 
-                Received.Add((await reader.ReadAsync(Ct))!); // select
+                Record((await reader.ReadAsync(Ct))!); // select
                 await Send("args", "hostname", "port", "password", "read-only", "VERSION_1_5_0");
-                for (var i = 0; i < 5; i++) Received.Add((await reader.ReadAsync(Ct))!); // size, audio, video, image, connect
+                for (var i = 0; i < 5; i++) Record((await reader.ReadAsync(Ct))!); // size, audio, video, image, connect
                 await Send("ready", "guacd-conn-1");
                 Connected.SetResult(stream);
-                while (await reader.ReadAsync(Ct) is { } more) Received.Add(more);
+                while (await reader.ReadAsync(Ct) is { } more) Record(more);
             }, Ct);
         }
 
@@ -185,14 +196,13 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
             Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
         }
 
-        // A real token used by a different user.
+        // The token is single use: the first connect consumes it (no guacd is listening, so that attempt ends with an error close)...
         var token = await GetTokenAsync(analyst, id);
-        using (var ws = await ConnectAsync(f, id, token, user: "someone-else"))
+        using (var ws = await ConnectAsync(f, id, token))
         {
-            Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
+            Assert.DoesNotContain("PolicyViolation", await ReceiveTextAsync(ws));
         }
-
-        // The token is single use: now burnt even for its owner.
+        // ...and a second use is refused.
         using (var ws = await ConnectAsync(f, id, token))
         {
             Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
@@ -205,25 +215,153 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
         {
             Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
         }
+
+        // A valid token for a task that is no longer running is refused too.
+        await SetStatusAsync(f, other, RunStatus.Completed);
+        var lateToken = await GetTokenAsync(analyst, id);
+        await SetStatusAsync(f, id, RunStatus.Completed);
+        using (var ws = await ConnectAsync(f, id, lateToken))
+        {
+            Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
+        }
+
+        // Every refusal is audited as session.join.denied, and no token ever appears in the audit trail.
+        await using var scope = f.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        var audit = await db.AuditLogs.ToListAsync(Ct);
+        Assert.Equal(4, audit.Count(a => a.Action == "session.join.denied"));
+        Assert.DoesNotContain(audit, a => a.Details is not null && (a.Details.Contains(token) || a.Details.Contains(otherToken) || a.Details.Contains(lateToken)));
     }
 
-    [Fact]
-    public async Task Tunnel_RejectsCrossOriginUpgrade()
+    private static async Task<Exception?> UpgradeWithOriginAsync(MaldexAppFactory f, Guid id, string token, string url, string origin)
+    {
+        var ws = f.Server.CreateWebSocketClient();
+        ws.SubProtocols.Add("guacamole");
+        ws.ConfigureRequest = r => r.Headers["Origin"] = origin;
+        try
+        {
+            using var socket = await ws.ConnectAsync(new Uri(url.Replace("{id}", id.ToString()) + $"?token={token}"), Ct);
+            return null;
+        }
+        catch (Exception ex) { return ex; }
+    }
+
+    [Theory]
+    [InlineData("https://evil.example")]
+    [InlineData("http://localhost:5174")]   // other port
+    [InlineData("https://localhost:5173")]  // other scheme
+    [InlineData("http://localhost")]        // default port 80 is not 5173
+    public async Task Tunnel_RejectsCrossOriginUpgrade_With403(string origin)
     {
         var f = Factory(1);
         var id = await CreateTaskAsync(f, RunStatus.Running);
         using var analyst = f.CreateClient(UserRole.Analyst, "analyst");
         var token = await GetTokenAsync(analyst, id);
 
-        var ws = f.Server.CreateWebSocketClient();
-        ws.SubProtocols.Add("guacamole");
-        ws.ConfigureRequest = r =>
+        var ex = await UpgradeWithOriginAsync(f, id, token, "ws://localhost:5173/api/tasks/{id}/tunnel", origin);
+        Assert.NotNull(ex);
+        Assert.Contains("403", ex.Message);
+    }
+
+    [Fact]
+    public async Task Tunnel_AcceptsDevServerOrigin_HostAndOriginMatch()
+    {
+        // The Vite dev server (changeOrigin: false) forwards Host: localhost:5173 and Origin: http://localhost:5173.
+        using var guacd = new FakeGuacd();
+        var f = Factory(guacd.Port);
+        var id = await CreateTaskAsync(f, RunStatus.Running);
+        using var analyst = f.CreateClient(UserRole.Analyst, "analyst");
+        var token = await GetTokenAsync(analyst, id);
+
+        Assert.Null(await UpgradeWithOriginAsync(f, id, token, "ws://localhost:5173/api/tasks/{id}/tunnel", "http://localhost:5173"));
+    }
+
+    [Fact]
+    public async Task Tunnel_NormalisesDefaultPorts()
+    {
+        using var guacd = new FakeGuacd();
+        var f = Factory(guacd.Port);
+        var id = await CreateTaskAsync(f, RunStatus.Running);
+        using var analyst = f.CreateClient(UserRole.Analyst, "analyst");
+
+        // Host without a port and Origin with the explicit default port are the same origin.
+        Assert.Null(await UpgradeWithOriginAsync(f, id, await GetTokenAsync(analyst, id), "ws://localhost/api/tasks/{id}/tunnel", "http://localhost:80"));
+    }
+
+    [Fact]
+    public async Task Tunnel_TokenIsTheCredential_NoAuthHeaders_EntraMode()
+    {
+        using var guacd = new FakeGuacd();
+        var f = new TunnelFactory(sql, guacd.Port, new VncEndpoint("127.0.0.1", 5901, VncPassword), authMode: "Entra");
+        _disposables.Add(f);
+
+        // Seed a Running task and a user straight into the database: Entra mode has no dev sign-in.
+        var userId = Guid.NewGuid();
+        var taskId = Guid.NewGuid();
+        await using (var scope = f.Services.CreateAsyncScope())
         {
-            r.Headers["X-Dev-Role"] = "Analyst";
-            r.Headers["X-Dev-User"] = "analyst";
-            r.Headers["Origin"] = "https://evil.example";
-        };
-        await Assert.ThrowsAnyAsync<Exception>(() => ws.ConnectAsync(new Uri(f.Server.BaseAddress, $"/api/tasks/{id}/tunnel?token={token}"), Ct));
+            var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+            var org = new Maldex.Core.Domain.Org { Id = Guid.NewGuid(), Name = "Org-" + Guid.NewGuid().ToString("N"), RetentionDays = 30 };
+            db.AddRange(
+                org,
+                new AppUser { Id = userId, EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "A", Role = UserRole.Analyst },
+                new AnalysisTask
+                {
+                    Id = taskId, OrgId = org.Id, SubmittedByUserId = userId, Url = "http://example.test/", Image = "win10",
+                    NetworkMode = NetworkMode.Simulated, DurationSec = 300, CreatedAt = DateTimeOffset.UtcNow, Status = RunStatus.Running,
+                });
+            await db.SaveChangesAsync(Ct);
+        }
+
+        // Issuing a token still needs an authenticated Analyst.
+        using var anonymous = f.CreateClient();
+        Assert.Equal(HttpStatusCode.Unauthorized, (await anonymous.GetAsync($"/api/tasks/{taskId}/tunnel-token", Ct)).StatusCode);
+
+        // The upgrade carries no Authorization header and no dev headers: only the token.
+        var token = f.Services.GetRequiredService<GuacamoleTokenService>().Issue(taskId, userId);
+        var client = f.Server.CreateWebSocketClient();
+        client.SubProtocols.Add("guacamole");
+        using var ws = await client.ConnectAsync(new Uri(f.Server.BaseAddress, $"/api/tasks/{taskId}/tunnel?token={token}"), Ct);
+        await ReceiveTextAsync(ws); // tunnel uuid
+        Assert.Equal("ready", Assert.Single(await GuacamoleInstructionReader.ParseAllAsync(await ReceiveTextAsync(ws), Ct))[0]);
+
+        // The audit row names the token's user, not a caller.
+        await using (var scope = f.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+            var join = Assert.Single(await db.AuditLogs.Where(a => a.Action == "session.join").ToListAsync(Ct));
+            Assert.Equal(userId, join.UserId);
+        }
+
+        // Without a valid token the same unauthenticated upgrade is refused.
+        var bad = f.Server.CreateWebSocketClient();
+        bad.SubProtocols.Add("guacamole");
+        using var rejected = await bad.ConnectAsync(new Uri(f.Server.BaseAddress, $"/api/tasks/{taskId}/tunnel"), Ct);
+        Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(rejected));
+    }
+
+    [Fact]
+    public async Task Tunnel_ClosesOnDisallowedUpstreamOpcode()
+    {
+        using var guacd = new FakeGuacd();
+        var f = Factory(guacd.Port);
+        var id = await CreateTaskAsync(f, RunStatus.Running);
+        using var analyst = f.CreateClient(UserRole.Analyst, "analyst");
+        using var ws = await ConnectAsync(f, id, await GetTokenAsync(analyst, id));
+        await ReceiveTextAsync(ws);
+        await ReceiveTextAsync(ws);
+
+        // Allowed opcodes pass.
+        foreach (var op in new[] { "mouse", "key", "sync", "size", "disconnect", "nop", "ack" })
+            await SendTextAsync(ws, GuacamoleProtocol.Encode(op, "1"));
+        var until = DateTime.UtcNow.AddSeconds(20);
+        while (guacd.Received.Count < 6 + 7 && DateTime.UtcNow < until) await Task.Delay(20, Ct);
+        Assert.Equal(13, guacd.Received.Count);
+
+        // Anything else (here: file transfer / clipboard) ends the session, and never reaches guacd.
+        await SendTextAsync(ws, GuacamoleProtocol.Encode("clipboard", "1", "text/plain"));
+        Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
+        Assert.DoesNotContain(guacd.Received, i => i[0] == "clipboard");
     }
 
     [Fact]

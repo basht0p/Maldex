@@ -22,6 +22,11 @@ public static class GuacamoleTunnelEndpoint
 {
     public const string Subprotocol = "guacamole";
     private const int DefaultWidth = 1280, DefaultHeight = 800, Dpi = 96;
+    /// <summary>The only instructions a browser may send to guacd once connected: input, frame acknowledgements and size/disconnect.</summary>
+    private static readonly HashSet<string> AllowedUpstreamOpcodes = new(StringComparer.Ordinal) { "mouse", "key", "sync", "size", "disconnect", "nop", "ack" };
+
+    private sealed class PolicyViolationException(string opcode) : Exception($"Instruction '{opcode}' is not allowed from the browser.");
+
     private const int MaxClientMessageBytes = 1_048_576;
     private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(15);
@@ -42,13 +47,15 @@ public static class GuacamoleTunnelEndpoint
             return Results.Ok(new { token });
         });
 
-        g.MapGet("{id:guid}/tunnel", TunnelAsync);
+        // A browser cannot send an Authorization header on a WebSocket upgrade, so the single-use token (issued above to an
+        // authenticated Analyst, 60 s, bound to the task) is this route's credential. Same-origin is enforced separately.
+        app.MapGet("/api/tasks/{id:guid}/tunnel", TunnelAsync).AllowAnonymous();
         return app;
     }
 
     private static async Task<IResult> TunnelAsync(
-        Guid id, string? token, int? width, int? height, HttpContext ctx, CurrentUser user, GuacamoleTokenService tokens,
-        IVmConsoleLocator locator, IOptions<GuacamoleOptions> options, IServiceScopeFactory scopes, AuditWriter audit,
+        Guid id, string? token, int? width, int? height, HttpContext ctx, GuacamoleTokenService tokens,
+        IVmConsoleLocator locator, IOptions<GuacamoleOptions> options, IServiceScopeFactory scopes, MaldexDbContext db, TimeProvider time,
         ILogger<GuacamoleTunnelLog> log)
     {
         if (!ctx.WebSockets.IsWebSocketRequest) return Results.Problem(title: "A WebSocket upgrade is required.", statusCode: StatusCodes.Status400BadRequest);
@@ -60,13 +67,21 @@ public static class GuacamoleTunnelEndpoint
 
         try
         {
-            if (!tokens.TryConsume(token, user.UserId, out var taskId) || taskId != id)
+            if (!tokens.TryConsume(token, out var taskId, out var userId))
             {
+                await AuditAsync(db, time, null, "session.join.denied", id, "invalid, reused or expired token", ct);
+                await CloseAsync(ws, WebSocketCloseStatus.PolicyViolation, "Invalid tunnel token.");
+                return Results.Empty;
+            }
+            if (taskId != id)
+            {
+                await AuditAsync(db, time, userId, "session.join.denied", id, "token was issued for another task", ct);
                 await CloseAsync(ws, WebSocketCloseStatus.PolicyViolation, "Invalid tunnel token.");
                 return Results.Empty;
             }
             if (!await IsRunningAsync(scopes, id, ct))
             {
+                await AuditAsync(db, time, userId, "session.join.denied", id, "task is not running", ct);
                 await CloseAsync(ws, WebSocketCloseStatus.PolicyViolation, "The task is not running.");
                 return Results.Empty;
             }
@@ -93,7 +108,7 @@ public static class GuacamoleTunnelEndpoint
                 handshakeCts.CancelAfter(HandshakeTimeout);
                 var ready = await HandshakeAsync(stream, reader, endpoint, Clamp(width, DefaultWidth), Clamp(height, DefaultHeight), handshakeCts.Token);
 
-                await audit.WriteAsync("session.join", id.ToString(), null, ct);
+                await AuditAsync(db, time, userId, "session.join", id, null, ct);
                 await RunAsync(ws, stream, reader, ready, id, options.Value, scopes, ct);
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
@@ -108,6 +123,13 @@ public static class GuacamoleTunnelEndpoint
             // The browser went away.
         }
         return Results.Empty;
+    }
+
+    /// <summary>Audit row written for the user named by the token (the anonymous route has no current user). Never put a token in <paramref name="details"/>.</summary>
+    private static async Task AuditAsync(MaldexDbContext db, TimeProvider time, Guid? userId, string action, Guid taskId, string? details, CancellationToken ct)
+    {
+        db.AuditLogs.Add(new AuditLog { At = time.GetUtcNow(), UserId = userId, Action = action, Target = taskId.ToString(), Details = details });
+        await db.SaveChangesAsync(ct);
     }
 
     private static int Clamp(int? v, int fallback) => v is { } x ? Math.Clamp(x, 320, 4096) : fallback;
@@ -188,6 +210,7 @@ public static class GuacamoleTunnelEndpoint
                 {
                     // Internal instructions (ping) are answered here and never reach guacd.
                     if (instruction[0] == GuacamoleProtocol.InternalOpcode) await SendAsync(GuacamoleProtocol.Encode(instruction));
+                    else if (!AllowedUpstreamOpcodes.Contains(instruction[0])) throw new PolicyViolationException(instruction[0]);
                     else forward.Append(GuacamoleProtocol.Encode(instruction));
                 }
                 if (forward.Length > 0) await WriteAsync(guacd, forward.ToString(), ct);
@@ -205,11 +228,17 @@ public static class GuacamoleTunnelEndpoint
         }, ct);
 
         var first = await Task.WhenAny(down, up, watch);
+        var status = WebSocketCloseStatus.NormalClosure;
         var description = first == watch ? "The task is no longer running." : "The live view ended.";
+        if (first == up && up.IsFaulted && up.Exception!.GetBaseException() is PolicyViolationException)
+        {
+            status = WebSocketCloseStatus.PolicyViolation;
+            description = "Instruction not allowed.";
+        }
         cts.Cancel();
         try { await Task.WhenAll(down, up, watch); }
-        catch (Exception ex) when (ex is OperationCanceledException or WebSocketException or IOException or InvalidDataException or FormatException) { }
-        await CloseAsync(ws, WebSocketCloseStatus.NormalClosure, description);
+        catch (Exception ex) when (ex is OperationCanceledException or WebSocketException or IOException or InvalidDataException or FormatException or PolicyViolationException) { }
+        await CloseAsync(ws, status, description);
     }
 
     private static async Task<bool> IsRunningAsync(IServiceScopeFactory scopes, Guid taskId, CancellationToken ct)
@@ -242,8 +271,11 @@ public static class GuacamoleTunnelEndpoint
         var origin = request.Headers.Origin.ToString();
         if (string.IsNullOrEmpty(origin)) return true;
         if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri)) return false;
-        return string.Equals(uri.Host, request.Host.Host, StringComparison.OrdinalIgnoreCase)
-            && uri.Port == (request.Host.Port ?? uri.Port);
+        // Scheme, host and port must all match; a missing port means the scheme's default (80 / 443).
+        var port = request.Host.Port ?? (string.Equals(request.Scheme, "https", StringComparison.OrdinalIgnoreCase) ? 443 : 80);
+        return string.Equals(uri.Scheme, request.Scheme, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(uri.Host, request.Host.Host, StringComparison.OrdinalIgnoreCase)
+            && uri.Port == port;
     }
 }
 

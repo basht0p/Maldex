@@ -27,13 +27,18 @@ public sealed class GuacamoleTokenService(TimeProvider time, IOptions<GuacamoleO
         return token;
     }
 
-    /// <summary>Consumes the token even when it does not match the user, so a stolen token cannot be probed.</summary>
-    public bool TryConsume(string? token, Guid userId, out Guid taskId)
+    /// <summary>
+    /// Consumes the token (single use, even when it turns out to be expired) and returns the task and the user it was
+    /// issued to. The token is the tunnel's only credential, so it must stay unguessable and short-lived.
+    /// </summary>
+    public bool TryConsume(string? token, out Guid taskId, out Guid userId)
     {
         taskId = default;
+        userId = default;
         if (string.IsNullOrEmpty(token) || !_tokens.TryRemove(token, out var entry)) return false;
-        if (entry.Expires <= time.GetUtcNow() || entry.UserId != userId) return false;
+        if (entry.Expires <= time.GetUtcNow()) return false;
         taskId = entry.TaskId;
+        userId = entry.UserId;
         return true;
     }
 
