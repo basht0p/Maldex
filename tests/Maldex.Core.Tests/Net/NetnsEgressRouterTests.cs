@@ -297,7 +297,7 @@ public sealed class NetnsEgressRouterTests : IDisposable
         Assert.Contains(_r.Calls, c => c.StartsWith("sudo -n install -d -m 0755 -o root -g root /run/maldex /run/maldex/mitm " + d));
         Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0700 -o maldex-mitm -g maldex-mitm {d}/conf");
         Assert.Contains(_r.Calls, c => c == $"sudo -n install -m 0600 -o maldex-mitm -g maldex-mitm {Path.Combine(_tmp, "ca", "mitmproxy-ca.pem")} {d}/conf/mitmproxy-ca.pem");
-        Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0755 -o maldex-mitm -g maldex-mitm {d}/out");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 2750 -o maldex-mitm -g 1000 {d}/out");
         Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0755 -o 1000 -g 1000 {d}/ctl");
         var m = Assert.Single(_r.Where(c => c.Contains("mitmdump --mode transparent")));
         Assert.Contains($"--set confdir={d}/conf", m);
@@ -307,6 +307,13 @@ public sealed class NetnsEgressRouterTests : IDisposable
         // staged before it is launched
         Assert.True(_r.IndexOf(c => c.Contains(d + "/conf/mitmproxy-ca.pem")) < _r.IndexOf(c => c.Contains("mitmdump --mode")));
         Assert.Equal(d + "/out/flows.jsonl", NetnsEgressRouter.MitmFlowsPath(id));
+    }
+
+    private static string RepoRoot()
+    {
+        for (var d = new DirectoryInfo(AppContext.BaseDirectory); d is not null; d = d.Parent)
+            if (Directory.Exists(Path.Combine(d.FullName, "deploy", "net", "inetsim"))) return d.FullName;
+        throw new InvalidOperationException("repo root not found");
     }
 
     [Fact]
@@ -348,12 +355,19 @@ public sealed class NetnsEgressRouterTests : IDisposable
             var mk = _r.IndexOf(c => c == $"sudo -n install -d -m 0750 -o inetsim -g inetsim {data}/{w}");
             Assert.True(rm > cp && mk > rm, w);
         }
-        Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0750 -o inetsim -g inetsim {iDir}/log");
-        // the only inetsim-owned directories are the three leaves and the log dir
+        // root writes logs/reports (following symlinks), so inetsim must own neither: log/ is root:inetsim 0750 with pre-created
+        // group-writable files, reports go to a separate root:root dir
+        Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0750 -o root -g inetsim {iDir}/log");
+        foreach (var lf in new[] { "main.log", "service.log", "debug.log" })
+            Assert.Contains(_r.Calls, c => c == $"sudo -n install -m 0660 -o root -g inetsim /dev/null {iDir}/log/{lf}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0755 -o root -g root {iDir}/report");
+        // the only inetsim-owned directories are the three upload leaves
         var owned = _r.Where(c => c.Contains("-o inetsim") && c.Contains("install -d")).Select(c => c.Split(' ')[^1]).OrderBy(x => x).ToList();
-        Assert.Equal(new[] { $"{iDir}/log", $"{data}/ftp/upload", $"{data}/http/postdata", $"{data}/smtp" }.OrderBy(x => x), owned);
+        Assert.Equal(new[] { $"{data}/ftp/upload", $"{data}/http/postdata", $"{data}/smtp" }.OrderBy(x => x), owned);
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("-o inetsim") && c.Contains("/dev/null"));
         var inet = Assert.Single(_r.Where(c => c.Contains("--config")));
-        Assert.Contains($"--data-dir {data} --log-dir {iDir}/log --report-dir {iDir}/log", inet);
+        Assert.Contains($"--data-dir {data} --log-dir {iDir}/log --report-dir {iDir}/report", inet);
+        Assert.Contains("create_reports          no", File.ReadAllText(Path.Combine(RepoRoot(), "deploy", "net", "inetsim", "inetsim.conf")));
         Assert.DoesNotContain("--data-dir /var/lib/inetsim", inet);
         await router.ReleaseAsync(lease, CancellationToken.None);
         Assert.Contains(_r.Calls, c => c == $"sudo -n rm -rf -- /run/maldex/inetsim/{n.Namespace}");

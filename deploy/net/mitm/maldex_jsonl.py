@@ -15,8 +15,8 @@ from mitmproxy import ctx
 
 BODY_CAP = 1024 * 1024
 
-# The flows file must be readable by the control plane, which is a different user.
-os.umask(0o022)
+# Flows hold decrypted traffic: 0640, readable only by the owner and the control-plane group (out/ is setgid to it).
+os.umask(0o027)
 
 
 def _body(msg):

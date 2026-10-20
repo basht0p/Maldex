@@ -115,6 +115,8 @@ public class RealEgressTests
             Assert.NotEqual(0, (await Guest("curl", "-s", "-m", "3", "-o", "/dev/null", $"http://{hostIp}:22/")).ExitCode);
             Assert.NotEqual(0, (await Guest("curl", "-s", "-m", "3", "-o", "/dev/null", $"http://{subnet.GatewayIp}:8080/")).ExitCode); // direct mitm port
 
+            // capture end to end (Simulated): enable capture, make an HTTP request from the guest, expect a flows line
+            if (mode == NetworkMode.Simulated) await File.WriteAllTextAsync(NetnsEgressRouter.MitmCaptureEnablePath(id), "");
             var any = await Guest("curl", "-s", "-m", "8", "-o", "/dev/null", "-w", "%{http_code}", "http://203.0.113.5/");
             if (mode == NetworkMode.Simulated)
             {
@@ -130,6 +132,16 @@ public class RealEgressTests
 
             if (mode == NetworkMode.Simulated)
             {
+                var flowsPath = NetnsEgressRouter.MitmFlowsPath(id);
+                string[] lines = [];
+                for (var i = 0; i < 50 && lines.Length == 0; i++)
+                {
+                    if (File.Exists(flowsPath)) lines = File.ReadAllLines(flowsPath);
+                    if (lines.Length == 0) await Task.Delay(100);
+                }
+                Assert.NotEmpty(lines);
+                Assert.Contains("203.0.113.5", lines[0]);
+                Assert.Equal("maldex-mitm 640", (await Sudo("stat", "-c", "%U %a", flowsPath)).Stdout.Trim());
                 var dataDir = NetnsEgressRouter.InetSimDataPath(id);
                 Assert.Equal(0, (await Sudo("test", "-d", dataDir + "/http/postdata")).ExitCode);
                 Assert.Equal(0, (await Sudo("test", "-f", dataDir + "/http/mime.types")).ExitCode);
@@ -137,12 +149,23 @@ public class RealEgressTests
                 // nothing under the run's inetsim tree is owned by (or writable for) inetsim except the leaves and the log dir
                 var iRoot = Path.GetDirectoryName(dataDir)!;
                 var owned = (await Sudo("find", iRoot, "-user", "inetsim", "-type", "d")).Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries).OrderBy(x => x).ToArray();
-                Assert.Equal(new[] { iRoot + "/log", dataDir + "/ftp/upload", dataDir + "/http/postdata", dataDir + "/smtp" }.OrderBy(x => x), owned);
+                Assert.Equal(new[] { dataDir + "/ftp/upload", dataDir + "/http/postdata", dataDir + "/smtp" }.OrderBy(x => x), owned);
+                // log/ is root:inetsim 0750 (inetsim cannot create entries); reports go to a separate root dir; no inetsim-owned file is in either
+                Assert.Equal("root:inetsim 750", (await Sudo("stat", "-c", "%U:%G %a", iRoot + "/log")).Stdout.Trim());
+                Assert.Equal("root:root 755", (await Sudo("stat", "-c", "%U:%G %a", iRoot + "/report")).Stdout.Trim());
+                Assert.Equal("", (await Sudo("find", iRoot + "/log", iRoot + "/report", "-user", "inetsim")).Stdout.Trim());
                 Assert.Equal("", (await Sudo("find", iRoot, "-type", "l")).Stdout.Trim());
                 Assert.Equal("root", (await Sudo("stat", "-c", "%U", iRoot)).Stdout.Trim());
                 Assert.Equal("root", (await Sudo("stat", "-c", "%U", dataDir)).Stdout.Trim());
             }
             Assert.Contains(lease, await router.ListAsync(CancellationToken.None));
+            if (mode == NetworkMode.Simulated)
+            {
+                // release keeps the flows for collection (safe copy), then everything is torn down
+                await router.ReleaseAsync(lease, CancellationToken.None);
+                var kept = Path.Combine(tmp, "run", "net", n.Namespace, "flows.jsonl");
+                Assert.True(File.Exists(kept) && new FileInfo(kept).Length > 0, "flows.jsonl must be kept in the run net dir");
+            }
         }
         finally
         {

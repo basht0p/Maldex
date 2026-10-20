@@ -45,6 +45,9 @@ public sealed partial class NetnsEgressRouter(
 
     private static readonly string[] MitmCaFiles = ["mitmproxy-ca.pem", "mitmproxy-ca-cert.pem", "mitmproxy-dhparam.pem"];
 
+    /// <summary>Upper bound on the flows file kept at release.</summary>
+    public const long MaxFlowsBytes = 512L * 1024 * 1024;
+
     private static string InetSimDir(string ns) => "/run/maldex/inetsim/" + ns;
 
     // mitmdump cannot traverse the owner's home (the repo and .data live there), so everything it touches is staged here.
@@ -188,7 +191,9 @@ public sealed partial class NetnsEgressRouter(
         foreach (var f in MitmCaFiles)
             if (File.Exists(Path.Combine(caDir, f)))
                 await Must(PrivilegedCommands.Sudo("install", "-m", "0600", "-o", MitmUser, "-g", MitmUser, Path.Combine(caDir, f), $"{mdir}/conf/{f}"), ct);
-        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", MitmUser, "-g", MitmUser, mdir + "/out"), ct);
+        // out/ is setgid to the control-plane group: flows.jsonl (umask 027 in the addon) is 0640 maldex-mitm:<control-plane group>,
+        // readable by us, invisible to every other local uid (decrypted traffic).
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "2750", "-o", MitmUser, "-g", myGid, mdir + "/out"), ct);
         await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", myUid, "-g", myGid, mdir + "/ctl"), ct);
         await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "mitmdump.log"), ["setpriv", $"--reuid={MitmUser}", $"--regid={MitmUser}",
             "--clear-groups", "--no-new-privs", "--inh-caps=-all", "--bounding-set=-all", "--", _o.MitmdumpBinary,
@@ -226,6 +231,7 @@ public sealed partial class NetnsEgressRouter(
             throw new EgressUnavailableException($"INetSim template {tmpl} is not root-owned/read-only/symlink-free ({bad.Stdout.Trim()}); run ./build.sh real-setup.");
         var data = isDir + "/data";
         var log = isDir + "/log";
+        var report = isDir + "/report";
         await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", "root", "-g", "root", "/run/maldex", "/run/maldex/inetsim", isDir, data), ct);
         await Must(PrivilegedCommands.Sudo("cp", "-rP", "--no-preserve=ownership", tmpl + "/.", data + "/"), ct);
         // the TLS key must be readable by the dropped-privilege service user
@@ -236,12 +242,16 @@ public sealed partial class NetnsEgressRouter(
             await Must(PrivilegedCommands.Sudo("rm", "-rf", "--", $"{data}/{w}"), ct);
             await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0750", "-o", "inetsim", "-g", "inetsim", $"{data}/{w}"), ct);
         }
-        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0750", "-o", "inetsim", "-g", "inetsim", log), ct);
+        // INetSim's ROOT main process appends to these logs and writes reports (following symlinks), so inetsim must never be able
+        // to create/unlink/rename entries where root writes: log/ is root:inetsim 0750 (no write for inetsim) with pre-created
+        // group-writable log files (INetSim only checks group inetsim + group rw); reports go to a separate root-only dir.
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0750", "-o", "root", "-g", "inetsim", log), ct);
         foreach (var lf in new[] { "main.log", "service.log", "debug.log" })
-            await Must(PrivilegedCommands.Sudo("install", "-m", "0660", "-o", "inetsim", "-g", "inetsim", "/dev/null", $"{log}/{lf}"), ct);
+            await Must(PrivilegedCommands.Sudo("install", "-m", "0660", "-o", "root", "-g", "inetsim", "/dev/null", $"{log}/{lf}"), ct);
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", "root", "-g", "root", report), ct);
         var conf = Path.GetFullPath(Path.Combine(_o.DeployNetDir, "inetsim", "inetsim.conf"));
         await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "inetsim.out"), [_o.InetSimBinary,
-            "--config", conf, "--data-dir", data, "--log-dir", log, "--report-dir", log, "--bind-address", "0.0.0.0"]), ct);
+            "--config", conf, "--data-dir", data, "--log-dir", log, "--report-dir", report, "--bind-address", "0.0.0.0"]), ct);
         await WaitFor(async () =>
         {
             var r = await Run(PrivilegedCommands.InNs(ns, "curl", "-s", "-o", "/dev/null", "-m", "2", "-w", "%{http_code}", $"http://{_o.SinkholeIp}/"), ct);
@@ -312,8 +322,12 @@ public sealed partial class NetnsEgressRouter(
         // Keep the captured flows for collection (copied as the control-plane user, so a planted symlink gets no root help).
         try
         {
-            var flows = MitmFlowsPath(taskId);
-            if (File.Exists(flows) && Directory.Exists(RunNetDir(ns))) File.Copy(flows, Path.Combine(RunNetDir(ns), "flows.jsonl"), true);
+            if (Directory.Exists(RunNetDir(ns)))
+            {
+                // The source sits in a directory the (hostile-traffic-facing) mitm user owns: never follow links or block on it.
+                var res = await UntrustedFile.CopyRegularFileAsync(MitmFlowsPath(taskId), Path.Combine(RunNetDir(ns), "flows.jsonl"), MaxFlowsBytes, ct);
+                if (res.Truncated) warn?.Invoke($"Flows for {taskId:N} truncated at {MaxFlowsBytes} bytes.");
+            }
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { warn?.Invoke($"Could not keep flows for {taskId:N}: {e.Message}"); }
         await Run(PrivilegedCommands.Sudo("rm", "-rf", "--", MitmDir(ns)), ct);
