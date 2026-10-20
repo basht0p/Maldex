@@ -84,6 +84,8 @@ public sealed class UntrustedFileTests : IDisposable
     [Fact]
     public async Task Missing_Throws()
     {
-        await Assert.ThrowsAsync<IOException>(() => UntrustedFile.CopyRegularFileAsync(P("nope"), P("dst"), 10, Ten()));
+        // a distinct type so callers can treat "nothing there" as "nothing to keep"
+        await Assert.ThrowsAsync<FileNotFoundException>(() => UntrustedFile.CopyRegularFileAsync(P("nope"), P("dst"), 10, Ten()));
+        Assert.False(File.Exists(P("dst")));
     }
 }

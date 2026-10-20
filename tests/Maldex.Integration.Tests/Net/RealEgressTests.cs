@@ -22,6 +22,86 @@ public class RealEgressTests
     [Fact]
     public Task CreateReleaseRealNamespace_Simulated() => Exercise(NetworkMode.Simulated);
 
+    /// <summary>
+    /// Two Simulated runs at once (each INetSim has its own pid file), then a SIGKILLed INetSim main in one of them must not
+    /// block the next Simulated run.
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentSimulatedRuns_EachHaveTheirOwnInetSim()
+    {
+        Assert.SkipUnless(Environment.GetEnvironmentVariable("MALDEX_REAL_NET") == "1" && OperatingSystem.IsLinux(),
+            "set MALDEX_REAL_NET=1 (needs passwordless sudo, nft, dnsmasq, mitmdump, inetsim)");
+        var tmp = Path.Combine(Path.GetTempPath(), "mx-real-net-" + Guid.NewGuid().ToString("N"));
+        var opts = Options.Create(new NetOptions
+        {
+            RunDir = Path.Combine(tmp, "run"),
+            MitmConfDir = Path.Combine(tmp, "ca"),
+            DeployNetDir = RepoDeployNet(),
+            ControlPlaneIps = ["192.0.2.1"],
+        });
+        await Proc.RunAsync("timeout", ["8", "/opt/mitmproxy/mitmdump", "--set", $"confdir={Path.Combine(tmp, "ca")}", "-n", "-q"], CancellationToken.None, null, TimeSpan.FromSeconds(20));
+        var router = new NetnsEgressRouter(opts, Proc);
+        Guid[] ids = [Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid()];
+        try
+        {
+            var leases = await Task.WhenAll(ids[..2].Select(id => router.CreateAsync(id, NetworkMode.Simulated, null, CancellationToken.None)));
+            var mains = new List<string>();
+            foreach (var id in ids[..2])
+            {
+                var ns = RunNetNames.For(id).Namespace;
+                mains.Add(await AssertPidFileAsync("/run/maldex/inetsim/" + ns, ns));
+                var code = (await Sudo("ip", "netns", "exec", ns, "curl", "-s", "-o", "/dev/null", "-m", "5", "-w", "%{http_code}", "http://198.18.0.10/")).Stdout.Trim();
+                Assert.Contains(code, new[] { "200", "404" });
+            }
+            Assert.NotEqual(mains[0], mains[1]);
+
+            // SIGKILL the first run's INetSim main (no clean-up of its pid file), release it, start a third Simulated run
+            Assert.Equal(0, (await Sudo("kill", "-KILL", mains[0])).ExitCode);
+            await router.ReleaseAsync(leases[0], CancellationToken.None);
+            await router.CreateAsync(ids[2], NetworkMode.Simulated, null, CancellationToken.None);
+            var ns3 = RunNetNames.For(ids[2]).Namespace;
+            await AssertPidFileAsync("/run/maldex/inetsim/" + ns3, ns3);
+            // the second run is still serving
+            var ns2 = RunNetNames.For(ids[1]).Namespace;
+            Assert.Contains((await Sudo("ip", "netns", "exec", ns2, "curl", "-s", "-o", "/dev/null", "-m", "5", "-w", "%{http_code}", "http://198.18.0.10/")).Stdout.Trim(), new[] { "200", "404" });
+        }
+        finally
+        {
+            foreach (var id in ids) await router.ReleaseAsync(new NetworkLease(id, RunNetNames.For(id).Tap), CancellationToken.None);
+            await Sudo("rm", "-rf", tmp);
+        }
+        foreach (var id in ids)
+        {
+            var h = id.ToString("N")[..12];
+            Assert.DoesNotContain(h, (await Proc.RunAsync("ip", ["-o", "link"], CancellationToken.None)).Stdout);
+            Assert.DoesNotContain(h, (await Proc.RunAsync("ip", ["netns", "list"], CancellationToken.None)).Stdout);
+            Assert.False(Directory.Exists("/run/maldex/inetsim/mxn" + h));
+            Assert.False(Directory.Exists("/run/maldex/mitm/mxn" + h));
+        }
+    }
+
+    /// <summary>The run's INetSim pid file is root-owned in its root-owned run dir and names a live process in that namespace.</summary>
+    private static async Task<string> AssertPidFileAsync(string iRoot, string ns)
+    {
+        Assert.Equal("root:root 755", (await Sudo("stat", "-c", "%U:%G %a", iRoot)).Stdout.Trim());
+        Assert.Equal("root", (await Sudo("stat", "-c", "%U", iRoot + "/inetsim.pid")).Stdout.Trim());
+        var pid = (await Sudo("cat", iRoot + "/inetsim.pid")).Stdout.Trim();
+        Assert.Matches("^[0-9]+$", pid);
+        Assert.Contains(pid, (await Sudo("ip", "netns", "pids", ns)).Stdout.Split([' ', '\n'], StringSplitOptions.RemoveEmptyEntries));
+        Assert.False(File.Exists("/var/run/inetsim.pid"), "the shared default pid file must not be used");
+        // sandbox: own IPC namespace (INetSim's 0666 "CNFG" shm segment is per run), and the only writable mount the root
+        // main process sees is its own run dir
+        var ipc = (await Sudo("readlink", $"/proc/{pid}/ns/ipc")).Stdout.Trim();
+        Assert.StartsWith("ipc:[", ipc);
+        Assert.NotEqual((await Sudo("readlink", "/proc/1/ns/ipc")).Stdout.Trim(), ipc);
+        var writable = (await Sudo("cat", $"/proc/{pid}/mountinfo")).Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(l => l.Split(' '))
+            .Where(f => !f[5].Split(',').Contains("ro") && f[Array.IndexOf(f, "-") + 1] != "nsfs")
+            .Select(f => f[4] + " " + f[5]).ToArray();
+        Assert.Equal([iRoot + " rw,nosuid,nodev,noexec,relatime"], writable);
+        return pid;
+    }
+
     private static async Task<ProcessResult> Sudo(params string[] args) => await Proc.RunAsync("sudo", ["-n", .. args], CancellationToken.None, null, TimeSpan.FromSeconds(30));
 
     private static string RepoDeployNet()
@@ -149,7 +229,23 @@ public class RealEgressTests
                 // nothing under the run's inetsim tree is owned by (or writable for) inetsim except the leaves and the log dir
                 var iRoot = Path.GetDirectoryName(dataDir)!;
                 var owned = (await Sudo("find", iRoot, "-user", "inetsim", "-type", "d")).Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries).OrderBy(x => x).ToArray();
-                Assert.Equal(new[] { dataDir + "/ftp/upload", dataDir + "/http/postdata", dataDir + "/smtp" }.OrderBy(x => x), owned);
+                Assert.Equal(new[] { dataDir + "/ftp/upload", dataDir + "/http/postdata" }.OrderBy(x => x), owned);
+                // inetsim owns nothing at all outside those two leaves (no files either)
+                var ownedAny = (await Sudo("find", iRoot, "-user", "inetsim")).Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries).OrderBy(x => x).ToArray();
+                Assert.Equal(owned, ownedAny);
+                // SMTP's root-context mbox handling only ever meets root-owned entries in a root-owned dir
+                Assert.Equal("root:inetsim 750", (await Sudo("stat", "-c", "%U:%G %a", dataDir + "/smtp")).Stdout.Trim());
+                foreach (var mbox in new[] { "smtp.mbox", "smtps.mbox" })
+                    Assert.Equal("root:inetsim 660 regular empty file", (await Sudo("stat", "-c", "%U:%G %a %F", $"{dataDir}/smtp/{mbox}")).Stdout.Trim());
+                Assert.Equal("", (await Sudo("find", dataDir + "/smtp", "-mindepth", "1", "!", "-name", "smtp.mbox", "!", "-name", "smtps.mbox")).Stdout.Trim());
+                // SMTP still delivers into the pre-created mbox (appended by the dropped-privilege child), which stays root-owned
+                var mail = await Proc.RunAsync("sudo", ["-n", "ip", "netns", "exec", n.Namespace, "curl", "-s", "-m", "8", "smtp://198.18.0.10/",
+                    "--mail-from", "a@example.org", "--mail-rcpt", "b@example.org", "-T", "-"], CancellationToken.None, "Subject: maldex\r\n\r\nhello\r\n", TimeSpan.FromSeconds(30));
+                Assert.Equal(0, mail.ExitCode);
+                Assert.Contains("hello", (await Sudo("cat", dataDir + "/smtp/smtp.mbox")).Stdout);
+                Assert.Equal("root:inetsim 660", (await Sudo("stat", "-c", "%U:%G %a", dataDir + "/smtp/smtp.mbox")).Stdout.Trim());
+                // per-run pid file, root-owned, in the root-owned run dir; nothing at the shared default path
+                await AssertPidFileAsync(iRoot, n.Namespace);
                 // log/ is root:inetsim 0750 (inetsim cannot create entries); reports go to a separate root dir; no inetsim-owned file is in either
                 Assert.Equal("root:inetsim 750", (await Sudo("stat", "-c", "%U:%G %a", iRoot + "/log")).Stdout.Trim());
                 Assert.Equal("root:root 755", (await Sudo("stat", "-c", "%U:%G %a", iRoot + "/report")).Stdout.Trim());

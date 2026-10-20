@@ -12,7 +12,8 @@ public sealed record UntrustedCopyResult(long BytesCopied, bool Truncated);
 /// </summary>
 public static class UntrustedFile
 {
-    private const int O_RDONLY = 0, O_NONBLOCK = 0x800, O_CLOEXEC = 0x80000;
+    private const int O_RDONLY = 0, O_NOCTTY = 0x100, O_NONBLOCK = 0x800, O_CLOEXEC = 0x80000;
+    private const int ENOENT = 2;
     private const int AT_EMPTY_PATH = 0x1000;
     private const uint STATX_BASIC_STATS = 0x7ff;
     private const uint S_IFMT = 0xF000, S_IFREG = 0x8000;
@@ -26,6 +27,7 @@ public static class UntrustedFile
     [DllImport("libc", EntryPoint = "statx", SetLastError = true)]
     private static extern int Statx(int dirfd, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags, uint mask, byte[] buf);
 
+    /// <exception cref="FileNotFoundException">The source does not exist (nothing to copy; <c>dest</c> is not created).</exception>
     /// <exception cref="IOException">The source is a symlink, not a regular file, has other hard links, or cannot be opened.</exception>
     public static async Task<UntrustedCopyResult> CopyRegularFileAsync(string source, string dest, long maxBytes, CancellationToken ct)
     {
@@ -36,8 +38,14 @@ public static class UntrustedFile
         ct.ThrowIfCancellationRequested();
 
         // O_NOFOLLOW: a symlink fails to open (ELOOP). O_NONBLOCK: a FIFO opens immediately instead of waiting for a writer.
-        var fd = Open(source, O_RDONLY | O_NONBLOCK | O_CLOEXEC | ONoFollow);
-        if (fd < 0) throw new IOException($"Cannot open '{source}' safely (errno {Marshal.GetLastPInvokeError()}); refusing (symlink?).");
+        // O_NOCTTY: a terminal device planted in its place can never become our controlling terminal.
+        var fd = Open(source, O_RDONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC | ONoFollow);
+        if (fd < 0)
+        {
+            var errno = Marshal.GetLastPInvokeError();
+            if (errno == ENOENT) throw new FileNotFoundException($"'{source}' does not exist.", source);
+            throw new IOException($"Cannot open '{source}' safely (errno {errno}); refusing (symlink?).");
+        }
         var handle = new SafeFileHandle(fd, ownsHandle: true);
         using (handle)
         {

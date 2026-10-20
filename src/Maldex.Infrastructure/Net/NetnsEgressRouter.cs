@@ -50,18 +50,47 @@ public sealed partial class NetnsEgressRouter(
 
     private static string InetSimDir(string ns) => "/run/maldex/inetsim/" + ns;
 
+    /// <summary>
+    /// Fixed script INetSim starts under, inside a fresh IPC + mount namespace (<c>$0</c> = the run's INetSim dir, then the
+    /// INetSim command). INetSim keeps its whole configuration in a fixed-key ("CNFG"), mode-0666 SysV shared memory segment
+    /// that its ROOT main process reads back after the services (which a guest can take over) are running, e.g. the report
+    /// settings at shutdown, where root then writes/chmods/chowns a file at a path taken from that segment. The private IPC
+    /// namespace keeps runs (and every other local uid) apart; the mount namespace makes every mount read-only except the
+    /// run's own dir (nosuid/nodev/noexec), so whatever a compromised child plants there, root can write nowhere else. Mounts
+    /// that cannot be made read-only are detached; if any writable mount other than an nsfs handle remains, it fails closed.
+    /// </summary>
+    public const string InetSimSandboxScript = """
+        set -eu
+        d="$0"
+        rw() { awk '{ for (i = 7; $i != "-"; i++) ; if ($6 !~ /(^|,)ro(,|$)/ && $(i + 1) != "nsfs") print $5 }' /proc/self/mountinfo | sort -ru; }
+        awk '{ print $5 }' /proc/self/mountinfo | sort -ru | while IFS= read -r m; do mount -o remount,bind,ro "$(printf '%b' "$m")" 2>/dev/null || true; done
+        for pass in 1 2 3 4 5 6 7 8; do
+          [ -z "$(rw)" ] && break
+          rw | while IFS= read -r m; do umount -l "$(printf '%b' "$m")" 2>/dev/null || true; done # stacked mounts: one per pass
+        done
+        left=$(rw)
+        if [ -n "$left" ]; then echo "inetsim sandbox: writable mounts remain: $left" >&2; exit 1; fi
+        mount --bind "$d" "$d"
+        mount -o remount,bind,rw,nosuid,nodev,noexec "$d"
+        exec "$@"
+        """;
+
     // mitmdump cannot traverse the owner's home (the repo and .data live there), so everything it touches is staged here.
     private static string MitmDir(string ns) => "/run/maldex/mitm/" + ns;
 
-    /// <summary>Live flows file written by mitmdump (world-readable). After release it is copied to <c>{runNetDir}/flows.jsonl</c>.</summary>
+    /// <summary>
+    /// Live flows file written by mitmdump: mode 0640, owner maldex-mitm, group = the control-plane user's group (readable by
+    /// the control plane only). Untrusted: read it with <see cref="UntrustedFile"/>. After release it is copied to
+    /// <c>{runNetDir}/flows.jsonl</c>.
+    /// </summary>
     public static string MitmFlowsPath(Guid taskId) => MitmDir(RunNetNames.For(taskId).Namespace) + "/out/flows.jsonl";
 
     /// <summary>Capture is on while this file exists; the control plane owns the directory, mitmdump only stats it.</summary>
     public static string MitmCaptureEnablePath(Guid taskId) => MitmDir(RunNetNames.For(taskId).Namespace) + "/ctl/capture.on";
 
     /// <summary>
-    /// The per-run INetSim data directory (guest uploads land in <c>http/postdata</c>, <c>ftp/upload</c> and <c>smtp</c>
-    /// under it). Root-managed: read it with sudo. Removed by <see cref="ReleaseAsync"/>.
+    /// The per-run INetSim data directory (guest uploads land in <c>http/postdata</c> and <c>ftp/upload</c>, mail in
+    /// <c>smtp/smtp.mbox</c> under it). Root-managed: read it with sudo. Removed by <see cref="ReleaseAsync"/>.
     /// </summary>
     public static string InetSimDataPath(Guid taskId) => InetSimDir(RunNetNames.For(taskId).Namespace) + "/data";
 
@@ -237,11 +266,19 @@ public sealed partial class NetnsEgressRouter(
         // the TLS key must be readable by the dropped-privilege service user
         await Must(PrivilegedCommands.Sudo("chgrp", "inetsim", data + "/certs/default_key.pem"), ct);
         await Must(PrivilegedCommands.Sudo("chmod", "0640", data + "/certs/default_key.pem"), ct);
-        foreach (var w in new[] { "http/postdata", "ftp/upload", "smtp" })
+        // Root never opens anything inside these two (INetSim's root code only chowns the directory itself, whose parent is root's).
+        foreach (var w in new[] { "http/postdata", "ftp/upload" })
         {
             await Must(PrivilegedCommands.Sudo("rm", "-rf", "--", $"{data}/{w}"), ct);
             await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0750", "-o", "inetsim", "-g", "inetsim", $"{data}/{w}"), ct);
         }
+        // SMTP's configure_hook runs as ROOT before the privilege drop and opens(>>)/chmods/chowns the mbox, following symlinks;
+        // services start back to back, so an already-compromised inetsim child must not be able to plant one there. smtp/ is
+        // therefore root:inetsim 0750 and the mbox files exist up front as root:inetsim 0660 (SMTP only appends to / reads them).
+        await Must(PrivilegedCommands.Sudo("rm", "-rf", "--", $"{data}/smtp"), ct);
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0750", "-o", "root", "-g", "inetsim", $"{data}/smtp"), ct);
+        foreach (var mbox in new[] { "smtp.mbox", "smtps.mbox" })
+            await Must(PrivilegedCommands.Sudo("install", "-m", "0660", "-o", "root", "-g", "inetsim", "/dev/null", $"{data}/smtp/{mbox}"), ct);
         // INetSim's ROOT main process appends to these logs and writes reports (following symlinks), so inetsim must never be able
         // to create/unlink/rename entries where root writes: log/ is root:inetsim 0750 (no write for inetsim) with pre-created
         // group-writable log files (INetSim only checks group inetsim + group rw); reports go to a separate root-only dir.
@@ -250,8 +287,10 @@ public sealed partial class NetnsEgressRouter(
             await Must(PrivilegedCommands.Sudo("install", "-m", "0660", "-o", "root", "-g", "inetsim", "/dev/null", $"{log}/{lf}"), ct);
         await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", "root", "-g", "root", report), ct);
         var conf = Path.GetFullPath(Path.Combine(_o.DeployNetDir, "inetsim", "inetsim.conf"));
-        await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "inetsim.out"), [_o.InetSimBinary,
-            "--config", conf, "--data-dir", data, "--log-dir", log, "--report-dir", report, "--bind-address", "0.0.0.0"]), ct);
+        await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "inetsim.out"), ["unshare", "--ipc", "--mount", "--propagation", "private", "--",
+            "sh", "-c", InetSimSandboxScript, isDir, _o.InetSimBinary,
+            "--config", conf, "--data-dir", data, "--log-dir", log, "--report-dir", report, "--bind-address", "0.0.0.0",
+            "--pidfile", isDir + "/inetsim.pid"]), ct); // per run, root-owned dir: no shared/stale /var/run/inetsim.pid
         await WaitFor(async () =>
         {
             var r = await Run(PrivilegedCommands.InNs(ns, "curl", "-s", "-o", "/dev/null", "-m", "2", "-w", "%{http_code}", $"http://{_o.SinkholeIp}/"), ct);
@@ -294,47 +333,82 @@ public sealed partial class NetnsEgressRouter(
         }, _t.HandshakeWait, () => "WireGuard handshake did not complete; the exit cannot be verified", ct);
     }
 
+    /// <summary>
+    /// Tears the run's network down. Idempotent, and NOT cancellable: a half-released gateway is worse than a slow release, so
+    /// every teardown step runs with <see cref="CancellationToken.None"/> (each is bounded by the runner's timeout and
+    /// <see cref="NetnsRouterTuning.KillGrace"/>). <paramref name="ct"/> only cuts short the optional copy of the captured
+    /// flows. The run's slot is always freed.
+    /// </summary>
     public Task ReleaseAsync(NetworkLease lease, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(lease);
         return ReleaseCoreAsync(lease.TaskId, ct);
     }
 
-    private async Task ReleaseCoreAsync(Guid taskId, CancellationToken ct)
+    private async Task ReleaseCoreAsync(Guid taskId, CancellationToken flowsCt)
     {
+        var none = CancellationToken.None;
         var names = RunNetNames.For(taskId);
         var ns = names.Namespace;
-        var pids = await PidsAsync(ns, ct);
-        foreach (var pid in pids) await Run(PrivilegedCommands.Sudo("kill", "-TERM", pid.ToString(CultureInfo.InvariantCulture)), ct);
-        if (pids.Count > 0)
-        {
-            var deadline = DateTime.UtcNow + _t.KillGrace;
-            while ((pids = await PidsAsync(ns, ct)).Count > 0 && DateTime.UtcNow < deadline)
-                await Task.Delay(_t.PollInterval, ct);
-            foreach (var pid in pids) await Run(PrivilegedCommands.Sudo("kill", "-KILL", pid.ToString(CultureInfo.InvariantCulture)), ct);
-        }
-        // Each step tolerates "does not exist".
-        await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.Bridge), ct);
-        await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.Tap), ct);
-        await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.VethHost), ct);
-        await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.WgIface), ct);
-        await Run(PrivilegedCommands.Sudo("ip", "netns", "del", ns), ct);
-        // Keep the captured flows for collection (copied as the control-plane user, so a planted symlink gets no root help).
         try
         {
-            if (Directory.Exists(RunNetDir(ns)))
+            var pids = await PidsAsync(ns, none);
+            foreach (var pid in pids) await Run(PrivilegedCommands.Sudo("kill", "-TERM", pid.ToString(CultureInfo.InvariantCulture)), none);
+            if (pids.Count > 0)
             {
-                // The source sits in a directory the (hostile-traffic-facing) mitm user owns: never follow links or block on it.
-                var res = await UntrustedFile.CopyRegularFileAsync(MitmFlowsPath(taskId), Path.Combine(RunNetDir(ns), "flows.jsonl"), MaxFlowsBytes, ct);
-                if (res.Truncated) warn?.Invoke($"Flows for {taskId:N} truncated at {MaxFlowsBytes} bytes.");
+                var deadline = DateTime.UtcNow + _t.KillGrace;
+                while ((pids = await PidsAsync(ns, none)).Count > 0 && DateTime.UtcNow < deadline)
+                    await Task.Delay(_t.PollInterval, none);
+                foreach (var pid in pids) await Run(PrivilegedCommands.Sudo("kill", "-KILL", pid.ToString(CultureInfo.InvariantCulture)), none);
             }
+            // Each step tolerates "does not exist".
+            await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.Bridge), none);
+            await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.Tap), none);
+            await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.VethHost), none);
+            await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.WgIface), none);
+            await Run(PrivilegedCommands.Sudo("ip", "netns", "del", ns), none);
+            await KeepFlowsAsync(taskId, ns, flowsCt);
+            await Run(PrivilegedCommands.Sudo("rm", "-rf", "--", MitmDir(ns)), none);
+            await Run(PrivilegedCommands.Sudo("rm", "-rf", "--", InetSimDir(ns)), none); // ns is mxn<12 hex>: derived from a Guid, never free text
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { warn?.Invoke($"Could not keep flows for {taskId:N}: {e.Message}"); }
-        await Run(PrivilegedCommands.Sudo("rm", "-rf", "--", MitmDir(ns)), ct);
-        await Run(PrivilegedCommands.Sudo("rm", "-rf", "--", InetSimDir(ns)), ct); // ns is mxn<12 hex>: derived from a Guid, never free text
-        await _gate.WaitAsync(CancellationToken.None);
-        try { _active.Remove(taskId); }
-        finally { _gate.Release(); }
+        finally
+        {
+            await _gate.WaitAsync(none);
+            try { _active.Remove(taskId); }
+            finally { _gate.Release(); }
+        }
+    }
+
+    /// <summary>Keeps the captured flows for collection; best effort, never throws.</summary>
+    private async Task KeepFlowsAsync(Guid taskId, string ns, CancellationToken ct)
+    {
+        var dir = RunNetDir(ns);
+        if (!Directory.Exists(dir)) return;
+        var dest = Path.Combine(dir, "flows.jsonl");
+        var partial = dest + ".partial"; // copied aside, then renamed: a cancelled/failed copy never clobbers flows kept earlier
+        try
+        {
+            // Copied as the control-plane user (a planted symlink gets no root help). The source sits in a directory the
+            // hostile-traffic-facing mitm user owns: never follow links, block on it or read more than the cap.
+            var res = await UntrustedFile.CopyRegularFileAsync(MitmFlowsPath(taskId), partial, MaxFlowsBytes, ct);
+            File.Move(partial, dest, overwrite: true);
+            if (res.Truncated) warn?.Invoke($"Flows for {taskId:N} truncated at {MaxFlowsBytes} bytes.");
+        }
+        catch (FileNotFoundException) { } // capture never produced a file: nothing to keep
+        catch (OperationCanceledException)
+        {
+            warn?.Invoke($"Keeping flows for {taskId:N} was cancelled; no new flows kept.");
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            warn?.Invoke($"Could not keep flows for {taskId:N}: {e.Message}");
+        }
+        finally { TryDelete(partial); } // never leave an unflagged partial copy
+    }
+
+    private static void TryDelete(string path)
+    {
+        try { File.Delete(path); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
     }
 
     private async Task<List<int>> PidsAsync(string ns, CancellationToken ct)

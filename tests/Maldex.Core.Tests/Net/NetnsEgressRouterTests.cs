@@ -20,11 +20,13 @@ public sealed class NetnsEgressRouterTests : IDisposable
         public string Pids = "";
         public bool GuardPresent = true;
         public string TemplateOffender = "";
+        public bool HonorCancellation;
 
         public Task<ProcessResult> RunAsync(string file, IReadOnlyList<string> args, CancellationToken ct, string? stdin = null, TimeSpan? timeout = null)
         {
             var line = file + " " + string.Join(' ', args);
             lock (Calls) { Calls.Add(line); Stdins.Add(stdin); }
+            if (HonorCancellation) ct.ThrowIfCancellationRequested();
             if (Fail(line)) return Task.FromResult(new ProcessResult(1, "", "scripted failure"));
             if (line.Contains("nft list table inet maldex_guard")) return Ok(GuardPresent ? 0 : 1);
             if (line.StartsWith("sudo -n ip netns add ")) { lock (Namespaces) Namespaces.Add(args[^1]); return Ok(); }
@@ -349,11 +351,22 @@ public sealed class NetnsEgressRouterTests : IDisposable
         var root = _r.IndexOf(c => c == $"sudo -n install -d -m 0755 -o root -g root /run/maldex /run/maldex/inetsim {iDir} {data}");
         var cp = _r.IndexOf(c => c == "sudo -n cp -rP --no-preserve=ownership /var/lib/inetsim/. " + data + "/");
         Assert.True(check >= 0 && root > check && cp > root, "template check, then root-owned dirs, then copy");
-        foreach (var w in new[] { "http/postdata", "ftp/upload", "smtp" })
+        foreach (var w in new[] { "http/postdata", "ftp/upload" })
         {
             var rm = _r.IndexOf(c => c == $"sudo -n rm -rf -- {data}/{w}");
             var mk = _r.IndexOf(c => c == $"sudo -n install -d -m 0750 -o inetsim -g inetsim {data}/{w}");
             Assert.True(rm > cp && mk > rm, w);
+        }
+        // SMTP's configure_hook runs as ROOT and opens/chmods/chowns the mbox (following symlinks): smtp/ is root:inetsim 0750
+        // (inetsim cannot create/replace entries) and both mbox files are pre-created root:inetsim 0660 before INetSim starts.
+        var smtpRm = _r.IndexOf(c => c == $"sudo -n rm -rf -- {data}/smtp");
+        var smtpMk = _r.IndexOf(c => c == $"sudo -n install -d -m 0750 -o root -g inetsim {data}/smtp");
+        Assert.True(smtpRm > cp && smtpMk > smtpRm, "smtp dir recreated root:inetsim");
+        var start = _r.IndexOf(c => c.Contains("--config"));
+        foreach (var mbox in new[] { "smtp.mbox", "smtps.mbox" })
+        {
+            var mf = _r.IndexOf(c => c == $"sudo -n install -m 0660 -o root -g inetsim /dev/null {data}/smtp/{mbox}");
+            Assert.True(mf > smtpMk && mf < start, mbox);
         }
         // root writes logs/reports (following symlinks), so inetsim must own neither: log/ is root:inetsim 0750 with pre-created
         // group-writable files, reports go to a separate root:root dir
@@ -361,12 +374,23 @@ public sealed class NetnsEgressRouterTests : IDisposable
         foreach (var lf in new[] { "main.log", "service.log", "debug.log" })
             Assert.Contains(_r.Calls, c => c == $"sudo -n install -m 0660 -o root -g inetsim /dev/null {iDir}/log/{lf}");
         Assert.Contains(_r.Calls, c => c == $"sudo -n install -d -m 0755 -o root -g root {iDir}/report");
-        // the only inetsim-owned directories are the three upload leaves
+        // the only inetsim-owned directories are the two upload leaves root never writes into
         var owned = _r.Where(c => c.Contains("-o inetsim") && c.Contains("install -d")).Select(c => c.Split(' ')[^1]).OrderBy(x => x).ToList();
-        Assert.Equal(new[] { $"{data}/ftp/upload", $"{data}/http/postdata", $"{data}/smtp" }.OrderBy(x => x), owned);
+        Assert.Equal(new[] { $"{data}/ftp/upload", $"{data}/http/postdata" }.OrderBy(x => x), owned);
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("-o inetsim") && !c.Contains("install -d -m 0750 -o inetsim -g inetsim"));
         Assert.DoesNotContain(_r.Calls, c => c.Contains("-o inetsim") && c.Contains("/dev/null"));
         var inet = Assert.Single(_r.Where(c => c.Contains("--config")));
         Assert.Contains($"--data-dir {data} --log-dir {iDir}/log --report-dir {iDir}/report", inet);
+        // per-run pid file in the root-owned run dir (never the shared /var/run/inetsim.pid)
+        Assert.Contains($"--pidfile {iDir}/inetsim.pid", inet);
+        // INetSim's config lives in a fixed-key, mode-0666 SysV shared memory segment that its ROOT main process reads back
+        // (e.g. report settings at shutdown): a private IPC namespace per run, and a mount namespace where everything but the
+        // run's own dir is read-only, so neither another run nor a compromised service child can steer root's writes.
+        Assert.Contains($"ip netns exec {n.Namespace} unshare --ipc --mount --propagation private -- sh -c ", inet);
+        Assert.Contains(NetnsEgressRouter.InetSimSandboxScript + " " + iDir + " " + "inetsim --config", inet);
+        Assert.Contains("remount,bind,ro", NetnsEgressRouter.InetSimSandboxScript);
+        Assert.Contains("exit 1", NetnsEgressRouter.InetSimSandboxScript); // fails closed if anything stays writable
+        Assert.EndsWith("exec \"$@\"", NetnsEgressRouter.InetSimSandboxScript.TrimEnd());
         Assert.Contains("create_reports          no", File.ReadAllText(Path.Combine(RepoRoot(), "deploy", "net", "inetsim", "inetsim.conf")));
         Assert.DoesNotContain("--data-dir /var/lib/inetsim", inet);
         await router.ReleaseAsync(lease, CancellationToken.None);
@@ -479,6 +503,57 @@ public sealed class NetnsEgressRouterTests : IDisposable
         _r.Fail = c => c.Contains("ip link del") || c.Contains("ip netns del") || c.Contains("netns pids") || c.Contains("rm -rf");
         await router.ReleaseAsync(lease, CancellationToken.None); // second release tolerates "does not exist"
         await router.ReleaseAsync(new NetworkLease(Guid.NewGuid(), "mxt000000000000"), CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Release_CancelledToken_StillTearsEverythingDown_AndFreesTheSlot()
+    {
+        var warnings = new List<string>();
+        var router = Router(warnings.Add);
+        var lease = await router.CreateAsync(Guid.NewGuid(), NetworkMode.Simulated, null, CancellationToken.None);
+        var n = RunNetNames.For(lease.TaskId);
+        _r.HonorCancellation = true;
+        _r.Pids = "4242\n";
+        _r.Calls.Clear();
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+        await router.ReleaseAsync(lease, cts.Token); // teardown is not cancellable: it completes and returns
+        Assert.Contains(_r.Calls, c => c == "sudo -n kill -TERM 4242");
+        Assert.Contains(_r.Calls, c => c == "sudo -n kill -KILL 4242");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip link del {n.Bridge}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip netns del {n.Namespace}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n rm -rf -- /run/maldex/mitm/{n.Namespace}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n rm -rf -- /run/maldex/inetsim/{n.Namespace}");
+        // the slot is free again: the same subnet index is handed out next
+        _r.Pids = "";
+        var next = await router.CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None);
+        var leaseJson = File.ReadAllText(Path.Combine(_tmp, "run", "net", RunNetNames.For(next.TaskId).Namespace, "lease.json"));
+        Assert.Contains("\"Index\":0", leaseJson);
+    }
+
+    [Fact]
+    public async Task Release_Again_WithCancelledToken_KeepsFlowsFromTheFirstRelease()
+    {
+        var router = Router();
+        var lease = await router.CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None);
+        var kept = Path.Combine(_tmp, "run", "net", RunNetNames.For(lease.TaskId).Namespace, "flows.jsonl");
+        await router.ReleaseAsync(lease, CancellationToken.None);
+        File.WriteAllText(kept, "{\"kept\":1}\n"); // as if the first release had kept a capture
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+        await router.ReleaseAsync(lease, cts.Token);
+        Assert.Equal("{\"kept\":1}\n", File.ReadAllText(kept));
+        Assert.False(File.Exists(kept + ".partial"));
+    }
+
+    [Fact]
+    public async Task Release_NoFlowsFile_IsNotAWarning()
+    {
+        var warnings = new List<string>();
+        var router = Router(warnings.Add);
+        var lease = await router.CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None);
+        await router.ReleaseAsync(lease, CancellationToken.None); // capture never ran: nothing to keep
+        Assert.DoesNotContain(warnings, w => w.Contains("flows", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
