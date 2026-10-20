@@ -20,6 +20,7 @@ public sealed class ProcessingPipeline(
     IServiceScopeFactory scopes,
     IYaraScanner yara,
     ISuricataRunner suricata,
+    HttpFlowIndexer httpFlows,
     IArtifactStore artifacts,
     ITaskEventPublisher publisher,
     TimeProvider time,
@@ -56,6 +57,11 @@ public sealed class ProcessingPipeline(
 
         await RunStepAsync("yara", warnings, ct, async () => results.AddRange(await ScanSampleAsync(task, ct).ConfigureAwait(false))).ConfigureAwait(false);
         await RunStepAsync("suricata", warnings, ct, async () => results.AddRange(await RunSuricataAsync(db, taskId, ct).ConfigureAwait(false))).ConfigureAwait(false);
+        await RunStepAsync("http indexing", warnings, ct, async () =>
+        {
+            var indexed = await httpFlows.IndexAsync(taskId, ct).ConfigureAwait(false);
+            if (indexed.Ignored > 0) warnings.Add($"http indexing: {indexed.Ignored} flows beyond the per-task limit were ignored");
+        }).ConfigureAwait(false);
         await RunStepAsync("heuristics", warnings, ct, async () => results.AddRange(await EvaluateHeuristicsAsync(db, taskId, ct).ConfigureAwait(false))).ConfigureAwait(false);
 
         var verdict = VerdictEngine.Compute(results);
