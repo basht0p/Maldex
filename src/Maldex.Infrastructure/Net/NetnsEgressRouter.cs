@@ -253,8 +253,11 @@ public sealed partial class NetnsEgressRouter(
             NetworkMode.LiveVpn => ["--no-resolv", $"--server={wg!.Dns}"],
             _ => ["--no-resolv"],
         };
+        // Per-run lease database (never the shared /var/lib/misc/dnsmasq.leases) and a reservation for the run's deterministic
+        // guest MAC: the one-address pool can only ever be handed to this run's guest, on every VM attempt.
         await Must(PrivilegedCommands.InNs(ns, [_o.DnsmasqBinary, "--conf-file=/dev/null", "--no-hosts", $"--interface={names.VethNs}", "--bind-interfaces",
-            $"--dhcp-range={subnet.GuestIp},{subnet.GuestIp},255.255.255.252,12h", $"--dhcp-option=3,{gw}", $"--dhcp-option=6,{gw}",
+            $"--dhcp-range={subnet.GuestIp},{subnet.GuestIp},255.255.255.252,12h", $"--dhcp-host={RunNetNames.GuestMac(taskId)},{subnet.GuestIp}",
+            $"--dhcp-leasefile={Path.Combine(dir, "dnsmasq.leases")}", $"--dhcp-option=3,{gw}", $"--dhcp-option=6,{gw}",
             $"--pid-file={Path.Combine(dir, "dnsmasq.pid")}", $"--log-facility={Path.Combine(dir, "dnsmasq.log")}", .. dnsArgs]), ct);
 
         // 4. MITM proxy, TCP only, bound to the gateway address. It parses hostile traffic and runs our addon, so it runs as

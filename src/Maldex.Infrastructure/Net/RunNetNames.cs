@@ -10,6 +10,17 @@ public sealed record RunNetNames(string Bridge, string Tap, string VethHost, str
         var h = taskId.ToString("N")[..12];
         return new($"mxb{h}", $"mxt{h}", $"mxv{h}", $"mxg{h}", $"mxn{h}", $"mxw{h}");
     }
+
+    /// <summary>
+    /// The guest NIC's MAC: QEMU's 52:54:00 prefix + the first 3 bytes of the task id. Deterministic, so every VM attempt
+    /// of a run (including the agent-ready retry) presents the MAC the run's dnsmasq has a <c>--dhcp-host</c> reservation for.
+    /// Only unique per bridge, which is all it needs (one guest per run bridge).
+    /// </summary>
+    public static string GuestMac(Guid taskId)
+    {
+        var h = taskId.ToString("N");
+        return $"52:54:00:{h[..2]}:{h[2..4]}:{h[4..6]}";
+    }
 }
 
 /// <summary>A /30 carved from 10.213.0.0/16: gateway .1, guest .2.</summary>

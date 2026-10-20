@@ -25,6 +25,14 @@ public class RunNetNamesTests
     }
 
     [Fact]
+    public void GuestMac_IsDeterministicQemuUnicast_FromTaskId()
+    {
+        Assert.Equal("52:54:00:01:23:45", RunNetNames.GuestMac(Id));
+        Assert.Equal(RunNetNames.GuestMac(Id), RunNetNames.GuestMac(Id));
+        Assert.Matches("^52:54:00(:[0-9a-f]{2}){3}$", RunNetNames.GuestMac(Guid.NewGuid()));
+    }
+
+    [Fact]
     public void RunSubnet_IndexesDoNotOverlap()
     {
         var seen = new HashSet<uint>();

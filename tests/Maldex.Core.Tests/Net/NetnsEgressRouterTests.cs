@@ -258,6 +258,9 @@ public sealed class NetnsEgressRouterTests : IDisposable
         Assert.DoesNotContain(_r.Calls, c => c.Contains("wireguard"));
         var dns = Assert.Single(_r.Where(c => c.Contains(" dnsmasq ")));
         Assert.Contains("--no-resolv", dns);
+        // per-run lease file and a reservation for the run's deterministic guest MAC (no shared /var/lib/misc lease db)
+        Assert.Contains($"--dhcp-leasefile={Path.Combine(_tmp, "run", "net", n.Namespace, "dnsmasq.leases")}", dns);
+        Assert.Contains($"--dhcp-host={RunNetNames.GuestMac(id)},10.213.0.2", dns);
         Assert.DoesNotContain("--server", dns);
         Assert.DoesNotContain("--address", dns);
         Assert.True(File.Exists(Path.Combine(_tmp, "run", "net", n.Namespace, "lease.json")));
