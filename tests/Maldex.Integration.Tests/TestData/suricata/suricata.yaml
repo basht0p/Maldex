@@ -1,0 +1,35 @@
+%YAML 1.1
+---
+# Minimal self-contained config for the SuricataRunner integration test (offline pcap replay only).
+vars:
+  address-groups:
+    HOME_NET: "any"
+    EXTERNAL_NET: "any"
+    HTTP_SERVERS: "any"
+    DNS_SERVERS: "any"
+  port-groups:
+    HTTP_PORTS: "80"
+
+default-log-dir: /tmp
+classification-file: /etc/suricata/classification.config
+reference-config-file: /etc/suricata/reference.config
+
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert
+
+app-layer:
+  protocols:
+    http:
+      enabled: yes
+    dns:
+      enabled: yes
+
+stream:
+  checksum-validation: no
+
+# Offline replay: do not validate checksums.
