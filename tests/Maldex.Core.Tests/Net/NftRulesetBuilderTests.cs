@@ -127,7 +127,7 @@ public class NftRulesetBuilderTests
         var input = Chain(NftRulesetBuilder.Build(t), "input");
         var port = "tcp dport 8123";
         // A non-dnat'd hit on the mitm port is dropped, and that drop precedes every accept that could match it.
-        var gate = input.FindIndex(l => l == $"iifname \"{Ns}\" tcp dport 8123 ct status != dnat drop");
+        var gate = input.FindIndex(l => l == $"iifname \"{Ns}\" tcp dport 8123 ct status & dnat == 0 drop");
         Assert.True(gate >= 0, "missing mitm dnat gate");
         var firstAccept = input.FindIndex(l => l.StartsWith($"iifname \"{Ns}\"") && l.EndsWith(" accept"));
         Assert.True(gate < firstAccept, "gate must precede every accept of guest traffic");
@@ -135,7 +135,7 @@ public class NftRulesetBuilderTests
         foreach (var l in input.Where(l => l.StartsWith($"iifname \"{Ns}\"") && l.EndsWith(" accept")))
         {
             if (l.Contains(port)) Assert.Contains("ct status dnat", l);
-            else if (!l.Contains("dport")) Assert.Contains("ct status != dnat", l); // generic accepts
+            else if (!l.Contains("dport")) Assert.Contains("ct status & dnat == 0", l); // generic accepts
         }
         // The only generic accept (Simulated any-IP) is never reachable by a direct mitm hit.
         Assert.Equal(mode == NetworkMode.Simulated, input.Any(l => l.Contains("meta l4proto")));
