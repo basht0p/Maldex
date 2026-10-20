@@ -11,7 +11,8 @@ namespace Maldex.Processing;
 
 /// <param name="Indexed">Rows written.</param>
 /// <param name="Ignored">Flows beyond the per-task cap that were not indexed.</param>
-public sealed record HttpFlowIndexResult(int Indexed, int Ignored);
+/// <param name="BodiesDropped">Response bodies not stored (oversize or over the per-task budget).</param>
+public sealed record HttpFlowIndexResult(int Indexed, int Ignored, int BodiesDropped = 0);
 
 /// <summary>
 /// Parses a task's <c>MitmFlows</c> artifacts and stores one <see cref="HttpTransaction"/> per flow. Safe to run again:
@@ -20,8 +21,8 @@ public sealed record HttpFlowIndexResult(int Indexed, int Ignored);
 /// </summary>
 public sealed class HttpFlowIndexer(IServiceScopeFactory scopes, IArtifactStore artifacts)
 {
-    private const long MaxBodyBytes = 32L * 1024 * 1024;
-    private const int MaxHeaders = 200;
+    private const long MaxBodyBytes = MitmFlowParser.MaxBodyBytes;
+    private const int MaxHeaders = MitmFlowParser.MaxHeaders;
     private const int HeaderNameMax = 256;
     private const int MethodMax = 16;
     private const int HostMax = 512;
@@ -39,14 +40,17 @@ public sealed class HttpFlowIndexer(IServiceScopeFactory scopes, IArtifactStore 
 
         var rows = new List<HttpTransaction>();
         var ignored = 0;
+        var droppedBodies = 0;
+        var budget = MitmFlowParser.MaxTotalBodyBytes;
         foreach (var artifact in flowArtifacts)
         {
             await using var stream = await artifacts.OpenReadAsync(artifact.BlobKey, ct).ConfigureAwait(false);
-            var parsed = MitmFlowParser.ParseWithStats(stream);
+            var parsed = MitmFlowParser.ParseWithStats(stream, MitmFlowParser.MaxFlows - rows.Count, budget);
             ignored += parsed.Ignored;
+            droppedBodies += parsed.BodiesDropped;
+            budget -= parsed.BodyBytes;
             foreach (var flow in parsed.Flows)
             {
-                if (rows.Count >= MitmFlowParser.MaxFlows) { ignored++; continue; }
                 rows.Add(await ToRowAsync(taskId, flow, ct).ConfigureAwait(false));
             }
         }
@@ -56,7 +60,7 @@ public sealed class HttpFlowIndexer(IServiceScopeFactory scopes, IArtifactStore 
         db.HttpTransactions.AddRange(rows);
         await db.SaveChangesAsync(ct).ConfigureAwait(false);
         await tx.CommitAsync(ct).ConfigureAwait(false);
-        return new HttpFlowIndexResult(rows.Count, ignored);
+        return new HttpFlowIndexResult(rows.Count, ignored, droppedBodies);
     }
 
     private async Task<HttpTransaction> ToRowAsync(Guid taskId, ParsedHttpTransaction flow, CancellationToken ct)
@@ -78,14 +82,21 @@ public sealed class HttpFlowIndexer(IServiceScopeFactory scopes, IArtifactStore 
         return new HttpTransaction
         {
             TaskId = taskId,
-            Method = GuestText.Clean(flow.Method, MethodMax - SuffixLength),
+            Method = Fit(flow.Method, MethodMax),
             Url = GuestText.Clean(flow.Url),
-            Host = GuestText.Clean(flow.Host, HostMax - SuffixLength),
+            Host = Fit(flow.Host, HostMax),
             Status = flow.Status,
             ReqHeaders = SerializeHeaders(flow.RequestHeaders),
             RespHeaders = SerializeHeaders(flow.ResponseHeaders),
             BodyBlobKey = bodyKey,
         };
+    }
+
+    /// <summary>Cleaned text left untouched when it fits the column; otherwise truncated so text plus marker fits.</summary>
+    private static string Fit(string s, int column)
+    {
+        var cleaned = GuestText.Clean(s, column);
+        return cleaned.Length <= column ? cleaned : GuestText.Clean(s, column - SuffixLength);
     }
 
     private static string SerializeHeaders(IReadOnlyList<KeyValuePair<string, string>> headers) =>

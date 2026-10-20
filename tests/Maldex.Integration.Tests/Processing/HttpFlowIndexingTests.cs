@@ -76,6 +76,25 @@ public class HttpFlowIndexingTests(SqlServerFixture sql)
     }
 
     [Fact]
+    public async Task Index_Method_FitsColumn_Untruncated_WhenShortEnough()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        var id = await ProcessingTaskAsync(h);
+        string Line(string m) => Flow("http://a.test/", "a.test", "v", null).Replace("\"method\":\"GET\"", $"\"method\":\"{m}\"");
+        var longMethod = new string('M', 40);
+        await AddFlowsArtifactAsync(h, id, Line("OPTIONS") + "\n" + Line(longMethod));
+
+        await h.Get<HttpFlowIndexer>().IndexAsync(id, Ct);
+
+        await using var db = h.NewContext();
+        var methods = await db.HttpTransactions.Where(x => x.TaskId == id).OrderBy(x => x.Id).Select(x => x.Method).ToListAsync(Ct);
+        Assert.Equal("OPTIONS", methods[0]);
+        Assert.True(methods[1].Length <= 16);
+        Assert.StartsWith("MMMM", methods[1]);
+        Assert.EndsWith("[truncated]", methods[1]);
+    }
+
+    [Fact]
     public async Task Index_IsIdempotent()
     {
         await using var h = await OrchestratorHarness.CreateAsync(sql);

@@ -60,4 +60,75 @@ public class MitmFlowParserTests
         Assert.Equal(MitmFlowParser.MaxFlows, result.Flows.Count);
         Assert.Equal(5, result.Ignored);
     }
+
+    private static string Mk(string method = "GET", string url = "http://h/", string hdrValue = "v", string? body = null, int headers = 1)
+    {
+        var hs = string.Join(",", Enumerable.Range(0, headers).Select(i => $"[\"H{i}\",\"{hdrValue}\"]"));
+        var b = body is null ? "null" : $"\"{body}\"";
+        return $$"""{"ts":1,"method":"{{method}}","url":"{{url}}","host":"h","status":200,"req_headers":[{{hs}}],"resp_headers":[],"resp_body_b64":{{b}},"tls":false}""";
+    }
+
+    [Theory]
+    [InlineData("method")]
+    [InlineData("url")]
+    [InlineData("header")]
+    public void Parse_LoneSurrogate_SkipsOnlyThatLine(string where)
+    {
+        var bad = where switch
+        {
+            "method" => Mk(method: "G\\udcffT"),
+            "url" => Mk(url: "http://x/\\udcff"),
+            _ => Mk(hdrValue: "a\\udcffb"),
+        };
+
+        var result = MitmFlowParser.Parse(Lines(bad, Mk(method: "PUT")));
+
+        Assert.Equal("PUT", Assert.Single(result).Method);
+    }
+
+    [Fact]
+    public void Parse_OversizeLine_IsSkippedWithoutBuffering()
+    {
+        var huge = Mk(url: "http://x/" + new string('a', 5000));
+
+        var result = MitmFlowParser.ParseWithStats(Lines(Mk(method: "A"), huge, Mk(method: "B")), maxLineBytes: 1000);
+
+        Assert.Equal(["A", "B"], result.Flows.Select(f => f.Method));
+        Assert.Equal(1, result.LinesSkipped);
+    }
+
+    [Fact]
+    public void Parse_OversizeBody_DropsBodyKeepsRow()
+    {
+        var big = Convert.ToBase64String(new byte[3000]);
+        var ok = Convert.ToBase64String(new byte[10]);
+
+        var result = MitmFlowParser.ParseWithStats(Lines(Mk(body: big), Mk(body: ok)), maxBodyBytes: 1000);
+
+        Assert.Equal(2, result.Flows.Count);
+        Assert.Null(result.Flows[0].ResponseBody);
+        Assert.Equal(10, result.Flows[1].ResponseBody!.Length);
+        Assert.Equal(1, result.BodiesDropped);
+    }
+
+    [Fact]
+    public void Parse_TotalBodyBudget_DropsBodiesBeyondIt()
+    {
+        var b = Convert.ToBase64String(new byte[100]);
+
+        var result = MitmFlowParser.ParseWithStats(Lines(Mk(body: b), Mk(body: b), Mk(body: b)), bodyBudget: 250);
+
+        Assert.Equal(3, result.Flows.Count);
+        Assert.Equal(2, result.Flows.Count(f => f.ResponseBody is not null));
+        Assert.Equal(1, result.BodiesDropped);
+        Assert.Equal(200, result.BodyBytes);
+    }
+
+    [Fact]
+    public void Parse_CapsHeaderPairs()
+    {
+        var flow = Assert.Single(MitmFlowParser.Parse(Lines(Mk(headers: 500))));
+
+        Assert.Equal(MitmFlowParser.MaxHeaders, flow.RequestHeaders.Count);
+    }
 }

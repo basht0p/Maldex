@@ -61,6 +61,7 @@ public sealed class ProcessingPipeline(
         {
             var indexed = await httpFlows.IndexAsync(taskId, ct).ConfigureAwait(false);
             if (indexed.Ignored > 0) warnings.Add($"http indexing: {indexed.Ignored} flows beyond the per-task limit were ignored");
+            if (indexed.BodiesDropped > 0) warnings.Add($"http indexing: {indexed.BodiesDropped} response bodies were too large or over the per-task budget and were not stored");
         }).ConfigureAwait(false);
         await RunStepAsync("heuristics", warnings, ct, async () => results.AddRange(await EvaluateHeuristicsAsync(db, taskId, ct).ConfigureAwait(false))).ConfigureAwait(false);
 
