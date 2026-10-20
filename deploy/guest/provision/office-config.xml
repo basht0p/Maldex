@@ -1,0 +1,17 @@
+<!--
+  Optional Office Deployment Tool configuration, used by Provision.ps1 only when MALDEX_OFFICE_ISO was attached.
+  Adjust Channel / Product ID to match the media you supply. Provision.ps1 replaces the placeholder
+  @OFFICE_SOURCE@ with the drive root of the mounted Office media.
+-->
+<Configuration>
+  <Add OfficeClientEdition="64" Channel="PerpetualVL2021" SourcePath="@OFFICE_SOURCE@">
+    <Product ID="ProPlus2021Volume">
+      <Language ID="en-us" />
+      <ExcludeApp ID="Teams" />
+      <ExcludeApp ID="OneDrive" />
+    </Product>
+  </Add>
+  <Updates Enabled="FALSE" />
+  <Display Level="None" AcceptEULA="TRUE" />
+  <Property Name="AUTOACTIVATE" Value="0" />
+</Configuration>

@@ -20,7 +20,7 @@ public sealed class CompositeEventSource(IReadOnlyList<IEventSource> sources) : 
             catch (OperationCanceledException) { }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"Event source {s.GetType().Name} stopped: {ex.Message}");
+                AgentLog.Write($"Event source {s.GetType().Name} stopped: {ex.Message}");
             }
         }, CancellationToken.None)).ToArray();
 

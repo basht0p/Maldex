@@ -90,7 +90,7 @@ public sealed class AgentHost(Stream channel, IEventSource source, CommandDispat
         }
     }
 
-    private void Log(string text) => Console.Error.WriteLine($"{time.GetUtcNow():O} {text}");
+    private void Log(string text) => AgentLog.Write(text, time.GetUtcNow());
 
     private async Task SendAsync(AgentMessage message, CancellationToken ct)
     {

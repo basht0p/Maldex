@@ -19,6 +19,7 @@ public static class AgentRunner
         using var mutex = new Mutex(true, MutexName, out var created);
         if (!created) return 0; // another instance already owns this machine
 
+        AgentLog.Write($"Agent {AgentHost.Version} starting");
         GdiScreenshotGrabber.EnableDpiAwareness();
         var time = TimeProvider.System;
         var shutdown = false;
@@ -29,6 +30,7 @@ public static class AgentRunner
             var port = await OpenPortAsync(ct).ConfigureAwait(false);
             if (port is null) break;
 
+            AgentLog.Write("Channel connected");
             var started = time.GetTimestamp();
             await using (port)
             {

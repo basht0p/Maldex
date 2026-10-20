@@ -23,7 +23,7 @@ public sealed class ScreenshotEventSource(IScreenshotGrabber grabber, TimeProvid
 
             ScreenshotImage? image = null;
             try { image = grabber.Grab(); }
-            catch (Exception ex) { Console.Error.WriteLine("Screenshot failed: " + ex.Message); }
+            catch (Exception ex) { AgentLog.Write("Screenshot failed: " + ex.Message); }
 
             if (image is not null)
                 yield return new ScreenshotMessage(time.GetUtcNow(), image.Format, Convert.ToBase64String(image.Data));
