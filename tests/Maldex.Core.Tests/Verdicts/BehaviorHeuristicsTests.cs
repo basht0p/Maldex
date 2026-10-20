@@ -53,6 +53,27 @@ public class BehaviorHeuristicsTests
     [Fact] public void RunOnceKeySet_HKLM_Fires() =>
         Assert.Single(BehaviorHeuristics.Evaluate([], [Reg("set", @"HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce\Sub")]));
 
+    [Theory]
+    [InlineData(@"HKU\S-1-5-21-3623811015-3361044348-30300820-1013\Software\Microsoft\Windows\CurrentVersion\Run")]
+    [InlineData(@"HKU\S-1-5-21-1-2-3-1001\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce")]
+    [InlineData(@"HKEY_USERS\S-1-5-21-1-2-3-1001\Software\Microsoft\Windows\CurrentVersion\Run")]
+    [InlineData(@"\REGISTRY\USER\S-1-5-21-1-2-3-1001\Software\Microsoft\Windows\CurrentVersion\Run")]
+    [InlineData(@"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run")]
+    public void RunKeySet_SysmonHiveForms_Fire(string key)
+    {
+        var d = Assert.Single(BehaviorHeuristics.Evaluate([], [Reg("set", key, "MaldexTest")]));
+        Assert.Equal("persistence_run_key", d.Rule);
+        Assert.Equal(key + @"\MaldexTest", d.Target);
+    }
+
+    [Theory]
+    [InlineData(@"HKU\S-1-5-21-1-2-3-1001_Classes\Software\Microsoft\Windows\CurrentVersion\Run")] // classes hive, not a run key
+    [InlineData(@"HKU\Software\Microsoft\Windows\CurrentVersion\Run")] // no SID component
+    [InlineData(@"HKU\S-1-5-21-1-2-3-1001\x\Software\Microsoft\Windows\CurrentVersion\Run")]
+    [InlineData(@"\REGISTRY\USER\Software\Microsoft\Windows\CurrentVersion\Run")]
+    public void RunKeyLookalikes_InUserHives_DoNotFire(string key) =>
+        Assert.Empty(BehaviorHeuristics.Evaluate([], [Reg("set", key, "v")]));
+
     [Fact] public void RunKeyRead_DoesNotFire()
     {
         Assert.Empty(BehaviorHeuristics.Evaluate([], [Reg("create", @"HKCU\Software\Microsoft\Windows\CurrentVersion\RunServices")]));
