@@ -11,11 +11,17 @@ public sealed class SubmissionOptions
 
     public long MaxUploadBytes { get; set; } = 268_435_456;
 
+    /// <summary><c>Maldex:Mode</c>. In Real mode the cap can never exceed what the agent accepts (a bigger sample would only fail after a VM boot).</summary>
+    public string? Mode { get; set; }
+
+    public bool IsReal => string.Equals(Mode, "Real", StringComparison.Ordinal);
+
     public void ApplyDefaults()
     {
         Images = Images.Where(i => !string.IsNullOrWhiteSpace(i)).ToList();
         if (Images.Count == 0) Images.Add(DefaultImage);
         if (MaxUploadBytes < 1) MaxUploadBytes = 268_435_456;
+        if (IsReal) MaxUploadBytes = Math.Min(MaxUploadBytes, Maldex.Core.Agent.AgentLimits.MaxInboundBytes);
     }
 }
 
