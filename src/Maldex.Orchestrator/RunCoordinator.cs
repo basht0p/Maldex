@@ -325,6 +325,7 @@ public sealed class RunCoordinator(
             }
 
             var now = time.GetUtcNow();
+            var flowsStored = false;
             foreach (var file in files)
             {
                 try
@@ -336,6 +337,7 @@ public sealed class RunCoordinator(
                     {
                         Id = Guid.NewGuid(), TaskId = task.Id, Kind = file.Kind, BlobKey = blob.Key, Sha256 = blob.Sha256, Size = blob.Size, CreatedAt = now,
                     });
+                    flowsStored |= file.Kind == ArtifactKind.MitmFlows;
                 }
                 catch (Exception ex)
                 {
@@ -345,6 +347,15 @@ public sealed class RunCoordinator(
             }
             // Only our own rows: unrelated pending changes are not flushed here.
             if (db.ChangeTracker.Entries<Artifact>().Any(e => e.State == EntityState.Added)) await db.SaveChangesAsync(none).ConfigureAwait(false);
+            // Saved: the router need not keep its own (second, up to 512 MiB) copy of the flows at release.
+            if (flowsStored)
+            {
+                try { NetnsEgressRouter.MarkFlowsStored(netOptions.Value.RunDir, task.Id); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    logger.LogWarning(ex, "Could not mark the flows of task {TaskId} as stored; the router keeps a copy.", task.Id);
+                }
+            }
         }
         catch (Exception ex)
         {

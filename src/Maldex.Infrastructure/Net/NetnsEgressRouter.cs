@@ -17,6 +17,8 @@ public sealed record NetnsRouterTuning
     public TimeSpan HandshakeWait { get; init; } = TimeSpan.FromSeconds(10);
     public TimeSpan KillGrace { get; init; } = TimeSpan.FromSeconds(5);
     public string BrNetfilterPath { get; init; } = "/proc/sys/net/bridge/bridge-nf-call-iptables";
+    /// <summary>Where the live mitm flows file is (tests point it at a scratch file).</summary>
+    public Func<Guid, string> FlowsSource { get; init; } = NetnsEgressRouter.MitmFlowsPath;
 }
 
 /// <summary>
@@ -49,6 +51,21 @@ public sealed partial class NetnsEgressRouter(
     public const long MaxFlowsBytes = 512L * 1024 * 1024;
 
     private static string InetSimDir(string ns) => "/run/maldex/inetsim/" + ns;
+
+    /// <summary>Marker in the run's net dir: the capture's flows are already stored as an artifact, so release skips its copy.</summary>
+    public const string FlowsStoredMarker = "flows.stored";
+
+    /// <summary>
+    /// Tells a later <see cref="ReleaseAsync"/> not to copy the flows again (they can be 512 MiB). Writes the marker into the
+    /// run's existing net dir (control-plane only, 0700); never creates the dir. Returns false when there is no such dir.
+    /// </summary>
+    public static bool MarkFlowsStored(string runDir, Guid taskId)
+    {
+        var dir = Path.Combine(Path.GetFullPath(runDir), "net", RunNetNames.For(taskId).Namespace);
+        if (!Directory.Exists(dir)) return false;
+        File.WriteAllText(Path.Combine(dir, FlowsStoredMarker), "");
+        return true;
+    }
 
     /// <summary>Unprivileged host account that is uid/gid 0 inside INetSim's user namespace (created by <c>./build.sh real-setup</c>).</summary>
     public const string IsRootUser = "maldex-isroot";
@@ -463,13 +480,14 @@ public sealed partial class NetnsEgressRouter(
     {
         var dir = RunNetDir(ns);
         if (!Directory.Exists(dir)) return;
+        if (File.Exists(Path.Combine(dir, FlowsStoredMarker))) return; // the capture already stored them: no second copy
         var dest = Path.Combine(dir, "flows.jsonl");
         var partial = dest + ".partial"; // copied aside, then renamed: a cancelled/failed copy never clobbers flows kept earlier
         try
         {
             // Copied as the control-plane user (a planted symlink gets no root help). The source sits in a directory the
             // hostile-traffic-facing mitm user owns: never follow links, block on it or read more than the cap.
-            var res = await UntrustedFile.CopyRegularFileAsync(MitmFlowsPath(taskId), partial, MaxFlowsBytes, ct);
+            var res = await UntrustedFile.CopyRegularFileAsync(_t.FlowsSource(taskId), partial, MaxFlowsBytes, ct);
             File.Move(partial, dest, overwrite: true);
             if (res.Truncated) warn?.Invoke($"Flows for {taskId:N} truncated at {MaxFlowsBytes} bytes.");
         }

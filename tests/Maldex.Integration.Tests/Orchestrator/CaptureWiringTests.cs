@@ -256,4 +256,62 @@ public class CaptureWiringTests(SqlServerFixture sql)
         }
         finally { Directory.Delete(runDir, true); }
     }
+
+    /// <summary>Records whether the capture's "flows stored" marker existed when the lease was released.</summary>
+    private sealed class MarkerSpyRouter(IEgressRouter inner, string runDir) : IEgressRouter
+    {
+        public bool? MarkerAtRelease;
+        public Task<NetworkLease> CreateAsync(Guid taskId, NetworkMode mode, string? exitCountry, CancellationToken ct) => inner.CreateAsync(taskId, mode, exitCountry, ct);
+        public Task ReleaseAsync(NetworkLease lease, CancellationToken ct)
+        {
+            MarkerAtRelease ??= File.Exists(Path.Combine(runDir, "net", Maldex.Infrastructure.Net.RunNetNames.For(lease.TaskId).Namespace, Maldex.Infrastructure.Net.NetnsEgressRouter.FlowsStoredMarker));
+            return inner.ReleaseAsync(lease, ct);
+        }
+        public Task<IReadOnlyList<NetworkLease>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
+    }
+
+    [Theory]
+    [InlineData(false, true)]  // flows stored as an artifact: the router must not copy them again
+    [InlineData(true, false)]  // storing failed: the router's copy is the fallback
+    public async Task Coordinator_TellsTheRouterWhenFlowsAreStored(bool storeFails, bool expectMarker)
+    {
+        var runDir = Directory.CreateTempSubdirectory("maldex-netdir-").FullName;
+        try
+        {
+            RecordingCapture? cap = null;
+            MarkerSpyRouter? spy = null;
+            OrchestratorHarness? h = null;
+            h = await OrchestratorHarness.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Real:Net:RunDir"] = runDir }, s =>
+            {
+                cap = new RecordingCapture(() => h!.Services);
+                s.Replace(ServiceDescriptor.Singleton<ICaptureService>(cap));
+                var inner = s.Last(d => d.ServiceType == typeof(IEgressRouter));
+                s.Replace(ServiceDescriptor.Singleton<IEgressRouter>(sp => spy = new MarkerSpyRouter((IEgressRouter)ActivatorUtilities.CreateInstance(sp, inner.ImplementationType!), runDir)));
+                if (storeFails) s.Replace(ServiceDescriptor.Singleton<IArtifactStore>(new FailingFlowsStore()));
+            });
+            await using var _ = h;
+            using var __ = cap;
+            var id = await h.SeedPreparingTaskAsync(durationSec: 60);
+            SeedNetDir(runDir, id);
+            await h.RunAsync(id, async () =>
+            {
+                await h.WaitForStatusAsync(id, RunStatus.Running);
+                h.Time.Advance(TimeSpan.FromSeconds(61));
+            });
+            Assert.Equal(expectMarker, spy!.MarkerAtRelease);
+        }
+        finally { Directory.Delete(runDir, true); }
+    }
+
+    /// <summary>Stores everything except captured flows.</summary>
+    private sealed class FailingFlowsStore : IArtifactStore
+    {
+        private readonly MemoryArtifactStore _inner = new();
+        public Task<StoredBlob> PutAsync(string category, Stream content, long maxBytes, CancellationToken ct) =>
+            category == "flows" ? throw new IOException("disk full") : _inner.PutAsync(category, content, maxBytes, ct);
+        public Task<Stream> OpenReadAsync(string key, CancellationToken ct) => _inner.OpenReadAsync(key, ct);
+        public Task DeleteAsync(string key, CancellationToken ct) => _inner.DeleteAsync(key, ct);
+        public bool Exists(string key) => _inner.Exists(key);
+        public IAsyncEnumerable<(string Key, DateTimeOffset LastWrite)> ListAsync(CancellationToken ct) => _inner.ListAsync(ct);
+    }
 }
