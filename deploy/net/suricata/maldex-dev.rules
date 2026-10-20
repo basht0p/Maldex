@@ -1,0 +1,4 @@
+# Maldex local development rules (sid 9000000+ is reserved for Maldex).
+alert http any any -> any any (msg:"MALDEX TEST controlled URL"; flow:established,to_server; http.host; content:"maldex-test.invalid"; sid:9000001; rev:1; classtype:trojan-activity; priority:1;)
+alert http any any -> any any (msg:"MALDEX TEST EICAR in HTTP body"; flow:established,to_client; file.data; content:"EICAR-STANDARD-ANTIVIRUS-TEST-FILE"; sid:9000002; rev:1; classtype:trojan-activity; priority:1;)
+alert dns any any -> any any (msg:"MALDEX TEST controlled DNS name"; dns.query; content:"maldex-test.invalid"; nocase; sid:9000003; rev:1; classtype:bad-unknown; priority:2;)
