@@ -1,0 +1,153 @@
+using Maldex.Core.Abstractions;
+using Maldex.Infrastructure.Libvirt;
+using Maldex.Infrastructure.Process;
+using Microsoft.Extensions.Options;
+using Xunit;
+
+namespace Maldex.Core.Tests.Libvirt;
+
+public sealed class LibvirtHypervisorTests : IDisposable
+{
+    private sealed class Recorder : IProcessRunner
+    {
+        public readonly List<(string File, string[] Args)> Calls = [];
+        public Func<string, string[], ProcessResult> Handler { get; set; } = (_, _) => new(0, "", "");
+        public Task<ProcessResult> RunAsync(string file, IReadOnlyList<string> args, CancellationToken ct, string? stdin = null, TimeSpan? timeout = null)
+        {
+            var a = args.ToArray();
+            Calls.Add((file, a));
+            return Task.FromResult(Handler(file, a));
+        }
+    }
+
+    private static readonly Guid Id = Guid.Parse("0123456789abcdef0123456789abcdef");
+    private readonly string _root = Path.Combine(Path.GetTempPath(), "mx-lv-" + Guid.NewGuid().ToString("N"));
+    private readonly Recorder _runner = new();
+    private readonly LibvirtOptions _opts;
+
+    public LibvirtHypervisorTests()
+    {
+        _opts = new LibvirtOptions { BaseImageDir = Path.Combine(_root, "base"), RunDir = Path.Combine(_root, "run") };
+        Directory.CreateDirectory(_opts.BaseImageDir);
+        Directory.CreateDirectory(_opts.RunDir);
+    }
+
+    public void Dispose() { try { Directory.Delete(_root, true); } catch { } }
+
+    private LibvirtHypervisor Hv() => new(Options.Create(_opts), _runner);
+    private VmSpec Spec() => new(Id, "win11-26h2", 4096, 2, "mxt" + Id.ToString("N")[..12]);
+    private string RunDirOf(VmHandle h) => Path.Combine(_opts.RunDir, h.Name);
+
+    private void SeedBase()
+    {
+        File.WriteAllText(Path.Combine(_opts.BaseImageDir, "win11-26h2.qcow2"), "q");
+        File.WriteAllText(Path.Combine(_opts.BaseImageDir, "win11-26h2.vars.fd"), "vars");
+    }
+
+    [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public async Task Start_CreatesOverlayFromBase_ThenCreatesTransientDomain()
+    {
+        SeedBase();
+        var h = await Hv().StartAsync(Spec(), CancellationToken.None);
+        var dir = RunDirOf(h);
+        Assert.Equal(VmHandle.For(Id), h);
+        Assert.Equal(2, _runner.Calls.Count);
+        Assert.Equal("qemu-img", _runner.Calls[0].File);
+        Assert.Equal(["create", "-f", "qcow2", "-F", "qcow2", "-b", Path.Combine(_opts.BaseImageDir, "win11-26h2.qcow2"), Path.Combine(dir, "overlay.qcow2")], _runner.Calls[0].Args);
+        Assert.Equal("virsh", _runner.Calls[1].File);
+        Assert.Equal(["-c", "qemu:///session", "create", Path.Combine(dir, "domain.xml")], _runner.Calls[1].Args);
+
+        Assert.Equal("vars", File.ReadAllText(Path.Combine(dir, "nvram.fd")));
+        var pass = File.ReadAllText(Path.Combine(dir, "vnc.pass"));
+        Assert.Matches("^[A-Za-z0-9]{8}$", pass);
+        var xml = File.ReadAllText(Path.Combine(dir, "domain.xml"));
+        Assert.Contains(Path.Combine(dir, "agent.sock"), xml);
+        Assert.Contains($"passwd=\"{pass}\"", xml);
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(dir));
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(Path.Combine(dir, "vnc.pass")));
+    }
+
+    [Fact]
+    public async Task Start_MissingBaseImage_ThrowsVmStart_NoVirshCall()
+    {
+        var ex = await Assert.ThrowsAsync<VmStartException>(() => Hv().StartAsync(Spec(), CancellationToken.None));
+        Assert.Contains("not found", ex.Message);
+        Assert.DoesNotContain(_runner.Calls, c => c.File == "virsh" && c.Args.Contains("create"));
+    }
+
+    [Fact]
+    public async Task Start_MissingVarsTemplate_ThrowsVmStart()
+    {
+        File.WriteAllText(Path.Combine(_opts.BaseImageDir, "win11-26h2.qcow2"), "q");
+        await Assert.ThrowsAsync<VmStartException>(() => Hv().StartAsync(Spec(), CancellationToken.None));
+        Assert.DoesNotContain(_runner.Calls, c => c.File == "virsh" && c.Args.Contains("create"));
+    }
+
+    [Fact]
+    public async Task StartFailure_ThrowsVmStart_AndRemovesRunDir()
+    {
+        SeedBase();
+        _runner.Handler = (f, a) => f == "virsh" && a.Contains("create") ? new(1, "", "error: boom") : new(0, "", "");
+        var ex = await Assert.ThrowsAsync<VmStartException>(() => Hv().StartAsync(Spec(), CancellationToken.None));
+        Assert.Contains("boom", ex.Message);
+        Assert.False(Directory.Exists(RunDirOf(VmHandle.For(Id))));
+        Assert.Contains(_runner.Calls, c => c.File == "virsh" && c.Args.Contains("destroy"));
+    }
+
+    [Fact]
+    public async Task Destroy_Idempotent_IgnoresNotFound()
+    {
+        var h = VmHandle.For(Id);
+        Directory.CreateDirectory(RunDirOf(h));
+        File.WriteAllText(Path.Combine(RunDirOf(h), "x"), "x");
+        _runner.Handler = (_, _) => new(1, "", "error: failed to get domain 'maldex-x'");
+        var hv = Hv();
+        await hv.DestroyAsync(h, CancellationToken.None);
+        await hv.DestroyAsync(h, CancellationToken.None);
+        Assert.False(Directory.Exists(RunDirOf(h)));
+        Assert.Equal(["-c", "qemu:///session", "destroy", h.Name], _runner.Calls[0].Args);
+
+        _runner.Handler = (_, _) => new(1, "", "error: Requested operation is not valid: domain is not running");
+        await hv.DestroyAsync(h, CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Destroy_OtherError_Throws()
+    {
+        _runner.Handler = (_, _) => new(1, "", "error: cannot connect");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Hv().DestroyAsync(VmHandle.For(Id), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task List_FiltersMaldexNames_AndIncludesOrphanRunDirs()
+    {
+        var running = Guid.NewGuid();
+        var orphan = Guid.NewGuid();
+        Directory.CreateDirectory(Path.Combine(_opts.RunDir, VmHandle.For(orphan).Name));
+        Directory.CreateDirectory(Path.Combine(_opts.RunDir, VmHandle.For(running).Name));
+        Directory.CreateDirectory(Path.Combine(_opts.RunDir, "maldex-notaguid"));
+        _runner.Handler = (_, _) => new(0, $"{VmHandle.For(running).Name}\nother-vm\nmaldex-zzz\n\n", "");
+        var list = await Hv().ListAsync(CancellationToken.None);
+        Assert.Equal(["-c", "qemu:///session", "list", "--all", "--name"], _runner.Calls[0].Args);
+        Assert.Equal(2, list.Count);
+        Assert.Contains(VmHandle.For(running), list);
+        Assert.Contains(VmHandle.For(orphan), list);
+    }
+
+    [Fact]
+    public async Task VncLocator_ParsesDisplay_AndReadsPassword()
+    {
+        var h = VmHandle.For(Id);
+        Directory.CreateDirectory(RunDirOf(h));
+        File.WriteAllText(Path.Combine(RunDirOf(h), "vnc.pass"), "Ab3dEf9h");
+        _runner.Handler = (_, _) => new(0, "127.0.0.1:7\n", "");
+        var loc = new VncConsoleLocator(Options.Create(_opts), _runner);
+        var ep = await loc.GetAsync(h, CancellationToken.None);
+        Assert.Equal(new VncEndpoint("127.0.0.1", 5907, "Ab3dEf9h"), ep);
+        Assert.Equal(["-c", "qemu:///session", "vncdisplay", h.Name], _runner.Calls[0].Args);
+
+        _runner.Handler = (_, _) => new(1, "", "error: Domain not found");
+        Assert.Null(await loc.GetAsync(h, CancellationToken.None));
+    }
+}
