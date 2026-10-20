@@ -73,7 +73,7 @@ public sealed class AgentHost(Stream channel, IEventSource source, CommandDispat
             switch (await reader.ReadAsync(ct).ConfigureAwait(false))
             {
                 case CommandReadResult.Frame f:
-                    var result = await dispatcher.DispatchAsync(f.Command, ct).ConfigureAwait(false);
+                    var result = await dispatcher.DispatchAsync(f.Command, ct, SendAsync).ConfigureAwait(false);
                     await SendAsync(result, ct).ConfigureAwait(false);
                     dispatcher.AfterResultSent(f.Command);
                     if (f.Command is ShutdownCommand) return;

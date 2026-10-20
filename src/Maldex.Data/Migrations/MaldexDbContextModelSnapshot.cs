@@ -164,6 +164,10 @@ namespace Maldex.Data.Migrations
                     b.Property<DateTimeOffset>("CreatedAt")
                         .HasColumnType("datetimeoffset");
 
+                    b.Property<string>("GuestPath")
+                        .HasMaxLength(1024)
+                        .HasColumnType("nvarchar(1024)");
+
                     b.Property<string>("Kind")
                         .IsRequired()
                         .HasMaxLength(32)

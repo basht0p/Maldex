@@ -34,6 +34,7 @@ public static class DependencyInjection
         {
             case "Fake":
                 services.AddSingleton<IHypervisor, FakeHypervisor>();
+                services.AddSingleton<FakeGuest>();
                 services.AddSingleton<IAgentChannelFactory, FakeAgentChannelFactory>();
                 services.AddSingleton<IEgressRouter, NoopEgressRouter>();
                 services.AddSingleton<ISuricataRunner, NoopSuricataRunner>();

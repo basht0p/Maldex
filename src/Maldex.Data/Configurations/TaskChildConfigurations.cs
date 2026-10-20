@@ -89,6 +89,7 @@ public sealed class ArtifactConfiguration : IEntityTypeConfiguration<Artifact>
         b.Property(x => x.Id).ValueGeneratedNever();
         b.Property(x => x.BlobKey).HasMaxLength(256).IsRequired();
         b.Property(x => x.Sha256).HasMaxLength(64).IsFixedLength().IsUnicode(false).IsRequired();
+        b.Property(x => x.GuestPath).HasMaxLength(1024);
         b.HasOne<AnalysisTask>().WithMany().HasForeignKey(x => x.TaskId).OnDelete(DeleteBehavior.Cascade);
         b.HasIndex(x => x.TaskId);
     }
