@@ -14,25 +14,47 @@ public sealed class PdfRenderer(IConfiguration configuration) : IAsyncDisposable
     private readonly SemaphoreSlim _initGate = new(1, 1);
     private IPlaywright? _playwright;
 
+    /// <summary>Test seam: called once the browser is up and cancellation is wired, just before the page is rendered.</summary>
+    public Action? OnRenderStarting { get; init; }
+
     public async Task<byte[]> RenderAsync(string html, CancellationToken ct)
     {
         await _concurrency.WaitAsync(ct);
         try
         {
-            var playwright = await GetPlaywrightAsync(ct);
-            var launch = new BrowserTypeLaunchOptions { Headless = true };
-            if (configuration["Maldex:Pdf:ChromiumPath"] is { Length: > 0 } path) launch.ExecutablePath = path;
-
-            await using var browser = await playwright.Chromium.LaunchAsync(launch);
-            await using var context = await browser.NewContextAsync(new BrowserNewContextOptions { JavaScriptEnabled = false, Offline = true });
-            var page = await context.NewPageAsync();
-            await page.SetContentAsync(html, new PageSetContentOptions { WaitUntil = WaitUntilState.Load });
-            return await page.PdfAsync(new PagePdfOptions { Format = "A4", PrintBackground = true });
+            return await RenderCoreAsync(html, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException && ct.IsCancellationRequested)
+        {
+            // Cancelling closes the browser under Playwright, which surfaces as its own exceptions (even while disposing).
+            throw new OperationCanceledException(ct);
         }
         finally
         {
             _concurrency.Release();
         }
+    }
+
+    private async Task<byte[]> RenderCoreAsync(string html, CancellationToken ct)
+    {
+        var playwright = await GetPlaywrightAsync(ct);
+        var launch = new BrowserTypeLaunchOptions { Headless = true };
+        if (configuration["Maldex:Pdf:ChromiumPath"] is { Length: > 0 } path) launch.ExecutablePath = path;
+
+        await using var browser = await playwright.Chromium.LaunchAsync(launch);
+        await using var context = await browser.NewContextAsync(new BrowserNewContextOptions { JavaScriptEnabled = false, Offline = true });
+        // Playwright calls take no token: closing the browser aborts whatever is in flight.
+        await using var onCancel = ct.Register(() => _ = CloseQuietlyAsync(browser));
+        OnRenderStarting?.Invoke();
+        var page = await context.NewPageAsync();
+        await page.SetContentAsync(html, new PageSetContentOptions { WaitUntil = WaitUntilState.Load });
+        return await page.PdfAsync(new PagePdfOptions { Format = "A4", PrintBackground = true });
+    }
+
+    private static async Task CloseQuietlyAsync(IBrowser browser)
+    {
+        try { await browser.CloseAsync(); }
+        catch (Exception) { /* already closing or closed */ }
     }
 
     private async Task<IPlaywright> GetPlaywrightAsync(CancellationToken ct)

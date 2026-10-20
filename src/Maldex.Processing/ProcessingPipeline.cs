@@ -24,7 +24,7 @@ public sealed class ProcessingPipeline(
     IArtifactStore artifacts,
     ITaskEventPublisher publisher,
     TimeProvider time,
-    ILogger<ProcessingPipeline> logger)
+    ILogger<ProcessingPipeline> logger) : IProcessingPipeline
 {
     private const int MaxSaveAttempts = 5;
     private const int RuleMax = 256;
@@ -180,29 +180,12 @@ public sealed class ProcessingPipeline(
     /// Stores detections, warnings and verdict and moves the task to <c>Completed</c> in one save. The task row is also
     /// written by the API, so it is reloaded first and the save retried on a concurrency conflict.
     /// </summary>
-    private async Task CompleteAsync(MaldexDbContext db, AnalysisTask task, Verdict verdict, List<string> warnings, CancellationToken ct)
-    {
-        for (var attempt = 1; ; attempt++)
+    private Task CompleteAsync(MaldexDbContext db, AnalysisTask task, Verdict verdict, List<string> warnings, CancellationToken ct) =>
+        TaskTransitions.TransitionWithRetryAsync(db, task, RunStatus.Completed, "processing complete", time.GetUtcNow(), t =>
         {
-            await db.Entry(task).ReloadAsync(ct).ConfigureAwait(false);
-            task.ProcessingWarnings = warnings;
-            task.Verdict = verdict;
-            task.TransitionTo(RunStatus.Completed, "processing complete", time.GetUtcNow());
-            try
-            {
-                await db.SaveChangesAsync(ct).ConfigureAwait(false);
-                return;
-            }
-            catch (DbUpdateConcurrencyException) when (attempt < MaxSaveAttempts)
-            {
-                foreach (var h in task.StatusHistory.Where(h => db.Entry(h).State == EntityState.Added).ToList())
-                {
-                    db.Entry(h).State = EntityState.Detached;
-                    task.StatusHistory.Remove(h);
-                }
-            }
-        }
-    }
+            t.ProcessingWarnings = warnings;
+            t.Verdict = verdict;
+        }, ct);
 
     /// <summary>A read-only (0400) temporary copy of a stored blob, because the scanners need a filesystem path. Deleted on dispose.</summary>
     private sealed class TempCopy : IDisposable
