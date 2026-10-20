@@ -113,6 +113,8 @@ internal sealed class OrchestratorHarness : IAsyncDisposable
         return h;
     }
 
+    public IServiceProvider Services => _services;
+
     public T Get<T>() where T : notnull => _services.GetRequiredService<T>();
 
     public MaldexDbContext NewContext() =>

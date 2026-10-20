@@ -52,7 +52,7 @@ public sealed class ProcessingPipeline(
 
         await ResetAsync(db, task, ct).ConfigureAwait(false);
 
-        var warnings = new List<string>();
+        var warnings = new List<string>(task.ProcessingWarnings); // only the run's own (capture) warnings survive the reset
         var results = new List<DetectionResult>();
 
         await RunStepAsync("yara", warnings, ct, async () => results.AddRange(await ScanSampleAsync(task, ct).ConfigureAwait(false))).ConfigureAwait(false);
@@ -118,7 +118,7 @@ public sealed class ProcessingPipeline(
         {
             await using var tx = await db.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
             await db.Detections.Where(d => d.TaskId == task.Id).ExecuteDeleteAsync(ct).ConfigureAwait(false);
-            task.ProcessingWarnings = [];
+            task.ProcessingWarnings = [.. task.ProcessingWarnings.Where(w => w.StartsWith(AnalysisTask.CaptureWarningPrefix, StringComparison.Ordinal))];
             try
             {
                 await db.SaveChangesAsync(ct).ConfigureAwait(false);
