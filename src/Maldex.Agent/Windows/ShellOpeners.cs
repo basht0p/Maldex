@@ -9,7 +9,11 @@ public sealed class ShellSampleOpener : ISampleOpener
 {
     public Task OpenAsync(string filePath, CancellationToken ct)
     {
-        using var p = Process.Start(new ProcessStartInfo(filePath) { UseShellExecute = true });
+        var launch = SampleLaunch.For(filePath, Environment.GetEnvironmentVariable("SystemRoot") ?? @"C:\Windows");
+        var psi = new ProcessStartInfo(launch.FileName) { UseShellExecute = launch.UseShellExecute };
+        foreach (var a in launch.Arguments) psi.ArgumentList.Add(a);
+        if (!launch.UseShellExecute) psi.WorkingDirectory = Path.GetDirectoryName(filePath) ?? "";
+        using var p = Process.Start(psi);
         return Task.CompletedTask;
     }
 }
