@@ -77,7 +77,76 @@ public class RealEgressTests
             Assert.DoesNotContain(h, (await Proc.RunAsync("ip", ["netns", "list"], CancellationToken.None)).Stdout);
             Assert.False(Directory.Exists("/run/maldex/inetsim/mxn" + h));
             Assert.False(Directory.Exists("/run/maldex/mitm/mxn" + h));
+            Assert.False(Directory.Exists("/run/maldex/dns/mxn" + h));
         }
+    }
+
+    /// <summary>
+    /// Each Simulated run's INetSim lives in its own PID namespace with a private /proc: from inside run A only A's own
+    /// processes are visible (never B's), and after release no process of either run survives.
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentSimulatedRuns_HavePrivatePidNamespaces_AndLeaveNoProcessesBehind()
+    {
+        Assert.SkipUnless(Environment.GetEnvironmentVariable("MALDEX_REAL_NET") == "1" && OperatingSystem.IsLinux(),
+            "set MALDEX_REAL_NET=1 (needs passwordless sudo, nft, dnsmasq, mitmdump, inetsim)");
+        var tmp = Path.Combine(Path.GetTempPath(), "mx-real-net-" + Guid.NewGuid().ToString("N"));
+        var opts = Options.Create(new NetOptions
+        {
+            RunDir = Path.Combine(tmp, "run"),
+            MitmConfDir = Path.Combine(tmp, "ca"),
+            DeployNetDir = RepoDeployNet(),
+            ControlPlaneIps = ["192.0.2.1"],
+        });
+        await Proc.RunAsync("timeout", ["8", "/opt/mitmproxy/mitmdump", "--set", $"confdir={Path.Combine(tmp, "ca")}", "-n", "-q"], CancellationToken.None, null, TimeSpan.FromSeconds(20));
+        var router = new NetnsEgressRouter(opts, Proc);
+        Guid[] ids = [Guid.NewGuid(), Guid.NewGuid()];
+        var everyPid = new List<string>();
+        try
+        {
+            await Task.WhenAll(ids.Select(id => router.CreateAsync(id, NetworkMode.Simulated, null, CancellationToken.None)));
+            var hostPids = new List<string>();
+            var nsLinks = new List<string>();
+            var members = new List<Dictionary<string, string>>(); // per run: host pid -> in-namespace pid, for the run's pid namespace
+            foreach (var id in ids)
+            {
+                var ns = RunNetNames.For(id).Namespace;
+                var main = await AssertInetSimSandboxAsync("/run/maldex/inetsim/" + ns, ns);
+                hostPids.Add(main);
+                var link = (await Sudo("readlink", $"/proc/{main}/ns/pid")).Stdout.Trim();
+                nsLinks.Add(link);
+                var m = new Dictionary<string, string>();
+                var all = (await Sudo("sh", "-c", "for p in /proc/[0-9]*; do echo \"${p#/proc/} $(readlink $p/ns/pid) $(grep '^NSpid:' $p/status)\"; done")).Stdout;
+                foreach (var l in all.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var f = l.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries);
+                    if (f.Length >= 4 && f[1] == link) m[f[0]] = f[^1];
+                }
+                Assert.True(m.Count >= 3, "launcher (PID 1) + INetSim main + service children expected in the namespace");
+                Assert.Equal("1", m.Values.Min(v => int.Parse(v, System.Globalization.CultureInfo.InvariantCulture)).ToString(System.Globalization.CultureInfo.InvariantCulture)); // the launcher is init
+                members.Add(m);
+                everyPid.AddRange(m.Keys);
+            }
+            Assert.NotEqual(nsLinks[0], nsLinks[1]);
+            Assert.Empty(members[0].Keys.Intersect(members[1].Keys));
+            for (var i = 0; i < 2; i++)
+            {
+                // the view from inside run i (its pid namespace + its mount namespace with the private /proc)
+                var view = await Sudo("nsenter", "-t", hostPids[i], "-p", "-m", "--", "ls", "/proc");
+                Assert.Equal(0, view.ExitCode);
+                var seen = view.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries).Where(e => e.All(char.IsAsciiDigit)).ToHashSet();
+                var own = members[i].Values.ToHashSet();
+                Assert.True(own.IsSubsetOf(seen), $"run {i}: own [{string.Join(',', own)}] not all in its /proc [{string.Join(',', seen)}]");
+                Assert.True(seen.Count <= own.Count + 1, $"run {i} sees {seen.Count} processes but owns {own.Count} (+ the ls itself): {string.Join(',', seen)}");
+            }
+        }
+        finally
+        {
+            foreach (var id in ids) await router.ReleaseAsync(new NetworkLease(id, RunNetNames.For(id).Tap), CancellationToken.None);
+            await Sudo("rm", "-rf", tmp);
+        }
+        for (var i = 0; i < 40 && everyPid.Any(p => Directory.Exists("/proc/" + p)); i++) await Task.Delay(100, CancellationToken.None);
+        Assert.False(everyPid.Any(p => Directory.Exists("/proc/" + p)), "a process of a released run survived: " + string.Join(',', everyPid.Where(p => Directory.Exists("/proc/" + p))));
     }
 
     /// <summary>
@@ -110,6 +179,7 @@ public class RealEgressTests
             {
                 var lease = await router.CreateAsync(id, NetworkMode.None, null, CancellationToken.None);
                 var n = RunNetNames.For(id);
+                await AssertDnsmasqUnprivilegedAsync(id, n.Namespace);
                 // run 1 gets two VM "attempts" (the second NIC reappears with the same MAC while the first lease is still held)
                 for (var attempt = 0; attempt < (id == ids[0] ? 2 : 1); attempt++)
                 {
@@ -125,7 +195,7 @@ public class RealEgressTests
                     Assert.Equal(0, (await Sudo("ip", "netns", "exec", sns, "ip", "link", "set", "mxe" + tag, "up")).ExitCode);
                     // -q: obtain one lease and exit; -n: fail instead of retrying forever; no-op script (nothing is configured)
                     var dhcp = await Sudo("ip", "netns", "exec", sns, "busybox", "udhcpc", "-i", "mxe" + tag, "-q", "-n", "-t", "4", "-T", "2", "-s", "/bin/true");
-                    var leases = await Sudo("cat", Path.Combine(tmp, "run", "net", n.Namespace, "dnsmasq.leases"));
+                    var leases = await Sudo("cat", NetnsEgressRouter.DnsDir(id) + "/dnsmasq.leases");
                     Assert.True(dhcp.ExitCode == 0 && (dhcp.Stderr + dhcp.Stdout).Contains($"lease of {guestIp} obtained", StringComparison.Ordinal),
                         $"run {Array.IndexOf(ids, id)} attempt {attempt}: no lease ({dhcp.ExitCode}) {dhcp.Stdout} {dhcp.Stderr}");
                     Assert.Contains(RunNetNames.GuestMac(id), leases.Stdout); // the run's own lease database
@@ -151,20 +221,26 @@ public class RealEgressTests
             var h = id.ToString("N")[..10];
             Assert.DoesNotContain(h, (await Proc.RunAsync("ip", ["-o", "link"], CancellationToken.None)).Stdout);
             Assert.DoesNotContain(h, (await Proc.RunAsync("ip", ["netns", "list"], CancellationToken.None)).Stdout);
+            Assert.False(Directory.Exists(NetnsEgressRouter.DnsDir(id)), "per-run dnsmasq dir must be removed");
         }
     }
 
     /// <summary>
     /// INetSim's main process: per-run pid file, own IPC namespace, read-only mounts except its run dir, and a user namespace
     /// whose root is the unprivileged maldex-isroot (no host capability: cannot read root-only files, write devices, remount
-    /// or enter host namespaces). Returns its host PID.
+    /// or enter host namespaces), in a PID namespace of its own. The pid file holds its PID inside that namespace; the host
+    /// PID is found through NSpid. Returns its host PID.
     /// </summary>
     private static async Task<string> AssertInetSimSandboxAsync(string iRoot, string ns)
     {
         Assert.Equal("root:root 755", (await Sudo("stat", "-c", "%U:%G %a", iRoot)).Stdout.Trim());
-        var pid = (await Sudo("cat", iRoot + "/pid/inetsim.pid")).Stdout.Trim();
-        Assert.Matches("^[0-9]+$", pid);
-        Assert.Contains(pid, (await Sudo("ip", "netns", "pids", ns)).Stdout.Split([' ', '\n'], StringSplitOptions.RemoveEmptyEntries));
+        var nsPid = (await Sudo("cat", iRoot + "/pid/inetsim.pid")).Stdout.Trim();
+        Assert.Matches("^[0-9]+$", nsPid);
+        var pid = await InetSimHostPidAsync(ns, nsPid);
+        // its own PID namespace (the launcher is PID 1 there), so it cannot see or signal any other run's processes
+        var pidNs = (await Sudo("readlink", $"/proc/{pid}/ns/pid")).Stdout.Trim();
+        Assert.StartsWith("pid:[", pidNs);
+        Assert.NotEqual((await Sudo("readlink", "/proc/1/ns/pid")).Stdout.Trim(), pidNs);
         Assert.False(File.Exists("/var/run/inetsim.pid"), "the shared default pid file must not be used");
         var ipc = (await Sudo("readlink", $"/proc/{pid}/ns/ipc")).Stdout.Trim();
         Assert.StartsWith("ipc:[", ipc);
@@ -213,6 +289,49 @@ public class RealEgressTests
         Assert.NotEqual(0, (await AsInetSimRoot("nsenter -t 1 -m true")).ExitCode); // no setns into host namespaces
         Assert.NotEqual(0, (await AsInetSimRoot($"echo x > {iRoot}/../escape")).ExitCode);
         return pid;
+    }
+
+    /// <summary>Host PID of the process in the run's netns whose NSpid chain is (host pid, <paramref name="nsPid"/>).</summary>
+    private static async Task<string> InetSimHostPidAsync(string ns, string nsPid)
+    {
+        foreach (var p in (await Sudo("ip", "netns", "pids", ns)).Stdout.Split([' ', '\n'], StringSplitOptions.RemoveEmptyEntries))
+        {
+            var line = (await Sudo("cat", $"/proc/{p}/status")).Stdout.Split('\n').FirstOrDefault(l => l.StartsWith("NSpid:", StringComparison.Ordinal));
+            var f = line?.Split(['\t', ' '], StringSplitOptions.RemoveEmptyEntries).Skip(1).ToArray() ?? [];
+            if (f.Length == 2 && f[1] == nsPid) return p;
+        }
+        Assert.Fail($"no process in {ns} has in-namespace pid {nsPid}");
+        return "";
+    }
+
+    /// <summary>
+    /// dnsmasq: dedicated user and group, no supplementary groups, no capability in any set, no new privileges; its files live
+    /// in the per-run dir (0700, owned by it). Returns its host PID.
+    /// </summary>
+    private static async Task<string> AssertDnsmasqUnprivilegedAsync(Guid id, string ns)
+    {
+        var uid = (await Proc.RunAsync("id", ["-u", NetnsEgressRouter.DnsUser], CancellationToken.None)).Stdout.Trim();
+        var gid = (await Proc.RunAsync("id", ["-g", NetnsEgressRouter.DnsUser], CancellationToken.None)).Stdout.Trim();
+        string? dns = null;
+        foreach (var p in (await Sudo("ip", "netns", "pids", ns)).Stdout.Split([' ', '\n'], StringSplitOptions.RemoveEmptyEntries))
+            if ((await Proc.RunAsync("ps", ["-o", "comm=", "-p", p], CancellationToken.None)).Stdout.Trim() == "dnsmasq") dns = p;
+        Assert.NotNull(dns);
+        var st = File.ReadAllLines($"/proc/{dns}/status").ToDictionary(l => l.Split(':')[0], l => l.Split(':', 2)[1].Trim());
+        Assert.Equal([uid, uid, uid, uid], st["Uid"].Split('\t'));
+        Assert.Equal([gid, gid, gid, gid], st["Gid"].Split('\t'));
+        Assert.Equal("", st["Groups"]);
+        Assert.Equal("1", st["NoNewPrivs"]);
+        foreach (var cap in new[] { "CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb" })
+            Assert.Equal("0000000000000000", st[cap]);
+        var d = NetnsEgressRouter.DnsDir(id);
+        Assert.Equal("maldex-dns:maldex-dns 700", (await Sudo("stat", "-c", "%U:%G %a", d)).Stdout.Trim());
+        Assert.Equal("root:root 755", (await Sudo("stat", "-c", "%U:%G %a", "/run/maldex/dns")).Stdout.Trim());
+        Assert.Equal(dns, (await Sudo("cat", d + "/dnsmasq.pid")).Stdout.Trim());
+        var log = (await Sudo("cat", d + "/dnsmasq.log")).Stdout;
+        Assert.Contains("DHCP, sockets bound exclusively to interface", log);
+        foreach (var bad in new[] { "failed", "cannot", "error", "setuid", "setgid", "capabilit" })
+            Assert.DoesNotContain(bad, log, StringComparison.OrdinalIgnoreCase); // no complaint about running unprivileged
+        return dns;
     }
 
     private static async Task<ProcessResult> Sudo(params string[] args) => await Proc.RunAsync("sudo", ["-n", .. args], CancellationToken.None, null, TimeSpan.FromSeconds(30));
@@ -280,6 +399,7 @@ public class RealEgressTests
             Assert.Equal("0000000000000000", status["CapBnd"]);
             Assert.Equal("0000000000000000", status["CapEff"]);
             Assert.Equal("0000000000000000", status["CapInh"]);
+            await AssertDnsmasqUnprivilegedAsync(id, n.Namespace);
             // the mitm user can read/write only its own conf/out (private CA copy 0600), nothing of ours
             Assert.Equal("maldex-mitm", (await Sudo("stat", "-c", "%U", $"/run/maldex/mitm/{n.Namespace}/conf")).Stdout.Trim());
             Assert.Equal("root", (await Sudo("stat", "-c", "%U", $"/run/maldex/mitm/{n.Namespace}")).Stdout.Trim());
@@ -413,6 +533,7 @@ public class RealEgressTests
         Assert.DoesNotContain(h, (await Proc.RunAsync("ip", ["-o", "link"], CancellationToken.None)).Stdout);
         Assert.False(Directory.Exists("/run/maldex/mitm/mxn" + h), "per-run mitm dir must be removed");
         Assert.False(Directory.Exists("/run/maldex/inetsim/mxn" + h), "per-run inetsim dir must be removed");
+        Assert.False(Directory.Exists("/run/maldex/dns/mxn" + h), "per-run dnsmasq dir must be removed");
         Assert.DoesNotContain(h, (await Proc.RunAsync("ip", ["netns", "list"], CancellationToken.None)).Stdout);
     }
 }
