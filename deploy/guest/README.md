@@ -39,6 +39,23 @@ media, fully unattended and offline.
 - The event logs are cleared by `Provision.ps1`, but the verification boot afterwards writes new entries, so the finished image does NOT have pristine logs. This is deliberate and harmless; the per-run overlay is what matters.
 - The build has not been run against real media yet (it needs `MALDEX_WIN_ISO`); only static validation was possible.
 
+## Manual preparation (prepare-guest / finalize-guest)
+
+Some changes cannot be made unattended, notably turning off Tamper Protection and Defender on Pro media. They are made by
+hand on a copy of the base image:
+
+1. `./build.sh prepare-guest` copies the base to `.data/vm/prepare/` and boots it as `maldex-prepare` with **no network**.
+   VNC listens on this host's LAN address (`MALDEX_VNC_LISTEN` overrides it) with a random 8-character password; the
+   address and password are printed. Plain VNC is unencrypted: keep it on a trusted LAN, and it only exists while
+   `maldex-prepare` runs. Windows logs on automatically as `analyst`.
+2. Make the changes in the Windows UI, then shut Windows down from the Start menu (a clean shutdown, not a reset).
+3. `./build.sh finalize-guest` refuses unless the VM is shut off, boots the prepared disk once more with VNC on
+   127.0.0.1 only, waits for the agent's `ready` frame and shuts it down cleanly. Only then does the copy replace the
+   base (0444); the previous base stays as `*.prev` until the next finalize. A failed check leaves the base untouched.
+4. `./build.sh discard-guest` throws the copy away instead.
+
+`./build.sh build-guest` produces a fresh unattended base and loses these changes: prepare and finalize again after it.
+
 ## Running the E2E suite
 
 `./build.sh e2e` detonates the **harmless** files in `deploy/guest/samples/` (EICAR, a registry-write script, the controlled URL `http://maldex-test.invalid/`) against the real stack: real libvirt VM, namespace networking, agent channel, capture and processing, in `Simulated` network mode through the real DI (`Maldex:Mode=Real`). It never runs malware.

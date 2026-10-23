@@ -468,6 +468,9 @@ case "${1:-}" in
   real-setup) cmd_real_setup ;;
   real-smoke) cmd_real_smoke ;;
   build-guest) cmd_build_guest ;;
+  prepare-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" deploy/guest/prepare-guest.sh prepare ;;
+  finalize-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" deploy/guest/prepare-guest.sh finalize ;;
+  discard-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" deploy/guest/prepare-guest.sh discard ;;
   e2e)    cmd_e2e ;;
-  *) echo "usage: $0 setup|dev-db|run|test|smoke|build|real-setup|real-smoke|build-guest|e2e" >&2; exit 64 ;;
+  *) echo "usage: $0 setup|dev-db|run|test|smoke|build|real-setup|real-smoke|build-guest|prepare-guest|finalize-guest|discard-guest|e2e" >&2; exit 64 ;;
 esac
