@@ -615,6 +615,15 @@ public sealed class NetnsEgressRouterTests : IDisposable
     }
 
     [Fact]
+    public async Task RunNetDir_IsOwnerOnly()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var lease = await Router().CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None);
+        var dir = Path.Combine(_tmp, "run", "net", RunNetNames.For(lease.TaskId).Namespace);
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(dir));
+    }
+
+    [Fact]
     public async Task Release_NoFlowsFile_IsNotAWarning()
     {
         var warnings = new List<string>();

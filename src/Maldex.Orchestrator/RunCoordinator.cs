@@ -254,10 +254,23 @@ public sealed class RunCoordinator(
                 // run error (Running -> Failed), not a Preparing failure.
                 inbox.MarkOpened();
                 if (command is OpenSampleCommand sample)
-                    await new SampleDelivery(time, pollInterval: _options.ControlPollInterval)
-                        .OpenAsync(channel, inbox, sample.BlobKey, sample.FileName, ct).ConfigureAwait(false);
+                {
+                    try
+                    {
+                        await new SampleDelivery(time, pollInterval: _options.ControlPollInterval)
+                            .OpenAsync(channel, inbox, sample.BlobKey, sample.FileName, ct, async token =>
+                                await db.Tasks.AsNoTracking().Where(t => t.Id == task.Id).Select(t => t.StopRequestedAt).SingleAsync(token).ConfigureAwait(false) is not null)
+                            .ConfigureAwait(false);
+                    }
+                    catch (DeliveryStoppedException)
+                    {
+                        // A stop while the open is pending ends like any stop in Running: the control loop sees it at once.
+                    }
+                }
                 else
+                {
                     await channel.SendAsync(command, ct).ConfigureAwait(false);
+                }
 
                 var reason = await ControlLoopAsync(task.Id, reader, flusher, channel, ct).ConfigureAwait(false);
 

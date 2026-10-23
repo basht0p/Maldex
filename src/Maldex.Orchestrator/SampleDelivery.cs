@@ -61,21 +61,24 @@ public sealed class SampleDelivery(TimeProvider time, TimeSpan? chunkTimeout = n
     }
 
     /// <summary>Asks the agent to open the delivered sample and waits for its answer.</summary>
+    /// <param name="stopRequested">Polled while waiting; true ends the wait with <see cref="DeliveryStoppedException"/>.</param>
     /// <exception cref="SampleOpenException">Refused, timed out or disconnected.</exception>
-    public async Task OpenAsync(IAgentChannel ch, TransferInbox inbox, string blobKey, string fileName, CancellationToken ct)
+    public async Task OpenAsync(IAgentChannel ch, TransferInbox inbox, string blobKey, string fileName, CancellationToken ct,
+        Func<CancellationToken, Task<bool>>? stopRequested = null)
     {
         using var lease = inbox.Open();
-        await SendAndAwaitAsync(ch, lease.Reader, new OpenSampleCommand(NewId(), fileName, blobKey), "open", null, m => new SampleOpenException(m), ct).ConfigureAwait(false);
+        await SendAndAwaitAsync(ch, lease.Reader, new OpenSampleCommand(NewId(), fileName, blobKey), "open", stopRequested, m => new SampleOpenException(m), ct).ConfigureAwait(false);
     }
 
     private async Task SendAndAwaitAsync(IAgentChannel ch, ChannelReader<AgentMessage> replies, AgentCommand command, string what,
         Func<CancellationToken, Task<bool>>? stopRequested, Func<string, Exception> fail, CancellationToken ct)
     {
+        // Checked before the timeout starts: the timeout bounds the agent's answer, not our own database read.
+        if (stopRequested is not null && await stopRequested(ct).ConfigureAwait(false)) throw new DeliveryStoppedException();
         using var timeout = new CancellationTokenSource(_chunkTimeout, time);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
         try
         {
-            if (stopRequested is not null && await stopRequested(linked.Token).ConfigureAwait(false)) throw new DeliveryStoppedException();
             await ch.SendAsync(command, linked.Token).ConfigureAwait(false);
             while (true)
             {

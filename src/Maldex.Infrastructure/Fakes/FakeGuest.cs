@@ -17,6 +17,9 @@ public sealed class FakeGuest
     /// <summary>When set, the chunk with this index is answered with a failure (the agent "refusing" the delivery).</summary>
     public int? RejectSampleChunkIndex { get; set; }
 
+    /// <summary>When true, the open_sample command is never answered (a guest that hangs while opening).</summary>
+    public bool SilentOpen { get; set; }
+
     /// <summary>When true, the open_sample command is refused (a sample the guest cannot open).</summary>
     public bool RejectOpen { get; set; }
 

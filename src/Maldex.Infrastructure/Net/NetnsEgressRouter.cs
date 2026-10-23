@@ -229,8 +229,11 @@ public sealed partial class NetnsEgressRouter(
     {
         var ns = names.Namespace;
         var dir = RunNetDir(ns);
-        Directory.CreateDirectory(dir);
-        Chmod(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        const UnixFileMode owner = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+        // 0700 from creation (no window with a umask-derived mode); chmod as well in case it already existed.
+        if (OperatingSystem.IsWindows()) Directory.CreateDirectory(dir);
+        else Directory.CreateDirectory(dir, owner);
+        Chmod(dir, owner);
         // Written first so a crash mid-create is still reconcilable and the slot is visible to other processes.
         await File.WriteAllTextAsync(Path.Combine(dir, "lease.json"), JsonSerializer.Serialize(new LeaseFile(
             taskId, subnet.Index, mode.ToString(), exitCountry, names.Bridge, names.Tap, names.VethHost, names.VethNs, names.Namespace, names.WgIface)), ct);

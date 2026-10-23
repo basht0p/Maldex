@@ -176,7 +176,8 @@ public sealed class ReplayAgentChannel : IAgentChannel
                 Enqueue(new CommandResultMessage(c.CommandId, true));
                 break;
             case OpenSampleCommand c:
-                if (_guest!.RejectOpen)
+                if (_guest!.SilentOpen) break;
+                if (_guest.RejectOpen)
                 {
                     Enqueue(new CommandResultMessage(c.CommandId, false, "no application is associated with this file"));
                     break;

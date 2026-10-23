@@ -253,6 +253,31 @@ public class SampleDeliveryTests(SqlServerFixture sql)
         Assert.Single(h.Channels.Channels); // not retried on a second VM
     }
 
+    [Fact]
+    public async Task Open_StopWhileTheOpenIsPending_EndsAsAStopInRunning()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        h.Get<FakeGuest>().SilentOpen = true;
+        var id = await h.SeedPreparingTaskAsync(sampleContent: Sample(1000));
+
+        await h.RunAsync(id, async () =>
+        {
+            while (!h.Channels.Channels.Any(c => c.SentCommands.Any(x => x is OpenSampleCommand))) await Task.Delay(2, Ct);
+            await using var api = h.NewContext();
+            var t = await api.Tasks.SingleAsync(x => x.Id == id, Ct);
+            t.StopRequestedAt = h.Time.GetUtcNow();
+            await api.SaveChangesAsync(Ct);
+        });
+
+        await using var db = h.NewContext();
+        var history = (await db.TaskStatusHistory.Where(x => x.TaskId == id).ToListAsync(Ct)).OrderBy(x => x.Id).ToList();
+        Assert.Equal([RunStatus.Preparing, RunStatus.Running, RunStatus.Collecting, RunStatus.Processing], history.Select(x => x.To));
+        Assert.Equal("stopped by analyst", history.Single(x => x.To == RunStatus.Collecting).Reason);
+        // honoured promptly: well inside the 30 s open timeout, not after it
+        var task = await db.Tasks.SingleAsync(t => t.Id == id, Ct);
+        Assert.True(task.EndedAt - task.StartedAt < TimeSpan.FromSeconds(10), $"stop took {task.EndedAt - task.StartedAt}");
+    }
+
     /// <summary>Records the task's status at the moment each open command leaves for the guest.</summary>
     private sealed class OpenObserver(IAgentChannelFactory inner, Func<Guid, Task<RunStatus>> status) : IAgentChannelFactory
     {
