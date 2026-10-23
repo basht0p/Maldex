@@ -45,12 +45,28 @@ public sealed partial class NetnsEgressRouter(
     /// <summary>Dedicated account mitmdump runs as: own group, no supplementary groups, no sudo (created by <c>./build.sh real-setup</c>).</summary>
     public const string MitmUser = "maldex-mitm";
 
+    /// <summary>
+    /// Dedicated account dnsmasq runs as: own group, no supplementary groups, no sudo, and no capability at all (created by
+    /// <c>./build.sh real-setup</c>). It parses guest-controlled DHCP/DNS, so it must not be able to touch the run's nftables.
+    /// </summary>
+    public const string DnsUser = "maldex-dns";
+
     private static readonly string[] MitmCaFiles = ["mitmproxy-ca.pem", "mitmproxy-ca-cert.pem", "mitmproxy-dhparam.pem"];
 
     /// <summary>Upper bound on the flows file kept at release.</summary>
     public const long MaxFlowsBytes = 512L * 1024 * 1024;
 
     private static string InetSimDir(string ns) => "/run/maldex/inetsim/" + ns;
+
+    // dnsmasq cannot write into the control-plane-only run net dir (0700), so its leases, pid file and log live here:
+    // root-owned parents, a 0700 leaf owned by DnsUser.
+    private static string DnsDirOf(string ns) => "/run/maldex/dns/" + ns;
+
+    /// <summary>
+    /// The per-run dnsmasq directory (<c>dnsmasq.leases</c>, <c>dnsmasq.pid</c>, <c>dnsmasq.log</c>); mode 0700, owned by
+    /// <see cref="DnsUser"/>: read it with sudo. Removed by <see cref="ReleaseAsync"/>.
+    /// </summary>
+    public static string DnsDir(Guid taskId) => DnsDirOf(RunNetNames.For(taskId).Namespace);
 
     /// <summary>Marker in the run's net dir: the capture's flows are already stored as an artifact, so release skips its copy.</summary>
     public const string FlowsStoredMarker = "flows.stored";
@@ -74,15 +90,21 @@ public sealed partial class NetnsEgressRouter(
     public const string IsUserUser = "maldex-isuser";
 
     /// <summary>
-    /// Fixed launcher, run by real root inside fresh IPC + mount namespaces. argv: uid_map, gid_map, run dir, sandbox script,
-    /// command. The child unshares a user namespace; the parent writes its uid/gid maps (only real root may map arbitrary host
-    /// ids; done before /proc goes read-only), then runs <see cref="InetSimSandboxScript"/> on the shared mount namespace
-    /// (owned by the initial user namespace, so the child can never undo it) and exits. Only then does the child switch to the
-    /// namespace's root (= the unprivileged maldex-isroot) and exec the command, with capabilities inside its user namespace
-    /// only. Any failure kills the child before it execs and exits non-zero.
+    /// Fixed launcher, run by real root inside fresh IPC, mount and PID namespaces (<c>unshare --pid --fork --mount-proc</c>,
+    /// initial user namespace), so it is PID 1 of a private PID namespace with a private /proc: INetSim of another run cannot
+    /// see or signal it. argv: uid_map, gid_map, run dir, sandbox script, command. The child unshares a user namespace; the
+    /// parent writes its uid/gid maps (only real root may map arbitrary host ids; done before /proc goes read-only), then runs
+    /// <see cref="InetSimSandboxScript"/> on the shared mount namespace (owned by the initial user namespace, so the child can
+    /// never undo it). Only then does the child switch to the namespace's root (= the unprivileged maldex-isroot) and exec the
+    /// command, with capabilities inside its user namespace only. Any failure kills the child before it execs and exits non-zero.
+    /// After the handshake the launcher stays as init: if PID 1 exits the kernel kills the whole namespace, so it forwards
+    /// SIGTERM/SIGINT/SIGHUP to INetSim, reaps every orphan, and exits with INetSim's status (128+n for a signal) once INetSim
+    /// is gone. INetSim runs as a different (unprivileged) uid, so it can neither signal nor ptrace the launcher. A SIGKILL of
+    /// the launcher from the host (the release fallback) tears the namespace down. The pid file INetSim writes holds its PID
+    /// inside this namespace; nothing reads it.
     /// </summary>
     public const string UserNsLauncherScript = """
-        import os, subprocess, sys, time
+        import os, signal, subprocess, sys, time
         umap, gmap, rundir, sandbox, argv = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
         r, w = os.pipe()
         pid = os.fork()
@@ -97,6 +119,13 @@ public sealed partial class NetnsEgressRouter(
             os.chdir(rundir)
             os.execvp(argv[0], argv)
         os.close(r)
+        def forward(signum, frame):
+            try:
+                os.kill(pid, signum)
+            except ProcessLookupError:
+                pass
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, forward)
         def fail(msg):
             os.kill(pid, 9)
             sys.exit("inetsim launcher: " + msg)
@@ -120,7 +149,14 @@ public sealed partial class NetnsEgressRouter(
         if subprocess.run(["sh", "-c", sandbox, rundir]).returncode != 0:
             fail("mount sandbox failed")
         os.write(w, b"1")
-        os._exit(0)
+        while True:
+            try:
+                done, status = os.waitpid(-1, 0)
+            except ChildProcessError:
+                sys.exit(1)
+            if done == pid:
+                code = os.waitstatus_to_exitcode(status)
+                sys.exit(code if code >= 0 else 128 - code)
         """;
 
     /// <summary>
@@ -129,12 +165,17 @@ public sealed partial class NetnsEgressRouter(
     /// settings at shutdown, where root then writes/chmods/chowns a file at a path taken from that segment. The private IPC
     /// namespace keeps runs (and every other local uid) apart; the mount namespace makes every mount read-only except the
     /// run's own dir (nosuid/nodev/noexec). Mounts that cannot be made read-only are detached; if any writable mount other
-    /// than an nsfs handle remains, it fails closed. Run by <see cref="UserNsLauncherScript"/>, so INetSim's "root" is an
+    /// than an nsfs handle remains, it fails closed. It first replaces the stacked /proc with one fresh /proc of the new PID namespace, which then goes read-only like every other mount. Run by <see cref="UserNsLauncherScript"/>, so INetSim's "root" is an
     /// unprivileged host id that holds no host capability and cannot undo these mounts (owned by the initial user namespace).
     /// </summary>
     public const string InetSimSandboxScript = """
         set -eu
         d="$0"
+        # `unshare --mount-proc` stacks the new /proc on top of the host's (and its children): the generic detach below works by
+        # path and would peel off our /proc first. So drop the whole /proc stack first and mount this PID namespace's own once.
+        n=$(awk '$5 == "/proc"' /proc/self/mountinfo | wc -l)
+        while [ "$n" -gt 0 ]; do umount -l /proc; n=$((n - 1)); done
+        mount -t proc -o nosuid,nodev,noexec proc /proc
         rw() { awk '{ for (i = 7; $i != "-"; i++) ; if ($6 !~ /(^|,)ro(,|$)/ && $(i + 1) != "nsfs") print $5 }' /proc/self/mountinfo | sort -ru; }
         awk '{ print $5 }' /proc/self/mountinfo | sort -ru | while IFS= read -r m; do mount -o remount,bind,ro "$(printf '%b' "$m")" 2>/dev/null || true; done
         for pass in 1 2 3 4 5 6 7 8; do
@@ -273,12 +314,24 @@ public sealed partial class NetnsEgressRouter(
             NetworkMode.LiveVpn => ["--no-resolv", $"--server={wg!.Dns}"],
             _ => ["--no-resolv"],
         };
+        // dnsmasq parses guest-controlled DHCP/DNS, so it starts already unprivileged (dedicated user, no groups, no new
+        // privileges, empty capability sets) and holds no capability over the run's netns. Without CAP_NET_ADMIN/NET_RAW it
+        // answers DHCP by broadcast (no ARP-cache injection) and does not ping-check addresses (no raw ICMP socket); low ports
+        // come from the netns sysctl. Its files live in /run/maldex/dns/<ns>/ (it cannot enter the 0700 run net dir).
+        await IdAsync("-u", ct, DnsUser); // fails closed if the dedicated user is missing
+        var ddir = DnsDirOf(ns);
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", "root", "-g", "root", "/run/maldex", "/run/maldex/dns"), ct);
+        await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0700", "-o", DnsUser, "-g", DnsUser, ddir), ct);
+        // allow low ports in this run's netns only (dnsmasq's 53/67 here, INetSim's services in Simulated): the one place
+        await Must(PrivilegedCommands.InNs(ns, "sysctl", "-w", "net.ipv4.ip_unprivileged_port_start=0"), ct);
         // Per-run lease database (never the shared /var/lib/misc/dnsmasq.leases) and a reservation for the run's deterministic
         // guest MAC: the one-address pool can only ever be handed to this run's guest, on every VM attempt.
-        await Must(PrivilegedCommands.InNs(ns, [_o.DnsmasqBinary, "--conf-file=/dev/null", "--no-hosts", $"--interface={names.VethNs}", "--bind-interfaces",
+        await Must(PrivilegedCommands.InNs(ns, ["setpriv", $"--reuid={DnsUser}", $"--regid={DnsUser}", "--clear-groups", "--no-new-privs",
+            "--inh-caps=-all", "--bounding-set=-all", "--", _o.DnsmasqBinary, "--conf-file=/dev/null", "--no-hosts", $"--user={DnsUser}",
+            $"--interface={names.VethNs}", "--bind-interfaces", "--dhcp-broadcast", "--no-ping",
             $"--dhcp-range={subnet.GuestIp},{subnet.GuestIp},255.255.255.252,12h", $"--dhcp-host={RunNetNames.GuestMac(taskId)},{subnet.GuestIp}",
-            $"--dhcp-leasefile={Path.Combine(dir, "dnsmasq.leases")}", $"--dhcp-option=3,{gw}", $"--dhcp-option=6,{gw}",
-            $"--pid-file={Path.Combine(dir, "dnsmasq.pid")}", $"--log-facility={Path.Combine(dir, "dnsmasq.log")}", .. dnsArgs]), ct);
+            $"--dhcp-leasefile={ddir}/dnsmasq.leases", $"--dhcp-option=3,{gw}", $"--dhcp-option=6,{gw}",
+            $"--pid-file={ddir}/dnsmasq.pid", $"--log-facility={ddir}/dnsmasq.log", .. dnsArgs]), ct);
 
         // 4. MITM proxy, TCP only, bound to the gateway address. It parses hostile traffic and runs our addon, so it runs as
         //    the dedicated powerless user with no groups, no new privileges and an empty capability bounding set.
@@ -380,13 +433,12 @@ public sealed partial class NetnsEgressRouter(
             await Must(PrivilegedCommands.Sudo("install", "-m", "0660", "-o", IsRootUser, "-g", IsUserUser, "/dev/null", $"{log}/{lf}"), ct);
         await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", "root", "-g", "root", report), ct); // create_reports no
         await Must(PrivilegedCommands.Sudo("install", "-d", "-m", "0755", "-o", IsRootUser, "-g", IsRootUser, pid), ct);
-        // the namespace's root has no CAP_NET_BIND_SERVICE on the host: allow low ports in this run's netns only
-        await Must(PrivilegedCommands.InNs(ns, "sysctl", "-w", "net.ipv4.ip_unprivileged_port_start=0"), ct);
+        // (low ports for the namespace's root, which has no CAP_NET_BIND_SERVICE on the host: sysctl set for every mode in BuildAsync)
         // the namespace's root cannot traverse the owner's home: stage a root-owned copy of the config
         var conf = isDir + "/inetsim.conf";
         await Must(PrivilegedCommands.Sudo("install", "-m", "0644", "-o", "root", "-g", "root",
             Path.GetFullPath(Path.Combine(_o.DeployNetDir, "inetsim", "inetsim.conf")), conf), ct);
-        await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "inetsim.out"), ["unshare", "--ipc", "--mount", "--propagation", "private", "--",
+        await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "inetsim.out"), ["unshare", "--ipc", "--mount", "--pid", "--fork", "--mount-proc", "--propagation", "private", "--",
             "python3", "-I", "-c", UserNsLauncherScript, uidMap, gidMap, isDir, InetSimSandboxScript, _o.InetSimBinary,
             "--config", conf, "--data-dir", data, "--log-dir", log, "--report-dir", report, "--bind-address", "0.0.0.0",
             "--pidfile", pid + "/inetsim.pid"]), ct); // per run: no shared/stale /var/run/inetsim.pid
@@ -469,6 +521,7 @@ public sealed partial class NetnsEgressRouter(
             await KeepFlowsAsync(taskId, ns, flowsCt);
             await Run(PrivilegedCommands.Sudo("rm", "-rf", "--", MitmDir(ns)), none);
             await Run(PrivilegedCommands.Sudo("rm", "-rf", "--", InetSimDir(ns)), none); // ns is mxn<12 hex>: derived from a Guid, never free text
+            await Run(PrivilegedCommands.Sudo("rm", "-rf", "--", DnsDirOf(ns)), none);
         }
         finally
         {

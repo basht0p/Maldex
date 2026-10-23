@@ -38,6 +38,7 @@ public sealed class NetnsEgressRouterTests : IDisposable
             if (line == "id -u" || line == "id -g") return Ok(out_: "1000\n");
             if (line == "id -u maldex-mitm") return Ok(out_: "995\n");
             if (MissingUser is not null && line.EndsWith(" " + MissingUser)) return Ok(1);
+            if (line == "id -u maldex-dns") return Ok(out_: "990\n");
             if (line == "id -u maldex-isroot") return Ok(out_: "994\n");
             if (line == "id -g maldex-isroot") return Ok(out_: "987\n");
             if (line == "id -u maldex-isuser") return Ok(out_: "993\n");
@@ -259,11 +260,78 @@ public sealed class NetnsEgressRouterTests : IDisposable
         var dns = Assert.Single(_r.Where(c => c.Contains(" dnsmasq ")));
         Assert.Contains("--no-resolv", dns);
         // per-run lease file and a reservation for the run's deterministic guest MAC (no shared /var/lib/misc lease db)
-        Assert.Contains($"--dhcp-leasefile={Path.Combine(_tmp, "run", "net", n.Namespace, "dnsmasq.leases")}", dns);
+        Assert.Contains($"--dhcp-leasefile=/run/maldex/dns/{n.Namespace}/dnsmasq.leases", dns);
+        Assert.DoesNotContain(Path.Combine(_tmp, "run"), dns); // nothing of dnsmasq's lives in the 0700 run net dir
+        Assert.Contains($"--pid-file=/run/maldex/dns/{n.Namespace}/dnsmasq.pid", dns);
+        Assert.Contains($"--log-facility=/run/maldex/dns/{n.Namespace}/dnsmasq.log", dns);
+        Assert.Contains("--dhcp-broadcast", dns); // no ARP-cache injection (needs CAP_NET_ADMIN)
+        Assert.Contains("--no-ping", dns); // no raw ICMP socket (needs CAP_NET_RAW)
+        Assert.Equal($"/run/maldex/dns/{n.Namespace}", NetnsEgressRouter.DnsDir(id));
         Assert.Contains($"--dhcp-host={RunNetNames.GuestMac(id)},10.213.0.2", dns);
         Assert.DoesNotContain("--server", dns);
         Assert.DoesNotContain("--address", dns);
         Assert.True(File.Exists(Path.Combine(_tmp, "run", "net", n.Namespace, "lease.json")));
+    }
+
+    [Theory]
+    [InlineData(NetworkMode.None)]
+    [InlineData(NetworkMode.Simulated)]
+    [InlineData(NetworkMode.LiveVpn)]
+    public async Task Dnsmasq_RunsWithNoCapabilities_ViaSetpriv_AndLowPortsAreOpenedFirst(NetworkMode mode)
+    {
+        if (mode == NetworkMode.LiveVpn) WriteWg("nl", GoodWg);
+        var id = Guid.NewGuid();
+        var n = RunNetNames.For(id);
+        await Router().CreateAsync(id, mode, mode == NetworkMode.LiveVpn ? "nl" : null, CancellationToken.None);
+        var dns = Assert.Single(_r.Where(c => c.Contains(" dnsmasq ")));
+        Assert.StartsWith($"sudo -n ip netns exec {n.Namespace} setpriv --reuid=maldex-dns --regid=maldex-dns --clear-groups --no-new-privs --inh-caps=-all --bounding-set=-all -- dnsmasq ", dns);
+        var ports = $"sudo -n ip netns exec {n.Namespace} sysctl -w net.ipv4.ip_unprivileged_port_start=0";
+        Assert.Single(_r.Calls, c => c == ports); // a single place sets it, for every mode
+        Assert.True(_r.IndexOf(c => c == ports) < _r.IndexOf(c => c.Contains(" dnsmasq ")));
+        // staged like the mitm dirs: root-owned parents, a 0700 leaf owned by the dnsmasq user
+        var d = $"/run/maldex/dns/{n.Namespace}";
+        var parents = _r.IndexOf(c => c == "sudo -n install -d -m 0755 -o root -g root /run/maldex /run/maldex/dns");
+        var leaf = _r.IndexOf(c => c == $"sudo -n install -d -m 0700 -o maldex-dns -g maldex-dns {d}");
+        Assert.True(parents >= 0 && leaf > parents && leaf < _r.IndexOf(c => c.Contains(" dnsmasq ")));
+    }
+
+    [Fact]
+    public async Task Dnsmasq_MissingUser_FailsClosed_BeforeStarting()
+    {
+        _r.MissingUser = "maldex-dns";
+        var ex = await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None));
+        Assert.Contains("maldex-dns", ex.Message);
+        Assert.DoesNotContain(_r.Calls, c => c.Contains(" dnsmasq "));
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("install") && c.Contains("/run/maldex/dns"));
+        Assert.Empty(_r.Namespaces);
+    }
+
+    [Fact]
+    public async Task Dnsmasq_DirIsRemovedOnRelease_AndOnFailedCreate()
+    {
+        var id = Guid.NewGuid();
+        var n = RunNetNames.For(id);
+        var router = Router();
+        var lease = await router.CreateAsync(id, NetworkMode.None, null, CancellationToken.None);
+        await router.ReleaseAsync(lease, CancellationToken.None);
+        Assert.Contains(_r.Calls, c => c == $"sudo -n rm -rf -- /run/maldex/dns/{n.Namespace}");
+        _r.Calls.Clear();
+        var id2 = Guid.NewGuid();
+        _r.Fail = c => c.Contains("mitmdump --mode");
+        await Assert.ThrowsAsync<EgressUnavailableException>(() => router.CreateAsync(id2, NetworkMode.None, null, CancellationToken.None));
+        Assert.Contains(_r.Calls, c => c == $"sudo -n rm -rf -- /run/maldex/dns/{RunNetNames.For(id2).Namespace}");
+    }
+
+    [Fact]
+    public void InetSimLauncher_StaysAsInit_ForwardingSignals_AndReaping()
+    {
+        var l = NetnsEgressRouter.UserNsLauncherScript;
+        Assert.DoesNotContain("os._exit(0)", l); // PID 1 must not exit after the handshake
+        Assert.Contains("signal.SIGTERM", l);
+        Assert.Contains("signal.SIGINT", l);
+        Assert.Contains("signal.SIGHUP", l);
+        Assert.Contains("os.waitpid(-1, 0)", l);
+        Assert.True(l.IndexOf("os.write(w, b\"1\")", StringComparison.Ordinal) < l.IndexOf("os.waitpid(-1, 0)", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -397,7 +465,7 @@ public sealed class NetnsEgressRouterTests : IDisposable
         Assert.Contains($"--data-dir {data} --log-dir {iDir}/log --report-dir {iDir}/report", inet);
         Assert.Contains($"--pidfile {iDir}/pid/inetsim.pid", inet);
         // real root sets up IPC + read-only mount namespaces, then the launcher enters the user namespace last
-        Assert.Contains($"ip netns exec {n.Namespace} unshare --ipc --mount --propagation private -- python3 -I -c "
+        Assert.Contains($"ip netns exec {n.Namespace} unshare --ipc --mount --pid --fork --mount-proc --propagation private -- python3 -I -c "
             + NetnsEgressRouter.UserNsLauncherScript + " 0 994 1\n110 993 1\n 0 987 1\n112 986 1\n " + iDir + " "
             + NetnsEgressRouter.InetSimSandboxScript + " inetsim --config", inet);
         Assert.Contains("CLONE_NEWUSER", NetnsEgressRouter.UserNsLauncherScript);
@@ -405,7 +473,8 @@ public sealed class NetnsEgressRouterTests : IDisposable
         Assert.True(confCopy >= 0 && confCopy < start, "root-owned config copy staged before start");
         Assert.Contains($"inetsim --config {iDir}/inetsim.conf ", inet);
         Assert.Contains("remount,bind,ro", NetnsEgressRouter.InetSimSandboxScript);
-        Assert.Contains("exit 1", NetnsEgressRouter.InetSimSandboxScript); // fails closed if anything stays writable
+        Assert.Contains("exit 1", NetnsEgressRouter.InetSimSandboxScript);
+        Assert.Contains("mount -t proc", NetnsEgressRouter.InetSimSandboxScript); // the PID namespace's own /proc, mounted once // fails closed if anything stays writable
         Assert.Contains("create_reports          no", File.ReadAllText(Path.Combine(RepoRoot(), "deploy", "net", "inetsim", "inetsim.conf")));
         Assert.DoesNotContain("--data-dir /var/lib/inetsim", inet);
         await router.ReleaseAsync(lease, CancellationToken.None);

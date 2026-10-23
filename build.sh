@@ -228,6 +228,14 @@ ensure_mitm_user() {
   fi
 }
 
+# Dedicated, powerless account for the per-run dnsmasq: own group, no supplementary groups, no home, no shell, no sudoers.
+# It runs with no capability at all (see NetnsEgressRouter).
+ensure_dns_user() {
+  if ! id maldex-dns >/dev/null 2>&1; then
+    sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin maldex-dns
+  fi
+}
+
 # INetSim insists on root; it runs in a user namespace whose root is maldex-isroot and whose 'inetsim' is maldex-isuser.
 # Both are dedicated, powerless system accounts: own group only, no home, no shell, no sudoers, own nothing on the host.
 ensure_inetsim_userns_ids() {
@@ -319,6 +327,7 @@ cmd_real_setup() {
 
   install_host_guard
   ensure_mitm_user
+  ensure_dns_user
   ensure_inetsim_userns_ids
   ensure_mitm_ca
   harden_inetsim_template
@@ -358,6 +367,8 @@ real_verify() {
     bash -c '[ ! -e /proc/sys/net/bridge/bridge-nf-call-iptables ] || [ "$(cat /proc/sys/net/bridge/bridge-nf-call-iptables)" != 1 ]'
   real_check "maldex-mitm user exists with no supplementary groups" "./build.sh real-setup" \
     bash -c '[ "$(id -nG maldex-mitm)" = maldex-mitm ] && ! sudo -n grep -rqs maldex-mitm /etc/sudoers /etc/sudoers.d'
+  real_check "maldex-dns user exists with no supplementary groups" "./build.sh real-setup" \
+    bash -c '[ "$(id -nG maldex-dns)" = maldex-dns ] && [ "$(id -u maldex-dns)" != 0 ] && ! sudo -n grep -rqs maldex-dns /etc/sudoers /etc/sudoers.d'
   for u in maldex-isroot maldex-isuser; do
     real_check "$u user exists, non-root, own group only, no sudoers" "./build.sh real-setup" \
       bash -c "[ \"\$(id -nG $u)\" = $u ] && [ \"\$(id -u $u)\" != 0 ] && ! sudo -n grep -rqs $u /etc/sudoers /etc/sudoers.d"
