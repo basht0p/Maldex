@@ -293,11 +293,7 @@ public class CaptureWiringTests(SqlServerFixture sql)
             using var __ = cap;
             var id = await h.SeedPreparingTaskAsync(durationSec: 60);
             SeedNetDir(runDir, id);
-            await h.RunAsync(id, async () =>
-            {
-                await h.WaitForStatusAsync(id, RunStatus.Running);
-                h.Time.Advance(TimeSpan.FromSeconds(61));
-            });
+            await h.RunAsync(id, () => h.ReachDeadlineAsync(id));
             Assert.Equal(expectMarker, spy!.MarkerAtRelease);
         }
         finally { Directory.Delete(runDir, true); }
