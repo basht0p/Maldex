@@ -125,6 +125,10 @@ try {
         New-Item -Path $edge -Force | Out-Null
         Set-ItemProperty -Path $edge -Name StartupBoostEnabled -Value 0 -Type DWord
         Set-ItemProperty -Path $edge -Name BackgroundModeEnabled -Value 0 -Type DWord
+        # Resolve through Windows (no built-in DNS client, no DNS over HTTPS): Sysmon only sees DnsQuery lookups, and the
+        # run's dnsmasq/INetSim must answer every name.
+        Set-ItemProperty -Path $edge -Name BuiltInDnsClientEnabled -Value 0 -Type DWord
+        Set-ItemProperty -Path $edge -Name DnsOverHttpsMode -Value 'off' -Type String
     }
 
     Step 'Power plan: never sleep' -BestEffort {

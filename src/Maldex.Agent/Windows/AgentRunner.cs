@@ -36,7 +36,7 @@ public static class AgentRunner
             {
                 using var dispatcher = new CommandDispatcher(new ShellSampleOpener(), new ShellUrlOpener(), () => shutdown = true);
                 var source = new CompositeEventSource([
-                    SysmonPresent() ? new SysmonEventSource() : new ProcessPollingSource(time),
+                    SysmonPresent() ? new SysmonEventSource(time) : new ProcessPollingSource(time),
                     new ScreenshotEventSource(new GdiScreenshotGrabber(), time),
                 ]);
                 await new AgentHost(port, source, dispatcher, time).RunAsync(ct).ConfigureAwait(false);
