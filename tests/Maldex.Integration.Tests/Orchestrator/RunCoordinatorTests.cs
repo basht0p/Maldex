@@ -180,6 +180,34 @@ internal sealed class OrchestratorHarness : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Waits for Running, then moves the run's deadline to just ahead of the fake clock; the pump in <see cref="RunAsync"/>
+    /// reaches it in small steps. Never one big clock jump: the sample open may still be awaiting the agent's answer when the
+    /// task turns Running, and a jump past its 30 s timeout fails the run.
+    /// </summary>
+    public async Task ReachDeadlineAsync(Guid taskId)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await WaitForStatusAsync(taskId, RunStatus.Running);
+        await using var db = NewContext();
+        // The coordinator writes the task concurrently: retry on a row-version conflict, as the stop endpoint does.
+        for (var attempt = 1; ; attempt++)
+        {
+            var task = await db.Tasks.SingleAsync(t => t.Id == taskId, ct);
+            if (task.Status != RunStatus.Running) return;
+            task.DeadlineAt = Time.GetUtcNow().AddSeconds(2); // past the end of the shipped replays (dropper: 1.4 s)
+            try
+            {
+                await db.SaveChangesAsync(ct);
+                return;
+            }
+            catch (DbUpdateConcurrencyException) when (attempt < 20)
+            {
+                db.ChangeTracker.Clear();
+            }
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         await _services.DisposeAsync();
@@ -244,11 +272,7 @@ public class RunCoordinatorTests(SqlServerFixture sql)
         await using var h = await OrchestratorHarness.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Fake:Replay:HoldOpen"] = "true" });
         var id = await h.SeedPreparingTaskAsync(durationSec: 60);
 
-        await h.RunAsync(id, async () =>
-        {
-            await h.WaitForStatusAsync(id, RunStatus.Running);
-            h.Time.Advance(TimeSpan.FromSeconds(61));
-        });
+        await h.RunAsync(id, () => h.ReachDeadlineAsync(id));
 
         await using var db = h.NewContext();
         Assert.Equal(RunStatus.Processing, (await db.Tasks.SingleAsync(t => t.Id == id, Ct)).Status);

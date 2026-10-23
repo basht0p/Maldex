@@ -356,15 +356,11 @@ public class DroppedFileCollectionTests(SqlServerFixture sql)
         ["Maldex:Fake:Replay:HoldOpen"] = "true",
     };
 
-    /// <summary>Runs a task to its deadline: wait for Running, then jump past the 60 s duration.</summary>
+    /// <summary>Runs a task to its deadline: wait for Running, then bring the deadline forward (see <see cref="OrchestratorHarness.ReachDeadlineAsync"/>).</summary>
     private static async Task<Guid> RunToDeadlineAsync(OrchestratorHarness h, byte[]? sample = null)
     {
         var id = await h.SeedPreparingTaskAsync(durationSec: 60, sampleContent: sample);
-        await h.RunAsync(id, async () =>
-        {
-            await h.WaitForStatusAsync(id, RunStatus.Running);
-            h.Time.Advance(TimeSpan.FromSeconds(61));
-        });
+        await h.RunAsync(id, () => h.ReachDeadlineAsync(id));
         return id;
     }
 
