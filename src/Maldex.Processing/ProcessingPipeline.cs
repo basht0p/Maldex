@@ -111,13 +111,14 @@ public sealed class ProcessingPipeline(
         return string.Join(',', kept);
     }
 
-    /// <summary>One transaction: drop the task's earlier detections and clear its warnings (this is what makes a rerun idempotent).</summary>
+    /// <summary>One transaction: drop the task's earlier detections and flows and clear its warnings (this is what makes a rerun idempotent).</summary>
     private static async Task ResetAsync(MaldexDbContext db, AnalysisTask task, CancellationToken ct)
     {
         for (var attempt = 1; ; attempt++)
         {
             await using var tx = await db.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
             await db.Detections.Where(d => d.TaskId == task.Id).ExecuteDeleteAsync(ct).ConfigureAwait(false);
+            await db.NetworkFlows.Where(f => f.TaskId == task.Id).ExecuteDeleteAsync(ct).ConfigureAwait(false);
             task.ProcessingWarnings = [.. task.ProcessingWarnings.Where(w => w.StartsWith(AnalysisTask.CaptureWarningPrefix, StringComparison.Ordinal))];
             try
             {
@@ -191,7 +192,13 @@ public sealed class ProcessingPipeline(
         foreach (var pcap in pcaps)
         {
             using var copy = await TempCopy.CreateAsync(artifacts, pcap.BlobKey, ct).ConfigureAwait(false);
-            found.AddRange(await suricata.RunAsync(copy.Path, ct).ConfigureAwait(false));
+            var result = await suricata.RunAsync(copy.Path, ct).ConfigureAwait(false);
+            found.AddRange(result.Alerts);
+            // Saved with the detections (one SaveChanges at the end); ResetAsync clears them on a rerun.
+            db.NetworkFlows.AddRange(result.Flows.Select(f => new NetworkFlow
+            {
+                TaskId = taskId, Proto = f.Proto, Src = f.Src, Dst = f.Dst, DstPort = f.DstPort, Bytes = f.Bytes, StartedAt = f.StartedAt,
+            }));
         }
         return found;
     }

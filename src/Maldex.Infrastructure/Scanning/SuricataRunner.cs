@@ -12,7 +12,7 @@ public sealed class SuricataRunner(IOptions<SuricataOptions> options) : ISuricat
 {
     private readonly SuricataOptions _options = options.Value;
 
-    public async Task<IReadOnlyList<DetectionResult>> RunAsync(string pcapPath, CancellationToken ct)
+    public async Task<SuricataResult> RunAsync(string pcapPath, CancellationToken ct)
     {
         var tmp = Path.Combine(Path.GetTempPath(), "maldex-suricata-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(tmp);
@@ -72,8 +72,8 @@ public sealed class SuricataRunner(IOptions<SuricataOptions> options) : ISuricat
             }
 
             var eve = Path.Combine(tmp, "eve.json");
-            if (!File.Exists(eve)) return [];
-            return SuricataEveParser.Parse(ReadLines(eve));
+            if (!File.Exists(eve)) return SuricataResult.Empty;
+            return SuricataEveParser.ParseEve(ReadLines(eve));
         }
         finally
         {
@@ -83,7 +83,7 @@ public sealed class SuricataRunner(IOptions<SuricataOptions> options) : ISuricat
 
     /// <summary>
     /// Streams eve.json line by line (never loading it whole). The parser stops after
-    /// <see cref="SuricataEveParser.MaxAlerts"/> alerts; reading also stops after 64 MiB of characters.
+    /// <see cref="SuricataEveParser.MaxAlerts"/> alerts and <see cref="SuricataEveParser.MaxFlows"/> flows; reading also stops after 64 MiB of characters.
     /// </summary>
     private static IEnumerable<string> ReadLines(string path)
     {
