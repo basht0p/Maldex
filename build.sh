@@ -288,7 +288,7 @@ cmd_real_setup() {
   local me="${SUDO_USER:-$(id -un)}"
   sudo apt-get update -qq
   sudo apt-get install -y qemu-system-x86 qemu-utils libvirt-daemon libvirt-clients virtinst ovmf swtpm swtpm-tools \
-    dnsmasq-base nftables tcpdump suricata inetsim wireguard-tools xorriso libxml2-utils socat genisoimage
+    dnsmasq-base nftables tcpdump suricata inetsim wireguard-tools xorriso libxml2-utils socat genisoimage wimtools
 
   if ! command -v pwsh >/dev/null 2>&1; then
     sudo snap install powershell --classic   # script parse checks only

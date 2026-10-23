@@ -5,7 +5,8 @@
   The "analyst" password below is a fixed throwaway value; it is NOT a secret and protects nothing.
 
   Image selection: by name ("Windows 11 Enterprise Evaluation"). build-guest.sh rewrites the two marked lines to
-  /IMAGE/INDEX 1 when the media does not contain an image of that name (or when MALDEX_WIN_IMAGE_INDEX is set).
+  /IMAGE/INDEX of Enterprise or Pro on multi-edition media (or MALDEX_WIN_IMAGE_INDEX), and fills in ProductKey/Key for
+  non-evaluation editions.
   No TPM / Secure Boot / RAM bypass (LabConfig) keys on purpose: the OVMF + vTPM domain satisfies the requirements.
 -->
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
