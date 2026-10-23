@@ -24,7 +24,7 @@ public class SelfTestGateProtocolTests
 
     private static IEnumerable<AgentMessage> Answer(AgentCommand c, Func<ProbeTarget, bool> reachable, string? echo = null) =>
         c is SelfTestCommand s
-            ? [new SelfTestResultMessage(DateTimeOffset.UnixEpoch, s.CommandId, s.Targets.Select(t => new ProbeResult(t.Name, reachable(t))).ToList(), echo),
+            ? [new SelfTestResultMessage(DateTimeOffset.UnixEpoch, s.CommandId, s.Targets.Select(t => new ProbeResult(t.Name, reachable(t))).ToList(), echo, ["10.213.0.2"]),
                new CommandResultMessage(s.CommandId, true)]
             : [];
 
@@ -48,6 +48,18 @@ public class SelfTestGateProtocolTests
         var verdict = await new SelfTestGate(new FakeTimeProvider()).RunAsync(ch, inbox, NetworkMode.None, null, Plan, Ct);
         Assert.False(verdict.Isolated);
         Assert.Contains("gateway", verdict.Reason);
+    }
+
+    [Fact]
+    public async Task Gate_GuestMustReportTheLeaseAddress()
+    {
+        var inbox = new TransferInbox();
+        var ch = new ScriptedChannel(inbox, c => c is SelfTestCommand s
+            ? [new SelfTestResultMessage(DateTimeOffset.UnixEpoch, s.CommandId, s.Targets.Select(t => new ProbeResult(t.Name, false)).ToList(), null, ["10.213.0.6"])]
+            : []);
+        var verdict = await new SelfTestGate(new FakeTimeProvider()).RunAsync(ch, inbox, NetworkMode.None, null, Plan, Ct);
+        Assert.False(verdict.Isolated);
+        Assert.Contains("10.213.0.2", verdict.Reason);
     }
 
     [Fact]
@@ -226,6 +238,43 @@ public class SelfTestGateTests(SqlServerFixture sql)
         await h.RunAsync(id);
 
         Assert.Equal(RunStatus.Failed, (await LoadAsync(h, id)).Task.Status);
+    }
+
+    [Fact]
+    public async Task SelfTest_FakeSimulated_InetSimEcho_Passes()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        var id = await h.SeedPreparingTaskAsync(NetworkMode.Simulated);
+        await h.RunAsync(id);
+
+        Assert.Equal(RunStatus.Processing, (await LoadAsync(h, id)).Task.Status);
+    }
+
+    [Fact]
+    public async Task SelfTest_Simulated_NoInetSimAnswer_FailsInPreparing()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        h.Get<FakeGuest>().SelfTestEchoBody = "198.18.0.10"; // an IP echo service answered, not INetSim
+        var id = await h.SeedPreparingTaskAsync(NetworkMode.Simulated);
+        await h.RunAsync(id);
+
+        var (task, _, _) = await LoadAsync(h, id);
+        Assert.Equal(RunStatus.Failed, task.Status);
+        Assert.Contains("not INetSim", task.FailureReason);
+    }
+
+    [Fact]
+    public async Task SelfTest_GuestWithoutLeaseAddress_FailsInPreparing()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        h.Get<FakeGuest>().SelfTestGuestAddresses = ["169.254.3.3"]; // APIPA: the guest never got the run's DHCP lease
+        var id = await h.SeedPreparingTaskAsync(NetworkMode.None);
+        await h.RunAsync(id);
+
+        var (task, _, _) = await LoadAsync(h, id);
+        Assert.Equal(RunStatus.Failed, task.Status);
+        Assert.Contains("does not hold its lease address 10.213.0.2", task.FailureReason);
+        Assert.DoesNotContain(Sent(h), c => c is PutFileChunkCommand or OpenSampleCommand or OpenUrlCommand);
     }
 
     [Fact]

@@ -89,6 +89,9 @@ public class DomainXmlBuilderTests
         Assert.Equal(Tap, target.Attribute("dev")!.Value);
         Assert.Equal("no", target.Attribute("managed")!.Value);
         Assert.Equal("virtio", nic.Element("model")!.Attribute("type")!.Value);
+        // deterministic from the task id: a retry attempt reuses the same MAC, so the per-run DHCP reservation still matches
+        Assert.Equal("52:54:00:01:23:45", nic.Element("mac")!.Attribute("address")!.Value);
+        Assert.Equal(nic.ToString(), Assert.Single(Domain().Descendants("interface")).ToString());
         Assert.DoesNotContain(d.Descendants("interface"),
             i => (string?)i.Attribute("type") is "user" or "network" or "bridge");
     }

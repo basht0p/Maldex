@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -302,7 +303,30 @@ public sealed class SubmissionTests(SqlServerFixture sql) : IDisposable
         var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
         var resp = await client.PostAsync("/api/tasks", Form(org, new byte[2048]), Ct);
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, resp.StatusCode);
+        Assert.Contains("1024 bytes", await resp.Content.ReadAsStringAsync(Ct)); // the analyst is told the limit
         Assert.Equal(0, await CountTasks(f));
+    }
+
+    /// <summary>A real guest can only receive AgentLimits.MaxInboundBytes: refuse at submit, never after a VM boot.</summary>
+    [Fact]
+    public void RealMode_UploadCap_IsTheAgentInboundLimit()
+    {
+        var real = new Maldex.Web.SubmissionOptions { Mode = "Real", MaxUploadBytes = 268_435_456 };
+        real.ApplyDefaults();
+        Assert.Equal(Maldex.Core.Agent.AgentLimits.MaxInboundBytes, real.MaxUploadBytes);
+        var smaller = new Maldex.Web.SubmissionOptions { Mode = "Real", MaxUploadBytes = 1024 };
+        smaller.ApplyDefaults();
+        Assert.Equal(1024, smaller.MaxUploadBytes);
+        var fake = new Maldex.Web.SubmissionOptions { Mode = "Fake", MaxUploadBytes = 268_435_456 };
+        fake.ApplyDefaults();
+        Assert.Equal(268_435_456, fake.MaxUploadBytes);
+
+        // and the shipped Real settings say so explicitly
+        var dir = AppContext.BaseDirectory;
+        while (!File.Exists(Path.Combine(dir, "Maldex.slnx"))) dir = Path.GetDirectoryName(dir)!;
+        var cfg = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+            .AddJsonFile(Path.Combine(dir, "src", "Maldex.Web", "appsettings.Real.json")).Build();
+        Assert.Equal(Maldex.Core.Agent.AgentLimits.MaxInboundBytes, long.Parse(cfg["Maldex:MaxUploadBytes"]!, System.Globalization.CultureInfo.InvariantCulture));
     }
 
     [Fact]

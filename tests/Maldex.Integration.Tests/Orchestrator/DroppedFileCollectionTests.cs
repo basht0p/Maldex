@@ -177,10 +177,83 @@ public class DroppedFileCollectorProtocolTests
             System.Text.Json.JsonSerializer.SerializeToUtf8Bytes<AgentCommand>(c, AgentJson.Options).Length <= AgentFrameReader.MaxFrameBytes));
     }
 
+    /// <summary>An inbox whose sample was opened and whose first process after the open (the sample's root) is <paramref name="pid"/>.</summary>
+    private static async Task<TransferInbox> OpenedAsync(int pid = 1, int? agentPid = null)
+    {
+        var inbox = new TransferInbox(agentPid);
+        inbox.MarkOpened();
+        await inbox.OfferAsync(new ProcessStartedMessage(DateTimeOffset.UnixEpoch, pid, agentPid ?? 0, @"C:\s.exe", "s.exe"), Ct);
+        return inbox;
+    }
+
+    private static FileEventMessage Create(int pid, string path) => new(DateTimeOffset.UnixEpoch, pid, "create", path);
+
+    private static ProcessStartedMessage Started(int pid, int parent, string image = @"C:\x.exe") => new(DateTimeOffset.UnixEpoch, pid, parent, image, image);
+
+    [Fact]
+    public async Task Inbox_TracksOnlyTheSampleProcessTree_FromTheAgentPid()
+    {
+        var inbox = new TransferInbox(agentPid: 900);
+        await inbox.OfferAsync(Started(500, 4), Ct);
+        await inbox.OfferAsync(Create(500, @"C:\before-open.txt"), Ct); // before the open: never the sample's
+        inbox.MarkOpened();
+        await inbox.OfferAsync(Started(2000, 4, @"C:\Windows\System32\svchost.exe"), Ct); // unrelated, even though first after the open
+        await inbox.OfferAsync(Started(1000, 900, @"C:\Users\a\Desktop\sample.exe"), Ct); // launched by the agent's opener
+        await inbox.OfferAsync(Started(1001, 1000, @"C:\Windows\System32\cmd.exe"), Ct);
+        await inbox.OfferAsync(Started(1002, 1001, @"C:\Users\a\AppData\Local\Temp\stage2.exe"), Ct);
+        await inbox.OfferAsync(Create(1000, @"C:\Users\a\AppData\Local\Temp\stage2.exe"), Ct);
+        await inbox.OfferAsync(Create(2000, @"C:\Windows\Temp\svchost-noise.etl"), Ct);
+        await inbox.OfferAsync(Create(1002, @"C:\Users\a\AppData\Roaming\evil.dll"), Ct);
+        await inbox.OfferAsync(Create(500, @"C:\other.txt"), Ct);
+        await inbox.OfferAsync(Create(31337, @"C:\unknown-pid.txt"), Ct);
+        Assert.Equal([@"C:\Users\a\AppData\Local\Temp\stage2.exe", @"C:\Users\a\AppData\Roaming\evil.dll"], inbox.CreatedPaths);
+    }
+
+    [Fact]
+    public async Task Inbox_WithoutAgentPid_SeedsWithTheFirstProcessAfterTheOpen()
+    {
+        var inbox = new TransferInbox();
+        await inbox.OfferAsync(Create(7, @"C:\early.txt"), Ct);
+        inbox.MarkOpened();
+        await inbox.OfferAsync(Create(7, @"C:\no-tree-yet.txt"), Ct);
+        await inbox.OfferAsync(Started(4120, 1, @"C:\Windows\explorer.exe"), Ct); // first after the open: the seed
+        await inbox.OfferAsync(Started(8088, 4120), Ct);
+        await inbox.OfferAsync(Started(9000, 640), Ct); // not in the tree
+        await inbox.OfferAsync(Create(8088, @"C:\a.exe"), Ct);
+        await inbox.OfferAsync(Create(9000, @"C:\b.exe"), Ct);
+        Assert.Equal([@"C:\a.exe"], inbox.CreatedPaths);
+    }
+
+    [Fact]
+    public async Task Inbox_ExitedPidLeavesTheTree_SoAReusedPidIsNotTheSample()
+    {
+        var inbox = await OpenedAsync(1000);
+        await inbox.OfferAsync(new ProcessExitedMessage(DateTimeOffset.UnixEpoch, 1000, 0), Ct);
+        await inbox.OfferAsync(Create(1000, @"C:\reused.txt"), Ct);
+        Assert.Empty(inbox.CreatedPaths);
+    }
+
+    [Theory]
+    [InlineData(@"C:\Windows\Prefetch\SAMPLE.EXE-1234ABCD.pf")]
+    [InlineData(@"C:\Users\a\AppData\Local\Microsoft\Windows\INetCache\IE\X1\page[1].htm")]
+    [InlineData(@"C:\Users\a\AppData\Local\Microsoft\Edge\User Data\Default\Cache\Cache_Data\f_000001")]
+    [InlineData(@"C:\Users\a\AppData\Local\Microsoft\Edge\User Data\Default\Code Cache\js\index")]
+    [InlineData(@"C:\Users\a\AppData\Local\Microsoft\Edge\User Data\ShaderCache\GPUCache\data_0")]
+    [InlineData(@"C:\Users\a\AppData\Local\Microsoft\Edge\User Data\Default\Service Worker\CacheStorage\x\y")]
+    [InlineData(@"C:\Users\a\AppData\Local\Temp\__PSScriptPolicyTest_abcd1234.efg.ps1")]
+    [InlineData(@"c:\users\a\appdata\local\temp\__psscriptpolicytest_x.psm1")]
+    public async Task Inbox_IgnoresWellKnownNoise(string path)
+    {
+        var inbox = await OpenedAsync();
+        await inbox.OfferAsync(Create(1, path), Ct);
+        await inbox.OfferAsync(Create(1, @"C:\Users\a\Downloads\payload.exe"), Ct);
+        Assert.Equal([@"C:\Users\a\Downloads\payload.exe"], inbox.CreatedPaths);
+    }
+
     [Fact]
     public async Task Inbox_DoesNotTrackOverlongOrBlankPaths()
     {
-        var inbox = new TransferInbox();
+        var inbox = await OpenedAsync();
         var t = DateTimeOffset.UnixEpoch;
         await inbox.OfferAsync(new FileEventMessage(t, 1, "create", new string('a', 1_000_000)), Ct);
         await inbox.OfferAsync(new FileEventMessage(t, 1, "create", "   "), Ct);
@@ -244,7 +317,7 @@ public class DroppedFileCollectorProtocolTests
     [Fact]
     public async Task Inbox_TracksCreatedPaths_AndSwallowsUnsolicitedChunks()
     {
-        var inbox = new TransferInbox();
+        var inbox = await OpenedAsync();
         var t = DateTimeOffset.UnixEpoch;
         Assert.False(await inbox.OfferAsync(new FileEventMessage(t, 1, "create", @"C:\a.exe"), Ct));
         Assert.False(await inbox.OfferAsync(new FileEventMessage(t, 1, "create", @"c:\A.EXE"), Ct));

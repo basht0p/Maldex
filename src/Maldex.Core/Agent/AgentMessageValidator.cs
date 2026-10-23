@@ -7,7 +7,7 @@ public static class AgentMessageValidator
     /// <summary>Returns null when valid, otherwise the reason.</summary>
     public static string? Validate(AgentMessage message) => message switch
     {
-        ReadyMessage m => Req(m.AgentVersion, "AgentVersion") ?? Req(m.Hostname, "Hostname"),
+        ReadyMessage m => Req(m.AgentVersion, "AgentVersion") ?? Req(m.Hostname, "Hostname") ?? (m.Pid is <= 0 ? "Pid must be positive." : null),
         ProcessStartedMessage m => Pid(m.Pid) ?? (m.ParentPid < 0 ? "ParentPid is negative." : null)
             ?? Req(m.ImagePath, "ImagePath") ?? Req(m.CommandLine, "CommandLine"),
         ProcessExitedMessage m => Pid(m.Pid),
@@ -34,6 +34,8 @@ public static class AgentMessageValidator
     private const int MaxProbes = 64;
     private const int MaxProbeNameChars = 64;
     private const int MaxEchoChars = 256;
+    private const int MaxGuestAddresses = 16;
+    private const int MaxIpChars = 45;
 
     private static string? ValidateSelfTest(SelfTestResultMessage m)
     {
@@ -45,7 +47,14 @@ public static class AgentMessageValidator
             if (p is null) return "Probes contains null.";
             if (string.IsNullOrEmpty(p.Name) || p.Name.Length > MaxProbeNameChars) return "Probe name is missing or too long.";
         }
-        return m.EchoBody is { Length: > MaxEchoChars } ? "EchoBody is too long." : null;
+        if (m.EchoBody is { Length: > MaxEchoChars }) return "EchoBody is too long.";
+        if (m.GuestAddresses is not null)
+        {
+            if (m.GuestAddresses.Count > MaxGuestAddresses) return "Too many guest addresses.";
+            foreach (var a in m.GuestAddresses)
+                if (a is null || a.Length > MaxIpChars || !System.Net.IPAddress.TryParse(a, out _)) return "Guest address is not an IP address.";
+        }
+        return null;
     }
 
     private static string? ValidateFileChunk(FileChunkMessage m)

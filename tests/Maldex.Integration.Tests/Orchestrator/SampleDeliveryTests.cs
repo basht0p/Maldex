@@ -1,3 +1,6 @@
+using Maldex.Core.Abstractions;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Maldex.Core.Agent;
 using Maldex.Core.Domain;
 using Maldex.Infrastructure.Fakes;
@@ -24,7 +27,7 @@ public class SampleDeliveryProtocolTests
     private static IEnumerable<AgentMessage> Ack(AgentCommand c) => [new CommandResultMessage(c.CommandId, true)];
 
     [Fact]
-    public async Task Deliver_SendsChunksThenOpen_InOrder()
+    public async Task Deliver_SendsChunksInOrder_ThenOpenIsSeparate()
     {
         var data = Data(1_258_291); // 1.2 MiB: three chunks
         var inbox = new TransferInbox();
@@ -33,7 +36,7 @@ public class SampleDeliveryProtocolTests
         await new SampleDelivery(new FakeTimeProvider()).DeliverAsync(
             channel, inbox, "samples/ab/cd/blob", "invoice.exe", new MemoryStream(data), data.Length, ScriptedChannel.Sha(data).ToUpperInvariant(), Ct);
 
-        Assert.Equal(4, channel.Sent.Count);
+        Assert.Equal(3, channel.Sent.Count); // delivery never opens: that happens once the run is Running
         var chunks = channel.Sent.Take(3).Cast<PutFileChunkCommand>().ToList();
         Assert.Equal([0, 1, 2], chunks.Select(c => c.Index));
         Assert.All(chunks, c =>
@@ -46,9 +49,19 @@ public class SampleDeliveryProtocolTests
         });
         Assert.Equal(data, chunks.SelectMany(c => Convert.FromBase64String(c.DataBase64)).ToArray());
         Assert.Equal(AgentLimits.ChunkBytes, Convert.FromBase64String(chunks[0].DataBase64).Length);
+        await new SampleDelivery(new FakeTimeProvider()).OpenAsync(channel, inbox, "samples/ab/cd/blob", "invoice.exe", Ct);
         var open = Assert.IsType<OpenSampleCommand>(channel.Sent[3]);
         Assert.Equal(("invoice.exe", "samples/ab/cd/blob"), (open.FileName, open.BlobKey));
         Assert.Equal(4, channel.Sent.Select(c => c.CommandId).Distinct().Count());
+    }
+
+    [Fact]
+    public async Task Open_Refused_ThrowsSampleOpenException()
+    {
+        var inbox = new TransferInbox();
+        var channel = new ScriptedChannel(inbox, c => [new CommandResultMessage(c.CommandId, false, "no handler")]);
+        var ex = await Assert.ThrowsAsync<SampleOpenException>(() => new SampleDelivery(new FakeTimeProvider()).OpenAsync(channel, inbox, "k", "a.docx", Ct));
+        Assert.StartsWith("sample open failed: open: the agent refused it", ex.Message);
     }
 
     [Fact]
@@ -67,7 +80,7 @@ public class SampleDeliveryProtocolTests
 
         await new SampleDelivery(new FakeTimeProvider()).DeliverAsync(channel, inbox, "k", "a.exe", new MemoryStream(data), data.Length, ScriptedChannel.Sha(data), Ct);
 
-        Assert.Equal(3, answered.Count);
+        Assert.Equal(2, answered.Count);
     }
 
     [Fact]
@@ -197,13 +210,21 @@ public class SampleDeliveryTests(SqlServerFixture sql)
     }
 
     [Fact]
-    public async Task Deliver_ThroughCoordinator_SendsChunksThenOpen_BeforeRunning()
+    public async Task Deliver_ThroughCoordinator_ChunksInPreparing_OpenOnlyOnceRunning()
     {
-        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        OpenObserver? observer = null;
+        OrchestratorHarness? hh = null;
+        await using var h = hh = await OrchestratorHarness.CreateAsync(sql, null, s =>
+            s.Replace(ServiceDescriptor.Singleton<IAgentChannelFactory>(_ => observer = new OpenObserver(hh!.Channels, async id =>
+            {
+                await using var db = hh!.NewContext();
+                return await db.Tasks.AsNoTracking().Where(t => t.Id == id).Select(t => t.Status).SingleAsync();
+            }))));
         var data = Sample(1_258_291);
         var id = await h.SeedPreparingTaskAsync(sampleContent: data);
 
         await h.RunAsync(id);
+        Assert.Equal([RunStatus.Running], observer!.StatusAtOpen); // the live view sees the start
 
         await using var db = h.NewContext();
         Assert.Equal(RunStatus.Processing, (await db.Tasks.SingleAsync(t => t.Id == id, Ct)).Status);
@@ -212,6 +233,75 @@ public class SampleDeliveryTests(SqlServerFixture sql)
         var chunks = sent.Take(3).Cast<PutFileChunkCommand>().ToList();
         Assert.Equal(data, chunks.SelectMany(c => Convert.FromBase64String(c.DataBase64)).ToArray());
         Assert.IsType<OpenSampleCommand>(sent[3]);
+    }
+
+    [Fact]
+    public async Task Open_RefusedAfterRunning_FailsFromRunning()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        h.Get<FakeGuest>().RejectOpen = true;
+        var id = await h.SeedPreparingTaskAsync(sampleContent: Sample(1000));
+
+        await h.RunAsync(id);
+
+        await using var db = h.NewContext();
+        var task = await db.Tasks.SingleAsync(t => t.Id == id, Ct);
+        Assert.Equal(RunStatus.Failed, task.Status);
+        Assert.Contains("sample open failed", task.FailureReason);
+        var history = (await db.TaskStatusHistory.Where(x => x.TaskId == id).ToListAsync(Ct)).OrderBy(x => x.Id).Select(x => x.To).ToList();
+        Assert.Equal([RunStatus.Preparing, RunStatus.Running, RunStatus.Failed], history); // a run error, not a Preparing failure
+        Assert.Single(h.Channels.Channels); // not retried on a second VM
+    }
+
+    [Fact]
+    public async Task Open_StopWhileTheOpenIsPending_EndsAsAStopInRunning()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        h.Get<FakeGuest>().SilentOpen = true;
+        var id = await h.SeedPreparingTaskAsync(sampleContent: Sample(1000));
+
+        await h.RunAsync(id, async () =>
+        {
+            while (!h.Channels.Channels.Any(c => c.SentCommands.Any(x => x is OpenSampleCommand))) await Task.Delay(2, Ct);
+            await using var api = h.NewContext();
+            var t = await api.Tasks.SingleAsync(x => x.Id == id, Ct);
+            t.StopRequestedAt = h.Time.GetUtcNow();
+            await api.SaveChangesAsync(Ct);
+        });
+
+        await using var db = h.NewContext();
+        var history = (await db.TaskStatusHistory.Where(x => x.TaskId == id).ToListAsync(Ct)).OrderBy(x => x.Id).ToList();
+        Assert.Equal([RunStatus.Preparing, RunStatus.Running, RunStatus.Collecting, RunStatus.Processing], history.Select(x => x.To));
+        Assert.Equal("stopped by analyst", history.Single(x => x.To == RunStatus.Collecting).Reason);
+        // honoured promptly: well inside the 30 s open timeout, not after it
+        var task = await db.Tasks.SingleAsync(t => t.Id == id, Ct);
+        Assert.True(task.EndedAt - task.StartedAt < TimeSpan.FromSeconds(10), $"stop took {task.EndedAt - task.StartedAt}");
+    }
+
+    /// <summary>Records the task's status at the moment each open command leaves for the guest.</summary>
+    private sealed class OpenObserver(IAgentChannelFactory inner, Func<Guid, Task<RunStatus>> status) : IAgentChannelFactory
+    {
+        public List<RunStatus> StatusAtOpen { get; } = [];
+
+        public async Task<IAgentChannel> ConnectAsync(VmHandle vm, CancellationToken ct) => new Observed(await inner.ConnectAsync(vm, ct), this, vm.TaskId);
+
+        private sealed class Observed(IAgentChannel ch, OpenObserver owner, Guid taskId) : IAgentChannel
+        {
+            public int Violations => ch.Violations;
+            public IAsyncEnumerable<AgentMessage> ReadAsync(CancellationToken ct) => ch.ReadAsync(ct);
+            public async Task SendAsync(AgentCommand command, CancellationToken ct)
+            {
+                if (command is OpenSampleCommand or OpenUrlCommand)
+                {
+                    var s = await owner.status(taskId);
+                    lock (owner.StatusAtOpen) owner.StatusAtOpen.Add(s);
+                }
+                await ch.SendAsync(command, ct);
+            }
+            public ValueTask DisposeAsync() => ch.DisposeAsync();
+        }
+
+        private readonly Func<Guid, Task<RunStatus>> status = status;
     }
 
     [Fact]

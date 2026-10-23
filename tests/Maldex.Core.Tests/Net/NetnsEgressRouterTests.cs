@@ -258,6 +258,9 @@ public sealed class NetnsEgressRouterTests : IDisposable
         Assert.DoesNotContain(_r.Calls, c => c.Contains("wireguard"));
         var dns = Assert.Single(_r.Where(c => c.Contains(" dnsmasq ")));
         Assert.Contains("--no-resolv", dns);
+        // per-run lease file and a reservation for the run's deterministic guest MAC (no shared /var/lib/misc lease db)
+        Assert.Contains($"--dhcp-leasefile={Path.Combine(_tmp, "run", "net", n.Namespace, "dnsmasq.leases")}", dns);
+        Assert.Contains($"--dhcp-host={RunNetNames.GuestMac(id)},10.213.0.2", dns);
         Assert.DoesNotContain("--server", dns);
         Assert.DoesNotContain("--address", dns);
         Assert.True(File.Exists(Path.Combine(_tmp, "run", "net", n.Namespace, "lease.json")));
@@ -457,6 +460,18 @@ public sealed class NetnsEgressRouterTests : IDisposable
         Assert.DoesNotContain("--mode wireguard", m);
     }
 
+    /// <summary>Malware infrastructure is often self-signed: the analysis proxy must not refuse the upstream (INetSim's own cert in Simulated).</summary>
+    [Theory]
+    [InlineData(NetworkMode.Simulated)]
+    [InlineData(NetworkMode.LiveVpn)]
+    public async Task Mitm_DoesNotVerifyUpstreamCertificates(NetworkMode mode)
+    {
+        if (mode == NetworkMode.LiveVpn) WriteWg("nl", GoodWg);
+        await Router().CreateAsync(Guid.NewGuid(), mode, mode == NetworkMode.LiveVpn ? "nl" : null, CancellationToken.None);
+        var m = Assert.Single(_r.Where(c => c.Contains("mitmdump --mode transparent")));
+        Assert.Contains("--set ssl_insecure=true", m);
+    }
+
     [Fact]
     public async Task EveryCommand_IsSudoN_WithDiscreteArgs()
     {
@@ -569,6 +584,43 @@ public sealed class NetnsEgressRouterTests : IDisposable
         await router.ReleaseAsync(lease, cts.Token);
         Assert.Equal("{\"kept\":1}\n", File.ReadAllText(kept));
         Assert.False(File.Exists(kept + ".partial"));
+    }
+
+    private NetnsEgressRouter RouterWithFlowsAt(string source) => new(Options.Create(new NetOptions
+    {
+        RunDir = Path.Combine(_tmp, "run"), WireGuardConfigDir = Path.Combine(_tmp, "wg"), MitmConfDir = Path.Combine(_tmp, "ca"),
+        DeployNetDir = Path.Combine(_tmp, "deploy"), ControlPlaneIps = ["192.168.50.7"],
+    }), _r, null, new NetnsRouterTuning
+    {
+        PollInterval = TimeSpan.FromMilliseconds(5), MitmWait = TimeSpan.FromMilliseconds(100), KillGrace = TimeSpan.FromMilliseconds(50),
+        BrNetfilterPath = Path.Combine(_tmp, "no-br-netfilter"), FlowsSource = _ => source,
+    });
+
+    [Fact]
+    public async Task Release_KeepsFlows_UnlessTheCaptureAlreadyStoredThem()
+    {
+        var source = Path.Combine(_tmp, "mitm-flows.jsonl");
+        File.WriteAllText(source, "{\"url\":\"http://203.0.113.5/\"}\n");
+        var router = RouterWithFlowsAt(source);
+
+        var plain = await router.CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None);
+        await router.ReleaseAsync(plain, CancellationToken.None);
+        Assert.Equal(File.ReadAllText(source), File.ReadAllText(Path.Combine(_tmp, "run", "net", RunNetNames.For(plain.TaskId).Namespace, "flows.jsonl")));
+
+        var stored = await router.CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None);
+        Assert.True(NetnsEgressRouter.MarkFlowsStored(Path.Combine(_tmp, "run"), stored.TaskId));
+        await router.ReleaseAsync(stored, CancellationToken.None);
+        Assert.False(File.Exists(Path.Combine(_tmp, "run", "net", RunNetNames.For(stored.TaskId).Namespace, "flows.jsonl")), "no second copy of stored flows");
+        Assert.False(NetnsEgressRouter.MarkFlowsStored(Path.Combine(_tmp, "run"), Guid.NewGuid())); // never creates a run dir
+    }
+
+    [Fact]
+    public async Task RunNetDir_IsOwnerOnly()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var lease = await Router().CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None);
+        var dir = Path.Combine(_tmp, "run", "net", RunNetNames.For(lease.TaskId).Namespace);
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(dir));
     }
 
     [Fact]

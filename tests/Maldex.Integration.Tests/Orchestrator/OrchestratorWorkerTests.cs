@@ -3,6 +3,8 @@ using Maldex.Data;
 using Maldex.Integration.Tests.Fixtures;
 using Maldex.Orchestrator;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Xunit;
 using OrgEntity = Maldex.Core.Domain.Org;
 
@@ -163,5 +165,66 @@ public class OrchestratorWorkerTests(SqlServerFixture sql)
         {
             await worker.StopAsync(CancellationToken.None);
         }
+    }
+
+    /// <summary>Lists fail a few times (libvirt/DB not ready at boot), then work.</summary>
+    private sealed class FlakyHypervisor(Maldex.Core.Abstractions.IHypervisor inner, int failures) : Maldex.Core.Abstractions.IHypervisor
+    {
+        public int ListCalls;
+        public Task<Maldex.Core.Abstractions.VmHandle> StartAsync(Maldex.Core.Abstractions.VmSpec spec, CancellationToken ct) => inner.StartAsync(spec, ct);
+        public Task DestroyAsync(Maldex.Core.Abstractions.VmHandle vm, CancellationToken ct) => inner.DestroyAsync(vm, ct);
+        public Task<IReadOnlyList<Maldex.Core.Abstractions.VmHandle>> ListAsync(CancellationToken ct) =>
+            Interlocked.Increment(ref ListCalls) <= failures ? throw new IOException("virsh: failed to connect to the hypervisor") : inner.ListAsync(ct);
+    }
+
+    [Fact]
+    public async Task Worker_Start_RetriesReconcile_ThenClaims()
+    {
+        FlakyHypervisor? flaky = null;
+        await using var h = await OrchestratorHarness.CreateAsync(sql, Settings(), s => s.Replace(ServiceDescriptor.Singleton<Maldex.Core.Abstractions.IHypervisor>(sp =>
+            flaky = new FlakyHypervisor(ActivatorUtilities.CreateInstance<Maldex.Infrastructure.Fakes.FakeHypervisor>(sp), failures: 2))));
+        var worker = h.Get<OrchestratorWorker>();
+        var orphan = await h.SeedTaskAsync(RunStatus.Running);
+        var queued = await h.SeedTaskAsync(RunStatus.Queued);
+
+        await worker.StartAsync(Ct);
+        try
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (await h.StatusOfAsync(queued) != RunStatus.Preparing)
+            {
+                Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30), "reconcile was not retried");
+                Assert.False(worker.ExecuteTask!.IsFaulted, worker.ExecuteTask.Exception?.ToString());
+                h.Time.Advance(TimeSpan.FromSeconds(1));
+                await Task.Delay(5, Ct);
+            }
+            Assert.Equal(RunStatus.Failed, await h.StatusOfAsync(orphan));
+            Assert.True(flaky!.ListCalls >= 3);
+        }
+        finally
+        {
+            await worker.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task Worker_Start_ReconcileKeepsFailing_FaultsAfterBoundedAttempts()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql, Settings(), s => s.Replace(ServiceDescriptor.Singleton<Maldex.Core.Abstractions.IHypervisor>(sp =>
+            new FlakyHypervisor(ActivatorUtilities.CreateInstance<Maldex.Infrastructure.Fakes.FakeHypervisor>(sp), failures: int.MaxValue))));
+        var worker = h.Get<OrchestratorWorker>();
+        var queued = await h.SeedTaskAsync(RunStatus.Queued);
+
+        await worker.StartAsync(Ct);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!worker.ExecuteTask!.IsCompleted)
+        {
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30), "reconcile retries are not bounded");
+            h.Time.Advance(TimeSpan.FromSeconds(5));
+            await Task.Delay(5, Ct);
+        }
+        Assert.True(worker.ExecuteTask.IsFaulted); // surfaced to the host (GatedHostedService stops the app)
+        Assert.Equal(RunStatus.Queued, await h.StatusOfAsync(queued)); // never claimed without a reconcile
+        await worker.StopAsync(CancellationToken.None);
     }
 }

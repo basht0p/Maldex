@@ -117,6 +117,16 @@ try {
         Set-ItemProperty -Path "$key\Open\Command" -Name '(default)' -Value '"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%1"'
     }
 
+    Step 'Edge: no Startup Boost, no background mode' -BestEffort {
+        # The agent launches msedge.exe for URL runs; with Startup Boost or background mode (Windows 11 defaults) an Edge
+        # already running outside the sample's process tree takes the URL over, and its downloads would not be collected.
+        # BackgroundModeEnabled=0 also covers "Continue running background extensions and apps when Microsoft Edge is closed".
+        $edge = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
+        New-Item -Path $edge -Force | Out-Null
+        Set-ItemProperty -Path $edge -Name StartupBoostEnabled -Value 0 -Type DWord
+        Set-ItemProperty -Path $edge -Name BackgroundModeEnabled -Value 0 -Type DWord
+    }
+
     Step 'Power plan: never sleep' -BestEffort {
         powercfg /x -standby-timeout-ac 0
         powercfg /x -standby-timeout-dc 0

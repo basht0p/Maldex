@@ -148,11 +148,13 @@ public static class TaskEndpoints
         }
         catch (BlobTooLargeException)
         {
-            return Results.Problem(title: "The uploaded file is too large.", statusCode: StatusCodes.Status413PayloadTooLarge);
+            return Results.Problem(title: "The uploaded file is too large.", statusCode: StatusCodes.Status413PayloadTooLarge,
+                detail: $"Samples may be at most {opts.MaxUploadBytes} bytes" + (opts.IsReal ? " (the most a real-mode guest can receive)." : "."));
         }
         catch (BadHttpRequestException ex) when (ex.StatusCode == StatusCodes.Status413PayloadTooLarge)
         {
-            return Results.Problem(title: "The request body is too large.", statusCode: StatusCodes.Status413PayloadTooLarge);
+            return Results.Problem(title: "The request body is too large.", statusCode: StatusCodes.Status413PayloadTooLarge,
+                detail: $"Samples may be at most {opts.MaxUploadBytes} bytes" + (opts.IsReal ? " (the most a real-mode guest can receive)." : "."));
         }
         catch (Exception ex) when (ex is InvalidDataException or ArgumentException or FormatException)
         {

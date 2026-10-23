@@ -13,9 +13,15 @@ public sealed class NoopEgressRouter(IOptions<FakeEgressOptions> options, FakeGu
     {
         if (mode is NetworkMode.LiveVpn or NetworkMode.LiveTor && !options.Value.LiveAvailable)
             throw new EgressUnavailableException("live egress is not available in fake mode");
-        // A fake LiveVpn guest "sits behind" the configured exit, so its self-test echo is that IP; every other mode has no internet.
+        // A fake LiveVpn guest "sits behind" the configured exit, so its self-test echo is that IP; a Simulated one gets INetSim's
+        // page; None has no internet.
         guest?.SetModeFor(taskId, mode);
-        guest?.SetEchoFor(taskId, mode == NetworkMode.LiveVpn ? options.Value.LiveEgressIp : null);
+        guest?.SetEchoFor(taskId, mode switch
+        {
+            NetworkMode.LiveVpn => options.Value.LiveEgressIp,
+            NetworkMode.Simulated => FakeGuest.InetSimEchoPage,
+            _ => null,
+        });
         var lease = _leases.GetOrAdd(taskId, id => new NetworkLease(id, $"fake-net-{id:N}"));
         return Task.FromResult(lease);
     }

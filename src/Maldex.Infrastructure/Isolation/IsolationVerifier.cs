@@ -15,7 +15,8 @@ public sealed record IsolationVerdict(bool Isolated, string? Reason)
 }
 
 /// <summary>What the coordinator asks the guest to probe for one run, and the probe names it expects back.</summary>
-public sealed record IsolationProbePlan(IReadOnlyList<ProbeTarget> Targets, string EchoUrl)
+/// <param name="GuestIp">The run's DHCP lease address; the guest must report it among its addresses.</param>
+public sealed record IsolationProbePlan(IReadOnlyList<ProbeTarget> Targets, string EchoUrl, string? GuestIp = null)
 {
     public IReadOnlyList<string> ExpectedNames => Targets.Select(t => t.Name).ToList();
 
@@ -33,7 +34,7 @@ public sealed record IsolationProbePlan(IReadOnlyList<ProbeTarget> Targets, stri
         targets.Add(new ProbeTarget("rfc1918_172", "172.16.0.1", WebPorts));
         targets.Add(new ProbeTarget("rfc1918_192", "192.168.1.1", WebPorts));
         targets.Add(new ProbeTarget("link_local", "169.254.169.254", WebPorts));
-        return new IsolationProbePlan(targets, net.EchoUrl);
+        return new IsolationProbePlan(targets, net.EchoUrl, run.GuestIp);
     }
 }
 
@@ -45,9 +46,16 @@ public sealed record IsolationProbePlan(IReadOnlyList<ProbeTarget> Targets, stri
 /// </summary>
 public static class IsolationVerifier
 {
-    public static IsolationVerdict Verify(NetworkMode mode, IReadOnlyList<string> expectedProbeNames, string? expectedEgressIp, SelfTestResultMessage? result)
+    /// <param name="expectedGuestIp">The run's lease address. The guest must report it, or the probes may have run from some
+    /// other network (a guest that never got its lease, or is attached elsewhere) and prove nothing about this run.</param>
+    public static IsolationVerdict Verify(NetworkMode mode, IReadOnlyList<string> expectedProbeNames, string? expectedEgressIp, SelfTestResultMessage? result,
+        string? expectedGuestIp)
     {
         if (result is null) return IsolationVerdict.Fail("no self-test result");
+        if (!TryParseIp(expectedGuestIp, out var leaseIp)) return IsolationVerdict.Fail("the run's guest address is unknown");
+        var addresses = result.GuestAddresses ?? [];
+        if (!addresses.Any(a => TryParseIp(a, out var have) && Normalize(have).Equals(Normalize(leaseIp))))
+            return IsolationVerdict.Fail($"the guest does not hold its lease address {leaseIp} (reported: {(addresses.Count == 0 ? "none" : Show(string.Join(", ", addresses.Take(4))))})");
         if (expectedProbeNames is null || expectedProbeNames.Count == 0) return IsolationVerdict.Fail("no probes were expected");
         if (result.Probes is null) return IsolationVerdict.Fail("self-test result has no probes");
 
@@ -74,10 +82,14 @@ public static class IsolationVerifier
                 return echo is null ? IsolationVerdict.Pass : IsolationVerdict.Fail("the guest reached the internet with networking off");
 
             case NetworkMode.Simulated:
-                // INetSim answers with a page; a bare public IP means the request reached the real internet.
-                return echo is not null && TryParseIp(echo, out var ip) && IsPublic(ip)
-                    ? IsolationVerdict.Fail("the guest reached the real internet in simulated mode")
-                    : IsolationVerdict.Pass;
+                // INetSim must have answered the echo request with its page. No answer means the simulated internet is not
+                // working; a bare IP means an echo service answered (a public one: the real internet was reached).
+                if (string.IsNullOrWhiteSpace(echo)) return IsolationVerdict.Fail("INetSim did not answer the echo request in simulated mode");
+                if (TryParseIp(echo, out var ip))
+                    return IsolationVerdict.Fail(IsPublic(ip)
+                        ? "the guest reached the real internet in simulated mode"
+                        : "the echo was answered by an IP echo service, not INetSim");
+                return IsolationVerdict.Pass;
 
             case NetworkMode.LiveVpn:
                 if (!TryParseIp(expectedEgressIp, out var want)) return IsolationVerdict.Fail("the expected VPN egress IP is unknown");

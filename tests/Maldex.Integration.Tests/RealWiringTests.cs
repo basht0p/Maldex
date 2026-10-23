@@ -301,4 +301,38 @@ public sealed class RealWiringTests
         Assert.Contains(runner.Calls, c => c == "sudo -n nft list table bridge maldex_guard");
         Assert.Contains(results, r => r.Name.Contains("base image") && r.Severity == GuardSeverity.Warn);
     }
+
+    /// <summary>Until INetSim runs in a per-run PID namespace, one real run's INetSim could tamper with another's: one VM at a time.</summary>
+    [Theory]
+    [InlineData(null, GuardSeverity.Ok)]
+    [InlineData("1", GuardSeverity.Ok)]
+    [InlineData("2", GuardSeverity.Fail)]
+    [InlineData("12", GuardSeverity.Fail)]
+    public async Task HostGuardProbe_RefusesMoreThanOneConcurrentVm(string? max, GuardSeverity expected)
+    {
+        var values = new Dictionary<string, string?>();
+        if (max is not null) values["Maldex:Orchestrator:MaxConcurrentVms"] = max;
+        var probe = new HostGuardProbe(new FailingNftRunner(), Options.Create(new LibvirtOptions { BaseImageDir = Path.GetTempPath() }),
+            new ConfigurationBuilder().AddInMemoryCollection(values).Build());
+        var r = Assert.Single(await probe.CheckAsync(CancellationToken.None), r => r.Name.Contains("MaxConcurrentVms"));
+        Assert.Equal(expected, r.Severity);
+        if (expected == GuardSeverity.Fail) Assert.Contains("INetSim", r.Detail);
+    }
+
+    [Fact]
+    public async Task Guards_MaxConcurrentVmsAboveOne_WorkerNotStarted_CriticalLog()
+    {
+        var sink = new LogSink();
+        var gate = new GuardedWorkerStartGate(new HostGuardProbe(new PassAllRunner(), Options.Create(new LibvirtOptions { BaseImageDir = Path.GetTempPath() }),
+            new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { ["Maldex:Orchestrator:MaxConcurrentVms"] = "3" }).Build()),
+            new Microsoft.Extensions.Logging.Logger<GuardedWorkerStartGate>(new LoggerFactory([sink])));
+        Assert.False(await gate.AllowStartAsync(CancellationToken.None));
+        Assert.Contains(sink.Entries, e => e.Level == LogLevel.Critical && e.Message.Contains("MaxConcurrentVms"));
+    }
+
+    private sealed class PassAllRunner : IProcessRunner
+    {
+        public Task<ProcessResult> RunAsync(string file, IReadOnlyList<string> args, CancellationToken ct, string? stdin = null, TimeSpan? timeout = null) =>
+            Task.FromResult(new ProcessResult(0, "", ""));
+    }
 }

@@ -112,6 +112,58 @@ public class SelfTestProbeTests
         Assert.Null(result.EchoBody);
     }
 
+    private static readonly SelfTestCommand Empty = new("c1", [], "");
+
+    [Fact]
+    public async Task Addresses_ReportsTheAddressesOfTheGatewayInterface()
+    {
+        var probes = new SelfTestProbes(addresses: () => [new("169.254.7.7", false), new("10.213.0.2", true), new("fe80::5", false)]);
+        var result = await probes.RunAsync(Empty, Ct);
+        Assert.Equal(["10.213.0.2"], result.GuestAddresses!);
+        Assert.Null(AgentMessageValidator.Validate(result));
+    }
+
+    [Fact]
+    public async Task Addresses_WaitsForADefaultGateway()
+    {
+        var calls = 0;
+        var probes = new SelfTestProbes(addressPoll: TimeSpan.FromMilliseconds(5), addresses: () =>
+            Interlocked.Increment(ref calls) < 4 ? [new("169.254.7.7", false)] : [new("10.213.0.2", true)]);
+        var result = await probes.RunAsync(Empty, Ct);
+        Assert.Equal(["10.213.0.2"], result.GuestAddresses!);
+        Assert.True(calls >= 4);
+    }
+
+    [Fact]
+    public async Task Addresses_NoGatewayInTime_ReportsWhatItHas_Bounded()
+    {
+        var probes = new SelfTestProbes(addressWait: TimeSpan.FromMilliseconds(150), addressPoll: TimeSpan.FromMilliseconds(10),
+            addresses: () => [new("169.254.7.7", false)]);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = await probes.RunAsync(Empty, Ct);
+        Assert.Equal(["169.254.7.7"], result.GuestAddresses!);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task Addresses_AreCappedAndNeverThrow()
+    {
+        var many = Enumerable.Range(1, 40).Select(i => new GuestAddress("10.1.0." + i, true)).ToList();
+        Assert.Equal(16, (await new SelfTestProbes(addresses: () => many).RunAsync(Empty, Ct)).GuestAddresses!.Count);
+        var broken = await new SelfTestProbes(addressWait: TimeSpan.FromMilliseconds(50), addressPoll: TimeSpan.FromMilliseconds(10),
+            addresses: () => throw new System.Net.NetworkInformation.NetworkInformationException()).RunAsync(Empty, Ct);
+        Assert.Empty(broken.GuestAddresses!);
+    }
+
+    [Fact]
+    public void Addresses_DefaultSource_ReadsThisHost()
+    {
+        // the real source on the dev host: some non-loopback address is visible and every entry parses
+        var all = SelfTestProbes.ReadInterfaceAddresses();
+        Assert.All(all, a => Assert.True(IPAddress.TryParse(a.Address, out _)));
+        Assert.DoesNotContain(all, a => IPAddress.IsLoopback(IPAddress.Parse(a.Address)));
+    }
+
     [Fact]
     public async Task Dispatcher_SelfTest_EmitsResultThenAcknowledges()
     {

@@ -201,4 +201,117 @@ public class CaptureWiringTests(SqlServerFixture sql)
         Assert.Equal(["capture: pcap truncated at the size limit"], task.ProcessingWarnings);
         Assert.Equal(2, await db.Artifacts.CountAsync(a => a.TaskId == id && (a.Kind == ArtifactKind.Pcap || a.Kind == ArtifactKind.MitmFlows), Ct));
     }
+
+    /// <summary>A router whose release always fails (the run's namespace may still exist).</summary>
+    private sealed class FailingReleaseRouter(IEgressRouter inner) : IEgressRouter
+    {
+        public Task<NetworkLease> CreateAsync(Guid taskId, NetworkMode mode, string? exitCountry, CancellationToken ct) => inner.CreateAsync(taskId, mode, exitCountry, ct);
+        public Task ReleaseAsync(NetworkLease lease, CancellationToken ct) => throw new IOException("ip netns del: device busy");
+        public Task<IReadOnlyList<NetworkLease>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
+    }
+
+    private static string SeedNetDir(string runDir, Guid taskId)
+    {
+        var dir = Path.Combine(runDir, "net", Maldex.Infrastructure.Net.RunNetNames.For(taskId).Namespace);
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "lease.json"), "{}");
+        return dir;
+    }
+
+    [Fact]
+    public async Task Coordinator_ReleaseSucceeded_NetDirRemoved_EvenWithoutCapture()
+    {
+        var runDir = Directory.CreateTempSubdirectory("maldex-netdir-").FullName;
+        try
+        {
+            await using var h = await OrchestratorHarness.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Real:Net:RunDir"] = runDir });
+            h.Get<Maldex.Infrastructure.Fakes.FakeGuest>().SetReachable("gateway"); // self-test fails: the capture never starts
+            var id = await h.SeedPreparingTaskAsync();
+            var dir = SeedNetDir(runDir, id);
+            await h.RunAsync(id);
+
+            await using var db = h.NewContext();
+            Assert.Equal(RunStatus.Failed, (await db.Tasks.SingleAsync(t => t.Id == id, Ct)).Status);
+            Assert.False(Directory.Exists(dir), "the lease was released: its run dir must go");
+        }
+        finally { Directory.Delete(runDir, true); }
+    }
+
+    [Fact]
+    public async Task Coordinator_ReleaseFailed_NetDirKept()
+    {
+        var runDir = Directory.CreateTempSubdirectory("maldex-netdir-").FullName;
+        try
+        {
+            await using var h = await OrchestratorHarness.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Real:Net:RunDir"] = runDir }, s =>
+            {
+                var inner = s.Last(d => d.ServiceType == typeof(IEgressRouter));
+                s.Replace(ServiceDescriptor.Singleton<IEgressRouter>(sp => new FailingReleaseRouter((IEgressRouter)ActivatorUtilities.CreateInstance(sp, inner.ImplementationType!))));
+            });
+            var id = await h.SeedPreparingTaskAsync();
+            var dir = SeedNetDir(runDir, id);
+            await h.RunAsync(id);
+
+            Assert.True(File.Exists(Path.Combine(dir, "lease.json")), "a lease that failed to release keeps its record (the reconciler needs it)");
+        }
+        finally { Directory.Delete(runDir, true); }
+    }
+
+    /// <summary>Records whether the capture's "flows stored" marker existed when the lease was released.</summary>
+    private sealed class MarkerSpyRouter(IEgressRouter inner, string runDir) : IEgressRouter
+    {
+        public bool? MarkerAtRelease;
+        public Task<NetworkLease> CreateAsync(Guid taskId, NetworkMode mode, string? exitCountry, CancellationToken ct) => inner.CreateAsync(taskId, mode, exitCountry, ct);
+        public Task ReleaseAsync(NetworkLease lease, CancellationToken ct)
+        {
+            MarkerAtRelease ??= File.Exists(Path.Combine(runDir, "net", Maldex.Infrastructure.Net.RunNetNames.For(lease.TaskId).Namespace, Maldex.Infrastructure.Net.NetnsEgressRouter.FlowsStoredMarker));
+            return inner.ReleaseAsync(lease, ct);
+        }
+        public Task<IReadOnlyList<NetworkLease>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
+    }
+
+    [Theory]
+    [InlineData(false, true)]  // flows stored as an artifact: the router must not copy them again
+    [InlineData(true, false)]  // storing failed: the router's copy is the fallback
+    public async Task Coordinator_TellsTheRouterWhenFlowsAreStored(bool storeFails, bool expectMarker)
+    {
+        var runDir = Directory.CreateTempSubdirectory("maldex-netdir-").FullName;
+        try
+        {
+            RecordingCapture? cap = null;
+            MarkerSpyRouter? spy = null;
+            OrchestratorHarness? h = null;
+            h = await OrchestratorHarness.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Real:Net:RunDir"] = runDir }, s =>
+            {
+                cap = new RecordingCapture(() => h!.Services);
+                s.Replace(ServiceDescriptor.Singleton<ICaptureService>(cap));
+                var inner = s.Last(d => d.ServiceType == typeof(IEgressRouter));
+                s.Replace(ServiceDescriptor.Singleton<IEgressRouter>(sp => spy = new MarkerSpyRouter((IEgressRouter)ActivatorUtilities.CreateInstance(sp, inner.ImplementationType!), runDir)));
+                if (storeFails) s.Replace(ServiceDescriptor.Singleton<IArtifactStore>(new FailingFlowsStore()));
+            });
+            await using var _ = h;
+            using var __ = cap;
+            var id = await h.SeedPreparingTaskAsync(durationSec: 60);
+            SeedNetDir(runDir, id);
+            await h.RunAsync(id, async () =>
+            {
+                await h.WaitForStatusAsync(id, RunStatus.Running);
+                h.Time.Advance(TimeSpan.FromSeconds(61));
+            });
+            Assert.Equal(expectMarker, spy!.MarkerAtRelease);
+        }
+        finally { Directory.Delete(runDir, true); }
+    }
+
+    /// <summary>Stores everything except captured flows.</summary>
+    private sealed class FailingFlowsStore : IArtifactStore
+    {
+        private readonly MemoryArtifactStore _inner = new();
+        public Task<StoredBlob> PutAsync(string category, Stream content, long maxBytes, CancellationToken ct) =>
+            category == "flows" ? throw new IOException("disk full") : _inner.PutAsync(category, content, maxBytes, ct);
+        public Task<Stream> OpenReadAsync(string key, CancellationToken ct) => _inner.OpenReadAsync(key, ct);
+        public Task DeleteAsync(string key, CancellationToken ct) => _inner.DeleteAsync(key, ct);
+        public bool Exists(string key) => _inner.Exists(key);
+        public IAsyncEnumerable<(string Key, DateTimeOffset LastWrite)> ListAsync(CancellationToken ct) => _inner.ListAsync(ct);
+    }
 }

@@ -8,6 +8,15 @@ public class AgentMessageValidatorTests
     private static readonly DateTimeOffset T = DateTimeOffset.UnixEpoch;
 
     [Fact]
+    public void Ready_Pid_IsOptionalButPositive()
+    {
+        Assert.Null(AgentMessageValidator.Validate(new ReadyMessage("1", "h")));
+        Assert.Null(AgentMessageValidator.Validate(new ReadyMessage("1", "h", 4242)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ReadyMessage("1", "h", 0)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ReadyMessage("1", "h", -5)));
+    }
+
+    [Fact]
     public void Valid_ReturnsNull()
     {
         Assert.Null(AgentMessageValidator.Validate(new ProcessStartedMessage(T, 1, 0, "c:\\a.exe", "", null, null)));

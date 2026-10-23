@@ -81,6 +81,80 @@ public class RealEgressTests
     }
 
     /// <summary>
+    /// DHCP per run: two consecutive runs on the same subnet index with different task ids, plus a "retry attempt" (a fresh
+    /// NIC with the same deterministic MAC) inside the first run, all get the run's guest address. Each run keeps its own
+    /// lease file; the host-wide /var/lib/misc/dnsmasq.leases is never touched. Guest stand-ins run busybox udhcpc.
+    /// </summary>
+    [Fact]
+    public async Task ConsecutiveRuns_SameSlot_EachGuestGetsTheLease()
+    {
+        Assert.SkipUnless(Environment.GetEnvironmentVariable("MALDEX_REAL_NET") == "1" && OperatingSystem.IsLinux(),
+            "set MALDEX_REAL_NET=1 (needs passwordless sudo, nft, dnsmasq, mitmdump, busybox)");
+        var tmp = Path.Combine(Path.GetTempPath(), "mx-real-net-" + Guid.NewGuid().ToString("N"));
+        var opts = Options.Create(new NetOptions
+        {
+            RunDir = Path.Combine(tmp, "run"),
+            MitmConfDir = Path.Combine(tmp, "ca"),
+            DeployNetDir = RepoDeployNet(),
+            ControlPlaneIps = ["192.0.2.1"],
+        });
+        await Proc.RunAsync("timeout", ["8", "/opt/mitmproxy/mitmdump", "--set", $"confdir={Path.Combine(tmp, "ca")}", "-n", "-q"], CancellationToken.None, null, TimeSpan.FromSeconds(20));
+        var router = new NetnsEgressRouter(opts, Proc);
+        var sharedBefore = (await Sudo("sh", "-c", "cat /var/lib/misc/dnsmasq.leases 2>/dev/null || true")).Stdout;
+        Guid[] ids = [Guid.NewGuid(), Guid.NewGuid()];
+        var guestIp = RunSubnet.For(0).GuestIp;
+        var scratch = new List<(string Ns, string HostLeg)>();
+        try
+        {
+            foreach (var id in ids)
+            {
+                var lease = await router.CreateAsync(id, NetworkMode.None, null, CancellationToken.None);
+                var n = RunNetNames.For(id);
+                // run 1 gets two VM "attempts" (the second NIC reappears with the same MAC while the first lease is still held)
+                for (var attempt = 0; attempt < (id == ids[0] ? 2 : 1); attempt++)
+                {
+                    var tag = $"{id.ToString("N")[..10]}{attempt}";
+                    var sns = "mxs" + tag;
+                    var hostLeg = "mxq" + tag;
+                    scratch.Add((sns, hostLeg));
+                    Assert.Equal(0, (await Sudo("ip", "netns", "add", sns)).ExitCode);
+                    Assert.Equal(0, (await Sudo("ip", "link", "add", hostLeg, "type", "veth", "peer", "name", "mxe" + tag, "netns", sns)).ExitCode);
+                    Assert.Equal(0, (await Sudo("ip", "netns", "exec", sns, "ip", "link", "set", "mxe" + tag, "address", RunNetNames.GuestMac(id))).ExitCode);
+                    Assert.Equal(0, (await Sudo("ip", "link", "set", hostLeg, "master", n.Bridge)).ExitCode);
+                    Assert.Equal(0, (await Sudo("ip", "link", "set", hostLeg, "up")).ExitCode);
+                    Assert.Equal(0, (await Sudo("ip", "netns", "exec", sns, "ip", "link", "set", "mxe" + tag, "up")).ExitCode);
+                    // -q: obtain one lease and exit; -n: fail instead of retrying forever; no-op script (nothing is configured)
+                    var dhcp = await Sudo("ip", "netns", "exec", sns, "busybox", "udhcpc", "-i", "mxe" + tag, "-q", "-n", "-t", "4", "-T", "2", "-s", "/bin/true");
+                    var leases = await Sudo("cat", Path.Combine(tmp, "run", "net", n.Namespace, "dnsmasq.leases"));
+                    Assert.True(dhcp.ExitCode == 0 && (dhcp.Stderr + dhcp.Stdout).Contains($"lease of {guestIp} obtained", StringComparison.Ordinal),
+                        $"run {Array.IndexOf(ids, id)} attempt {attempt}: no lease ({dhcp.ExitCode}) {dhcp.Stdout} {dhcp.Stderr}");
+                    Assert.Contains(RunNetNames.GuestMac(id), leases.Stdout); // the run's own lease database
+                    await Sudo("ip", "link", "del", hostLeg);
+                    await Sudo("ip", "netns", "del", sns);
+                }
+                await router.ReleaseAsync(lease, CancellationToken.None);
+            }
+            Assert.Equal(sharedBefore, (await Sudo("sh", "-c", "cat /var/lib/misc/dnsmasq.leases 2>/dev/null || true")).Stdout);
+        }
+        finally
+        {
+            foreach (var (sns, hostLeg) in scratch)
+            {
+                await Sudo("ip", "link", "del", hostLeg);
+                await Sudo("ip", "netns", "del", sns);
+            }
+            foreach (var id in ids) await router.ReleaseAsync(new NetworkLease(id, RunNetNames.For(id).Tap), CancellationToken.None);
+            await Sudo("rm", "-rf", tmp);
+        }
+        foreach (var id in ids)
+        {
+            var h = id.ToString("N")[..10];
+            Assert.DoesNotContain(h, (await Proc.RunAsync("ip", ["-o", "link"], CancellationToken.None)).Stdout);
+            Assert.DoesNotContain(h, (await Proc.RunAsync("ip", ["netns", "list"], CancellationToken.None)).Stdout);
+        }
+    }
+
+    /// <summary>
     /// INetSim's main process: per-run pid file, own IPC namespace, read-only mounts except its run dir, and a user namespace
     /// whose root is the unprivileged maldex-isroot (no host capability: cannot read root-only files, write devices, remount
     /// or enter host namespaces). Returns its host PID.
@@ -260,6 +334,25 @@ public class RealEgressTests
                 }
                 Assert.NotEmpty(lines);
                 Assert.Contains("203.0.113.5", lines[0]);
+
+                // HTTPS through the proxy: mitmdump must accept INetSim's self-signed upstream cert (ssl_insecure) and record
+                // a real response from INetSim, not an upstream-verification error record
+                var tlsCode = await Guest("curl", "-sk", "-m", "8", "-o", "/dev/null", "-w", "%{http_code}", "https://203.0.113.9/");
+                Assert.Contains(tlsCode.Stdout.Trim(), new[] { "200", "404" });
+                System.Text.Json.JsonElement tlsFlow = default;
+                for (var i = 0; i < 50 && tlsFlow.ValueKind == System.Text.Json.JsonValueKind.Undefined; i++)
+                {
+                    foreach (var l in File.ReadAllLines(flowsPath))
+                    {
+                        var doc = System.Text.Json.JsonDocument.Parse(l).RootElement;
+                        if (doc.GetProperty("url").GetString()!.StartsWith("https://203.0.113.9", StringComparison.Ordinal)) tlsFlow = doc.Clone();
+                    }
+                    if (tlsFlow.ValueKind == System.Text.Json.JsonValueKind.Undefined) await Task.Delay(100);
+                }
+                Assert.Equal(System.Text.Json.JsonValueKind.Object, tlsFlow.ValueKind);
+                Assert.False(tlsFlow.TryGetProperty("error", out var tlsErr), "HTTPS flow is an error record: " + tlsErr);
+                Assert.Contains(tlsFlow.GetProperty("status").GetInt32(), new[] { 200, 404 });
+                Assert.True(tlsFlow.GetProperty("tls").GetBoolean());
                 Assert.Equal("maldex-mitm 640", (await Sudo("stat", "-c", "%U %a", flowsPath)).Stdout.Trim());
                 var dataDir = NetnsEgressRouter.InetSimDataPath(id);
                 Assert.Equal(0, (await Sudo("test", "-d", dataDir + "/http/postdata")).ExitCode);

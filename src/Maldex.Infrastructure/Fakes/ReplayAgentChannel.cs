@@ -132,8 +132,9 @@ public sealed class ReplayAgentChannel : IAgentChannel
     }
 
     /// <summary>
-    /// A fake guest is perfectly isolated unless a test says otherwise: every probe blocked, no echo. Without a <see cref="FakeGuest"/>
-    /// the channel answers exactly that. Fake LiveVpn runs echo the configured exit IP (see <see cref="FakeEgressOptions.LiveEgressIp"/>).
+    /// A fake guest is perfectly isolated unless a test says otherwise: it holds its lease address (10.213.0.2), every probe is
+    /// blocked, no echo. Without a <see cref="FakeGuest"/> the channel answers exactly that. Fake LiveVpn runs echo the configured
+    /// exit IP (see <see cref="FakeEgressOptions.LiveEgressIp"/>), fake Simulated runs INetSim's default page.
     /// </summary>
     private void RespondSelfTest(SelfTestCommand c)
     {
@@ -141,7 +142,8 @@ public sealed class ReplayAgentChannel : IAgentChannel
         var reachable = _guest is null ? [] : _guest.ReachableProbes.ToHashSet(StringComparer.Ordinal);
         var echo = _guest is not null && _taskId is { } id ? _guest.EchoFor(id) : null;
         Enqueue(new SelfTestResultMessage(_time.GetUtcNow(), c.CommandId,
-            c.Targets.Select(t => new ProbeResult(t.Name, reachable.Contains(t.Name))).ToList(), echo));
+            c.Targets.Select(t => new ProbeResult(t.Name, reachable.Contains(t.Name))).ToList(), echo,
+            _guest?.SelfTestGuestAddresses ?? [FakeGuest.LeaseAddress]));
         Enqueue(new CommandResultMessage(c.CommandId, true));
     }
 
@@ -174,6 +176,12 @@ public sealed class ReplayAgentChannel : IAgentChannel
                 Enqueue(new CommandResultMessage(c.CommandId, true));
                 break;
             case OpenSampleCommand c:
+                if (_guest!.SilentOpen) break;
+                if (_guest.RejectOpen)
+                {
+                    Enqueue(new CommandResultMessage(c.CommandId, false, "no application is associated with this file"));
+                    break;
+                }
                 Enqueue(new CommandResultMessage(c.CommandId, true));
                 _opened.TrySetResult();
                 break;
@@ -212,6 +220,9 @@ public sealed class ReplayAgentChannel : IAgentChannel
                     ? Encoding.UTF8.GetBytes(line)
                     : JsonSerializer.SerializeToUtf8Bytes(Stamp(message, _time.GetUtcNow()), AgentJson.Options);
                 _outbox.Writer.TryWrite(Frame(body));
+                // Like a real guest, a fake one runs the sample only once the host has opened it: everything after the ready
+                // line is the sample's behaviour (and is collected as such).
+                if (_guest is not null && message is ReadyMessage) await _opened.Task.WaitAsync(ct).ConfigureAwait(false);
             }
 
             if (_holdOpen) await Task.Delay(Timeout.InfiniteTimeSpan, ct).ConfigureAwait(false);

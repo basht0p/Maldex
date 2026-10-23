@@ -17,6 +17,8 @@ public sealed record NetnsRouterTuning
     public TimeSpan HandshakeWait { get; init; } = TimeSpan.FromSeconds(10);
     public TimeSpan KillGrace { get; init; } = TimeSpan.FromSeconds(5);
     public string BrNetfilterPath { get; init; } = "/proc/sys/net/bridge/bridge-nf-call-iptables";
+    /// <summary>Where the live mitm flows file is (tests point it at a scratch file).</summary>
+    public Func<Guid, string> FlowsSource { get; init; } = NetnsEgressRouter.MitmFlowsPath;
 }
 
 /// <summary>
@@ -49,6 +51,21 @@ public sealed partial class NetnsEgressRouter(
     public const long MaxFlowsBytes = 512L * 1024 * 1024;
 
     private static string InetSimDir(string ns) => "/run/maldex/inetsim/" + ns;
+
+    /// <summary>Marker in the run's net dir: the capture's flows are already stored as an artifact, so release skips its copy.</summary>
+    public const string FlowsStoredMarker = "flows.stored";
+
+    /// <summary>
+    /// Tells a later <see cref="ReleaseAsync"/> not to copy the flows again (they can be 512 MiB). Writes the marker into the
+    /// run's existing net dir (control-plane only, 0700); never creates the dir. Returns false when there is no such dir.
+    /// </summary>
+    public static bool MarkFlowsStored(string runDir, Guid taskId)
+    {
+        var dir = Path.Combine(Path.GetFullPath(runDir), "net", RunNetNames.For(taskId).Namespace);
+        if (!Directory.Exists(dir)) return false;
+        File.WriteAllText(Path.Combine(dir, FlowsStoredMarker), "");
+        return true;
+    }
 
     /// <summary>Unprivileged host account that is uid/gid 0 inside INetSim's user namespace (created by <c>./build.sh real-setup</c>).</summary>
     public const string IsRootUser = "maldex-isroot";
@@ -212,8 +229,11 @@ public sealed partial class NetnsEgressRouter(
     {
         var ns = names.Namespace;
         var dir = RunNetDir(ns);
-        Directory.CreateDirectory(dir);
-        Chmod(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        const UnixFileMode owner = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+        // 0700 from creation (no window with a umask-derived mode); chmod as well in case it already existed.
+        if (OperatingSystem.IsWindows()) Directory.CreateDirectory(dir);
+        else Directory.CreateDirectory(dir, owner);
+        Chmod(dir, owner);
         // Written first so a crash mid-create is still reconcilable and the slot is visible to other processes.
         await File.WriteAllTextAsync(Path.Combine(dir, "lease.json"), JsonSerializer.Serialize(new LeaseFile(
             taskId, subnet.Index, mode.ToString(), exitCountry, names.Bridge, names.Tap, names.VethHost, names.VethNs, names.Namespace, names.WgIface)), ct);
@@ -253,8 +273,11 @@ public sealed partial class NetnsEgressRouter(
             NetworkMode.LiveVpn => ["--no-resolv", $"--server={wg!.Dns}"],
             _ => ["--no-resolv"],
         };
+        // Per-run lease database (never the shared /var/lib/misc/dnsmasq.leases) and a reservation for the run's deterministic
+        // guest MAC: the one-address pool can only ever be handed to this run's guest, on every VM attempt.
         await Must(PrivilegedCommands.InNs(ns, [_o.DnsmasqBinary, "--conf-file=/dev/null", "--no-hosts", $"--interface={names.VethNs}", "--bind-interfaces",
-            $"--dhcp-range={subnet.GuestIp},{subnet.GuestIp},255.255.255.252,12h", $"--dhcp-option=3,{gw}", $"--dhcp-option=6,{gw}",
+            $"--dhcp-range={subnet.GuestIp},{subnet.GuestIp},255.255.255.252,12h", $"--dhcp-host={RunNetNames.GuestMac(taskId)},{subnet.GuestIp}",
+            $"--dhcp-leasefile={Path.Combine(dir, "dnsmasq.leases")}", $"--dhcp-option=3,{gw}", $"--dhcp-option=6,{gw}",
             $"--pid-file={Path.Combine(dir, "dnsmasq.pid")}", $"--log-facility={Path.Combine(dir, "dnsmasq.log")}", .. dnsArgs]), ct);
 
         // 4. MITM proxy, TCP only, bound to the gateway address. It parses hostile traffic and runs our addon, so it runs as
@@ -282,7 +305,9 @@ public sealed partial class NetnsEgressRouter(
         await Must(PrivilegedCommands.DetachedInNs(ns, Path.Combine(dir, "mitmdump.log"), ["setpriv", $"--reuid={MitmUser}", $"--regid={MitmUser}",
             "--clear-groups", "--no-new-privs", "--inh-caps=-all", "--bounding-set=-all", "--", _o.MitmdumpBinary,
             "--mode", "transparent", "--listen-host", gw, "--listen-port", _o.MitmPort.ToString(CultureInfo.InvariantCulture),
-            "--set", $"confdir={mdir}/conf", "--set", "block_global=false", "--set", "http3=false",
+            // ssl_insecure: never verify upstream certificates. This is an analysis proxy and malware infrastructure (and
+            // INetSim in Simulated) is routinely self-signed; verification would turn every such flow into an error record.
+            "--set", $"confdir={mdir}/conf", "--set", "block_global=false", "--set", "http3=false", "--set", "ssl_insecure=true",
             "-s", mdir + "/addon/maldex_jsonl.py", "--set", $"maldex_out={mdir}/out/flows.jsonl", "--set", $"maldex_enable_file={mdir}/ctl/capture.on"]), ct);
         await WaitFor(async () =>
         {
@@ -458,13 +483,14 @@ public sealed partial class NetnsEgressRouter(
     {
         var dir = RunNetDir(ns);
         if (!Directory.Exists(dir)) return;
+        if (File.Exists(Path.Combine(dir, FlowsStoredMarker))) return; // the capture already stored them: no second copy
         var dest = Path.Combine(dir, "flows.jsonl");
         var partial = dest + ".partial"; // copied aside, then renamed: a cancelled/failed copy never clobbers flows kept earlier
         try
         {
             // Copied as the control-plane user (a planted symlink gets no root help). The source sits in a directory the
             // hostile-traffic-facing mitm user owns: never follow links, block on it or read more than the cap.
-            var res = await UntrustedFile.CopyRegularFileAsync(MitmFlowsPath(taskId), partial, MaxFlowsBytes, ct);
+            var res = await UntrustedFile.CopyRegularFileAsync(_t.FlowsSource(taskId), partial, MaxFlowsBytes, ct);
             File.Move(partial, dest, overwrite: true);
             if (res.Truncated) warn?.Invoke($"Flows for {taskId:N} truncated at {MaxFlowsBytes} bytes.");
         }

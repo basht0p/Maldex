@@ -141,8 +141,10 @@ public sealed class RunCoordinator(
         }
         finally
         {
-            await ReleaseLeaseAsync(taskId, lease).ConfigureAwait(false);
-            if (capture.Used && capture.Stored) CleanupRunNetDir(taskId);
+            // The run's net dir (lease record, daemon logs, the router's flows copy) goes once the lease is released, whether or
+            // not a capture ran. It stays when the release failed (the reconciler needs the lease record) or when captured
+            // data could not be stored (the router's copy is then the only one left).
+            if (await ReleaseLeaseAsync(taskId, lease).ConfigureAwait(false) && (!capture.Used || capture.Stored)) CleanupRunNetDir(taskId);
         }
 
         if (task.Status == RunStatus.Collecting)
@@ -223,7 +225,7 @@ public sealed class RunCoordinator(
                 FullMode = BoundedChannelFullMode.Wait,
             });
 
-            var inbox = new TransferInbox();
+            var inbox = new TransferInbox((enumerator.Current as ReadyMessage)?.Pid);
             var reader = ReadLoopAsync(enumerator, messages.Writer, inbox, readerCts.Token);
             var flusher = FlushLoopAsync(messages.Reader, ingestor, ct);
             disposed = true; // the reader task now owns the enumerator
@@ -237,6 +239,7 @@ public sealed class RunCoordinator(
                 // Recording starts before anything is delivered; if it cannot start, the sample is never sent.
                 await StartCaptureAsync(lease, capture, ct).ConfigureAwait(false);
 
+                // The sample is delivered in Preparing (a failure or stop here never reaches Running)...
                 if (command is OpenSampleCommand open)
                     await DeliverSampleAsync(db, channel, inbox, task, open, ct).ConfigureAwait(false);
 
@@ -247,8 +250,27 @@ public sealed class RunCoordinator(
                     t.DeadlineAt = now.AddSeconds(t.DurationSec);
                 }, ct).ConfigureAwait(false);
 
-                // A sample is opened by its delivery; a URL is opened now.
-                if (command is not OpenSampleCommand) await channel.SendAsync(command, ct).ConfigureAwait(false);
+                // ...and opened only once the run is Running, so the live view sees it start. From here a failed open is a
+                // run error (Running -> Failed), not a Preparing failure.
+                inbox.MarkOpened();
+                if (command is OpenSampleCommand sample)
+                {
+                    try
+                    {
+                        await new SampleDelivery(time, pollInterval: _options.ControlPollInterval)
+                            .OpenAsync(channel, inbox, sample.BlobKey, sample.FileName, ct, async token =>
+                                await db.Tasks.AsNoTracking().Where(t => t.Id == task.Id).Select(t => t.StopRequestedAt).SingleAsync(token).ConfigureAwait(false) is not null)
+                            .ConfigureAwait(false);
+                    }
+                    catch (DeliveryStoppedException)
+                    {
+                        // A stop while the open is pending ends like any stop in Running: the control loop sees it at once.
+                    }
+                }
+                else
+                {
+                    await channel.SendAsync(command, ct).ConfigureAwait(false);
+                }
 
                 var reason = await ControlLoopAsync(task.Id, reader, flusher, channel, ct).ConfigureAwait(false);
 
@@ -316,6 +338,7 @@ public sealed class RunCoordinator(
             }
 
             var now = time.GetUtcNow();
+            var flowsStored = false;
             foreach (var file in files)
             {
                 try
@@ -327,6 +350,7 @@ public sealed class RunCoordinator(
                     {
                         Id = Guid.NewGuid(), TaskId = task.Id, Kind = file.Kind, BlobKey = blob.Key, Sha256 = blob.Sha256, Size = blob.Size, CreatedAt = now,
                     });
+                    flowsStored |= file.Kind == ArtifactKind.MitmFlows;
                 }
                 catch (Exception ex)
                 {
@@ -336,6 +360,15 @@ public sealed class RunCoordinator(
             }
             // Only our own rows: unrelated pending changes are not flushed here.
             if (db.ChangeTracker.Entries<Artifact>().Any(e => e.State == EntityState.Added)) await db.SaveChangesAsync(none).ConfigureAwait(false);
+            // Saved: the router need not keep its own (second, up to 512 MiB) copy of the flows at release.
+            if (flowsStored)
+            {
+                try { NetnsEgressRouter.MarkFlowsStored(netOptions.Value.RunDir, task.Id); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    logger.LogWarning(ex, "Could not mark the flows of task {TaskId} as stored; the router keeps a copy.", task.Id);
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -373,7 +406,7 @@ public sealed class RunCoordinator(
         }
     }
 
-    /// <summary>The run's leftovers (lease record, logs, the router's own copy of the flows) once everything is stored. Best effort.</summary>
+    /// <summary>The run's leftovers (lease record, logs, the router's own copy of the flows) once the lease is released. Best effort.</summary>
     private void CleanupRunNetDir(Guid taskId)
     {
         try
@@ -436,7 +469,7 @@ public sealed class RunCoordinator(
             .ConfigureAwait(false);
     }
 
-    /// <summary>Streams the stored sample into the guest and has it opened. Any failure fails the run in Preparing (no retry).</summary>
+    /// <summary>Streams the stored sample into the guest (it is opened later, once Running). Any failure fails the run in Preparing (no retry).</summary>
     private async Task DeliverSampleAsync(MaldexDbContext db, IAgentChannel channel, TransferInbox inbox, AnalysisTask task, OpenSampleCommand open, CancellationToken ct)
     {
         Stream blob;
@@ -676,11 +709,20 @@ public sealed class RunCoordinator(
         }
     }
 
-    private async Task ReleaseLeaseAsync(Guid taskId, NetworkLease? lease)
+    /// <summary>True when a lease existed and its release succeeded.</summary>
+    private async Task<bool> ReleaseLeaseAsync(Guid taskId, NetworkLease? lease)
     {
-        if (lease is null) return;
-        try { await egress.ReleaseAsync(lease, CancellationToken.None).ConfigureAwait(false); }
-        catch (Exception ex) { logger.LogError(ex, "Releasing network lease for {TaskId} failed.", taskId); }
+        if (lease is null) return false;
+        try
+        {
+            await egress.ReleaseAsync(lease, CancellationToken.None).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Releasing network lease for {TaskId} failed.", taskId);
+            return false;
+        }
     }
 
     private async Task CancelAsync(MaldexDbContext db, AnalysisTask task, string reason)

@@ -19,8 +19,11 @@ public static class BehaviorHeuristics
     private static readonly HashSet<string> ExecutableExtensions = new(StringComparer.OrdinalIgnoreCase)
     { ".exe", ".dll", ".scr", ".com" };
 
+    // Hive prefixes: abbreviated/long names, Sysmon's per-user form (HKU\<SID>\..., how it reports HKCU writes) and the kernel
+    // forms (\REGISTRY\MACHINE, \REGISTRY\USER\<SID>). A user's *_Classes hive has no Run key.
     private static readonly Regex RunKey = new(
-        @"(?i)^(HKLM|HKCU|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER)\\Software\\(WOW6432Node\\)?Microsoft\\Windows\\CurrentVersion\\Run(Once)?(\\|$)",
+        @"(?i)^(HKLM|HKCU|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER|\\REGISTRY\\MACHINE|(HKU|HKEY_USERS|\\REGISTRY\\USER)\\(?![^\\]*_Classes\\)[^\\]+)" +
+        @"\\Software\\(WOW6432Node\\)?Microsoft\\Windows\\CurrentVersion\\Run(Once)?(\\|$)",
         RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
 
     public static IReadOnlyList<DetectionResult> Evaluate(IReadOnlyList<ProcessNode> processes, IReadOnlyList<BehaviorEvent> events)
