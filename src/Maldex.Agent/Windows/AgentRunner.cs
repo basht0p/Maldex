@@ -36,7 +36,7 @@ public static class AgentRunner
             {
                 using var dispatcher = new CommandDispatcher(new ShellSampleOpener(), new ShellUrlOpener(), () => shutdown = true);
                 var source = new CompositeEventSource([
-                    SysmonPresent() ? new SysmonEventSource(time) : new ProcessPollingSource(time),
+                    SysmonPresent() ? new SysmonEventSource() : new ProcessPollingSource(time),
                     new ScreenshotEventSource(new GdiScreenshotGrabber(), time),
                 ]);
                 await new AgentHost(port, source, dispatcher, time).RunAsync(ct).ConfigureAwait(false);
@@ -66,7 +66,7 @@ public static class AgentRunner
         {
             try
             {
-                return new FileStream(PortPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite, 4096, FileOptions.Asynchronous);
+                return AgentPort.OpenDuplex(PortPath);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
