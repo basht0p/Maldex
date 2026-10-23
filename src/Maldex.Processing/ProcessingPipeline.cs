@@ -52,10 +52,11 @@ public sealed class ProcessingPipeline(
 
         await ResetAsync(db, task, ct).ConfigureAwait(false);
 
-        var warnings = new List<string>();
+        var warnings = new List<string>(task.ProcessingWarnings); // only the run's own (capture) warnings survive the reset
         var results = new List<DetectionResult>();
 
         await RunStepAsync("yara", warnings, ct, async () => results.AddRange(await ScanSampleAsync(task, ct).ConfigureAwait(false))).ConfigureAwait(false);
+        await RunStepAsync("yara (dropped files)", warnings, ct, async () => results.AddRange(await ScanDroppedAsync(db, taskId, warnings, ct).ConfigureAwait(false))).ConfigureAwait(false);
         await RunStepAsync("suricata", warnings, ct, async () => results.AddRange(await RunSuricataAsync(db, taskId, ct).ConfigureAwait(false))).ConfigureAwait(false);
         await RunStepAsync("http indexing", warnings, ct, async () =>
         {
@@ -117,7 +118,7 @@ public sealed class ProcessingPipeline(
         {
             await using var tx = await db.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
             await db.Detections.Where(d => d.TaskId == task.Id).ExecuteDeleteAsync(ct).ConfigureAwait(false);
-            task.ProcessingWarnings = [];
+            task.ProcessingWarnings = [.. task.ProcessingWarnings.Where(w => w.StartsWith(AnalysisTask.CaptureWarningPrefix, StringComparison.Ordinal))];
             try
             {
                 await db.SaveChangesAsync(ct).ConfigureAwait(false);
@@ -151,6 +152,32 @@ public sealed class ProcessingPipeline(
         var target = string.IsNullOrEmpty(task.OriginalFileName) ? task.Sample.Sha256 : task.OriginalFileName;
         using var copy = await TempCopy.CreateAsync(artifacts, task.Sample.BlobKey, ct).ConfigureAwait(false);
         return await yara.ScanAsync(copy.Path, target, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>YARA over every file the guest dropped; detections are reported against the file's path inside the guest.</summary>
+    private async Task<IReadOnlyList<DetectionResult>> ScanDroppedAsync(MaldexDbContext db, Guid taskId, List<string> warnings, CancellationToken ct)
+    {
+        var dropped = await db.Artifacts.AsNoTracking()
+            .Where(a => a.TaskId == taskId && a.Kind == ArtifactKind.Dropped)
+            .OrderBy(a => a.CreatedAt).ThenBy(a => a.Id)
+            .ToListAsync(ct).ConfigureAwait(false);
+
+        var found = new List<DetectionResult>();
+        foreach (var file in dropped)
+        {
+            // One unreadable or unscannable file must not hide detections in the others.
+            try
+            {
+                using var copy = await TempCopy.CreateAsync(artifacts, file.BlobKey, ct).ConfigureAwait(false);
+                found.AddRange(await yara.ScanAsync(copy.Path, file.GuestPath ?? file.Sha256, ct).ConfigureAwait(false));
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogWarning(ex, "Scanning dropped file {Sha256} of task {TaskId} failed.", file.Sha256, taskId);
+                warnings.Add(GuestText.Clean($"yara failed on a dropped file ({file.GuestPath ?? file.Sha256}): {ex.Message}", WarningMax));
+            }
+        }
+        return found;
     }
 
     private async Task<IReadOnlyList<DetectionResult>> RunSuricataAsync(MaldexDbContext db, Guid taskId, CancellationToken ct)

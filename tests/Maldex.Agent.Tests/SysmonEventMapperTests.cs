@@ -36,6 +36,25 @@ public class SysmonEventMapperTests
         Assert.Equal(("set", @"HKLM\S\Run", "evil", "c:\\x.exe"), (s.Operation, s.Key, s.ValueName, s.Data));
     }
 
+    /// <summary>Sysmon reports HKCU writes under the user's SID (HKU\&lt;SID&gt;\...); the mapper keeps that form and the run-key heuristic must fire on it.</summary>
+    [Fact]
+    public void Registry_RealSysmonHkuRunValue_MapsAndTriggersPersistenceHeuristic()
+    {
+        const string target = @"HKU\S-1-5-21-3623811015-3361044348-30300820-1013\Software\Microsoft\Windows\CurrentVersion\Run\MaldexTest";
+        var s = Assert.IsType<RegistryEventMessage>(Map(13, ("ProcessId", "4242"), ("EventType", "SetValue"), ("TargetObject", target), ("Details", @"C:\Users\u\AppData\Local\Temp\x.exe")));
+        Assert.Equal(@"HKU\S-1-5-21-3623811015-3361044348-30300820-1013\Software\Microsoft\Windows\CurrentVersion\Run", s.Key);
+        Assert.Equal("MaldexTest", s.ValueName);
+        Assert.Null(AgentMessageValidator.Validate(s));
+        var ev = new Maldex.Core.Domain.BehaviorEvent
+        {
+            Type = Maldex.Core.Domain.EventType.Registry, At = At,
+            Data = System.Text.Json.JsonSerializer.Serialize<AgentMessage>(s, AgentJson.Options),
+        };
+        var d = Assert.Single(Maldex.Core.Verdicts.BehaviorHeuristics.Evaluate([], [ev]));
+        Assert.Equal(Maldex.Core.Verdicts.BehaviorHeuristics.PersistenceRunKey, d.Rule);
+        Assert.Equal(target, d.Target);
+    }
+
     [Fact]
     public void Dns_NormalisesRealisticQueryResults()
     {

@@ -32,4 +32,7 @@ public sealed class FakeEgressOptions
     public const string SectionName = "Maldex:Fake:Egress";
 
     public bool LiveAvailable { get; set; }
+
+    /// <summary>The "VPN exit IP" of fake LiveVpn runs: the fake expected-egress source returns it and the fake guest echoes it, so the self-test passes.</summary>
+    public string LiveEgressIp { get; set; } = "203.0.113.7";
 }

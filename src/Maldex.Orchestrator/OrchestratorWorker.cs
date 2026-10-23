@@ -41,7 +41,7 @@ public sealed class OrchestratorWorker(
     {
         try
         {
-            await reconciler.ReconcileAsync(stoppingToken).ConfigureAwait(false);
+            await ReconcileWithRetryAsync(stoppingToken).ConfigureAwait(false);
 
             using var timer = new PeriodicTimer(PollInterval, time);
             do
@@ -65,6 +65,34 @@ public sealed class OrchestratorWorker(
         {
             // Runs left mid-flight are failed by the reconciler on the next start.
             await StopRunsAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Bounded retry of the startup reconcile. Never claims before a reconcile succeeded (leftovers would hold slots and
+    /// networks); after the last attempt the exception escapes, faulting ExecuteTask, which the host wrapper turns into a stop.
+    /// </summary>
+    private async Task ReconcileWithRetryAsync(CancellationToken ct)
+    {
+        var attempts = Math.Max(1, _options.ReconcileAttempts);
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                await reconciler.ReconcileAsync(ct).ConfigureAwait(false);
+                if (attempt > 1) logger.LogInformation("Startup reconcile succeeded on attempt {Attempt}.", attempt);
+                return;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException && attempt < attempts)
+            {
+                logger.LogWarning(ex, "Startup reconcile failed (attempt {Attempt}/{Attempts}); retrying in {Delay}.", attempt, attempts, _options.ReconcileRetryDelay);
+                await Task.Delay(_options.ReconcileRetryDelay, time, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogCritical(ex, "Startup reconcile failed {Attempts} times; the orchestrator worker stops.", attempts);
+                throw;
+            }
         }
     }
 

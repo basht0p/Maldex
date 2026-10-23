@@ -1,0 +1,317 @@
+using System.Security.Cryptography;
+using Maldex.Core.Abstractions;
+using Maldex.Core.Agent;
+using Maldex.Core.Domain;
+using Maldex.Integration.Tests.Fixtures;
+using Maldex.Processing;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Xunit;
+
+namespace Maldex.Integration.Tests.Orchestrator;
+
+/// <summary>Records when the coordinator starts/stops the capture and what the rest of the run looked like at that moment.</summary>
+internal sealed class RecordingCapture(Func<IServiceProvider> services) : ICaptureService, IDisposable
+
+{
+    public Func<IServiceProvider> Services { get; } = services;
+    public string Dir { get; } = Directory.CreateTempSubdirectory("maldex-cap-test-").FullName;
+    public List<string> HandleWarnings { get; } = [];
+    public void Dispose() { try { Directory.Delete(Dir, true); } catch (IOException) { } }
+    public Exception? StartFails { get; set; }
+    public Exception? StopFails { get; set; }
+    public bool Disposed { get; private set; }
+    public bool? OpenSentAtStart;
+    public int VmsAtStop = -1;
+    public int LeasesAtStop = -1;
+    public List<string> Order { get; } = [];
+
+    public async Task<ICaptureHandle> StartAsync(NetworkLease lease, CancellationToken ct)
+    {
+        Order.Add("start");
+        var channels = ((CapturingChannelFactory)Services.Invoke().GetRequiredService<IAgentChannelFactory>()).Channels;
+        OpenSentAtStart = channels.SelectMany(c => c.SentCommands).Any(c => c is OpenSampleCommand or OpenUrlCommand);
+        if (StartFails is not null) throw StartFails;
+        await Task.CompletedTask;
+        return new Handle(this);
+    }
+
+    private sealed class Handle(RecordingCapture owner) : ICaptureHandle
+    {
+        public async Task<IReadOnlyList<CapturedFile>> StopAsync(CancellationToken ct)
+        {
+            owner.Order.Add("stop");
+            var sp = owner.Services();
+            owner.VmsAtStop = (await sp.GetRequiredService<IHypervisor>().ListAsync(ct)).Count;
+            owner.LeasesAtStop = (await sp.GetRequiredService<IEgressRouter>().ListAsync(ct)).Count;
+            if (owner.StopFails is not null) throw owner.StopFails;
+            var pcap = Path.Combine(owner.Dir, "capture.pcap");
+            var flows = Path.Combine(owner.Dir, "flows.jsonl");
+            await File.WriteAllBytesAsync(pcap, [.. Enumerable.Range(0, 100).Select(i => (byte)i)], ct);
+            await File.WriteAllTextAsync(flows, "{\"method\":\"GET\",\"url\":\"http://203.0.113.5/\",\"host\":\"203.0.113.5\",\"status\":200}\n", ct);
+            return [new CapturedFile(ArtifactKind.Pcap, pcap), new CapturedFile(ArtifactKind.MitmFlows, flows)];
+        }
+
+        public IReadOnlyList<string> Warnings => owner.HandleWarnings;
+
+        public ValueTask DisposeAsync()
+        {
+            owner.Disposed = true;
+            return ValueTask.CompletedTask;
+        }
+    }
+}
+
+[Collection("sql")]
+public class CaptureWiringTests(SqlServerFixture sql)
+{
+    private static CancellationToken Ct => TestContext.Current.CancellationToken;
+
+    private static async Task<(OrchestratorHarness H, RecordingCapture Cap)> HarnessAsync(SqlServerFixture sql)
+    {
+        RecordingCapture? cap = null;
+        OrchestratorHarness? h = null;
+        h = await OrchestratorHarness.CreateAsync(sql, null, services =>
+        {
+            cap = new RecordingCapture(() => h!.Services);
+            services.Replace(ServiceDescriptor.Singleton<ICaptureService>(cap));
+        });
+        return (h, cap!);
+    }
+
+    [Fact]
+    public async Task Coordinator_StoresPcapAndFlowsArtifacts()
+    {
+        var (h, cap) = await HarnessAsync(sql);
+        await using var _ = h;
+        using var __ = cap;
+        var id = await h.SeedPreparingTaskAsync();
+
+        await h.RunAsync(id);
+
+        await using var db = h.NewContext();
+        var task = await db.Tasks.SingleAsync(t => t.Id == id, Ct);
+        Assert.Equal(RunStatus.Processing, task.Status);
+        var artifacts = await db.Artifacts.Where(a => a.TaskId == id && (a.Kind == ArtifactKind.Pcap || a.Kind == ArtifactKind.MitmFlows)).ToListAsync(Ct);
+        Assert.Equal([ArtifactKind.Pcap, ArtifactKind.MitmFlows], artifacts.OrderBy(a => a.Kind).Select(a => a.Kind));
+
+        var pcap = artifacts.Single(a => a.Kind == ArtifactKind.Pcap);
+        var expected = Enumerable.Range(0, 100).Select(i => (byte)i).ToArray();
+        Assert.Equal(Convert.ToHexStringLower(SHA256.HashData(expected)), pcap.Sha256);
+        Assert.Equal(100, pcap.Size);
+        await using (var stored = await h.Get<IArtifactStore>().OpenReadAsync(pcap.BlobKey, Ct))
+        {
+            using var ms = new MemoryStream();
+            await stored.CopyToAsync(ms, Ct);
+            Assert.Equal(expected, ms.ToArray());
+        }
+        var flows = artifacts.Single(a => a.Kind == ArtifactKind.MitmFlows);
+        Assert.True(flows.Size > 0);
+        Assert.True(h.Get<IArtifactStore>().Exists(flows.BlobKey));
+
+        Assert.Empty(task.ProcessingWarnings);
+        Assert.True(cap.Disposed, "the handle is disposed once the files are stored");
+    }
+
+    [Fact]
+    public async Task Coordinator_Order_CaptureStartsBeforeDelivery_StopsAfterVmGone_BeforeLeaseRelease()
+    {
+        var (h, cap) = await HarnessAsync(sql);
+        await using var _ = h;
+        using var __ = cap;
+        var id = await h.SeedPreparingTaskAsync();
+
+        await h.RunAsync(id);
+
+        Assert.Equal(["start", "stop"], cap.Order);
+        Assert.False(cap.OpenSentAtStart);    // recording was already on when the sample was delivered
+        Assert.Equal(0, cap.VmsAtStop);       // the VM was destroyed before capture stopped
+        Assert.Equal(1, cap.LeasesAtStop);    // the lease is still held while capture stops
+        Assert.Empty(await h.Get<IEgressRouter>().ListAsync(Ct));
+        Assert.Contains(h.Channels.Channels.SelectMany(c => c.SentCommands), c => c is OpenSampleCommand);
+    }
+
+    [Fact]
+    public async Task Coordinator_CaptureStartFails_FailsInPreparing_SampleNeverSent()
+    {
+        var (h, cap) = await HarnessAsync(sql);
+        await using var _ = h;
+        using var __ = cap;
+        cap.StartFails = new CaptureStartException("tcpdump did not start capturing in time");
+        var id = await h.SeedPreparingTaskAsync();
+
+        await h.RunAsync(id);
+
+        await using var db = h.NewContext();
+        var task = await db.Tasks.SingleAsync(t => t.Id == id, Ct);
+        Assert.Equal(RunStatus.Failed, task.Status);
+        Assert.Equal("capture failed to start: tcpdump did not start capturing in time", task.FailureReason);
+        var failed = await db.TaskStatusHistory.Where(x => x.TaskId == id).OrderByDescending(x => x.Id).FirstAsync(Ct);
+        Assert.Equal(RunStatus.Preparing, failed.From);
+        Assert.Equal(RunStatus.Failed, failed.To);
+        Assert.DoesNotContain(h.Channels.Channels.SelectMany(c => c.SentCommands), c => c is OpenSampleCommand or OpenUrlCommand);
+        Assert.Empty(await h.Get<IHypervisor>().ListAsync(Ct));
+        Assert.Empty(await h.Get<IEgressRouter>().ListAsync(Ct));
+        Assert.Empty(await db.Artifacts.Where(a => a.TaskId == id && (a.Kind == ArtifactKind.Pcap || a.Kind == ArtifactKind.MitmFlows)).ToListAsync(Ct));
+    }
+
+    [Fact]
+    public async Task Coordinator_CaptureStopFails_RecordsWarning_AndContinuesToProcessing()
+    {
+        var (h, cap) = await HarnessAsync(sql);
+        await using var _ = h;
+        using var __ = cap;
+        cap.StopFails = new IOException("disk full");
+        var id = await h.SeedPreparingTaskAsync();
+
+        await h.RunAsync(id);
+
+        await using (var db = h.NewContext())
+        {
+            var task = await db.Tasks.SingleAsync(t => t.Id == id, Ct);
+            Assert.Equal(RunStatus.Processing, task.Status);
+            Assert.Equal(["capture: the capture could not be stopped cleanly: disk full"], task.ProcessingWarnings);
+            Assert.Empty(await db.Artifacts.Where(a => a.TaskId == id && a.Kind == ArtifactKind.Pcap).ToListAsync(Ct));
+        }
+        Assert.True(cap.Disposed);
+
+        // processing rewrites the warnings list but keeps the run's own capture warning
+        await h.Get<IProcessingPipeline>().ProcessAsync(id, Ct);
+        await using var db2 = h.NewContext();
+        var done = await db2.Tasks.SingleAsync(t => t.Id == id, Ct);
+        Assert.Equal(RunStatus.Completed, done.Status);
+        Assert.Contains("capture: the capture could not be stopped cleanly: disk full", done.ProcessingWarnings);
+    }
+
+    [Fact]
+    public async Task Coordinator_HandleWarnings_BecomeProcessingWarnings_ArtifactsStillStored()
+    {
+        var (h, cap) = await HarnessAsync(sql);
+        await using var _ = h;
+        using var __ = cap;
+        cap.HandleWarnings.Add("pcap truncated at the size limit");
+        var id = await h.SeedPreparingTaskAsync();
+
+        await h.RunAsync(id);
+
+        await using var db = h.NewContext();
+        var task = await db.Tasks.SingleAsync(t => t.Id == id, Ct);
+        Assert.Equal(RunStatus.Processing, task.Status);
+        Assert.Equal(["capture: pcap truncated at the size limit"], task.ProcessingWarnings);
+        Assert.Equal(2, await db.Artifacts.CountAsync(a => a.TaskId == id && (a.Kind == ArtifactKind.Pcap || a.Kind == ArtifactKind.MitmFlows), Ct));
+    }
+
+    /// <summary>A router whose release always fails (the run's namespace may still exist).</summary>
+    private sealed class FailingReleaseRouter(IEgressRouter inner) : IEgressRouter
+    {
+        public Task<NetworkLease> CreateAsync(Guid taskId, NetworkMode mode, string? exitCountry, CancellationToken ct) => inner.CreateAsync(taskId, mode, exitCountry, ct);
+        public Task ReleaseAsync(NetworkLease lease, CancellationToken ct) => throw new IOException("ip netns del: device busy");
+        public Task<IReadOnlyList<NetworkLease>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
+    }
+
+    private static string SeedNetDir(string runDir, Guid taskId)
+    {
+        var dir = Path.Combine(runDir, "net", Maldex.Infrastructure.Net.RunNetNames.For(taskId).Namespace);
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "lease.json"), "{}");
+        return dir;
+    }
+
+    [Fact]
+    public async Task Coordinator_ReleaseSucceeded_NetDirRemoved_EvenWithoutCapture()
+    {
+        var runDir = Directory.CreateTempSubdirectory("maldex-netdir-").FullName;
+        try
+        {
+            await using var h = await OrchestratorHarness.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Real:Net:RunDir"] = runDir });
+            h.Get<Maldex.Infrastructure.Fakes.FakeGuest>().SetReachable("gateway"); // self-test fails: the capture never starts
+            var id = await h.SeedPreparingTaskAsync();
+            var dir = SeedNetDir(runDir, id);
+            await h.RunAsync(id);
+
+            await using var db = h.NewContext();
+            Assert.Equal(RunStatus.Failed, (await db.Tasks.SingleAsync(t => t.Id == id, Ct)).Status);
+            Assert.False(Directory.Exists(dir), "the lease was released: its run dir must go");
+        }
+        finally { Directory.Delete(runDir, true); }
+    }
+
+    [Fact]
+    public async Task Coordinator_ReleaseFailed_NetDirKept()
+    {
+        var runDir = Directory.CreateTempSubdirectory("maldex-netdir-").FullName;
+        try
+        {
+            await using var h = await OrchestratorHarness.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Real:Net:RunDir"] = runDir }, s =>
+            {
+                var inner = s.Last(d => d.ServiceType == typeof(IEgressRouter));
+                s.Replace(ServiceDescriptor.Singleton<IEgressRouter>(sp => new FailingReleaseRouter((IEgressRouter)ActivatorUtilities.CreateInstance(sp, inner.ImplementationType!))));
+            });
+            var id = await h.SeedPreparingTaskAsync();
+            var dir = SeedNetDir(runDir, id);
+            await h.RunAsync(id);
+
+            Assert.True(File.Exists(Path.Combine(dir, "lease.json")), "a lease that failed to release keeps its record (the reconciler needs it)");
+        }
+        finally { Directory.Delete(runDir, true); }
+    }
+
+    /// <summary>Records whether the capture's "flows stored" marker existed when the lease was released.</summary>
+    private sealed class MarkerSpyRouter(IEgressRouter inner, string runDir) : IEgressRouter
+    {
+        public bool? MarkerAtRelease;
+        public Task<NetworkLease> CreateAsync(Guid taskId, NetworkMode mode, string? exitCountry, CancellationToken ct) => inner.CreateAsync(taskId, mode, exitCountry, ct);
+        public Task ReleaseAsync(NetworkLease lease, CancellationToken ct)
+        {
+            MarkerAtRelease ??= File.Exists(Path.Combine(runDir, "net", Maldex.Infrastructure.Net.RunNetNames.For(lease.TaskId).Namespace, Maldex.Infrastructure.Net.NetnsEgressRouter.FlowsStoredMarker));
+            return inner.ReleaseAsync(lease, ct);
+        }
+        public Task<IReadOnlyList<NetworkLease>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
+    }
+
+    [Theory]
+    [InlineData(false, true)]  // flows stored as an artifact: the router must not copy them again
+    [InlineData(true, false)]  // storing failed: the router's copy is the fallback
+    public async Task Coordinator_TellsTheRouterWhenFlowsAreStored(bool storeFails, bool expectMarker)
+    {
+        var runDir = Directory.CreateTempSubdirectory("maldex-netdir-").FullName;
+        try
+        {
+            RecordingCapture? cap = null;
+            MarkerSpyRouter? spy = null;
+            OrchestratorHarness? h = null;
+            h = await OrchestratorHarness.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Real:Net:RunDir"] = runDir }, s =>
+            {
+                cap = new RecordingCapture(() => h!.Services);
+                s.Replace(ServiceDescriptor.Singleton<ICaptureService>(cap));
+                var inner = s.Last(d => d.ServiceType == typeof(IEgressRouter));
+                s.Replace(ServiceDescriptor.Singleton<IEgressRouter>(sp => spy = new MarkerSpyRouter((IEgressRouter)ActivatorUtilities.CreateInstance(sp, inner.ImplementationType!), runDir)));
+                if (storeFails) s.Replace(ServiceDescriptor.Singleton<IArtifactStore>(new FailingFlowsStore()));
+            });
+            await using var _ = h;
+            using var __ = cap;
+            var id = await h.SeedPreparingTaskAsync(durationSec: 60);
+            SeedNetDir(runDir, id);
+            await h.RunAsync(id, async () =>
+            {
+                await h.WaitForStatusAsync(id, RunStatus.Running);
+                h.Time.Advance(TimeSpan.FromSeconds(61));
+            });
+            Assert.Equal(expectMarker, spy!.MarkerAtRelease);
+        }
+        finally { Directory.Delete(runDir, true); }
+    }
+
+    /// <summary>Stores everything except captured flows.</summary>
+    private sealed class FailingFlowsStore : IArtifactStore
+    {
+        private readonly MemoryArtifactStore _inner = new();
+        public Task<StoredBlob> PutAsync(string category, Stream content, long maxBytes, CancellationToken ct) =>
+            category == "flows" ? throw new IOException("disk full") : _inner.PutAsync(category, content, maxBytes, ct);
+        public Task<Stream> OpenReadAsync(string key, CancellationToken ct) => _inner.OpenReadAsync(key, ct);
+        public Task DeleteAsync(string key, CancellationToken ct) => _inner.DeleteAsync(key, ct);
+        public bool Exists(string key) => _inner.Exists(key);
+        public IAsyncEnumerable<(string Key, DateTimeOffset LastWrite)> ListAsync(CancellationToken ct) => _inner.ListAsync(ct);
+    }
+}

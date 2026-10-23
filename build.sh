@@ -79,7 +79,7 @@ start_guacd() {
   docker rm -f maldex-guacd >/dev/null 2>&1 || true
   docker run -d --rm --name maldex-guacd --network host guacamole/guacd:1.5.5 /opt/guacamole/sbin/guacd -b 127.0.0.1 -L info -f >/dev/null
   GUACD_STARTED=1
-  export Maldex__Mode=Real
+  export Maldex__Mode=Real   # the backend then layers src/Maldex.Web/appsettings.Real.json over appsettings.json
 }
 
 stop_guacd() {
@@ -221,6 +221,48 @@ UNIT
   sudo systemctl restart maldex-host-guard.service
 }
 
+# Dedicated, powerless account for the per-run mitmproxy: own group, no supplementary groups, no home, no shell, no sudoers.
+ensure_mitm_user() {
+  if ! id maldex-mitm >/dev/null 2>&1; then
+    sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin maldex-mitm
+  fi
+}
+
+# INetSim insists on root; it runs in a user namespace whose root is maldex-isroot and whose 'inetsim' is maldex-isuser.
+# Both are dedicated, powerless system accounts: own group only, no home, no shell, no sudoers, own nothing on the host.
+ensure_inetsim_userns_ids() {
+  local u
+  for u in maldex-isroot maldex-isuser; do
+    if ! id "$u" >/dev/null 2>&1; then
+      sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "$u"
+    fi
+  done
+}
+
+# mitmproxy's CA (the guest image trusts it); generated once, copied per run into a private confdir for maldex-mitm.
+MITM_CA_DIR=".data/mitm/ca"
+ensure_mitm_ca() {
+  mkdir -p "$MITM_CA_DIR"
+  chmod 0700 "$MITM_CA_DIR"
+  if [ ! -f "$MITM_CA_DIR/mitmproxy-ca.pem" ]; then
+    # mitmdump writes the CA at startup and then idles; stop it after a few seconds.
+    timeout 8 mitmdump --set "confdir=$MITM_CA_DIR" -n -q >/dev/null 2>&1 || true
+  fi
+  [ -f "$MITM_CA_DIR/mitmproxy-ca.pem" ] && [ -f "$MITM_CA_DIR/mitmproxy-ca-cert.pem" ]
+}
+
+# INetSim's template data is only ever read (as root) and copied per run, so it must be root-owned, not writable by others
+# and free of symlinks; the guest-facing INetSim user gets only fresh per-run leaf directories.
+harden_inetsim_template() {
+  sudo chown -R root:root /var/lib/inetsim
+  sudo chmod -R go-w /var/lib/inetsim
+  sudo chmod 0755 /var/lib/inetsim
+}
+
+inetsim_template_clean() {
+  [ -z "$(sudo find /var/lib/inetsim \( -type l -o ! -user root -o -perm /022 \) -print -quit)" ]
+}
+
 # Stop and disable a system unit Maldex runs per run; tolerate only a missing unit, then verify it is inactive.
 disable_system_unit() {
   local unit="$1"
@@ -276,6 +318,10 @@ cmd_real_setup() {
   disable_system_unit suricata
 
   install_host_guard
+  ensure_mitm_user
+  ensure_inetsim_userns_ids
+  ensure_mitm_ca
+  harden_inetsim_template
 
   real_verify
 }
@@ -310,6 +356,17 @@ real_verify() {
   real_check "host guard table loaded" "./build.sh real-setup" sudo -n nft list table inet maldex_guard
   real_check "br_netfilter not filtering bridged traffic (host guard assumes this)" "sudo sysctl -w net.bridge.bridge-nf-call-iptables=0 and do not load br_netfilter" \
     bash -c '[ ! -e /proc/sys/net/bridge/bridge-nf-call-iptables ] || [ "$(cat /proc/sys/net/bridge/bridge-nf-call-iptables)" != 1 ]'
+  real_check "maldex-mitm user exists with no supplementary groups" "./build.sh real-setup" \
+    bash -c '[ "$(id -nG maldex-mitm)" = maldex-mitm ] && ! sudo -n grep -rqs maldex-mitm /etc/sudoers /etc/sudoers.d'
+  for u in maldex-isroot maldex-isuser; do
+    real_check "$u user exists, non-root, own group only, no sudoers" "./build.sh real-setup" \
+      bash -c "[ \"\$(id -nG $u)\" = $u ] && [ \"\$(id -u $u)\" != 0 ] && ! sudo -n grep -rqs $u /etc/sudoers /etc/sudoers.d"
+  done
+  real_check "INetSim user-namespace ids are distinct" "./build.sh real-setup" \
+    bash -c '[ "$(id -u maldex-isroot)" != "$(id -u maldex-isuser)" ] && [ "$(id -g maldex-isroot)" != "$(id -g maldex-isuser)" ]'
+  real_check "mitmproxy CA present (.data/mitm/ca)" "./build.sh real-setup" \
+    bash -c "[ -f $MITM_CA_DIR/mitmproxy-ca.pem ] && [ -f $MITM_CA_DIR/mitmproxy-ca-cert.pem ]"
+  real_check "/var/lib/inetsim is root-owned, not group/world-writable, symlink-free" "./build.sh real-setup" inetsim_template_clean
   real_check "host guard enabled at boot" "./build.sh real-setup" systemctl is-enabled maldex-host-guard
   return "$REAL_FAILED"
 }
@@ -379,6 +436,17 @@ cmd_build_guest() {
     deploy/guest/build-guest.sh
 }
 
+# Harmless real-VM end-to-end suite (needs the built guest image; see deploy/guest/README.md "Running the E2E suite").
+cmd_e2e() {
+  local base="$VM_DIR/base"
+  if [ ! -f "$base/win11-26h2.qcow2" ] || [ ! -f "$base/win11-26h2.vars.fd" ]; then
+    echo "The Windows 11 26H2 base image is missing ($base/win11-26h2.qcow2 and .vars.fd)." >&2
+    echo "Build it first:  MALDEX_WIN_ISO=/path/to/Win11_26H2.iso ./build.sh build-guest" >&2
+    return 2
+  fi
+  MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 dotnet test --project tests/Maldex.Integration.Tests --filter-class "*RealVmE2ETests"
+}
+
 case "${1:-}" in
   setup)  cmd_setup ;;
   dev-db) cmd_dev_db ;;
@@ -389,6 +457,6 @@ case "${1:-}" in
   real-setup) cmd_real_setup ;;
   real-smoke) cmd_real_smoke ;;
   build-guest) cmd_build_guest ;;
-  e2e)    echo "Real-VM E2E is implemented in Plan 1b"; exit 2 ;;
+  e2e)    cmd_e2e ;;
   *) echo "usage: $0 setup|dev-db|run|test|smoke|build|real-setup|real-smoke|build-guest|e2e" >&2; exit 64 ;;
 esac

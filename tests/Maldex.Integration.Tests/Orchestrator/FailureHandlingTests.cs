@@ -146,7 +146,8 @@ public class FailureHandlingTests(SqlServerFixture sql)
         var garbage = Enumerable.Repeat("this is not a frame", 12).ToArray();
         var dir = await WriteReplayAsync([
             ReadyLine,
-            JsonSerializer.Serialize(new { delayMs = 1, message = new { type = "process_started", at = "2000-01-01T00:00:00Z", pid = 10, parentPid = 1, imagePath = "C:\\a.exe", commandLine = "a.exe", user = "u" } }),
+            // The delay keeps the garbage from arriving while the sample is still being delivered (which would end the run in Preparing).
+            JsonSerializer.Serialize(new { delayMs = 600_000, message = new { type = "process_started", at = "2000-01-01T00:00:00Z", pid = 10, parentPid = 1, imagePath = "C:\\a.exe", commandLine = "a.exe", user = "u" } }),
             .. garbage,
         ]);
         try

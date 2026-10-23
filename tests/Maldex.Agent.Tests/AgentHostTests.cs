@@ -27,6 +27,7 @@ public class AgentHostTests
         var ready = Assert.IsType<ReadyMessage>(await pair.NextAsync());
         Assert.Equal(Environment.MachineName, ready.Hostname);
         Assert.False(string.IsNullOrWhiteSpace(ready.AgentVersion));
+        Assert.Equal(Environment.ProcessId, ready.Pid); // the host scopes dropped files to children of this pid
 
         pair.CloseHostSide();
         await run.WaitAsync(Limit, TestContext.Current.CancellationToken);

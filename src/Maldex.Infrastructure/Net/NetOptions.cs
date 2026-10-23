@@ -17,5 +17,17 @@ public sealed class NetOptions
     public string DnsmasqBinary { get; set; } = "dnsmasq";
     public string WireGuardConfigDir { get; set; } = "/etc/maldex/wg";
     public string RunDir { get; set; } = ".data/vm/run";
+    /// <summary>Fetched by the guest during the isolation self-test; the answer must match the run's network mode. The URL must return a bare IP address (the body is compared as an IP in LiveVpn mode).</summary>
+    public string EchoUrl { get; set; } = "http://api.ipify.org/";
+
     public int MaxRuns { get; set; } = 64;
+
+    /// <summary>The CA directory the guest image trusts (mitmproxy confdir). Resolved with Path.GetFullPath.</summary>
+    public string MitmConfDir { get; set; } = ".data/mitm/ca";
+
+    /// <summary>Directory holding the mitm addon (<c>mitm/maldex_jsonl.py</c>) and <c>inetsim/inetsim.conf</c>.</summary>
+    public string DeployNetDir { get; set; } = "deploy/net";
+
+    /// <summary>Template INetSim data (read-only content); each run gets its own copy.</summary>
+    public string InetSimDataDir { get; set; } = "/var/lib/inetsim";
 }

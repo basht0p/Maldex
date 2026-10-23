@@ -13,4 +13,7 @@ public sealed class OrchestratorOptions
     public int FlushBatchSize { get; set; } = 200;
     public TimeSpan ControlPollInterval { get; set; } = TimeSpan.FromSeconds(1);
     public long MinFreeDiskMiB { get; set; } = 5120;
+    /// <summary>Startup reconcile attempts (DB not ready yet, a virsh hiccup) before the worker gives up and faults.</summary>
+    public int ReconcileAttempts { get; set; } = 5;
+    public TimeSpan ReconcileRetryDelay { get; set; } = TimeSpan.FromSeconds(5);
 }

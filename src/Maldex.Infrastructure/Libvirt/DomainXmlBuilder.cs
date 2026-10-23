@@ -1,6 +1,7 @@
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using Maldex.Core.Abstractions;
+using Maldex.Infrastructure.Net;
 
 namespace Maldex.Infrastructure.Libvirt;
 
@@ -55,6 +56,7 @@ public static partial class DomainXmlBuilder
                     new XElement("source", new XAttribute("file", paths.OverlayDiskPath)),
                     new XElement("target", new XAttribute("dev", "vda"), new XAttribute("bus", "virtio"))),
                 new XElement("interface", new XAttribute("type", "ethernet"),
+                    new XElement("mac", new XAttribute("address", RunNetNames.GuestMac(spec.TaskId))),
                     new XElement("target", new XAttribute("dev", spec.NetworkId), new XAttribute("managed", "no")),
                     new XElement("model", new XAttribute("type", "virtio"))),
                 new XElement("channel", new XAttribute("type", "unix"),

@@ -26,14 +26,11 @@ public class InfrastructureRegistrationTests
         using var sp = Add(mode).BuildServiceProvider();
         Assert.IsType<FakeHypervisor>(sp.GetRequiredService<IHypervisor>());
         Assert.IsType<NoopEgressRouter>(sp.GetRequiredService<IEgressRouter>());
+        Assert.IsType<NoopCaptureService>(sp.GetRequiredService<ICaptureService>());
         Assert.IsType<FakeAgentChannelFactory>(sp.GetRequiredService<IAgentChannelFactory>());
         Assert.NotNull(sp.GetRequiredService<IDiskSpaceProbe>());
         Assert.Same(sp.GetRequiredService<IHypervisor>(), sp.GetRequiredService<IHypervisor>());
     }
-
-    [Fact]
-    public void RealMode_NotSupported() =>
-        Assert.Equal("Real mode is implemented in Plan 1b", Assert.Throws<NotSupportedException>(() => Add("Real")).Message);
 
     [Fact]
     public void UnknownMode_Throws() => Assert.Throws<InvalidOperationException>(() => Add("Bogus"));
