@@ -114,8 +114,8 @@ public class TemplateSealerTests
         await kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct);
 
         var types = ch.SentCommands.Select(c => c.GetType()).ToList();
-        // 3 agent chunks + 1 sysmon + 1 CA, then apply, then power off.
-        Assert.Equal([.. Enumerable.Repeat(typeof(PutFileChunkCommand), 5), typeof(ApplyComponentsCommand), typeof(PowerOffCommand)], types);
+        // The liveness round trip, 3 agent chunks + 1 sysmon + 1 CA, then apply, then power off.
+        Assert.Equal([typeof(ProvenanceCommand), .. Enumerable.Repeat(typeof(PutFileChunkCommand), 5), typeof(ApplyComponentsCommand), typeof(PowerOffCommand)], types);
         // Sealed once, after the guest was gone.
         Assert.Equal([("win11-edit", 0)], kit.Store.Seals);
         Assert.Empty(await kit.Hypervisor.ListAsync(Ct));
@@ -149,17 +149,54 @@ public class TemplateSealerTests
     }
 
     [Fact]
-    public async Task Seal_AgentNeverReady_FailsWithoutSealing()
+    public async Task Seal_AgentNeverAnswers_FailsWithoutSealing()
     {
         await using var kit = new TemplateJobKit();
-        kit.Options.AgentReadyTimeout = TimeSpan.FromMilliseconds(300);
-        var (ch, vm) = await kit.StartTemplateVmAsync(ready: false);
+        kit.Guest.SilentProvenance = true;
+        kit.Options.ProvenanceTimeout = TimeSpan.FromMilliseconds(300);
+        var (ch, vm) = await kit.StartTemplateVmAsync();
 
         var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
 
-        Assert.Contains("agent", ex.Message);
+        Assert.StartsWith("the guest agent did not answer", ex.Message);
         Assert.Empty(kit.Store.Seals);
-        Assert.Empty(ch.SentCommands);
+        Assert.IsType<ProvenanceCommand>(Assert.Single(ch.SentCommands)); // nothing was delivered
+    }
+
+    [Fact]
+    public async Task Seal_AgentRefusesTheRoundTrip_Fails()
+    {
+        await using var kit = new TemplateJobKit();
+        kit.Guest.RejectProvenance = true;
+        var (ch, vm) = await kit.StartTemplateVmAsync();
+
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
+
+        Assert.StartsWith("the guest agent did not answer", ex.Message);
+        Assert.Empty(kit.Store.Seals);
+    }
+
+    [Fact]
+    public async Task Seal_NeverSeesAReadyMessage_StillSeals() // R25: a second connection to a long-running agent gets no ready
+    {
+        await using var kit = new TemplateJobKit();
+        var (ch, vm) = await kit.StartTemplateVmAsync(ready: false);
+
+        await kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct);
+
+        Assert.Equal([("win11-edit", 0)], kit.Store.Seals);
+    }
+
+    [Fact]
+    public async Task Seal_CancelledDuringTheRoundTrip_Propagates()
+    {
+        await using var kit = new TemplateJobKit();
+        kit.Guest.SilentProvenance = true;
+        var (ch, vm) = await kit.StartTemplateVmAsync();
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, cts.Token));
+        Assert.Empty(kit.Store.Seals);
     }
 
     [Fact]

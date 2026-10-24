@@ -1,4 +1,5 @@
 using Maldex.Data.Templates;
+using Maldex.Infrastructure.Real;
 using Maldex.Orchestrator.Templates;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -18,6 +19,16 @@ public static class DependencyInjection
         services.AddMaldexTemplateCatalog(configuration);
         services.Configure<OrchestratorOptions>(configuration.GetSection(OrchestratorOptions.SectionName));
         services.Configure<TemplateJobOptions>(configuration.GetSection(TemplateJobOptions.SectionName));
+        // The web host starts in src/Maldex.Web, so the relative component paths must not depend on the working directory: same base as real mode (both modes load the bundle).
+        services.PostConfigure<TemplateJobOptions>(o =>
+        {
+            var configuredRoot = configuration[$"{RealOptions.SectionName}:{nameof(RealOptions.Root)}"];
+            var root = string.IsNullOrWhiteSpace(configuredRoot) ? RealPaths.FindRoot(AppContext.BaseDirectory) : Path.GetFullPath(configuredRoot);
+            o.AgentExePath = RealPaths.Resolve(root, o.AgentExePath);
+            o.AgentVersionPath = RealPaths.Resolve(root, o.AgentVersionPath);
+            o.SysmonConfigPath = RealPaths.Resolve(root, o.SysmonConfigPath);
+            o.MitmCaPemPath = RealPaths.Resolve(root, o.MitmCaPemPath);
+        });
         services.AddSingleton<VmSlotGate>();
         services.AddSingleton<JobConsoleRegistry>();
         services.AddSingleton<TemplateSealer>();

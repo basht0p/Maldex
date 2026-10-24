@@ -58,6 +58,9 @@ public sealed class FakeGuest
     /// <summary>When true, the fake guest never answers <c>provenance</c>.</summary>
     public bool SilentProvenance { get; set; }
 
+    /// <summary>When true, <c>provenance</c> is refused as an unknown command (an agent older than the command).</summary>
+    public bool RejectProvenance { get; set; }
+
     private readonly ConcurrentQueue<string> _applied = new();
 
     /// <summary>Transfer ids (agent, Sysmon config, CA) of every accepted <c>apply_components</c>, in the order the command named them.</summary>

@@ -16,6 +16,10 @@ public sealed class TemplateJobOptions
     public TimeSpan AgentReadyTimeout { get; set; } = TimeSpan.FromMinutes(5);
     public TimeSpan PowerOffTimeout { get; set; } = TimeSpan.FromMinutes(3);
     public TimeSpan VerifyTimeout { get; set; } = TimeSpan.FromMinutes(5);
+    /// <summary>How long writing the current agent into the working copy (libguestfs) may take.</summary>
+    public TimeSpan AgentInstallTimeout { get; set; } = TimeSpan.FromMinutes(5);
+    /// <summary>How long a booted working copy's agent may take to answer the provenance check (after it said ready).</summary>
+    public TimeSpan ProvenanceTimeout { get; set; } = TimeSpan.FromMinutes(1);
     /// <summary>How long the coordinator waits for the open consoles of a job to close once a seal is requested, before sealing anyway.</summary>
     public TimeSpan ConsoleCloseTimeout { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan ConfigureIdleTimeout { get; set; } = TimeSpan.FromHours(2);

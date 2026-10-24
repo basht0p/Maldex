@@ -43,6 +43,7 @@ public static class DependencyInjection
             case "Fake":
                 services.AddSingleton<IHypervisor, FakeHypervisor>();
                 services.AddSingleton<ITemplateStore, FakeTemplateStore>();
+                services.AddSingleton<IGuestDiskEditor, FakeGuestDiskEditor>();
                 services.AddSingleton<FakeGuest>();
                 services.AddSingleton<IAgentChannelFactory, FakeAgentChannelFactory>();
                 services.AddSingleton<IEgressRouter, NoopEgressRouter>();
@@ -113,6 +114,7 @@ public static class DependencyInjection
         services.AddSingleton<IProcessRunner, ProcessRunner>();
         services.AddSingleton<IHypervisor, LibvirtHypervisor>();
         services.AddSingleton<ITemplateStore, LibvirtTemplateStore>();
+        services.AddSingleton<IGuestDiskEditor, GuestfishDiskEditor>();
         services.AddSingleton<IVmConsoleLocator, VncConsoleLocator>();
         services.AddSingleton<IAgentChannelFactory, VirtioSerialAgentChannelFactory>();
         services.AddSingleton<IEgressRouter, NetnsEgressRouter>();
