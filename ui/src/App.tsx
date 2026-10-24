@@ -3,6 +3,8 @@ import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom'
 import { getMe } from './api/client'
 import type { MeDto } from './api/types'
 import styles from './App.module.css'
+import markDark from '../../brand/logo/maldex-mark.svg'
+import markLight from '../../brand/logo/maldex-mark-light.svg'
 import OrgsAdminPage from './pages/OrgsAdminPage'
 import SubmitPage from './pages/SubmitPage'
 import TaskPage from './pages/TaskPage'
@@ -21,7 +23,11 @@ export default function App() {
   return (
     <BrowserRouter>
       <nav className={styles.nav}>
-        <span className={styles.brand}>MALDEX</span>
+        <span className={styles.brand}>
+          <img className={`${styles.mark} ${styles.markDark}`} src={markDark} alt="" />
+          <img className={`${styles.mark} ${styles.markLight}`} src={markLight} alt="" />
+          <span className={styles.wordmark}>MAL<span>DEX</span></span>
+        </span>
         <NavLink to="/" end>Tasks</NavLink>
         <NavLink to="/submit">Submit</NavLink>
         {isAdmin && <NavLink to="/admin/orgs">Organizations</NavLink>}

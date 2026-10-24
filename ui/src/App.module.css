@@ -3,13 +3,26 @@
   align-items: center;
   gap: 1.25rem;
   padding: 0.6rem 1.5rem;
-  background: #0f172a;
-  color: #e2e8f0;
+  background: var(--mx-surface);
+  border-bottom: 1px solid var(--mx-border);
+  color: var(--mx-text);
 }
-.nav a { color: #e2e8f0; text-decoration: none; }
-.nav a:hover, .nav a.active { color: #fff; text-decoration: underline; }
-.brand { font-weight: 700; letter-spacing: 0.04em; margin-right: 1rem; }
+.nav a { color: var(--mx-muted); text-decoration: none; padding: 0.15rem 0; border-bottom: 2px solid transparent; }
+.nav a:hover { color: var(--mx-text); }
+.nav a:global(.active) { color: var(--mx-text); border-bottom-color: var(--mx-accent); }
+/* The mark keeps two cells of clear space (about 31% of its width) from the wordmark. */
+.brand { display: flex; align-items: center; gap: 0.75rem; margin-right: 1rem; }
+.mark { display: block; width: 28px; height: 28px; }
+.markLight { display: none; }
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .markDark { display: none; }
+  :root:not([data-theme="dark"]) .markLight { display: block; }
+}
+:root[data-theme="light"] .markDark { display: none; }
+:root[data-theme="light"] .markLight { display: block; }
+.wordmark { font-family: var(--mx-font-mono); font-weight: 700; font-stretch: 112.5%; letter-spacing: 0.04em; color: var(--mx-text); }
+.wordmark span { color: var(--mx-accent); }
 .spacer { flex: 1; }
-.user { font-size: 0.85rem; color: #94a3b8; }
+.user { font-size: 0.85rem; color: var(--mx-muted); }
 .main { padding: 1.5rem; max-width: 1200px; margin: 0 auto; }
-.error { color: #b91c1c; }
+.error { color: var(--mx-critical); }
