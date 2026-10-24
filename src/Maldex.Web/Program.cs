@@ -81,6 +81,7 @@ app.UseAuthorization();
 
 app.MapMeEndpoints();
 app.MapOrgEndpoints();
+app.MapTemplateEndpoints();
 app.MapTaskEndpoints();
 app.MapLiveControlEndpoints();
 app.MapReportEndpoints();
