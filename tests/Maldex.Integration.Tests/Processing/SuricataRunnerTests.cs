@@ -22,12 +22,17 @@ public class SuricataRunnerTests
         var result = await new SuricataRunner(Options.Create(options))
             .RunAsync(Path.Combine(data, "dev-test.pcap"), TestContext.Current.CancellationToken);
 
-        var d = Assert.Single(result);
+        var d = Assert.Single(result.Alerts);
         Assert.Equal(DetectionSource.Suricata, d.Source);
         Assert.Equal("MALDEX TEST controlled URL", d.Rule);
         Assert.Equal(1, d.Severity);
         Assert.Equal("sid 9000001 rev 1", d.Details);
         Assert.Contains("10.213.0.2:49152", d.Target);
+
+        // Real eve.json flow records (Suricata's own format) parse into flows.
+        var f = Assert.Single(result.Flows, x => x.Src == "10.213.0.2" && x.DstPort == 80);
+        Assert.Equal("TCP", f.Proto);
+        Assert.True(f.Bytes > 0);
     }
 
     [Fact]

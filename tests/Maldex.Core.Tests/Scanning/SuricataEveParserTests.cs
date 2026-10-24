@@ -66,4 +66,62 @@ public class SuricataEveParserTests
     [InlineData("")]
     [InlineData("\n\n")]
     public void Parse_Empty_ReturnsEmpty(string input) => Assert.Empty(SuricataEveParser.Parse(input));
+
+    private const string Flow =
+        """{"timestamp":"2026-10-23T19:33:12.500000+0000","event_type":"flow","src_ip":"10.213.0.2","src_port":49700,"dest_ip":"198.18.0.10","dest_port":80,"proto":"TCP","app_proto":"http","flow":{"pkts_toserver":6,"pkts_toclient":4,"bytes_toserver":600,"bytes_toclient":900,"start":"2026-10-23T19:33:12.123456+0000","end":"2026-10-23T19:33:13.000000+0000","state":"closed"}}""";
+
+    [Fact]
+    public void ParseEve_Flow_MapsFields()
+    {
+        var r = SuricataEveParser.ParseEve([Flow]);
+
+        Assert.Empty(r.Alerts);
+        var f = Assert.Single(r.Flows);
+        Assert.Equal("TCP", f.Proto);
+        Assert.Equal("10.213.0.2", f.Src);
+        Assert.Equal("198.18.0.10", f.Dst);
+        Assert.Equal(80, f.DstPort);
+        Assert.Equal(1500, f.Bytes);
+        Assert.Equal(new DateTimeOffset(2026, 10, 23, 19, 33, 12, 123, TimeSpan.Zero).AddTicks(4560), f.StartedAt);
+    }
+
+    [Fact]
+    public void ParseEve_AlertsAndFlows_InOnePass()
+    {
+        var r = SuricataEveParser.ParseEve([Alert, Flow, """{"event_type":"dns"}"""]);
+        Assert.Single(r.Alerts);
+        Assert.Single(r.Flows);
+    }
+
+    [Theory]
+    [InlineData("""{"event_type":"flow","src_ip":"10.0.0.1","dest_ip":"10.0.0.2","dest_port":80,"proto":"TCP"}""")] // no flow object
+    [InlineData("""{"event_type":"flow","dest_ip":"10.0.0.2","dest_port":80,"proto":"TCP","flow":{"bytes_toserver":1,"bytes_toclient":1,"start":"2026-10-23T19:33:12.123456+0000"}}""")] // no source
+    [InlineData("""{"event_type":"flow","src_ip":"10.0.0.1","dest_ip":"10.0.0.2","dest_port":"x","proto":"TCP","flow":{"bytes_toserver":1,"bytes_toclient":1,"start":"2026-10-23T19:33:12.123456+0000"}}""")] // port not a number
+    [InlineData("""{"event_type":"flow","src_ip":"10.0.0.1","dest_ip":"10.0.0.2","dest_port":80,"proto":"TCP","flow":{"bytes_toserver":1,"bytes_toclient":1,"start":"yesterday"}}""")] // bad start
+    public void ParseEve_MalformedFlow_IsSkipped(string line) => Assert.Empty(SuricataEveParser.ParseEve([line]).Flows);
+
+    [Fact]
+    public void ParseEve_ICMPFlowWithoutPort_IsKeptWithPortZero()
+    {
+        var icmp = Flow.Replace("\"dest_port\":80,", "").Replace("\"proto\":\"TCP\"", "\"proto\":\"ICMP\"");
+        Assert.Equal(0, Assert.Single(SuricataEveParser.ParseEve([icmp]).Flows).DstPort);
+    }
+
+    [Fact]
+    public void ParseEve_Flows_AreCapped()
+    {
+        var r = SuricataEveParser.ParseEve(Enumerable.Repeat(Flow, 30), maxAlerts: 5, maxFlows: 7);
+        Assert.Equal(7, r.Flows.Count);
+    }
+
+    [Fact]
+    public void ParseEve_StopsReading_OnceBothCapsAreReached()
+    {
+        var read = 0;
+        IEnumerable<string> Lines() { while (true) { read++; yield return read % 2 == 0 ? Alert : Flow; } }
+        var r = SuricataEveParser.ParseEve(Lines(), maxAlerts: 3, maxFlows: 3);
+        Assert.Equal(3, r.Alerts.Count);
+        Assert.Equal(3, r.Flows.Count);
+        Assert.True(read <= 7, $"read {read} lines");
+    }
 }

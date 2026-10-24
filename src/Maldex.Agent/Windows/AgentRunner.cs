@@ -66,7 +66,7 @@ public static class AgentRunner
         {
             try
             {
-                return new FileStream(PortPath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite, 4096, FileOptions.Asynchronous);
+                return AgentPort.OpenDuplex(PortPath);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {

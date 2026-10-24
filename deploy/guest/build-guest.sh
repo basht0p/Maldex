@@ -4,9 +4,10 @@
 #
 # Normally run through `./build.sh build-guest`, which also downloads and pins Sysmon (SYSMON_ZIP).
 #
-# Inputs:  MALDEX_WIN_ISO          required, Windows 11 x64 Enterprise (evaluation) media
+# Inputs:  MALDEX_WIN_ISO          required, Windows 11 x64 media: Enterprise evaluation, or multi-edition media (Enterprise or Pro is picked)
 #          MALDEX_OFFICE_ISO       optional, Office media (installed with deploy/guest/provision/office-config.xml)
 #          MALDEX_WIN_IMAGE_INDEX  optional, force /IMAGE/INDEX instead of selecting the image by name
+#          MALDEX_WIN_PRODUCT_KEY  optional, setup key for non-evaluation media (default: the edition's generic KMS client key)
 #          SYSMON_ZIP              Sysmon.zip (pinned by build.sh)
 # Outputs: $VM_DIR/base/win11-26h2.qcow2 and win11-26h2.vars.fd (both chmod 0444)
 set -euo pipefail
@@ -32,6 +33,10 @@ STAGE="$WORK/provision"
 PROV_ISO="$WORK/provision.iso"
 BUILDING_DISK="$BASE_DIR/$IMAGE_ID.building.qcow2"
 BUILDING_VARS="$BASE_DIR/$IMAGE_ID.building.vars.fd"
+
+RUN_DIR="$ROOT/$VM_DIR/run"
+# shellcheck source=deploy/guest/lib.sh
+. deploy/guest/lib.sh
 
 virsh_() { virsh -c "$LIBVIRT_URI" "$@"; }
 log() { echo "[build-guest $(date +%H:%M:%S)] $*"; }
@@ -61,6 +66,7 @@ for f in "$OVMF_CODE_SECBOOT" "$OVMF_VARS_TEMPLATE"; do
 done
 { [ -r /dev/kvm ] && [ -w /dev/kvm ]; } || { echo "/dev/kvm is not usable by this session; run ./build.sh real-setup" >&2; exit 2; }
 
+refuse_if_runs_active "$LIBVIRT_URI" "$RUN_DIR" # fail fast; checked again right before the swap
 mkdir -p "$BASE_DIR" "$WORK"
 
 keypress_pid=""
@@ -118,27 +124,64 @@ fi
 # Windows wants a DER .cer (the mitmproxy .cer is PEM text).
 openssl x509 -in "$ca_pem" -outform DER -out "$STAGE/maldex-ca.cer"
 
-# ---- 3. Windows image selection: by name, falling back to index 1 ----
+# ---- 3. Windows image selection and product key ----
+# Windows media keep their files on UDF, which xorriso cannot read: inspect install.wim/esd through a read-only loop mount.
+# Preference: Enterprise Evaluation (no key needed), then Enterprise, then Pro. Never fall back to Home silently.
 cp deploy/guest/autounattend/Autounattend.xml "$STAGE/Autounattend.xml"
-use_index=""
-if [ -n "${MALDEX_WIN_IMAGE_INDEX:-}" ]; then
-  use_index="$MALDEX_WIN_IMAGE_INDEX"
-elif command -v wiminfo >/dev/null 2>&1; then
-  # Look at the media's image list; if no image has the expected name, use index 1.
-  wimtmp="$WORK/wiminfo"; rm -rf "$wimtmp"; mkdir -p "$wimtmp"
-  for f in install.wim install.esd; do
-    if xorriso -osirrox on -indev "$MALDEX_WIN_ISO" -extract "/sources/$f" "$wimtmp/$f" >/dev/null 2>&1 && [ -s "$wimtmp/$f" ]; then
-      if wiminfo "$wimtmp/$f" 2>/dev/null | grep -q "^Name:.*$IMAGE_NAME"; then log "Media contains '$IMAGE_NAME'"; else use_index=1; fi
-      break
-    fi
-  done
-  rm -rf "$wimtmp"
-else
-  log "wiminfo not installed: selecting the image by name '$IMAGE_NAME' (set MALDEX_WIN_IMAGE_INDEX=1 if the media names it differently)"
+use_index="${MALDEX_WIN_IMAGE_INDEX:-}"
+use_name=""
+images=""
+if command -v wiminfo >/dev/null 2>&1; then
+  iso_mnt="$WORK/isomnt"; mkdir -p "$iso_mnt"
+  if sudo -n mount -o loop,ro,nosuid,nodev,noexec "$MALDEX_WIN_ISO" "$iso_mnt" 2>/dev/null; then
+    for f in install.wim install.esd; do
+      if [ -f "$iso_mnt/sources/$f" ]; then
+        # "<index>\t<name>" per image
+        images="$(wiminfo "$iso_mnt/sources/$f" | awk -F': *' '/^Index:/ { i = $2 } /^Name:/ { print i "\t" $2 }')"
+        break
+      fi
+    done
+    sudo -n umount "$iso_mnt" || true
+  fi
+  rmdir "$iso_mnt" 2>/dev/null || true
 fi
 if [ -n "$use_index" ]; then
-  log "Selecting the Windows image by /IMAGE/INDEX $use_index"
+  use_name="$(printf '%s\n' "$images" | awk -F'\t' -v i="$use_index" '$1 == i { print $2 }')"
+elif [ -n "$images" ]; then
+  for want in "$IMAGE_NAME" "Windows 11 Enterprise" "Windows 11 Pro"; do
+    use_index="$(printf '%s\n' "$images" | awk -F'\t' -v n="$want" '$2 == n { print $1; exit }')"
+    if [ -n "$use_index" ]; then use_name="$want"; break; fi
+  done
+  if [ -z "$use_index" ]; then
+    echo "No Enterprise or Pro image on $MALDEX_WIN_ISO. Images on the media:" >&2
+    printf '%s\n' "$images" | sed 's/^/  /' >&2
+    echo "Pick one with MALDEX_WIN_IMAGE_INDEX=<index> (and MALDEX_WIN_PRODUCT_KEY if it needs a key)." >&2
+    exit 2
+  fi
+else
+  log "Could not list the images on the media (needs wiminfo and sudo for a read-only loop mount): selecting '$IMAGE_NAME' by name"
+fi
+if [ -n "$use_index" ]; then
+  log "Selecting the Windows image by /IMAGE/INDEX $use_index${use_name:+ ($use_name)}"
   sed -i -e "s|<Key>/IMAGE/NAME</Key>|<Key>/IMAGE/INDEX</Key>|" -e "s|<Value>$IMAGE_NAME</Value>|<Value>$use_index</Value>|" "$STAGE/Autounattend.xml"
+fi
+# Evaluation media need no key; other media stop at the key prompt without one. Default to Microsoft's published generic
+# KMS client setup key for the edition: it installs, it does not activate (fine for a disposable analysis guest).
+product_key="${MALDEX_WIN_PRODUCT_KEY:-}"
+if [ -z "$product_key" ]; then
+  case "$use_name" in
+    *Evaluation|"") ;;
+    "Windows 11 Enterprise") product_key="NPPR9-FWDCX-D2C8J-H872K-2YT43" ;;
+    "Windows 11 Pro") product_key="W269N-WFGWX-YVC9B-4J6C9-T83GX" ;;
+    "Windows 11 Education") product_key="NW6C2-QMPVW-D7KKK-3GKT6-VCFB2" ;;
+    *) echo "'$use_name' needs a product key: set MALDEX_WIN_PRODUCT_KEY." >&2; exit 2 ;;
+  esac
+fi
+if [ -n "$product_key" ]; then
+  [[ "$product_key" =~ ^[A-Z0-9]{5}(-[A-Z0-9]{5}){4}$ ]] || { echo "MALDEX_WIN_PRODUCT_KEY is not a XXXXX-XXXXX-XXXXX-XXXXX-XXXXX key." >&2; exit 2; }
+  log "Using a setup product key for the selected edition (installs without activating)"
+  sed -i "s|<ProductKey><WillShowUI>OnError</WillShowUI></ProductKey>|<ProductKey><Key>$product_key</Key><WillShowUI>OnError</WillShowUI></ProductKey>|" "$STAGE/Autounattend.xml"
+  grep -q "<Key>$product_key</Key>" "$STAGE/Autounattend.xml" || { echo "Could not insert the product key into Autounattend.xml" >&2; exit 1; }
 fi
 xmllint --noout "$STAGE/Autounattend.xml"
 
@@ -244,6 +287,7 @@ cp -f "$nvram_path" "$BUILDING_VARS.final"
 virsh_ undefine "$DOMAIN" --keep-nvram >/dev/null 2>&1 || virsh_ undefine "$DOMAIN" >/dev/null
 mv -f "$BUILDING_VARS.final" "$BUILDING_VARS"
 
+refuse_if_runs_active "$LIBVIRT_URI" "$RUN_DIR" # a run may have started during the build
 rm -f "$BASE_DIR/$IMAGE_ID.qcow2" "$BASE_DIR/$IMAGE_ID.vars.fd"
 mv "$BUILDING_DISK" "$BASE_DIR/$IMAGE_ID.qcow2"
 mv "$BUILDING_VARS" "$BASE_DIR/$IMAGE_ID.vars.fd"

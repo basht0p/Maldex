@@ -56,7 +56,14 @@ public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcess
             var overlay = Path.Combine(runDir, "overlay.qcow2");
             var nvram = Path.Combine(runDir, "nvram.fd");
             await new QemuImageCli(runner, _o.QemuImgBinary).CreateOverlayAsync(basePath, overlay, ct);
-            File.Copy(varsPath, nvram, overwrite: true);
+            // Not File.Copy: it keeps the template's mode, and the template is finalised read-only (0444) while QEMU must write
+            // the run's UEFI variable store. 0600 from creation; chmod as well in case a retry finds the file already there.
+            var nvramOptions = new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.Write };
+            if (!OperatingSystem.IsWindows()) nvramOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+            await using (var src = File.OpenRead(varsPath))
+            await using (var dst = new FileStream(nvram, nvramOptions))
+                await src.CopyToAsync(dst, ct);
+            if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(nvram, UnixFileMode.UserRead | UnixFileMode.UserWrite);
 
             var password = RandomNumberGenerator.GetString(VncAlphabet, 8);
             var passFile = Path.Combine(runDir, "vnc.pass");

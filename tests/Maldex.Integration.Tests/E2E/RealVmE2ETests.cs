@@ -60,6 +60,30 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
 
     private static bool IsTerminal(RunStatus s) => s is RunStatus.Completed or RunStatus.Failed or RunStatus.Cancelled;
 
+    /// <summary>What the run recorded (events, flows, HTTP, detections, artifacts), for a failure message.</summary>
+    private static async Task<string> DescribeAsync(MaldexDbContext db, Guid taskId)
+    {
+        static string Cut(string? s, int max) => s is null ? "" : s.Length <= max ? s : s[..max] + "...";
+        var sb = new System.Text.StringBuilder("--- recorded by the run ---\n");
+        foreach (var s in await db.TaskStatusHistory.AsNoTracking().Where(s => s.TaskId == taskId).OrderBy(s => s.Id).ToListAsync())
+            sb.AppendLine($"  status {s.At:HH:mm:ss.fff} -> {s.To}: {s.Reason}");
+        var events = await db.BehaviorEvents.AsNoTracking().Where(e => e.TaskId == taskId).OrderBy(e => e.Id).ToListAsync();
+        sb.AppendLine($"events: {events.Count} ({string.Join(", ", events.GroupBy(e => e.Type).Select(g => $"{g.Key} {g.Count()}"))})");
+        // Every process event and Run-key write, then a sample of the rest (registry noise dominates otherwise).
+        var key = events.Where(e => e.Type == EventType.Process
+            || (e.Type == EventType.Registry && e.Data.Contains("CurrentVersion\\\\Run", StringComparison.OrdinalIgnoreCase))).ToList();
+        foreach (var e in key.Concat(events.Except(key).Where(e => e.Type != EventType.Registry).Take(40)))
+            sb.AppendLine($"  {e.Type} pid {e.Pid}: {Cut(e.Summary, 160)} | {Cut(e.Data, 400)}");
+        foreach (var f in await db.NetworkFlows.AsNoTracking().Where(f => f.TaskId == taskId).Take(30).ToListAsync())
+            sb.AppendLine($"  flow {f.Proto} {f.Src} -> {f.Dst}:{f.DstPort} {f.Bytes} B");
+        foreach (var h in await db.HttpTransactions.AsNoTracking().Where(h => h.TaskId == taskId).Take(30).ToListAsync())
+            sb.AppendLine($"  http {h.Method} {Cut(h.Url, 160)} -> {h.Status}");
+        foreach (var d in await db.Detections.AsNoTracking().Where(d => d.TaskId == taskId).ToListAsync())
+            sb.AppendLine($"  detection {d.Source} {d.Rule} sev {d.Severity}: {Cut(d.Details, 200)}");
+        sb.AppendLine("artifacts: " + string.Join(", ", await db.Artifacts.AsNoTracking().Where(a => a.TaskId == taskId).Select(a => a.Kind.ToString() + " " + a.Size).ToListAsync()));
+        return sb.ToString();
+    }
+
     /// <summary>
     /// Submits a file or URL in Simulated mode, waits for a terminal status and hands the finished task to <paramref name="assert"/>.
     /// Whatever happens (assertion failure, timeout, exception) the run is stopped, the host is shut down, and the leak check runs;
@@ -114,7 +138,15 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
             // The isolation self-test passed before anything was delivered.
             Assert.Contains(await checks.AuditLogs.AsNoTracking().Where(a => a.Target == taskId.ToString()).Select(a => a.Action).ToListAsync(Ct),
                 a => a == "isolation.selftest.passed");
-            await assert(task, checks);
+            try
+            {
+                await assert(task, checks);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // The database goes with the factory: keep what the guest reported in the failure itself.
+                throw new InvalidOperationException(ex.Message + "\n" + await DescribeAsync(checks, taskId), ex);
+            }
         }
         catch (Exception ex)
         {

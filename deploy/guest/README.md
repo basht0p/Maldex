@@ -7,7 +7,8 @@ media, fully unattended and offline.
 
 | Variable / file | Purpose |
 |---|---|
-| `MALDEX_WIN_ISO` (required) | Windows 11 x64 Enterprise (evaluation media is fine). Exit code 2 if unset or missing. |
+| `MALDEX_WIN_ISO` (required) | Windows 11 x64: Enterprise evaluation media, or multi-edition (consumer/business) media. Exit code 2 if unset or missing. |
+| `MALDEX_WIN_PRODUCT_KEY` (optional) | Setup key for non-evaluation media. Default: Microsoft's published generic KMS client setup key for the selected edition (installs, does not activate). |
 | `.data/vm/iso/virtio-win.iso` | Cached by `./build.sh real-setup`. |
 | `MALDEX_OFFICE_ISO` (optional) | Office media; installed with `provision/office-config.xml` (adjust product and channel to your media). Macro security is set to "enable all" and Protected View off for `analyst`. |
 | `MALDEX_WIN_IMAGE_INDEX` (optional) | Force `/IMAGE/INDEX` instead of selecting by name. |
@@ -23,12 +24,13 @@ media, fully unattended and offline.
 
 ## Decisions worth knowing
 
-- **Image selection:** by name `Windows 11 Enterprise Evaluation`. If `wiminfo` (apt `wimtools`) is installed, the script inspects the ISO and falls back to `/IMAGE/INDEX 1` when no image has that name; without `wiminfo` it uses the name, and `MALDEX_WIN_IMAGE_INDEX=1` is the manual override. The `wiminfo` check first extracts `sources/install.wim` (or `install.esd`) from the ISO into a scratch directory: expect about 5 GB of temporary disk and a minute or two of I/O.
+- **Image selection:** the script loop-mounts the ISO read-only (`sudo`; Windows media are UDF, which xorriso cannot read) and lists `sources/install.wim` (or `.esd`) with `wiminfo` (apt `wimtools`, installed by `real-setup`). It picks, in order, `Windows 11 Enterprise Evaluation`, `Windows 11 Enterprise`, `Windows 11 Pro`, and fails (exit 2, listing the images) rather than fall back to Home. `MALDEX_WIN_IMAGE_INDEX` forces an index. Without `wiminfo` or `sudo` it asks Setup for the evaluation image by name.
+- **Product key:** evaluation media need none. Enterprise, Pro and Education get Microsoft's generic KMS client setup key, so Setup does not stop at the key page; the guest stays unactivated, which is fine for a disposable analysis VM. Production with volume licensing can pass its own key or activate against its KMS.
 - **No LabConfig bypass keys.** 26H2 still checks TPM 2.0 / Secure Boot / RAM; the OVMF + vTPM domain satisfies them. Offline OOBE uses `BypassNRO` plus a local `analyst` account from the unattend file.
 - **The `analyst` password (`Maldex-Analyst-1!`) is a fixed, throwaway value, not a secret.** The guest is disposable, has no network during the build and no route to anything at run time.
 - **The agent is not a service.** `Provision.ps1` registers scheduled task `MaldexAgent` (at logon of `analyst`, highest run level, interactive, no time limit, restart every minute up to 999 times, ignore new instances) so it runs in the interactive session; autologon makes it fire at boot. The agent logs to `C:\ProgramData\Maldex\agent.log` (5 MiB, one old file).
 - **Defender real-time protection and SmartScreen are turned off** by policy keys and `Set-MpPreference` (best effort). Tamper Protection can refuse this on some builds; the provisioning log (`C:\ProgramData\Maldex\provision.log`) states the outcome and warns if Defender is still on.
-- **Edge Startup Boost and background mode are off** (`HKLM:\SOFTWARE\Policies\Microsoft\Edge`, `StartupBoostEnabled=0`, `BackgroundModeEnabled=0`, best effort). Dropped files are collected only from the sample's process tree (children of the agent); a pre-running Edge would take a URL run over outside that tree. **The first real-VM run must confirm that a file downloaded during a URL run is collected as a dropped file.**
+- **Edge Startup Boost and background mode are off** (`HKLM:\SOFTWARE\Policies\Microsoft\Edge`, `StartupBoostEnabled=0`, `BackgroundModeEnabled=0`, best effort). Edge also resolves names through Windows (`BuiltInDnsClientEnabled=0`, `DnsOverHttpsMode=off`), so its lookups appear as Sysmon DNS events. Dropped files are collected only from the sample's process tree (children of the agent); a pre-running Edge would take a URL run over outside that tree. **The first real-VM run must confirm that a file downloaded during a URL run is collected as a dropped file.**
 - **BitLocker device encryption is prevented** (`PreventDeviceEncryption`), because the vTPM state is not carried into cloned runs.
 - **Sysmon.zip** is pinned by SHA-256 in `build.sh`. Sysinternals publishes no checksum file, so the hash was taken from a download; bump `SYSMON_URL` / `SYSMON_SHA256` together when updating.
 - A failed critical provisioning step (virtio tools, Sysmon, CA import) still powers the VM off, but the agent task is then NOT registered, so the host-side boot check fails loudly (no `ready` frame). The failing step is named in `C:\ProgramData\Maldex\provision.log`.
@@ -36,6 +38,25 @@ media, fully unattended and offline.
 - On any failure the build VM (including its NVRAM and TPM state) and the intermediate files are removed. Set `MALDEX_KEEP_FAILED_BUILD=1` to keep them; the script then prints the `virsh vncdisplay` command.
 - The event logs are cleared by `Provision.ps1`, but the verification boot afterwards writes new entries, so the finished image does NOT have pristine logs. This is deliberate and harmless; the per-run overlay is what matters.
 - The build has not been run against real media yet (it needs `MALDEX_WIN_ISO`); only static validation was possible.
+
+## Manual preparation (prepare-guest / finalize-guest)
+
+Some changes cannot be made unattended, notably turning off Tamper Protection and Defender on Pro media. They are made by
+hand on a copy of the base image:
+
+1. `./build.sh prepare-guest` copies the base to `.data/vm/prepare/` and boots it as `maldex-prepare` with **no network**.
+   VNC listens on this host's LAN address (`MALDEX_VNC_LISTEN` overrides it) with a random 8-character password; the
+   address and password are printed. Plain VNC is unencrypted: keep it on a trusted LAN, and it only exists while
+   `maldex-prepare` runs. Windows logs on automatically as `analyst`.
+2. Make the changes in the Windows UI, then shut Windows down from the Start menu (a clean shutdown, not a reset).
+3. `./build.sh finalize-guest` refuses unless the VM is shut off, boots the prepared disk once more with VNC on
+   127.0.0.1 only, waits for the agent's `ready` frame and shuts it down cleanly. Only then does the copy replace the
+   base (0444); the previous base stays as `*.prev` until the next finalize. A failed check leaves the base untouched.
+4. `./build.sh discard-guest` throws the copy away instead.
+
+`./build.sh build-guest` produces a fresh unattended base and loses these changes: prepare and finalize again after it.
+
+Both `build-guest` and `finalize-guest` replace the base in place, so both refuse (exit 2) while any analysis run exists (a `maldex-<32 hex>` domain or run directory): every run's overlay reads the base as its backing file. They check before starting and again right before the swap.
 
 ## Running the E2E suite
 

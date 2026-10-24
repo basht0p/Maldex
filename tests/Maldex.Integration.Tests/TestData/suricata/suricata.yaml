@@ -21,6 +21,7 @@ outputs:
       filename: eve.json
       types:
         - alert
+        - flow # as in deploy/net/suricata/suricata.yaml: flows become NetworkFlow rows
 
 app-layer:
   protocols:

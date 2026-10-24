@@ -6,6 +6,8 @@ using Maldex.Integration.Tests.Fixtures;
 using Maldex.Integration.Tests.Orchestrator;
 using Maldex.Processing;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Xunit;
 
 namespace Maldex.Integration.Tests.Processing;
@@ -107,6 +109,42 @@ public class ProcessingTests(SqlServerFixture sql)
         var task = await db.Tasks.SingleAsync(t => t.Id == id, Ct);
         Assert.Equal(RunStatus.Completed, task.Status);
         Assert.StartsWith("yara failed:", Assert.Single(task.ProcessingWarnings));
+    }
+
+    /// <summary>Returns one fixed flow (and no alerts) for every capture.</summary>
+    private sealed class OneFlowSuricata : ISuricataRunner
+    {
+        public static readonly SuricataFlow Flow = new("TCP", "10.213.0.2", "198.18.0.10", 80, 1500, new DateTimeOffset(2026, 10, 23, 19, 33, 12, TimeSpan.Zero));
+        public Task<SuricataResult> RunAsync(string pcapPath, CancellationToken ct) => Task.FromResult(new SuricataResult([], [Flow]));
+    }
+
+    [Fact]
+    public async Task SuricataFlows_AreStored_AndReplacedOnRerun()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql, configure: s =>
+            s.Replace(ServiceDescriptor.Singleton<ISuricataRunner>(new OneFlowSuricata())));
+        var id = await RunToProcessingAsync(h, Unique());
+        var blob = await h.Get<IArtifactStore>().PutAsync("pcaps", new MemoryStream([1, 2, 3]), 1_048_576, Ct);
+        await using (var db = h.NewContext())
+        {
+            db.Artifacts.Add(new Artifact { Id = Guid.NewGuid(), TaskId = id, Kind = ArtifactKind.Pcap, BlobKey = blob.Key, Sha256 = blob.Sha256, Size = blob.Size, CreatedAt = DateTimeOffset.UtcNow });
+            await db.SaveChangesAsync(Ct);
+        }
+        var pipeline = h.Get<ProcessingPipeline>();
+
+        await pipeline.ProcessAsync(id, Ct);
+        await using (var db = h.NewContext())
+        {
+            var t = await db.Tasks.SingleAsync(x => x.Id == id, Ct);
+            t.Status = RunStatus.Processing; // a rerun after a restart mid-processing
+            await db.SaveChangesAsync(Ct);
+        }
+        await pipeline.ProcessAsync(id, Ct);
+
+        await using var check = h.NewContext();
+        var f = Assert.Single(await check.NetworkFlows.Where(x => x.TaskId == id).ToListAsync(Ct));
+        Assert.Equal(("TCP", "10.213.0.2", "198.18.0.10", 80, 1500L), (f.Proto, f.Src, f.Dst, f.DstPort, f.Bytes));
+        Assert.Equal(OneFlowSuricata.Flow.StartedAt, f.StartedAt);
     }
 
     [Fact]

@@ -19,7 +19,12 @@ public sealed class SysmonEventSource : IEventSource
         using var watcher = new EventLogWatcher(new EventLogQuery(LogName, PathType.LogName, "*"));
         watcher.EventRecordWritten += (_, e) =>
         {
-            if (e.EventRecord is null) return;
+            if (e.EventRecord is null)
+            {
+                // The watcher reports subscription errors this way; say so instead of going quiet.
+                if (e.EventException is { } error) AgentLog.Write("Sysmon subscription error: " + error.Message);
+                return;
+            }
             using var record = e.EventRecord;
             try
             {
