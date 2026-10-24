@@ -173,6 +173,9 @@ VM_DIR=".data/vm"
 GUARD_SRC="deploy/host/maldex-host-guard.nft"
 GUARD_DST="/etc/maldex/maldex-host-guard.nft"
 GUARD_UNIT="/etc/systemd/system/maldex-host-guard.service"
+DOCKER_USER_SRC="deploy/host/maldex-docker-user.sh"
+DOCKER_USER_DST="/etc/maldex/maldex-docker-user.sh"
+DOCKER_USER_UNIT="/etc/systemd/system/maldex-docker-user.service"
 
 # Verify file $1 against SHA-256 $2; on mismatch delete it and fail loudly.
 verify_sha256() {
@@ -219,6 +222,41 @@ UNIT
   sudo systemctl daemon-reload
   sudo systemctl enable maldex-host-guard.service
   sudo systemctl restart maldex-host-guard.service
+}
+
+# Direct egress (template edit sessions) needs a narrow exception in Docker's DOCKER-USER chain (Docker's FORWARD policy is DROP):
+# exactly two rules for the default-route interface, tagged maldex-direct (see deploy/host/maldex-docker-user.sh). Re-applied at
+# every docker.service start; nothing else in Docker's chains, tables or settings is touched. (Approved by basht0p, 2026-10-24.)
+install_direct_docker_exception() {
+  sudo install -d -m 0755 /etc/maldex
+  sudo install -m 0755 "$DOCKER_USER_SRC" "$DOCKER_USER_DST"
+  sudo tee "$DOCKER_USER_UNIT" >/dev/null <<UNIT
+[Unit]
+Description=Maldex Direct egress exception in Docker's DOCKER-USER chain
+Documentation=file://$DOCKER_USER_DST
+After=docker.service network-online.target
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$DOCKER_USER_DST
+
+[Install]
+WantedBy=docker.service multi-user.target
+UNIT
+  sudo systemctl daemon-reload
+  sudo systemctl enable maldex-docker-user.service
+  sudo systemctl restart maldex-docker-user.service
+}
+
+# True when both maldex-direct rules exist in DOCKER-USER for the current default-route interface.
+direct_docker_exception_present() {
+  local i
+  i=$(ip -4 -o route show default | awk '{for (k = 1; k < NF; k++) if ($k == "dev") { print $(k + 1); exit }}')
+  [ -n "$i" ] || return 1
+  sudo -n iptables -C DOCKER-USER -i 'mxu+' -o "$i" -m comment --comment maldex-direct -j ACCEPT \
+    && sudo -n iptables -C DOCKER-USER -i "$i" -o 'mxu+' -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment maldex-direct -j ACCEPT
 }
 
 # Dedicated, powerless account for the per-run mitmproxy: own group, no supplementary groups, no home, no shell, no sudoers.
@@ -326,6 +364,7 @@ cmd_real_setup() {
   disable_system_unit suricata
 
   install_host_guard
+  install_direct_docker_exception
   ensure_mitm_user
   ensure_dns_user
   ensure_inetsim_userns_ids
@@ -378,6 +417,7 @@ real_verify() {
   real_check "mitmproxy CA present (.data/mitm/ca)" "./build.sh real-setup" \
     bash -c "[ -f $MITM_CA_DIR/mitmproxy-ca.pem ] && [ -f $MITM_CA_DIR/mitmproxy-ca-cert.pem ]"
   real_check "/var/lib/inetsim is root-owned, not group/world-writable, symlink-free" "./build.sh real-setup" inetsim_template_clean
+  real_check "Direct egress exception in DOCKER-USER (both maldex-direct rules, current default interface)" "./build.sh real-setup" direct_docker_exception_present
   real_check "host guard enabled at boot" "./build.sh real-setup" systemctl is-enabled maldex-host-guard
   return "$REAL_FAILED"
 }

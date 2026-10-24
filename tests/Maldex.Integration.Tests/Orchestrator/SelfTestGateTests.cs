@@ -80,6 +80,37 @@ public class SelfTestGateProtocolTests
         Assert.True(verdict.Isolated);
     }
 
+    private static readonly IsolationProbePlan DirectPlan =
+        IsolationProbePlan.Build(new NetOptions { ControlPlaneIps = ["192.168.1.10"] }, new RunNetworkInfo("10.213.0.1", "10.213.0.2", NetworkMode.Direct));
+
+    [Fact]
+    public async Task SelfTest_Direct_ProbesDirectUrl_AndPassesWhenInternalBlockedAndPublicReachable()
+    {
+        var inbox = new TransferInbox();
+        var ch = new ScriptedChannel(inbox, c => Answer(c, _ => false, ""));
+        var verdict = await new SelfTestGate(new FakeTimeProvider()).RunAsync(ch, inbox, NetworkMode.Direct, null, DirectPlan, Ct);
+        Assert.True(verdict.Isolated);
+        Assert.Equal("http://connectivitycheck.gstatic.com/generate_204", Assert.IsType<SelfTestCommand>(Assert.Single(ch.Sent)).EchoUrl);
+    }
+
+    [Fact]
+    public async Task SelfTest_Direct_NoInternet_Fails()
+    {
+        var inbox = new TransferInbox();
+        var ch = new ScriptedChannel(inbox, c => Answer(c, _ => false, null));
+        Assert.False((await new SelfTestGate(new FakeTimeProvider()).RunAsync(ch, inbox, NetworkMode.Direct, null, DirectPlan, Ct)).Isolated);
+    }
+
+    [Fact]
+    public async Task SelfTest_Direct_ReachableControlPlane_Fails()
+    {
+        var inbox = new TransferInbox();
+        var ch = new ScriptedChannel(inbox, c => Answer(c, t => t.Name == "control_plane_0", ""));
+        var verdict = await new SelfTestGate(new FakeTimeProvider()).RunAsync(ch, inbox, NetworkMode.Direct, null, DirectPlan, Ct);
+        Assert.False(verdict.Isolated);
+        Assert.Contains("control_plane_0", verdict.Reason);
+    }
+
     [Fact]
     public async Task Gate_AnswerForAnotherCommand_IsIgnored_ThenTimesOut()
     {

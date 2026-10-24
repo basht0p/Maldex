@@ -13,7 +13,7 @@ namespace Maldex.Infrastructure.Net;
 public static class NftRulesetBuilder
 {
     /// <summary>Never reachable by a guest, and never an accepted input destination other than the gateway.</summary>
-    private static readonly string[] PrivateRanges =
+    internal static readonly string[] PrivateRanges =
         ["0.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "224.0.0.0/4", "240.0.0.0/4"];
 
     public static string Build(EgressTopology t)
@@ -22,7 +22,7 @@ public static class NftRulesetBuilder
         ArgumentNullException.ThrowIfNull(t.Names);
         ArgumentNullException.ThrowIfNull(t.Subnet);
         if (t.ControlPlaneIps is null) throw new ArgumentException("ControlPlaneIps must not be null.", nameof(t));
-        if (t.Mode is not (NetworkMode.None or NetworkMode.Simulated or NetworkMode.LiveVpn))
+        if (t.Mode is not (NetworkMode.None or NetworkMode.Simulated or NetworkMode.LiveVpn or NetworkMode.Direct))
             throw new ArgumentException($"Network mode {t.Mode} has no namespace ruleset.", nameof(t));
 
         var ns = Name(t.Names.VethNs, "mxg", nameof(t.Names.VethNs));
@@ -38,6 +38,19 @@ public static class NftRulesetBuilder
         var cp = t.ControlPlaneIps.Select(ip => Ip(ip, "ControlPlaneIps")).Distinct().ToList();
         var dns = t.VpnDnsIp is null ? null : Ip(t.VpnDnsIp, nameof(t.VpnDnsIp));
         if (dns is not null && cp.Contains(dns)) throw new ArgumentException("VpnDnsIp must not be a control-plane IP.", nameof(t));
+
+        var direct = t.Mode == NetworkMode.Direct;
+        var up = "";
+        var dnsServers = "";
+        if (direct)
+        {
+            if (t.Uplink is null) throw new ArgumentException("Direct needs an uplink subnet.", nameof(t));
+            up = Name(t.Names.UplinkNs, "mxy", nameof(t.Names.UplinkNs));
+            Name(t.Names.UplinkHost, "mxu", nameof(t.Names.UplinkHost));
+            Ip(t.Uplink.HostIp, nameof(t.Uplink.HostIp));
+            Ip(t.Uplink.NsIp, nameof(t.Uplink.NsIp));
+            dnsServers = string.Join(", ", ValidateDirectDns(t.DirectDnsServers, cp));
+        }
 
         // Everything a guest must never reach: private ranges (incl. the control plane's own LAN) and the control-plane IPs.
         var blocked = string.Join(", ", PrivateRanges.Concat(cp));
@@ -55,11 +68,11 @@ public static class NftRulesetBuilder
         L("\t\tct state established,related accept");
         L("\t\tiifname \"lo\" accept");
         // Every path to the MITM port must have been DNAT'd/redirected; a direct hit (e.g. via the Simulated any-IP route) is dropped.
-        L($"\t\tiifname \"{ns}\" tcp dport {t.MitmPort} ct status & dnat == 0 drop");
+        if (!direct) L($"\t\tiifname \"{ns}\" tcp dport {t.MitmPort} ct status & dnat == 0 drop");
         L($"\t\tiifname \"{ns}\" udp dport 67 accept");
         L($"\t\tiifname \"{ns}\" ip daddr {gw} udp dport 53 accept");
         L($"\t\tiifname \"{ns}\" ip daddr {gw} tcp dport 53 accept");
-        L($"\t\tiifname \"{ns}\" ip daddr {gw} tcp dport {t.MitmPort} ct status dnat accept");
+        if (!direct) L($"\t\tiifname \"{ns}\" ip daddr {gw} tcp dport {t.MitmPort} ct status dnat accept");
         if (t.Mode == NetworkMode.Simulated)
         {
             // INetSim answers on any public address; never to the control plane or private ranges (which include the gateway).
@@ -79,6 +92,11 @@ public static class NftRulesetBuilder
             L($"\t\tiifname \"{ns}\" oifname \"{wg}\" accept");
             L($"\t\tiifname \"{wg}\" oifname \"{ns}\" ct state established,related accept");
         }
+        if (direct)
+        {
+            L($"\t\tiifname \"{ns}\" oifname \"{up}\" accept");
+            L($"\t\tiifname \"{up}\" oifname \"{ns}\" ct state established,related accept");
+        }
         L("\t}");
 
         L("\tchain output {");
@@ -86,6 +104,12 @@ public static class NftRulesetBuilder
         L("\t\tmeta nfproto ipv6 drop");
         L("\t\toifname \"lo\" accept");
         L($"\t\toifname \"{ns}\" accept");
+        if (direct)
+        {
+            // dnsmasq's own queries: the configured resolvers (even when private), TCP/UDP 53; nothing else leaves by the uplink
+            L($"\t\toifname \"{up}\" ip daddr {{ {dnsServers} }} udp dport 53 accept");
+            L($"\t\toifname \"{up}\" ip daddr {{ {dnsServers} }} tcp dport 53 accept");
+        }
         if (vpn)
         {
             if (dns is not null)
@@ -100,7 +124,7 @@ public static class NftRulesetBuilder
 
         L("\tchain prerouting {");
         L("\t\ttype nat hook prerouting priority dstnat; policy accept;");
-        L($"\t\tiifname \"{ns}\" tcp dport {{ 80, 443 }} ip daddr != {{ {blocked} }} redirect to :{t.MitmPort}");
+        if (!direct) L($"\t\tiifname \"{ns}\" tcp dport {{ 80, 443 }} ip daddr != {{ {blocked} }} redirect to :{t.MitmPort}");
         L($"\t\tiifname \"{ns}\" udp dport 53 dnat ip to {gw}");
         L($"\t\tiifname \"{ns}\" tcp dport 53 dnat ip to {gw}");
         L("\t}");
@@ -108,10 +132,27 @@ public static class NftRulesetBuilder
         L("\tchain postrouting {");
         L("\t\ttype nat hook postrouting priority srcnat; policy accept;");
         if (vpn) L($"\t\toifname \"{wg}\" masquerade");
+        if (direct) L($"\t\toifname \"{up}\" masquerade");
         L("\t}");
 
         L("}");
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// The resolvers are the only private-range destinations a Direct namespace may reach. They must be canonical IPv4, not
+    /// loopback (that is the host itself) and not a control-plane address.
+    /// </summary>
+    internal static List<string> ValidateDirectDns(IReadOnlyList<string>? servers, IReadOnlyList<string> controlPlane)
+    {
+        if (servers is null || servers.Count == 0) throw new ArgumentException("Direct needs at least one DNS server.");
+        var list = servers.Select(s => Ip(s, "DirectDnsServers")).Distinct().ToList();
+        foreach (var s in list)
+        {
+            if (IPAddress.IsLoopback(IPAddress.Parse(s)) || s == "0.0.0.0") throw new ArgumentException($"DNS server {s} is the host itself.");
+            if (controlPlane.Contains(s)) throw new ArgumentException($"DNS server {s} is a control-plane address.");
+        }
+        return list;
     }
 
     private static string Name(string? value, string prefix, string what)
@@ -122,7 +163,7 @@ public static class NftRulesetBuilder
     }
 
     /// <summary>Canonical dotted-quad IPv4 only (rejects "1", CIDR, IPv6, whitespace and trailing text).</summary>
-    private static string Ip(string? value, string what)
+    internal static string Ip(string? value, string what)
     {
         if (value is null || !IPAddress.TryParse(value, out var ip) || ip.AddressFamily != AddressFamily.InterNetwork || ip.ToString() != value)
             throw new ArgumentException($"{what} is not a valid IPv4 address.");

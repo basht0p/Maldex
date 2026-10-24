@@ -20,6 +20,7 @@ public sealed class NoopEgressRouter(IOptions<FakeEgressOptions> options, FakeGu
         {
             NetworkMode.LiveVpn => options.Value.LiveEgressIp,
             NetworkMode.Simulated => FakeGuest.InetSimEchoPage,
+            NetworkMode.Direct => "", // the probe URL answered (204, empty body)
             _ => null,
         });
         var lease = _leases.GetOrAdd(taskId, id => new NetworkLease(id, $"fake-net-{id:N}"));
@@ -31,6 +32,13 @@ public sealed class NoopEgressRouter(IOptions<FakeEgressOptions> options, FakeGu
         _leases.TryRemove(lease.TaskId, out _);
         guest?.SetEchoFor(lease.TaskId, null);
         guest?.SetModeFor(lease.TaskId, null);
+        return Task.CompletedTask;
+    }
+
+    public Task IsolateAsync(NetworkLease lease, CancellationToken ct)
+    {
+        guest?.SetModeFor(lease.TaskId, NetworkMode.None);
+        guest?.SetEchoFor(lease.TaskId, null);
         return Task.CompletedTask;
     }
 

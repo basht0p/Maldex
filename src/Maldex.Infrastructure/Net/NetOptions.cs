@@ -30,4 +30,16 @@ public sealed class NetOptions
 
     /// <summary>Template INetSim data (read-only content); each run gets its own copy.</summary>
     public string InetSimDataDir { get; set; } = "/var/lib/inetsim";
+
+    /// <summary>Pool the per-run /30 uplinks of <c>Direct</c> leases are carved from (same index as the guest subnet).</summary>
+    public string DirectUplinkPool { get; set; } = "100.127.0.0/16";
+
+    /// <summary>
+    /// Resolvers a <c>Direct</c> run's dnsmasq forwards to; the only private-range destinations a Direct namespace may reach, TCP/UDP 53
+    /// only. Empty = the host's upstream resolvers from <c>/run/systemd/resolve/resolv.conf</c>.
+    /// </summary>
+    public string[] DirectDnsServers { get; set; } = [];
+
+    /// <summary>Fetched by the guest during the Direct self-test; any HTTP answer proves a public address is reachable.</summary>
+    public string DirectProbeUrl { get; set; } = "http://connectivitycheck.gstatic.com/generate_204";
 }

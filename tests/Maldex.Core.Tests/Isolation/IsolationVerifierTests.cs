@@ -180,6 +180,45 @@ public class IsolationVerifierTests
         Assert.Null(Assert.IsType<SelfTestResultMessage>(old).GuestAddresses);
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("<html>ok</html>")]
+    public void SelfTest_Direct_AllBlocked_AndPublicAddressReachable_Passes(string echo) =>
+        Assert.True(V(NetworkMode.Direct, Names, null, Result(echo)).Isolated);
+
+    [Fact]
+    public void SelfTest_Direct_NoPublicAddressReachable_Fails()
+    {
+        var v = V(NetworkMode.Direct, Names, null, Result(null));
+        Assert.False(v.Isolated);
+        Assert.Contains("public", v.Reason);
+    }
+
+    [Theory]
+    [InlineData("gateway")]
+    [InlineData("control_plane_0")]
+    [InlineData("rfc1918_10")]
+    [InlineData("rfc1918_172")]
+    [InlineData("rfc1918_192")]
+    [InlineData("link_local")]
+    public void SelfTest_Direct_AnyInternalReachable_Fails(string probe)
+    {
+        var v = V(NetworkMode.Direct, Names, null, Result("", [probe]));
+        Assert.False(v.Isolated);
+        Assert.Contains(probe, v.Reason);
+    }
+
+    [Fact]
+    public void ProbePlan_Direct_UsesTheDirectProbeUrl()
+    {
+        var net = new NetOptions { ControlPlaneIps = ["192.168.1.10"], DirectProbeUrl = "http://probe.example/204" };
+        var plan = IsolationProbePlan.Build(net, new RunNetworkInfo("10.213.0.5", "10.213.0.6", NetworkMode.Direct));
+        Assert.Equal("http://probe.example/204", plan.EchoUrl);
+        Assert.Contains("control_plane_0", plan.ExpectedNames);
+        Assert.Equal("http://connectivitycheck.gstatic.com/generate_204", new NetOptions().DirectProbeUrl);
+        Assert.Equal(net.EchoUrl, IsolationProbePlan.Build(net, new RunNetworkInfo("10.213.0.5", "10.213.0.6", NetworkMode.None)).EchoUrl);
+    }
+
     [Fact]
     public void ProbePlan_UsesGatewayAndControlPlanes()
     {
