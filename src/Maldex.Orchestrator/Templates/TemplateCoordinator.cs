@@ -1,4 +1,5 @@
 using Maldex.Core.Abstractions;
+using Maldex.Core.Agent;
 using Maldex.Core.Domain;
 using Maldex.Core.Lifecycle;
 using Maldex.Core.Text;
@@ -25,6 +26,7 @@ namespace Maldex.Orchestrator.Templates;
 public sealed class TemplateCoordinator(
     IServiceScopeFactory scopes,
     IHypervisor hypervisor,
+    IGuestDiskEditor diskEditor,
     IAgentChannelFactory channels,
     IEgressRouter egress,
     ITemplateStore store,
@@ -146,12 +148,12 @@ public sealed class TemplateCoordinator(
             await StopWatchingAsync(watcherCts, watcher).ConfigureAwait(false);
             var reason = ex switch
             {
-                JobFailedException or TemplateSealException or TemplateVerifyException => ex.Message,
+                JobFailedException or TemplateSealException or TemplateVerifyException or TemplateAgentInstallException => ex.Message,
                 VmStartException => $"the VM could not be started: {ex.Message}",
                 EgressUnavailableException => $"egress unavailable: {ex.Message}",
                 _ => $"job failed: {GuestText.Clean(ex.Message, 300)}",
             };
-            if (ex is not (JobFailedException or TemplateSealException or TemplateVerifyException)) logger.LogError(ex, "Template job {JobId} failed.", jobId);
+            if (ex is not (JobFailedException or TemplateSealException or TemplateVerifyException or TemplateAgentInstallException)) logger.LogError(ex, "Template job {JobId} failed.", jobId);
             else logger.LogWarning("Template job {JobId} failed: {Reason}", jobId, reason);
             await FailAsync(db, job, reason, held).ConfigureAwait(false);
         }
@@ -217,6 +219,10 @@ public sealed class TemplateCoordinator(
         held.FilesCreated = true; // a partial copy is deleted too
         await store.CreateWorkingCopyAsync(baseVersion.FileStem, stem, ct).ConfigureAwait(false);
 
+        // Whatever agent the base version carries, the working copy boots with the current one (R24: always, one path).
+        await SaveJobAsync(db, job.Id, j => { j.Message = "installing the current agent into the working copy"; return true; }, [], ct).ConfigureAwait(false);
+        await InstallAgentAsync(stem, o, ct).ConfigureAwait(false);
+
         await TakeVmSlotAsync(db, job.Id, ct).ConfigureAwait(false);
 
         var mode = job.Kind == TemplateJobKind.Edit ? job.Network : NetworkMode.None;
@@ -228,6 +234,9 @@ public sealed class TemplateCoordinator(
         }
         var vmOptions = orchestrator.Value;
         held.Vm = await hypervisor.StartAsync(new VmSpec(job.Id, stem, vmOptions.VmMemoryMiB, vmOptions.VmVCpus, held.Lease.NetworkId, Writable: true), ct).ConfigureAwait(false);
+
+        await SaveJobAsync(db, job.Id, j => { j.Message = "checking the guest agent"; return true; }, [], ct).ConfigureAwait(false);
+        await CheckAgentAsync(held.Vm!, bundle, o, ct).ConfigureAwait(false);
 
         if (job.Kind == TemplateJobKind.Edit)
         {
@@ -277,6 +286,83 @@ public sealed class TemplateCoordinator(
         await TransitionAsync(db, job.Id, TemplateJobState.Verifying, "verifying the sealed version", [], ct).ConfigureAwait(false);
         var provenance = await verifier.VerifyAsync(stem, bundle, ct).ConfigureAwait(false);
         return new Verified(provenance, bundle);
+    }
+
+    /// <summary>Writes the current agent into the working copy's disk, bounded by <see cref="TemplateJobOptions.AgentInstallTimeout"/>.</summary>
+    private async Task InstallAgentAsync(string stem, TemplateJobOptions o, CancellationToken ct)
+    {
+        using var timeout = new CancellationTokenSource(o.AgentInstallTimeout, time);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
+        try
+        {
+            await diskEditor.InstallAgentAsync(stem, Path.GetFullPath(o.AgentExePath), linked.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            throw new JobFailedException($"writing the agent into the working copy did not finish within {o.AgentInstallTimeout.TotalSeconds:0} s");
+        }
+    }
+
+    /// <summary>
+    /// Proves the booted working copy runs the agent that was written into it: waits for ready, asks <c>provenance</c> and compares the
+    /// build id. An agent that is older (refuses the command, never answers) or different fails the job. The channel is closed again
+    /// afterwards: the sealer connects its own and reads that connection's ready message (an agent whose host end is not connected
+    /// retries its connection and says ready again, which is how a long-idle Edit guest reaches the sealer too).
+    /// </summary>
+    private async Task CheckAgentAsync(VmHandle vm, ComponentBundle bundle, TemplateJobOptions o, CancellationToken ct)
+    {
+        IAgentChannel channel;
+        try
+        {
+            channel = await channels.ConnectAsync(vm, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new JobFailedException($"could not connect to the guest agent ({GuestText.Clean(ex.Message, 200)}); the agent could not be checked");
+        }
+
+        try
+        {
+            await using var session = new GuestSession(channel);
+
+            ReadyMessage ready;
+            try
+            {
+                ready = await session.Ready.WaitAsync(o.AgentReadyTimeout, time, ct).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                throw new JobFailedException($"the guest agent was not ready within {o.AgentReadyTimeout.TotalSeconds:0} s; the agent could not be checked");
+            }
+            catch (InvalidOperationException ex)
+            {
+                throw new JobFailedException($"the guest agent never became ready ({GuestText.Clean(ex.Message, 200)}); the agent could not be checked");
+            }
+
+            var stale = $"the working copy still runs agent {GuestText.Clean(ready.AgentVersion, 100)}; the agent could not be updated";
+            using var budget = new CancellationTokenSource(o.ProvenanceTimeout, time);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, budget.Token);
+            ProvenanceMessage answer;
+            try
+            {
+                answer = await session.AskProvenanceAsync(linked.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (budget.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                throw new JobFailedException(stale); // too old to know the command, or hung
+            }
+            catch (InvalidOperationException)
+            {
+                throw new JobFailedException(stale); // refused it, or went away
+            }
+
+            if (answer.AgentVersion != bundle.AgentBuildId)
+                throw new JobFailedException($"the working copy still runs agent {GuestText.Clean(answer.AgentVersion, 100)}; the agent could not be updated");
+        }
+        finally
+        {
+            await DisposeQuietlyAsync(channel, vm.TaskId).ConfigureAwait(false);
+        }
     }
 
     /// <summary>

@@ -187,6 +187,11 @@ public sealed class ReplayAgentChannel : IAgentChannel
                 break;
             case ProvenanceCommand c:
                 if (_guest!.SilentProvenance) break;
+                if (_guest.RejectProvenance)
+                {
+                    Enqueue(new CommandResultMessage(c.CommandId, false, "unknown command"));
+                    break;
+                }
                 Enqueue(new ProvenanceMessage(c.CommandId, _guest!.ProvenanceEdition, _guest.ProvenanceBuild, _guest.ProvenanceAgentVersion,
                     _guest.ProvenanceOfficePresent, _guest.ProvenanceRealTimeProtection));
                 Enqueue(new CommandResultMessage(c.CommandId, true));

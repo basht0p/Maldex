@@ -305,6 +305,28 @@ ensure_mitm_ca() {
   [ -f "$MITM_CA_DIR/mitmproxy-ca.pem" ] && [ -f "$MITM_CA_DIR/mitmproxy-ca-cert.pem" ]
 }
 
+# libguestfs's fixed appliance (LIBGUESTFS_PATH): the guest disk editor writes the current agent into a template working copy with
+# guestfish as the app's own user. Ubuntu's 0600 /boot/vmlinuz-* stops supermin from building an appliance for a non-root user, so
+# one is built once as root into a world-readable directory. The stamp records the libguestfs version it was built from.
+GUESTFS_APPLIANCE_DIR="/var/lib/maldex/guestfs-appliance"
+guestfs_version() { dpkg-query -W -f='${Version}' libguestfs-tools; }
+ensure_guestfs_appliance() {
+  local want; want="$(guestfs_version)"
+  if [ -f "$GUESTFS_APPLIANCE_DIR/maldex-libguestfs-version" ] && [ "$(cat "$GUESTFS_APPLIANCE_DIR/maldex-libguestfs-version")" = "$want" ] \
+     && [ -f "$GUESTFS_APPLIANCE_DIR/kernel" ] && [ -f "$GUESTFS_APPLIANCE_DIR/initrd" ] && [ -f "$GUESTFS_APPLIANCE_DIR/root" ]; then
+    return 0
+  fi
+  local fresh="$GUESTFS_APPLIANCE_DIR.new"
+  sudo rm -rf "$fresh"
+  sudo mkdir -p "$(dirname "$GUESTFS_APPLIANCE_DIR")"
+  sudo libguestfs-make-fixed-appliance "$fresh"
+  echo "$want" | sudo tee "$fresh/maldex-libguestfs-version" >/dev/null
+  sudo chown -R root:root "$fresh"
+  sudo chmod -R a+rX,go-w "$fresh"
+  sudo rm -rf "$GUESTFS_APPLIANCE_DIR"
+  sudo mv "$fresh" "$GUESTFS_APPLIANCE_DIR"
+}
+
 # INetSim's template data is only ever read (as root) and copied per run, so it must be root-owned, not writable by others
 # and free of symlinks; the guest-facing INetSim user gets only fresh per-run leaf directories.
 harden_inetsim_template() {
@@ -334,7 +356,8 @@ cmd_real_setup() {
   local me="${SUDO_USER:-$(id -un)}"
   sudo apt-get update -qq
   sudo apt-get install -y qemu-system-x86 qemu-utils libvirt-daemon libvirt-clients virtinst ovmf swtpm swtpm-tools \
-    dnsmasq-base nftables tcpdump suricata inetsim wireguard-tools xorriso libxml2-utils socat genisoimage wimtools
+    dnsmasq-base nftables tcpdump suricata inetsim wireguard-tools xorriso libxml2-utils socat genisoimage wimtools \
+    libguestfs-tools
 
   if ! command -v pwsh >/dev/null 2>&1; then
     sudo snap install powershell --classic   # script parse checks only
@@ -378,6 +401,7 @@ cmd_real_setup() {
   ensure_inetsim_userns_ids
   ensure_mitm_ca
   harden_inetsim_template
+  ensure_guestfs_appliance
 
   real_verify
 }
@@ -431,6 +455,8 @@ real_verify() {
   else
     echo "skip Direct egress DOCKER-USER exception checks (Docker is not installed; no FORWARD drop to work around)"
   fi
+  real_check "guest disk editor (libguestfs appliance)" "./build.sh real-setup" \
+    env LIBGUESTFS_BACKEND=direct "LIBGUESTFS_PATH=$GUESTFS_APPLIANCE_DIR" libguestfs-test-tool
   real_check "host guard enabled at boot" "./build.sh real-setup" systemctl is-enabled maldex-host-guard
   return "$REAL_FAILED"
 }

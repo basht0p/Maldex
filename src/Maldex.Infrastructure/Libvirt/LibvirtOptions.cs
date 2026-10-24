@@ -8,6 +8,12 @@ public sealed class LibvirtOptions
     public string Uri { get; set; } = "qemu:///session";
     public string VirshBinary { get; set; } = "virsh";
     public string QemuImgBinary { get; set; } = "qemu-img";
+    public string GuestfishBinary { get; set; } = "guestfish";
+    /// <summary>
+    /// The libguestfs fixed appliance (<c>LIBGUESTFS_PATH</c>), built by <c>./build.sh real-setup</c>: Ubuntu's 0600 kernel image
+    /// stops libguestfs from building its own appliance as a non-root user.
+    /// </summary>
+    public string GuestfsAppliancePath { get; set; } = "/var/lib/maldex/guestfs-appliance";
     public string OvmfCodePath { get; set; } = "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd";
     public string BaseImageDir { get; set; } = ".data/vm/base";
     public string RunDir { get; set; } = ".data/vm/run";
