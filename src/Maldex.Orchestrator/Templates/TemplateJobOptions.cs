@@ -20,6 +20,11 @@ public sealed class TemplateJobOptions
     public TimeSpan AgentInstallTimeout { get; set; } = TimeSpan.FromMinutes(5);
     /// <summary>How long a booted working copy's agent may take to answer the provenance check (after it said ready).</summary>
     public TimeSpan ProvenanceTimeout { get; set; } = TimeSpan.FromMinutes(1);
+    /// <summary>
+    /// How often the provenance request is sent again until any reply arrives. After a host disconnect the agent reconnects within
+    /// 1-10 s, and a request sent in that gap is lost (QEMU does not hold it).
+    /// </summary>
+    public TimeSpan ProvenanceRetryInterval { get; set; } = TimeSpan.FromSeconds(3);
     /// <summary>How long the coordinator waits for the open consoles of a job to close once a seal is requested, before sealing anyway.</summary>
     public TimeSpan ConsoleCloseTimeout { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan ConfigureIdleTimeout { get; set; } = TimeSpan.FromHours(2);

@@ -70,11 +70,19 @@ internal sealed class SilenceableChannels(IAgentChannelFactory inner, FakeGuest 
     /// <summary>Guests whose connection attempt fails (the agent socket is not there).</summary>
     public Func<VmHandle, bool>? Unreachable { get; set; }
 
-    public Task<IAgentChannel> ConnectAsync(VmHandle vm, CancellationToken ct) =>
-        Unreachable?.Invoke(vm) == true ? throw new IOException("the agent socket is not there")
-        : Silent?.Invoke(vm) == true
-            ? Task.FromResult<IAgentChannel>(new ReplayAgentChannel([], 1, holdOpen: true, time, guest, vm.TaskId))
-            : inner.ConnectAsync(vm, ct);
+    /// <summary>The next connections to a guest lose their first N provenance requests (the agent is still reconnecting).</summary>
+    public int DropProvenanceRequests { get; set; }
+    /// <summary>How many connections that applies to (the job's check and sealer connect first; the verification boot is a fresh guest).</summary>
+    public int DropOnConnections { get => _dropConnections; set => _dropConnections = value; }
+    private int _dropConnections = int.MaxValue;
+
+    public async Task<IAgentChannel> ConnectAsync(VmHandle vm, CancellationToken ct)
+    {
+        if (Unreachable?.Invoke(vm) == true) throw new IOException("the agent socket is not there");
+        if (Silent?.Invoke(vm) == true) return new ReplayAgentChannel([], 1, holdOpen: true, time, guest, vm.TaskId);
+        var channel = await inner.ConnectAsync(vm, ct);
+        return DropProvenanceRequests > 0 && Interlocked.Decrement(ref _dropConnections) >= 0 ? new ReconnectGapChannel((ReplayAgentChannel)channel, DropProvenanceRequests) : channel;
+    }
 }
 
 /// <summary>
@@ -796,6 +804,19 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
         var connects = 0;
         rig.Channels.Silent = vm => vm.TaskId == id && Interlocked.Increment(ref connects) > 1; // no ready on the sealer's connection
+
+        await rig.PumpAsync(rig.Start(id));
+
+        Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
+    }
+
+    [Fact]
+    public async Task CheckAgent_ResendsProvenanceLostInTheGap_AndTheSealerToo()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        rig.Channels.DropProvenanceRequests = 2; // the check's and the sealer's connections lose their first two requests
+        rig.Channels.DropOnConnections = 2;
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
 
         await rig.PumpAsync(rig.Start(id));
 
