@@ -621,6 +621,9 @@ namespace Maldex.Data.Migrations
                         .HasMaxLength(32)
                         .HasColumnType("nvarchar(32)");
 
+                    b.Property<DateTimeOffset?>("CurrentUntil")
+                        .HasColumnType("datetimeoffset");
+
                     b.Property<string>("FileStem")
                         .IsRequired()
                         .HasMaxLength(64)

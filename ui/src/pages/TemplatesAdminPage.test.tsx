@@ -21,23 +21,23 @@ import TemplatesAdminPage from './TemplatesAdminPage'
 const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin' }
 
 const version = (over: Partial<TemplateVersionDto>): TemplateVersionDto => ({
-  id: 'v-id', number: 1, origin: 'Imported', status: 'Ready', isCurrent: false, diskPresent: true,
+  id: 'v-id', number: 1, origin: 'Imported', status: 'Ready', role: 'Pending', isCurrent: false, diskPresent: true,
   windowsEdition: null, windowsBuild: null, officePresent: null, agentVersion: null, sealedBy: null,
   sealedAt: '2026-10-24T10:00:00Z', note: null, sizeBytes: null, ...over,
 })
 
 const v3 = version({
-  id: 'g3', number: 3, origin: 'Edit', isCurrent: true, windowsEdition: 'Windows 11 Pro', windowsBuild: '26300', agentVersion: '1.0.0', sealedBy: 'basht0p',
+  id: 'g3', number: 3, origin: 'Edit', isCurrent: true, role: 'Current', windowsEdition: 'Windows 11 Pro', windowsBuild: '26300', agentVersion: '1.0.0', sealedBy: 'basht0p',
 })
-const v2 = version({ id: 'g2', number: 2, origin: 'Refresh', status: 'Ready' })
-const v1 = version({ id: 'g1', number: 1, origin: 'IsoBuild', status: 'Deleted', diskPresent: false })
+const v2 = version({ id: 'g2', number: 2, origin: 'Refresh', status: 'Ready', role: 'RollbackTarget' })
+const v1 = version({ id: 'g1', number: 1, origin: 'IsoBuild', status: 'Deleted', role: 'Deleted', diskPresent: false })
 
 const golden = (over: Partial<AdminTemplateDto> = {}): AdminTemplateDto => ({
   id: 'win11-golden', displayName: 'Windows 11 Golden', description: null, isDefault: false, enabled: true,
   current: v3, versions: [v3, v2, v1], ...over,
 })
 const base = (over: Partial<AdminTemplateDto> = {}): AdminTemplateDto => {
-  const cur = version({ id: 'b1', number: 1, isCurrent: true })
+  const cur = version({ id: 'b1', number: 1, isCurrent: true, role: 'Current' })
   return { id: 'win11-26h2', displayName: 'Windows 11 26H2', description: null, isDefault: true, enabled: true, current: cur, versions: [cur], ...over }
 }
 
@@ -84,8 +84,8 @@ describe('TemplatesAdminPage', () => {
     expect(within(g).getAllByText('Disk missing')).toHaveLength(1)
   })
 
-  it('keeps only a Ready non-current version: Retired history means no previous version and Roll back is disabled', async () => {
-    const retired = version({ id: 'r2', number: 2, status: 'Retired' })
+  it('Retired history means no previous version and Roll back is disabled', async () => {
+    const retired = version({ id: 'r2', number: 2, status: 'Retired', role: 'Retired' })
     listAdminTemplates.mockResolvedValue([golden({ versions: [v3, retired, v1] })])
     renderPage()
     const g = await region('Windows 11 Golden')
@@ -93,11 +93,21 @@ describe('TemplatesAdminPage', () => {
     expect(within(g).getByRole('button', { name: 'Roll back' })).toBeDisabled()
   })
 
+  it('a Pending version (sealed, never current) is not a rollback target: it is listed apart and Roll back stays disabled', async () => {
+    const pending = version({ id: 'p4', number: 4, origin: 'Edit', role: 'Pending' })
+    listAdminTemplates.mockResolvedValue([golden({ versions: [pending, v3] })])
+    renderPage()
+    const g = await region('Windows 11 Golden')
+    expect(within(g).getByText('No previous version kept')).toBeInTheDocument()
+    expect(within(g).getByText('Not yet published: v4')).toBeInTheDocument()
+    expect(within(g).getByRole('button', { name: 'Roll back' })).toBeDisabled()
+  })
+
   it('names exactly the Ready previous version in the confirmation', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     const v4 = version({ id: 'g4', number: 4, isCurrent: true, origin: 'Edit' })
-    const v3r = version({ id: 'r3', number: 3, status: 'Retired' })
-    const v2r = version({ id: 'g2', number: 2, status: 'Ready' })
+    const v3r = version({ id: 'r3', number: 3, status: 'Retired', role: 'Retired' })
+    const v2r = version({ id: 'g2', number: 2, status: 'Ready', role: 'RollbackTarget' })
     listAdminTemplates.mockResolvedValue([golden({ current: v4, versions: [v4, v3r, v2r] })])
     renderPage()
     const g = await region('Windows 11 Golden')
@@ -109,30 +119,30 @@ describe('TemplatesAdminPage', () => {
     expect(text).not.toContain('v3')
   })
 
-  it('says the replaced version stays available as the previous version', async () => {
+  it('says the version rolled back from is retired, never kept', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     renderPage()
     const g = await region('Windows 11 Golden')
     await userEvent.click(within(g).getByRole('button', { name: 'Roll back' }))
     const text = String(confirm.mock.calls[0][0])
     expect(text).toContain('New tasks will use v2.')
-    expect(text).toContain('v3 stays available as the previous version.')
-    expect(text).not.toMatch(/retired/i)
+    expect(text).toContain('v3 will be retired')
+    expect(text).not.toContain('stays available')
   })
 
-  it('does not promise to keep the replaced version when a newer previous version is kept before it', async () => {
+  it('takes the rollback target from the server role, not from the highest number, and lists the other kept versions', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
-    const c2 = version({ id: 'c2', number: 2, isCurrent: true })
-    const r3 = version({ id: 'r3', number: 3 })
-    const r4 = version({ id: 'r4', number: 4 })
-    listAdminTemplates.mockResolvedValue([golden({ current: c2, versions: [r4, r3, c2] })])
+    const c5 = version({ id: 'c5', number: 5, isCurrent: true, role: 'Current' })
+    const t2 = version({ id: 't2', number: 2, role: 'RollbackTarget' })
+    const p4 = version({ id: 'p4', number: 4, role: 'Previous' })
+    listAdminTemplates.mockResolvedValue([golden({ current: c5, versions: [c5, p4, t2] })])
     renderPage()
     const g = await region('Windows 11 Golden')
+    expect(within(g).getByText('Previous kept: v2, v4')).toBeInTheDocument()
     await userEvent.click(within(g).getByRole('button', { name: 'Roll back' }))
     const text = String(confirm.mock.calls[0][0])
-    expect(text).toContain('New tasks will use v4.')
-    expect(text).not.toContain('stays available')
-    expect(text).toContain('v2 becomes a previous version')
+    expect(text).toContain('New tasks will use v2.')
+    expect(text).toContain('v5 will be retired')
   })
 
   it('shows a Ready previous version whose disk is missing as kept, with a warning, and disables Roll back', async () => {

@@ -46,7 +46,7 @@ public sealed class TemplateAdminTests(SqlServerFixture sql) : IDisposable
         var t = new Template { Id = "other", DisplayName = "Other", CreatedAt = now };
         db.Templates.Add(t);
         await db.SaveChangesAsync(Ct);
-        var v1 = new TemplateVersion { Id = Guid.NewGuid(), TemplateId = "other", Number = 1, Origin = TemplateVersionOrigin.Imported, FileStem = "other-1", SealedAt = now };
+        var v1 = new TemplateVersion { Id = Guid.NewGuid(), TemplateId = "other", Number = 1, Origin = TemplateVersionOrigin.Imported, FileStem = "other-1", SealedAt = now, CurrentUntil = now.AddHours(-1) };
         var v2 = new TemplateVersion { Id = Guid.NewGuid(), TemplateId = "other", Number = 2, Origin = TemplateVersionOrigin.Imported, FileStem = "other-2", SealedAt = now };
         db.TemplateVersions.AddRange(v1, v2);
         await db.SaveChangesAsync(Ct);
@@ -82,6 +82,41 @@ public sealed class TemplateAdminTests(SqlServerFixture sql) : IDisposable
         Assert.Equal("Imported", versions[0].GetProperty("origin").GetString());
         var seeded = list.EnumerateArray().Single(t => t.GetProperty("id").GetString() == Seeded);
         Assert.True(seeded.GetProperty("isDefault").GetBoolean());
+    }
+
+    [Fact]
+    public async Task List_ReportsRoles()
+    {
+        var f = Factory();
+        await SeedOtherAsync(f); // v1 was current until an hour ago, v2 is current
+        using (var scope = f.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+            var now = DateTimeOffset.UtcNow;
+            TemplateVersion Extra(int n, TemplateVersionStatus status, DateTimeOffset? until) => new()
+            {
+                Id = Guid.NewGuid(), TemplateId = "other", Number = n, Origin = TemplateVersionOrigin.Imported, FileStem = $"other-{n}",
+                SealedAt = now, Status = status, CurrentUntil = until,
+            };
+            db.TemplateVersions.AddRange(
+                Extra(3, TemplateVersionStatus.Ready, null),                  // sealed, never current
+                Extra(4, TemplateVersionStatus.Retired, now.AddHours(-5)),
+                Extra(5, TemplateVersionStatus.Deleted, now.AddHours(-6)),
+                Extra(6, TemplateVersionStatus.Ready, now.AddHours(-2)));     // current before v1: a further kept version
+            await db.SaveChangesAsync(Ct);
+        }
+        using var client = f.CreateClient(UserRole.Admin);
+
+        var list = await client.GetFromJsonAsync<JsonElement>("/api/admin/templates", Ct);
+
+        var roles = list.EnumerateArray().Single(t => t.GetProperty("id").GetString() == "other").GetProperty("versions").EnumerateArray()
+            .ToDictionary(v => v.GetProperty("number").GetInt32(), v => v.GetProperty("role").GetString());
+        Assert.Equal("Current", roles[2]);
+        Assert.Equal("RollbackTarget", roles[1]);
+        Assert.Equal("Previous", roles[6]);
+        Assert.Equal("Pending", roles[3]);
+        Assert.Equal("Retired", roles[4]);
+        Assert.Equal("Deleted", roles[5]);
     }
 
     [Fact]

@@ -23,4 +23,6 @@ public class TemplateVersion
     public string? Note { get; set; }
     public TemplateVersionStatus Status { get; set; } = TemplateVersionStatus.Ready;
     public long? SizeBytes { get; set; }
+    /// <summary>When this version stopped being current (null: it never was, or it is current now). Retention keeps the latest ones.</summary>
+    public DateTimeOffset? CurrentUntil { get; set; }
 }

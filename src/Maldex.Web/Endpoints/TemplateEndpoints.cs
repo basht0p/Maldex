@@ -11,7 +11,7 @@ public sealed record TemplateSummaryDto(string Id, string DisplayName, bool IsDe
 
 public sealed record TemplateVersionDto(Guid Id, int Number, string Origin, string Status, bool IsCurrent, bool DiskPresent,
     string? WindowsEdition, string? WindowsBuild, bool? OfficePresent, string? AgentVersion, string? SealedBy, DateTimeOffset SealedAt,
-    string? Note, long? SizeBytes);
+    string? Note, long? SizeBytes, string Role);
 
 public sealed record AdminTemplateDto(string Id, string DisplayName, string? Description, bool IsDefault, bool Enabled,
     TemplateVersionDto? Current, IReadOnlyList<TemplateVersionDto> Versions);
@@ -101,12 +101,14 @@ public static class TemplateEndpoints
 
         return templates.Select(t =>
         {
-            var dtos = versions.Where(v => v.TemplateId == t.Id).Select(v => new TemplateVersionDto(
+            var mine = versions.Where(v => v.TemplateId == t.Id).ToList();
+            var roles = TemplateCatalog.RolesOf(mine, t.CurrentVersionId);
+            var dtos = mine.Select(v => new TemplateVersionDto(
                 v.Id, v.Number, v.Origin.ToString(), v.Status.ToString(), v.Id == t.CurrentVersionId,
                 v.Status != TemplateVersionStatus.Deleted && catalog.DiskPresent(v.FileStem),
                 v.WindowsEdition, v.WindowsBuild, v.OfficePresent, v.AgentVersion,
                 v.SealedByUserId is { } u && names.TryGetValue(u, out var name) ? name : null,
-                v.SealedAt, v.Note, v.SizeBytes)).ToList();
+                v.SealedAt, v.Note, v.SizeBytes, roles[v.Id])).ToList();
             return new AdminTemplateDto(t.Id, t.DisplayName, t.Description, t.IsDefault, t.Enabled, dtos.FirstOrDefault(d => d.IsCurrent), dtos);
         }).ToList();
     }
