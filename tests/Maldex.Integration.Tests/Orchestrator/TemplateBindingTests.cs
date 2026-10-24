@@ -222,6 +222,69 @@ public class TemplateBindingTests(SqlServerFixture sql)
         Assert.Equal(v2.Id, (await check.Tasks.SingleAsync(t => t.Id == taskId, Ct)).TemplateVersionId);
     }
 
+    /// <summary>The API's stop request: it writes the task row (and so its row version) while the run is binding.</summary>
+    private static async Task RequestStopAsync(OrchestratorHarness h, Guid taskId)
+    {
+        await using var api = h.NewContext();
+        (await api.Tasks.SingleAsync(t => t.Id == taskId, Ct)).StopRequestedAt = h.Time.GetUtcNow();
+        await api.SaveChangesAsync(Ct);
+    }
+
+    [Fact]
+    public async Task Bind_ConcurrentStop_BindsWithoutConflict_AndKeepsTheStop()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        var v1 = await V1Async(h);
+        var taskId = await h.SeedPreparingTaskAsync();
+        var interceptor = new BeforeLockInterceptor(() => RequestStopAsync(h, taskId));
+        await using var db = ContextWith(h, interceptor);
+        var task = await db.Tasks.SingleAsync(t => t.Id == taskId, Ct);
+
+        var bound = await Catalog(h, db).BindTaskVersionAsync(task, Ct);
+
+        Assert.Equal(v1.Id, bound.Id);
+        Assert.Equal(v1.Id, task.TemplateVersionId);
+        Assert.False(db.Entry(task).Property(t => t.TemplateVersionId).IsModified); // already saved; a later save must not resend it
+        await using var check = h.NewContext();
+        var row = await check.Tasks.SingleAsync(t => t.Id == taskId, Ct);
+        Assert.Equal(v1.Id, row.TemplateVersionId);
+        Assert.NotNull(row.StopRequestedAt);
+    }
+
+    [Fact]
+    public async Task Run_StopDuringBind_EndsCancelled_NotFailed()
+    {
+        var dir = Directory.CreateTempSubdirectory("maldex-replay-").FullName;
+        await File.WriteAllLinesAsync(Path.Combine(dir, "slow.jsonl"),
+            ["""{"delayMs":600000,"message":{"type":"ready","agentVersion":"1","hostname":"h"}}"""], Ct);
+        try
+        {
+            OrchestratorHarness? harness = null;
+            Guid taskId = default;
+            var interceptor = new BeforeLockInterceptor(() => RequestStopAsync(harness!, taskId));
+            await using var h = await OrchestratorHarness.CreateAsync(sql, new Dictionary<string, string?>
+            {
+                ["Maldex:Fake:Replay:Directory"] = dir,
+                ["Maldex:Fake:Replay:DefaultFile"] = "slow.jsonl",
+                ["Maldex:Fake:Replay:Speed"] = "1",
+                ["Maldex:Fake:Replay:HoldOpen"] = "true",
+                ["Maldex:Orchestrator:AgentReadyTimeout"] = "01:00:00",
+            }, s => s.ConfigureDbContext<MaldexDbContext>(o => o.AddInterceptors(interceptor)));
+            harness = h;
+            var v1 = await V1Async(h);
+            taskId = await h.SeedPreparingTaskAsync();
+
+            await h.RunAsync(taskId);
+
+            await using var db = h.NewContext();
+            var task = await db.Tasks.SingleAsync(t => t.Id == taskId, Ct);
+            Assert.Equal(RunStatus.Cancelled, task.Status);
+            Assert.Null(task.FailureReason);
+            Assert.Equal(v1.Id, task.TemplateVersionId);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
     [Fact]
     public async Task Bind_VersionRetiredAndNothingReplacesIt_RefusesAndLeavesTaskUnbound()
     {

@@ -87,9 +87,21 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
                 .AsNoTracking().SingleOrDefaultAsync(ct).ConfigureAwait(false);
             if (locked is { Status: TemplateVersionStatus.Ready })
             {
-                task.TemplateVersionId = locked.Id;
-                await db.SaveChangesAsync(ct).ConfigureAwait(false);
+                // One column, no row-version check: the API may write the task meanwhile (a stop is allowed while
+                // Preparing), and that must not turn into a concurrency failure of the run.
+                var taskId = task.Id;
+                await db.Tasks.Where(t => t.Id == taskId)
+                    .ExecuteUpdateAsync(s => s.SetProperty(t => t.TemplateVersionId, locked.Id), ct).ConfigureAwait(false);
                 await tx.CommitAsync(ct).ConfigureAwait(false);
+                // Mirror the saved value on the entity without leaving it marked modified.
+                task.TemplateVersionId = locked.Id;
+                var entry = db.Entry(task);
+                if (entry.State != EntityState.Detached)
+                {
+                    var column = entry.Property(t => t.TemplateVersionId);
+                    column.OriginalValue = locked.Id;
+                    column.IsModified = false;
+                }
                 return locked;
             }
             if (n == 2) throw new TemplateUnavailableException(task.Image);
