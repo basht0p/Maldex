@@ -7,3 +7,5 @@ public enum UserRole { Analyst, Admin }
 public enum EventType { Process, File, Registry, Network, Dns }
 public enum DetectionSource { Suricata, Yara, Heuristic }
 public enum ArtifactKind { Sample, Dropped, Pcap, Screenshot, Report, MitmFlows }
+public enum TemplateVersionOrigin { IsoBuild, Edit, Refresh, Imported }
+public enum TemplateVersionStatus { Ready, Retired, Deleted }

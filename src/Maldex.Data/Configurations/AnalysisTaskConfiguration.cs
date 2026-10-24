@@ -35,6 +35,8 @@ public sealed class AnalysisTaskConfiguration : IEntityTypeConfiguration<Analysi
         b.HasOne(x => x.Sample).WithMany().HasForeignKey(x => x.SampleSha256).OnDelete(DeleteBehavior.Restrict);
         b.HasOne(x => x.SubmittedBy).WithMany().HasForeignKey(x => x.SubmittedByUserId).OnDelete(DeleteBehavior.Restrict);
 
+        b.HasOne<TemplateVersion>().WithMany().HasForeignKey(x => x.TemplateVersionId).OnDelete(DeleteBehavior.Restrict);
+
         b.HasMany(x => x.StatusHistory).WithOne().HasForeignKey(h => h.TaskId).OnDelete(DeleteBehavior.Cascade);
 
         b.HasIndex(x => new { x.Status, x.Interactive, x.CreatedAt });

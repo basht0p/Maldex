@@ -11,6 +11,8 @@ public class AnalysisTask
     public string? OriginalFileName { get; set; }
     public Guid SubmittedByUserId { get; set; }
     public string Image { get; set; } = "";
+    /// <summary>The template version the run is bound to when it starts; null for tasks from before templates.</summary>
+    public Guid? TemplateVersionId { get; set; }
     public NetworkMode NetworkMode { get; set; }
     public string? ExitCountry { get; set; }
     public int DurationSec { get; set; }

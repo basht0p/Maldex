@@ -17,6 +17,8 @@ public class MaldexDbContext(DbContextOptions<MaldexDbContext> options) : DbCont
     public DbSet<Detection> Detections => Set<Detection>();
     public DbSet<Artifact> Artifacts => Set<Artifact>();
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
+    public DbSet<Template> Templates => Set<Template>();
+    public DbSet<TemplateVersion> TemplateVersions => Set<TemplateVersion>();
 
     protected override void ConfigureConventions(ModelConfigurationBuilder configurationBuilder)
     {
@@ -28,6 +30,8 @@ public class MaldexDbContext(DbContextOptions<MaldexDbContext> options) : DbCont
         configurationBuilder.Properties<EventType>().HaveConversion<string>().HaveMaxLength(32);
         configurationBuilder.Properties<DetectionSource>().HaveConversion<string>().HaveMaxLength(32);
         configurationBuilder.Properties<ArtifactKind>().HaveConversion<string>().HaveMaxLength(32);
+        configurationBuilder.Properties<TemplateVersionOrigin>().HaveConversion<string>().HaveMaxLength(32);
+        configurationBuilder.Properties<TemplateVersionStatus>().HaveConversion<string>().HaveMaxLength(32);
     }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder) =>
