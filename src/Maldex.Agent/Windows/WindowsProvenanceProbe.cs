@@ -12,13 +12,10 @@ public sealed class WindowsProvenanceProbe : IProvenanceProbe
     public ProvenanceReport Probe()
     {
         using var nt = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
-        var product = nt?.GetValue("ProductName") as string ?? "Windows";
-        var editionId = nt?.GetValue("EditionID") as string;
-        var edition = string.IsNullOrWhiteSpace(editionId) || product.Contains(editionId, StringComparison.OrdinalIgnoreCase)
-            ? product
-            : $"{product} {editionId}";
-        var build = nt?.GetValue("CurrentBuild") as string ?? "0";
-        var ubr = nt?.GetValue("UBR");
+        var build = nt?.GetValue("CurrentBuild") as string;
+        if (string.IsNullOrWhiteSpace(build)) throw new InvalidOperationException("CurrentBuild is missing from HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+        var edition = EditionFormat.FormatEdition(nt!.GetValue("ProductName") as string, nt.GetValue("EditionID") as string, build);
+        var ubr = nt.GetValue("UBR");
         return new ProvenanceReport(edition, ubr is null ? build : $"{build}.{ubr}", OfficePresent(), RealTimeProtection());
     }
 
@@ -43,6 +40,7 @@ public sealed class WindowsProvenanceProbe : IProvenanceProbe
         try
         {
             using var searcher = new ManagementObjectSearcher(@"root\Microsoft\Windows\Defender", "SELECT RealTimeProtectionEnabled FROM MSFT_MpComputerStatus");
+            searcher.Options = new System.Management.EnumerationOptions { Timeout = TimeSpan.FromSeconds(10), ReturnImmediately = false };
             foreach (ManagementBaseObject o in searcher.Get())
                 using (o) return o["RealTimeProtectionEnabled"] as bool?;
             return null;

@@ -29,14 +29,20 @@ public sealed class AgentHost(Stream channel, IEventSource source, CommandDispat
     {
         try
         {
-            if (exePath is null) return version + "+" + new string('0', 12);
+            if (exePath is null) return Fallback(version, "no process path");
             using var stream = File.OpenRead(exePath);
             return version + "+" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(stream))[..12].ToLowerInvariant();
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex)
         {
-            return version + "+" + new string('0', 12);
+            return Fallback(version, ex.Message);
         }
+    }
+
+    private static string Fallback(string version, string reason)
+    {
+        try { AgentLog.Write("Build hash unavailable, using zeros: " + reason); } catch { }
+        return version + "+" + new string('0', 12);
     }
 
     public async Task RunAsync(CancellationToken ct)

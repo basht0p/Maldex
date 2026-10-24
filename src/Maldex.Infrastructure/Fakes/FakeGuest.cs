@@ -50,7 +50,7 @@ public sealed class FakeGuest
     /// <summary>What the fake guest answers to <c>provenance</c>.</summary>
     public string ProvenanceEdition { get; set; } = "Windows 11 Pro";
     public string ProvenanceBuild { get; set; } = "26300.1";
-    public string ProvenanceAgentVersion { get; set; } = "0.1.0-fake";
+    public string ProvenanceAgentVersion { get; set; } = "0.1.0-fake+000000000000";
     public bool? ProvenanceOfficePresent { get; set; } = false;
     public bool? ProvenanceRealTimeProtection { get; set; } = false;
 

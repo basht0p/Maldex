@@ -248,7 +248,7 @@ public sealed class ReplayAgentChannelTests : IDisposable
             got.Add(m);
             if (m is CommandResultMessage) break;
         }
-        Assert.Equal(new ProvenanceMessage("p1", "Windows 10 Enterprise", "19045.5", "0.1.0-fake", true, true), got[0]);
+        Assert.Equal(new ProvenanceMessage("p1", "Windows 10 Enterprise", "19045.5", "0.1.0-fake+000000000000", true, true), got[0]);
         Assert.Equal(new CommandResultMessage("p1", true), got[1]);
     }
 
@@ -256,7 +256,7 @@ public sealed class ReplayAgentChannelTests : IDisposable
     public void FakeGuest_ProvenanceDefaults()
     {
         var g = new FakeGuest();
-        Assert.Equal(("Windows 11 Pro", "26300.1", "0.1.0-fake", false, false),
+        Assert.Equal(("Windows 11 Pro", "26300.1", "0.1.0-fake+000000000000", false, false),
             (g.ProvenanceEdition, g.ProvenanceBuild, g.ProvenanceAgentVersion, g.ProvenanceOfficePresent, g.ProvenanceRealTimeProtection));
     }
 
