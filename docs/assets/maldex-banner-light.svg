@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 200" width="880" height="200" role="img" aria-label="MALdex: interactive malware analysis sandbox">
+<rect x=".5" y=".5" width="879" height="199" rx="12" fill="#F4F6FB" stroke="#D5DBEA"/>
+<g transform="translate(48 36) scale(2)">
+<rect x="3" y="3" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="15.75" y="3.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="27.75" y="3.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="39.75" y="3.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="51" y="3" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="3" y="15" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="15" y="15" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="27.75" y="15.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="39" y="15" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="51" y="15" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="3" y="27" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="15.75" y="27.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="27" y="27" width="10" height="10" rx="1.5" fill="#2B65E3"/>
+<rect x="39.75" y="27.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="51" y="27" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="3" y="39" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="15.75" y="39.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="27.75" y="39.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="39.75" y="39.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="51" y="39" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="3" y="51" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="15.75" y="51.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="27.75" y="51.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="39.75" y="51.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="51" y="51" width="10" height="10" rx="1.5" fill="#121829"/>
+</g>
+<text x="208" y="112" font-family="'Martian Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-weight="700" font-size="64" letter-spacing="2" fill="#121829">MAL<tspan fill="#2B65E3">DEX</tspan></text>
+<text x="211" y="150" font-family="'Martian Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" letter-spacing="1.5" fill="#55607A"><tspan fill="#2B65E3">4D 5A</tspan>  ·  INTERACTIVE MALWARE ANALYSIS SANDBOX</text>
+</svg>
