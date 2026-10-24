@@ -42,10 +42,10 @@ public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcess
     {
         var handle = VmHandle.For(spec.TaskId);
         var runDir = LibvirtPaths.RunDirFor(_o, handle);
-        var basePath = Path.Combine(LibvirtPaths.BaseRoot(_o), spec.Image + ".qcow2");
-        var varsPath = Path.Combine(LibvirtPaths.BaseRoot(_o), spec.Image + ".vars.fd");
-        if (spec.Image.Contains('/') || spec.Image.Contains('\\') || spec.Image.Contains(".."))
-            throw new VmStartException($"invalid image id '{spec.Image}'");
+        var basePath = Path.Combine(LibvirtPaths.BaseRoot(_o), spec.DiskStem + ".qcow2");
+        var varsPath = Path.Combine(LibvirtPaths.BaseRoot(_o), spec.DiskStem + ".vars.fd");
+        if (spec.DiskStem.Contains('/') || spec.DiskStem.Contains('\\') || spec.DiskStem.Contains(".."))
+            throw new VmStartException($"invalid disk stem '{spec.DiskStem}'");
         if (!File.Exists(basePath)) throw new VmStartException($"base image {basePath} not found");
         if (!File.Exists(varsPath)) throw new VmStartException($"UEFI vars template {varsPath} not found");
 

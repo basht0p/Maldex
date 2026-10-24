@@ -39,6 +39,37 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
         return version;
     }
 
+    /// <summary>
+    /// Binds the task to its template's current Ready version and saves; a task that is already bound keeps its version.
+    /// Runs in a transaction that re-reads the chosen version under UPDLOCK, HOLDLOCK: a publish that retires it must wait
+    /// for this commit, and the sweep only deletes a Retired version no Preparing/Running task is bound to, so a disk
+    /// can never be deleted between choosing the version and recording the choice. A version found retired after the
+    /// lock is taken is resolved once more; if that fails too the task stays unbound.
+    /// </summary>
+    /// <exception cref="TemplateUnavailableException">No Ready version could be bound.</exception>
+    public async Task<TemplateVersion> BindAsync(AnalysisTask task, CancellationToken ct)
+    {
+        if (task.TemplateVersionId is { } bound)
+            return await db.TemplateVersions.AsNoTracking().SingleAsync(v => v.Id == bound, ct).ConfigureAwait(false);
+
+        await using var tx = await db.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
+        for (var n = 1; ; n++)
+        {
+            var current = await CurrentReadyVersionAsync(task.Image, ct).ConfigureAwait(false);
+            var locked = await db.TemplateVersions
+                .FromSqlInterpolated($"SELECT * FROM TemplateVersions WITH (UPDLOCK, HOLDLOCK) WHERE Id = {current.Id}")
+                .AsNoTracking().SingleOrDefaultAsync(ct).ConfigureAwait(false);
+            if (locked is { Status: TemplateVersionStatus.Ready })
+            {
+                task.TemplateVersionId = locked.Id;
+                await db.SaveChangesAsync(ct).ConfigureAwait(false);
+                await tx.CommitAsync(ct).ConfigureAwait(false);
+                return locked;
+            }
+            if (n == 2) throw new TemplateUnavailableException(task.Image);
+        }
+    }
+
     /// <summary>Makes <paramref name="versionId"/> current (it must be Ready and belong to the template), then applies retention.</summary>
     public Task PublishAsync(string templateId, Guid versionId, CancellationToken ct) =>
         MutateAsync(async () =>

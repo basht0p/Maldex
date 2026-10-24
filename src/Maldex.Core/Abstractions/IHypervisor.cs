@@ -1,6 +1,6 @@
 namespace Maldex.Core.Abstractions;
 
-public sealed record VmSpec(Guid TaskId, string Image, int MemoryMiB, int VCpus, string NetworkId);
+public sealed record VmSpec(Guid TaskId, string DiskStem, int MemoryMiB, int VCpus, string NetworkId);
 
 public sealed record VmHandle(Guid TaskId, string Name)
 {
