@@ -690,6 +690,9 @@ namespace Maldex.Data.Migrations
 
                     b.HasKey("Id");
 
+                    b.HasIndex("FileStem")
+                        .IsUnique();
+
                     b.HasIndex("ParentVersionId");
 
                     b.HasIndex("SealedByUserId");

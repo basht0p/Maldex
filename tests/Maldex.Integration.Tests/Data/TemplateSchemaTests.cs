@@ -122,6 +122,26 @@ public class TemplateSchemaTests(SqlServerFixture sql)
     }
 
     [Fact]
+    public async Task FileStem_IsUnique_AcrossTemplates()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            db.Templates.AddRange(NewTemplate("a"), NewTemplate("b"));
+            await db.SaveChangesAsync(Ct);
+            var first = NewVersion("a", 1);
+            db.TemplateVersions.Add(first);
+            await db.SaveChangesAsync(Ct);
+
+            var twin = NewVersion("b", 1);
+            twin.FileStem = first.FileStem; // two versions must never share one disk
+            db.TemplateVersions.Add(twin);
+            var ex = await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync(Ct));
+            Assert.Contains("IX_TemplateVersions_FileStem", ex.InnerException?.Message);
+        }
+    }
+
+    [Fact]
     public async Task Task_TemplateVersionId_IsOptional()
     {
         var (db, cs) = await FreshAsync();
