@@ -55,6 +55,9 @@ public sealed class FakeGuest
     public bool? ProvenanceOfficePresent { get; set; } = false;
     public bool? ProvenanceRealTimeProtection { get; set; } = false;
 
+    /// <summary>When true, the fake guest never answers <c>provenance</c>.</summary>
+    public bool SilentProvenance { get; set; }
+
     private readonly ConcurrentQueue<string> _applied = new();
 
     /// <summary>Transfer ids (agent, Sysmon config, CA) of every accepted <c>apply_components</c>, in the order the command named them.</summary>

@@ -125,7 +125,7 @@ public sealed class CommandDispatcher : IDisposable
         foreach (var id in new[] { c.CaCertTransferId, c.SysmonConfigTransferId, c.AgentTransferId })
         {
             if (!AgentLimits.IsComponentTransfer(id))
-                return new CommandResultMessage(c.CommandId, false, $"transfer id '{id}' is not a component transfer (it must start with {AgentLimits.ComponentTransferPrefix})");
+                return new CommandResultMessage(c.CommandId, false, AgentLimits.NotComponentTransferMessage(id));
         }
 
         try

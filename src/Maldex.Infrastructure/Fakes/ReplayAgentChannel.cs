@@ -186,11 +186,19 @@ public sealed class ReplayAgentChannel : IAgentChannel
                 _opened.TrySetResult();
                 break;
             case ProvenanceCommand c:
+                if (_guest!.SilentProvenance) break;
                 Enqueue(new ProvenanceMessage(c.CommandId, _guest!.ProvenanceEdition, _guest.ProvenanceBuild, _guest.ProvenanceAgentVersion,
                     _guest.ProvenanceOfficePresent, _guest.ProvenanceRealTimeProtection));
                 Enqueue(new CommandResultMessage(c.CommandId, true));
                 break;
             case ApplyComponentsCommand c:
+                // Same check, same order and same text as the real agent: a sample can never be installed as a component.
+                foreach (var transferId in new[] { c.CaCertTransferId, c.SysmonConfigTransferId, c.AgentTransferId })
+                {
+                    if (AgentLimits.IsComponentTransfer(transferId)) continue;
+                    Enqueue(new CommandResultMessage(c.CommandId, false, AgentLimits.NotComponentTransferMessage(transferId)));
+                    return;
+                }
                 if (_guest!.RejectApplyComponents)
                 {
                     Enqueue(new CommandResultMessage(c.CommandId, false, "import_ca failed: refused by the fake guest"));

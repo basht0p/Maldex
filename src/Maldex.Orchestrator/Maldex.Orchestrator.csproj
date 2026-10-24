@@ -4,5 +4,6 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Maldex.Infrastructure\Maldex.Infrastructure.csproj" />
+    <ProjectReference Include="..\Maldex.Agent\Maldex.Agent.csproj" />
   </ItemGroup>
 </Project>

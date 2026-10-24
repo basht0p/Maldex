@@ -436,6 +436,12 @@ cmd_real_smoke() {
 SYSMON_URL="https://download.sysinternals.com/files/Sysmon.zip"
 SYSMON_SHA256="00ecf1b46aec99299d3ae0bca79dc621458bd014b20b509d7c5c8e8c8611aa54"
 
+# Publishes the guest agent (self-contained single-file win-x64) to .data/agent/Maldex.Agent.exe. Used by build-guest and by template sealing.
+cmd_agent() {
+  dotnet publish src/Maldex.Agent -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o "$PWD/.data/agent" --nologo -v q
+  [ -f .data/agent/Maldex.Agent.exe ] || { echo "Agent publish did not produce Maldex.Agent.exe" >&2; return 1; }
+}
+
 cmd_build_guest() {
   if [ -z "${MALDEX_WIN_ISO:-}" ] || [ ! -f "${MALDEX_WIN_ISO:-}" ]; then
     echo "MALDEX_WIN_ISO must point to a Windows 11 x64 Enterprise (evaluation) ISO (got: '${MALDEX_WIN_ISO:-}')." >&2
@@ -467,10 +473,11 @@ case "${1:-}" in
   build)  cmd_build ;;
   real-setup) cmd_real_setup ;;
   real-smoke) cmd_real_smoke ;;
+  agent) cmd_agent ;;
   build-guest) cmd_build_guest ;;
   prepare-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" deploy/guest/prepare-guest.sh prepare ;;
   finalize-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" deploy/guest/prepare-guest.sh finalize ;;
   discard-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" deploy/guest/prepare-guest.sh discard ;;
   e2e)    cmd_e2e ;;
-  *) echo "usage: $0 setup|dev-db|run|test|smoke|build|real-setup|real-smoke|build-guest|prepare-guest|finalize-guest|discard-guest|e2e" >&2; exit 64 ;;
+  *) echo "usage: $0 setup|dev-db|run|test|smoke|build|agent|real-setup|real-smoke|build-guest|prepare-guest|finalize-guest|discard-guest|e2e" >&2; exit 64 ;;
 esac
