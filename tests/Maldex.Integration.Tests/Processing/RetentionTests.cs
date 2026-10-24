@@ -269,6 +269,8 @@ public class RetentionTests(SqlServerFixture sql)
         db.TemplateVersions.Add(v2);
         await db.SaveChangesAsync(Ct);
         (await db.Templates.SingleAsync(t => t.Id == "win10", Ct)).CurrentVersionId = v2.Id;
+        // v1 was current until v2 took over (what a publish records), so a rollback can return to it.
+        (await db.TemplateVersions.SingleAsync(v => v.TemplateId == "win10" && v.Number == 1, Ct)).CurrentUntil = h.Time.GetUtcNow();
         await db.SaveChangesAsync(Ct);
         return v2;
     }

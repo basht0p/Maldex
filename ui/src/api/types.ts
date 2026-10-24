@@ -50,6 +50,8 @@ export interface TaskDto {
 
 export type TemplateVersionOrigin = 'IsoBuild' | 'Edit' | 'Refresh' | 'Imported'
 export type TemplateVersionStatus = 'Ready' | 'Retired' | 'Deleted'
+/** What a version is for the admin; the server derives it (retention by "was current before"). */
+export type TemplateVersionRole = 'Current' | 'Previous' | 'RollbackTarget' | 'Pending' | 'Retired' | 'Deleted'
 
 /** GET /api/templates: the enabled templates an analyst may pick. */
 export interface TemplateSummaryDto {
@@ -78,6 +80,7 @@ export interface TemplateVersionDto {
   number: number
   origin: TemplateVersionOrigin
   status: TemplateVersionStatus
+  role: TemplateVersionRole
   isCurrent: boolean
   diskPresent: boolean
   windowsEdition?: string | null

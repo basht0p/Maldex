@@ -23,23 +23,10 @@ function versionSummary(v: TemplateVersionDto): string {
   return `v${v.number} (${parts.join(', ')})`
 }
 
-/** The version the server keeps and rolls back to: the newest non-current Ready version (its disk may still be missing). */
-function keptPrevious(t: AdminTemplateDto): TemplateVersionDto | undefined {
-  return t.versions.filter((v) => !v.isCurrent && v.status === 'Ready').sort((a, b) => b.number - a.number)[0]
-}
-
-/**
- * What happens to the version a rollback replaces. The server keeps the newest previous Ready versions (KeepPrevious,
- * at least one while there is a previous version to roll back to), so the replaced current version stays when no
- * other kept version is newer than it.
- */
-function replacedNote(t: AdminTemplateDto, target: TemplateVersionDto): string {
-  const current = t.current
-  if (!current) return ''
-  const newerKept = t.versions.some((v) => v.status === 'Ready' && v.id !== current.id && v.id !== target.id && v.number > current.number)
-  return newerKept
-    ? ` v${current.number} becomes a previous version; it is retired if newer previous versions fill the retention limit.`
-    : ` v${current.number} stays available as the previous version.`
+/** The versions the server keeps for rollback, rollback target first (its `role` decides; a disk may still be missing). */
+function keptVersions(t: AdminTemplateDto): TemplateVersionDto[] {
+  const target = t.versions.filter((v) => v.role === 'RollbackTarget')
+  return [...target, ...t.versions.filter((v) => v.role === 'Previous')]
 }
 
 function officeLabel(present: boolean | null | undefined): string {
@@ -49,7 +36,9 @@ function officeLabel(present: boolean | null | undefined): string {
 function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; onChanged: () => Promise<void> }) {
   const [errors, setErrors] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
-  const previous = keptPrevious(t)
+  const kept = keptVersions(t)
+  const previous = kept.find((v) => v.role === 'RollbackTarget')
+  const pending = t.versions.filter((v) => v.role === 'Pending')
   const previousDiskMissing = previous !== undefined && !previous.diskPresent
   const headingId = `template-${t.id}`
 
@@ -69,7 +58,7 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
   function rollBack() {
     if (!previous) return
     const ok = window.confirm(
-      `Roll back ${t.displayName} to v${previous.number}? New tasks will use v${previous.number}.${replacedNote(t, previous)}`,
+      `Roll back ${t.displayName} to v${previous.number}? New tasks will use v${previous.number}.${t.current ? ` v${t.current.number} will be retired: a rolled-back version is never kept.` : ''}`,
     )
     if (ok) void run(() => rollBackTemplate(t.id))
   }
@@ -97,8 +86,13 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
           </> : <span className={styles.hint}>No current version</span>}
       </p>
       <p className={page.summary}>
-        {previous ? <span className={styles.mono}>{`Previous kept: v${previous.number}`}</span> : <span className={styles.hint}>No previous version kept</span>}
+        {kept.length > 0 ? <span className={styles.mono}>{`Previous kept: ${kept.map((v) => `v${v.number}`).join(', ')}`}</span> : <span className={styles.hint}>No previous version kept</span>}
       </p>
+      {pending.length > 0 && (
+        <p className={page.summary}>
+          <span className={styles.hint}>{`Not yet published: ${pending.map((v) => `v${v.number}`).join(', ')}`}</span>
+        </p>
+      )}
       <table className={styles.table}>
         <thead><tr><th>Version</th><th>Origin</th><th>Status</th><th>Disk</th></tr></thead>
         <tbody>
