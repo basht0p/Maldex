@@ -36,9 +36,13 @@ public sealed class InboundTransfers(string stagingDirectory) : IDisposable
     private void AddChunkCore(PutFileChunkCommand c)
     {
         if (string.IsNullOrEmpty(c.TransferId) || c.TransferId.Length > 256) throw new InvalidOperationException("Invalid TransferId.");
-        if (c.Count is < 1 or > AgentLimits.MaxChunks) throw new InvalidOperationException($"Chunk count {c.Count} outside 1..{AgentLimits.MaxChunks}.");
+        // Component files (the agent exe is ~77 MB) may exceed the sample caps; every other transfer keeps them.
+        var component = AgentLimits.IsComponentTransfer(c.TransferId);
+        var maxChunks = component ? AgentLimits.MaxComponentChunks : AgentLimits.MaxChunks;
+        var maxBytes = component ? AgentLimits.MaxComponentBytes : AgentLimits.MaxInboundBytes;
+        if (c.Count < 1 || c.Count > maxChunks) throw new InvalidOperationException($"Chunk count {c.Count} outside 1..{maxChunks}.");
         if (c.Index < 0 || c.Index >= c.Count) throw new InvalidOperationException($"Chunk index {c.Index} outside 0..{c.Count - 1}.");
-        if (c.TotalBytes < 0 || c.TotalBytes > AgentLimits.MaxInboundBytes) throw new InvalidOperationException($"Total size {c.TotalBytes} exceeds {AgentLimits.MaxInboundBytes} bytes.");
+        if (c.TotalBytes < 0 || c.TotalBytes > maxBytes) throw new InvalidOperationException($"Total size {c.TotalBytes} exceeds {maxBytes} bytes.");
         if (c.DataBase64 is null || c.DataBase64.Length > (AgentLimits.ChunkBytes + 2) / 3 * 4) throw new InvalidOperationException("Chunk data exceeds the chunk size limit.");
 
         var data = new byte[c.DataBase64.Length / 4 * 3 + 3];
@@ -49,7 +53,7 @@ public sealed class InboundTransfers(string stagingDirectory) : IDisposable
             // A fresh start for this id replaces any earlier attempt.
             Discard(c.TransferId);
             if (_active.Count >= MaxOpenTransfers) throw new InvalidOperationException("Too many transfers in progress.");
-            _active[c.TransferId] = new InboundFileAssembler(stagingDirectory, StageName(c.TransferId), c.Sha256, c.Count, c.TotalBytes);
+            _active[c.TransferId] = new InboundFileAssembler(stagingDirectory, StageName(c.TransferId), c.Sha256, c.Count, c.TotalBytes, component);
         }
 
         if (!_active.TryGetValue(c.TransferId, out var assembler)) throw new InvalidOperationException("Unknown transfer; chunk 0 must come first.");

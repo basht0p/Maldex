@@ -4,10 +4,18 @@ using Microsoft.Extensions.Options;
 
 namespace Maldex.Infrastructure.Fakes;
 
-public sealed class FakeHypervisor(IOptions<FakeHypervisorOptions> options) : IHypervisor
+public sealed class FakeHypervisor : IHypervisor
 {
     private readonly ConcurrentDictionary<string, VmHandle> _running = new();
+    private readonly IOptions<FakeHypervisorOptions> options;
     private int _starts;
+
+    /// <param name="guest">When given, a VM whose fake guest handles <c>power_off</c> stops being listed, like a VM that shut itself down.</param>
+    public FakeHypervisor(IOptions<FakeHypervisorOptions> options, FakeGuest? guest = null)
+    {
+        this.options = options;
+        if (guest is not null) guest.PoweredOff += taskId => _running.TryRemove(VmHandle.For(taskId).Name, out _);
+    }
 
     public Task<VmHandle> StartAsync(VmSpec spec, CancellationToken ct)
     {

@@ -190,6 +190,21 @@ public sealed class ReplayAgentChannel : IAgentChannel
                     _guest.ProvenanceOfficePresent, _guest.ProvenanceRealTimeProtection));
                 Enqueue(new CommandResultMessage(c.CommandId, true));
                 break;
+            case ApplyComponentsCommand c:
+                if (_guest!.RejectApplyComponents)
+                {
+                    Enqueue(new CommandResultMessage(c.CommandId, false, "import_ca failed: refused by the fake guest"));
+                    break;
+                }
+                _guest.RecordApplied(c);
+                Enqueue(new CommandResultMessage(c.CommandId, true));
+                break;
+            case PowerOffCommand c:
+                // The guest acknowledges, then the OS goes away: the stream ends and the VM is no longer running.
+                Enqueue(new CommandResultMessage(c.CommandId, true));
+                _outbox.Writer.TryComplete();
+                if (_taskId is { } id) _guest!.NotifyPoweredOff(id);
+                break;
             case OpenUrlCommand:
                 _opened.TrySetResult();
                 break;
