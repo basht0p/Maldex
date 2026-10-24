@@ -675,6 +675,9 @@ namespace Maldex.Data.Migrations
                     b.Property<DateTimeOffset?>("SealRequestedAt")
                         .HasColumnType("datetimeoffset");
 
+                    b.Property<DateTimeOffset?>("SlotHeldAt")
+                        .HasColumnType("datetimeoffset");
+
                     b.Property<DateTimeOffset?>("StartedAt")
                         .HasColumnType("datetimeoffset");
 

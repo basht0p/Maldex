@@ -27,9 +27,12 @@ public sealed partial class LibvirtTemplateStore(IOptions<LibvirtOptions> option
     public Task DeleteAsync(string fileStem, CancellationToken ct)
     {
         var (disk, vars) = Paths(fileStem);
-        // Finalized images are 0444; unlinking needs write access to the directory only, which the process owns.
+        // Finalized images are 0444; unlinking needs write access to the directory only, which the process owns. The .tmp
+        // files are what a crash in the middle of CreateWorkingCopyAsync leaves behind.
         File.Delete(disk);
         File.Delete(vars);
+        File.Delete(disk + ".tmp");
+        File.Delete(vars + ".tmp");
         return Task.CompletedTask;
     }
 

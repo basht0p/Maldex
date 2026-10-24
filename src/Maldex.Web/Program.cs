@@ -5,6 +5,7 @@ using Maldex.Data.Templates;
 using Maldex.Infrastructure;
 using Maldex.Infrastructure.Real;
 using Maldex.Orchestrator;
+using Maldex.Orchestrator.Templates;
 using Maldex.Processing;
 using Maldex.Web;
 using Maldex.Web.Auth;
@@ -53,6 +54,8 @@ if ((builder.Configuration.GetSection(WorkersOptions.SectionName).Get<WorkersOpt
 {
     // Real mode: the orchestrator only starts when the host guards pass (fail closed; the web app stays up either way).
     builder.Services.AddGatedHostedService<OrchestratorWorker>();
+    // Template jobs run VMs too: same gate, and they start only after the orchestrator's startup reconcile.
+    builder.Services.AddGatedHostedService<TemplateJobWorker>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<ProcessingWorker>());
     builder.Services.AddHostedService(sp => sp.GetRequiredService<RetentionWorker>());
 }

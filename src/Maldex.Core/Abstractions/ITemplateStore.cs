@@ -17,6 +17,6 @@ public interface ITemplateStore
     /// <summary>Makes both files read-only (0444): from now on they are a version disk.</summary>
     Task SealAsync(string fileStem, CancellationToken ct) => throw new NotSupportedException();
 
-    /// <summary>Deletes both files (version disk or working copy); idempotent.</summary>
+    /// <summary>Deletes both files (version disk or working copy) and any temporary files of an interrupted copy; idempotent.</summary>
     Task DeleteAsync(string fileStem, CancellationToken ct);
 }
