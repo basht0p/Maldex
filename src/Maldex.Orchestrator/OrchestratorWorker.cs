@@ -21,6 +21,7 @@ public sealed class OrchestratorWorker(
     IServiceScopeFactory scopes,
     Reconciler reconciler,
     RunCoordinator coordinator,
+    VmSlotGate slotGate,
     IDiskSpaceProbe disk,
     IOptions<OrchestratorOptions> options,
     IOptions<ArtifactStoreOptions> artifactOptions,
@@ -110,6 +111,8 @@ public sealed class OrchestratorWorker(
         await using var scope = scopes.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
 
+        // Count and claim under the slot gate: a template job taking a slot does the same, so both never take the same one.
+        using var gate = await slotGate.EnterAsync(ct).ConfigureAwait(false);
         var busy = await VmSlots.BusyAsync(db, ct).ConfigureAwait(false);
         var slots = _options.MaxConcurrentVms - busy;
         if (slots <= 0) return [];

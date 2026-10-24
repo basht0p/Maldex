@@ -24,6 +24,8 @@ public class TemplateJob
     public string? Note { get; set; }
     public DateTimeOffset? SealRequestedAt { get; set; }
     public DateTimeOffset? CancelRequestedAt { get; set; }
+    /// <summary>When the job took a VM slot (before its first VM boots). A non-terminal job with this set counts as busy in <c>VmSlots</c>.</summary>
+    public DateTimeOffset? SlotHeldAt { get; set; }
     public byte[] RowVersion { get; set; } = [];
 
     public void TransitionTo(TemplateJobState to, string? message, DateTimeOffset at)

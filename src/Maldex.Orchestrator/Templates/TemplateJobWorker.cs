@@ -11,9 +11,10 @@ namespace Maldex.Orchestrator.Templates;
 
 /// <summary>
 /// Once the orchestrator's startup reconcile is done, starts queued template jobs (oldest first) while VM slots are free, one
-/// <see cref="TemplateCoordinator"/> run per job. Slots are the shared <see cref="VmSlots"/> count; jobs this worker has started
-/// that do not hold a VM yet (Queued, Preparing) are counted too, so a burst of jobs cannot overbook. A job with a cancel
-/// request is started regardless, so that the coordinator ends it at once.
+/// <see cref="TemplateCoordinator"/> run per job. Slots are the shared <see cref="VmSlots"/> count; runs this worker has started
+/// that have not taken their slot yet are counted too, so a burst of jobs does not copy disks it cannot boot. The slot itself
+/// is taken by the coordinator under the <see cref="VmSlotGate"/>. A job with a cancel request is started regardless, so that
+/// the coordinator ends it at once.
 /// </summary>
 public sealed class TemplateJobWorker(
     IServiceScopeFactory scopes,
@@ -75,10 +76,12 @@ public sealed class TemplateJobWorker(
             .ToListAsync(ct).ConfigureAwait(false);
         if (queued.Count == 0) return [];
 
+        // Busy slots (the one VmSlots definition), plus the runs started here that have not taken their slot yet.
         var busy = await VmSlots.BusyAsync(db, ct).ConfigureAwait(false);
-        var preparing = await db.TemplateJobs.AsNoTracking().CountAsync(j => j.State == TemplateJobState.Preparing, ct).ConfigureAwait(false);
-        var startedButQueued = queued.Count(q => _runs.ContainsKey(q.Id));
-        var free = options.Value.MaxConcurrentVms - busy - preparing - startedButQueued;
+        var mine = _runs.Keys.ToArray();
+        var notYetHolding = mine.Length == 0 ? 0 : await db.TemplateJobs.AsNoTracking()
+            .CountAsync(j => mine.Contains(j.Id) && j.SlotHeldAt == null && (j.State == TemplateJobState.Queued || j.State == TemplateJobState.Preparing), ct).ConfigureAwait(false);
+        var free = options.Value.MaxConcurrentVms - busy - notYetHolding;
 
         var started = new List<Guid>();
         foreach (var job in queued)

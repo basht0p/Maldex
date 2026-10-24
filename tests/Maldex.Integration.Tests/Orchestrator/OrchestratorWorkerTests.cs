@@ -90,11 +90,13 @@ public class OrchestratorWorkerTests(SqlServerFixture sql)
     }
 
     [Theory]
-    [InlineData(TemplateJobState.Configuring, true)]
-    [InlineData(TemplateJobState.Sealing, true)]
-    [InlineData(TemplateJobState.Verifying, true)]
-    [InlineData(TemplateJobState.Preparing, false)] // only copies disks, holds no VM
-    public async Task Worker_CountsJobVmsAgainstMaxConcurrentVms(TemplateJobState jobState, bool blocks)
+    [InlineData(TemplateJobState.Preparing, false, false)] // still copying the disk, no slot taken yet
+    [InlineData(TemplateJobState.Preparing, true, true)]   // slot taken, about to boot
+    [InlineData(TemplateJobState.Configuring, true, true)]
+    [InlineData(TemplateJobState.Sealing, true, true)]
+    [InlineData(TemplateJobState.Verifying, true, true)]
+    [InlineData(TemplateJobState.Failed, true, false)]     // terminal: the slot is free again
+    public async Task Worker_CountsJobVmsAgainstMaxConcurrentVms(TemplateJobState jobState, bool slotHeld, bool blocks)
     {
         await using var h = await OrchestratorHarness.CreateAsync(sql, Settings());
         var worker = h.Get<OrchestratorWorker>();
@@ -108,6 +110,7 @@ public class OrchestratorWorkerTests(SqlServerFixture sql)
             {
                 Id = Guid.NewGuid(), Kind = TemplateJobKind.Edit, TemplateId = template.Id, BaseVersionId = template.CurrentVersionId!.Value,
                 Network = NetworkMode.Simulated, State = jobState, RequestedByUserId = user.Id, CreatedAt = h.Time.GetUtcNow(),
+                SlotHeldAt = slotHeld ? h.Time.GetUtcNow() : null,
             });
             await db.SaveChangesAsync(Ct);
         }

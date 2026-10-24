@@ -3,18 +3,21 @@ using Microsoft.EntityFrameworkCore;
 
 namespace Maldex.Data;
 
-/// <summary>The single count of VMs in use; analyses and template jobs share <c>MaxConcurrentVms</c>.</summary>
+/// <summary>
+/// The single count of VMs in use; analyses and template jobs share <c>MaxConcurrentVms</c>. A template job holds its slot
+/// from <see cref="TemplateJob.SlotHeldAt"/> (set just before its first VM boots) until it is terminal.
+/// </summary>
 public static class VmSlots
 {
     private static readonly RunStatus[] TaskStates = [RunStatus.Preparing, RunStatus.Running, RunStatus.Collecting];
 
-    // Preparing jobs only copy disks and hold no VM.
-    private static readonly TemplateJobState[] JobStates = [TemplateJobState.Configuring, TemplateJobState.Sealing, TemplateJobState.Verifying];
+    private static readonly TemplateJobState[] Terminal =
+        [TemplateJobState.Published, TemplateJobState.Sealed, TemplateJobState.Failed, TemplateJobState.Cancelled];
 
     public static async Task<int> BusyAsync(MaldexDbContext db, CancellationToken ct)
     {
         var tasks = await db.Tasks.AsNoTracking().CountAsync(t => TaskStates.Contains(t.Status), ct).ConfigureAwait(false);
-        var jobs = await db.TemplateJobs.AsNoTracking().CountAsync(j => JobStates.Contains(j.State), ct).ConfigureAwait(false);
+        var jobs = await db.TemplateJobs.AsNoTracking().CountAsync(j => j.SlotHeldAt != null && !Terminal.Contains(j.State), ct).ConfigureAwait(false);
         return tasks + jobs;
     }
 }

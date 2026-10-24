@@ -36,11 +36,14 @@ internal sealed class RecordingEgress(IEgressRouter inner) : IEgressRouter
     private readonly List<string> _calls = [];
     public IReadOnlyList<string> Calls { get { lock (_calls) return _calls.ToArray(); } }
     public Func<Guid, Task<string>>? DescribeAtIsolate { get; set; }
+    /// <summary>Awaited before each lease is created (a test can hold a job between taking its slot and booting).</summary>
+    public Func<Guid, Task>? BeforeCreate { get; set; }
 
     private void Add(string call) { lock (_calls) _calls.Add(call); }
 
     public async Task<NetworkLease> CreateAsync(Guid taskId, NetworkMode mode, string? exitCountry, CancellationToken ct)
     {
+        if (BeforeCreate is not null) await BeforeCreate(taskId);
         Add($"create {mode}");
         return await inner.CreateAsync(taskId, mode, exitCountry, ct);
     }
@@ -238,6 +241,16 @@ internal sealed class TemplateJobRig : IAsyncDisposable
             H.Time.Advance(TimeSpan.FromMilliseconds(100));
             await Task.Delay(5, Ct);
         }
+    }
+
+    /// <summary>Ends a seeded Running analysis (it moves on to Processing and frees its VM slot).</summary>
+    public async Task EndAnalysisAsync(Guid taskId)
+    {
+        await using var db = H.NewContext();
+        var t = await db.Tasks.SingleAsync(x => x.Id == taskId, Ct);
+        t.TransitionTo(RunStatus.Collecting, "test", H.Time.GetUtcNow());
+        t.TransitionTo(RunStatus.Processing, "test", H.Time.GetUtcNow());
+        await db.SaveChangesAsync(Ct);
     }
 
     public async Task<List<AuditLog>> AuditsAsync()
@@ -648,15 +661,110 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         Assert.Empty(await rig.Hypervisor.ListAsync(Ct));
         Assert.Empty(rig.Egress.Calls);
 
-        await using (var db = rig.H.NewContext())
-        {
-            var t = await db.Tasks.SingleAsync(x => x.Id == analysis, Ct);
-            t.TransitionTo(RunStatus.Collecting, "test", rig.H.Time.GetUtcNow());
-            t.TransitionTo(RunStatus.Processing, "test", rig.H.Time.GetUtcNow());
-            await db.SaveChangesAsync(Ct);
-        }
+        await rig.EndAnalysisAsync(analysis);
         await rig.PumpAsync(run);
         Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
+    }
+
+    [Fact]
+    public async Task SlotFreedWhileTheJobWaits_TheJobTakesIt_AndNoAnalysisBootsAlongside()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        var analyses = rig.H.Get<OrchestratorWorker>();
+        var running = await rig.H.SeedTaskAsync(RunStatus.Running);
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var go = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Egress.BeforeCreate = async taskId =>
+        {
+            if (taskId != id) return;
+            reached.TrySetResult();
+            await go.Task;
+        };
+        var run = rig.Start(id);
+        await rig.PumpUntilAsync(id, TemplateJobState.Preparing, run);
+        await rig.IdleAsync(); // waiting for the analysis' slot
+        var queued = await rig.H.SeedTaskAsync(RunStatus.Queued);
+        List<Guid> claimed = [];
+        try
+        {
+            await rig.EndAnalysisAsync(running);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (!reached.Task.IsCompleted)
+            {
+                Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30), "The job never took the freed slot.");
+                rig.H.Time.Advance(TimeSpan.FromMilliseconds(50));
+                await Task.Delay(1, Ct);
+            }
+
+            // The job has taken the slot and is about to boot: the analysis must not get it.
+            claimed.AddRange(await analyses.ClaimAndStartAsync(Ct));
+            Assert.Empty(claimed);
+
+            go.SetResult();
+            for (var i = 0; !run.IsCompleted; i++)
+            {
+                Assert.True(sw.Elapsed < TimeSpan.FromSeconds(60), "The job did not finish.");
+                if (i % 20 == 0) claimed.AddRange(await analyses.ClaimAndStartAsync(Ct));
+                rig.H.Time.Advance(TimeSpan.FromMilliseconds(50));
+                await Task.Delay(1, Ct);
+            }
+            await run;
+            Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
+
+            claimed.AddRange(await analyses.ClaimAndStartAsync(Ct));
+            Assert.Equal([queued], claimed);
+            while ((await rig.Hypervisor.ListAsync(Ct)).Count == 0)
+            {
+                Assert.True(sw.Elapsed < TimeSpan.FromSeconds(90), "The analysis never booted.");
+                await rig.IdleAsync(5);
+            }
+            Assert.Equal(1, ((FakeHypervisor)rig.Hypervisor).MaxRunning); // never two VMs at once
+        }
+        finally
+        {
+            go.TrySetResult();
+            await analyses.StopRunsAsync();
+        }
+    }
+
+    [Fact]
+    public async Task RacedJobsForOneTemplate_TheOlderRuns_AndTheNewerIsRefused()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        await using (var db = rig.H.NewContext())
+        {
+            // The one-active-job index normally stops this race at the endpoint; drop it to exercise the coordinator's own check.
+            await db.Database.ExecuteSqlRawAsync("DROP INDEX IX_TemplateJobs_TemplateId_Active ON TemplateJobs", Ct);
+        }
+        var older = await rig.SeedJobAsync(TemplateJobKind.Edit);
+        rig.H.Time.Advance(TimeSpan.FromSeconds(1));
+        var newer = await rig.SeedJobAsync(TemplateJobKind.Refresh);
+
+        var run = rig.Start(older); // a newer queued job does not block it
+        await rig.PumpUntilAsync(older, TemplateJobState.Configuring, run);
+        await rig.PumpAsync(rig.Start(newer));
+
+        var refused = await rig.JobAsync(newer);
+        Assert.Equal((TemplateJobState.Failed, TemplateCoordinator.AlreadyRunning), (refused.State, refused.FailureReason));
+        await rig.RequestCancelAsync(older);
+        await rig.PumpAsync(run);
+        Assert.Equal(TemplateJobState.Cancelled, (await rig.JobAsync(older)).State);
+    }
+
+    [Fact]
+    public async Task VmStartFailure_FailsTheJob_ReleasesTheLease_AndDeletesTheWorkingCopy()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Fake:Hypervisor:FailStarts"] = "1" });
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit);
+
+        await rig.PumpAsync(rig.Start(id));
+
+        var job = await rig.JobAsync(id);
+        Assert.Equal(TemplateJobState.Failed, job.State);
+        Assert.Equal("the VM could not be started: Fake hypervisor configured to fail this start.", job.FailureReason);
+        Assert.Equal(["create None", "release"], rig.Egress.Calls);
+        await rig.AssertDiscardedAsync(id);
     }
 
     [Fact]
@@ -697,13 +805,7 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
             Assert.Empty(await worker.ClaimAndStartAsync(Ct)); // the analysis holds the only slot
             Assert.Equal(TemplateJobState.Queued, (await rig.JobAsync(id)).State);
 
-            await using (var db = rig.H.NewContext())
-            {
-                var t = await db.Tasks.SingleAsync(x => x.Id == analysis, Ct);
-                t.TransitionTo(RunStatus.Collecting, "test", rig.H.Time.GetUtcNow());
-                t.TransitionTo(RunStatus.Processing, "test", rig.H.Time.GetUtcNow());
-                await db.SaveChangesAsync(Ct);
-            }
+            await rig.EndAnalysisAsync(analysis);
 
             Assert.Equal([id], await worker.ClaimAndStartAsync(Ct));
             Assert.Empty(await worker.ClaimAndStartAsync(Ct)); // already running: never started twice

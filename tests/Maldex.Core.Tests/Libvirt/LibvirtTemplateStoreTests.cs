@@ -85,6 +85,16 @@ public sealed class LibvirtTemplateStoreTests : IDisposable
         await Assert.ThrowsAsync<ArgumentException>(() => s.DeleteAsync(stem, CancellationToken.None));
     }
 
+    [Fact]
+    public async Task Delete_AlsoRemovesTheTempFilesOfAnInterruptedCopy()
+    {
+        var s = Store();
+        File.WriteAllBytes(Qcow + ".tmp", [1, 2]); // a crash mid-copy leaves these behind
+        File.WriteAllBytes(Vars + ".tmp", [3]);
+        await s.DeleteAsync(Stem, CancellationToken.None);
+        Assert.Empty(Directory.GetFiles(_dir));
+    }
+
     private const string Copy = "fedcba9876543210fedcba9876543210";
     private string CopyQcow => Path.Combine(_dir, Copy + ".qcow2");
     private string CopyVars => Path.Combine(_dir, Copy + ".vars.fd");

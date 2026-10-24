@@ -18,6 +18,7 @@ public static class DependencyInjection
         services.AddMaldexTemplateCatalog(configuration);
         services.Configure<OrchestratorOptions>(configuration.GetSection(OrchestratorOptions.SectionName));
         services.Configure<TemplateJobOptions>(configuration.GetSection(TemplateJobOptions.SectionName));
+        services.AddSingleton<VmSlotGate>();
         services.AddSingleton<TemplateSealer>();
         services.AddSingleton<TemplateVerifier>();
         services.AddSingleton<TemplateCoordinator>();

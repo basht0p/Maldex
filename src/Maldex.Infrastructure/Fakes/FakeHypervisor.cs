@@ -11,6 +11,10 @@ public sealed class FakeHypervisor : IHypervisor
     private readonly ConcurrentDictionary<string, byte> _off = new();
     private readonly IOptions<FakeHypervisorOptions> options;
     private int _starts;
+    private int _maxRunning;
+
+    /// <summary>The most VMs that were ever running at the same time (checked at each start).</summary>
+    public int MaxRunning => Volatile.Read(ref _maxRunning);
 
     /// <param name="guest">When given, a VM whose fake guest handles <c>power_off</c> stops being listed, like a VM that shut itself down.</param>
     public FakeHypervisor(IOptions<FakeHypervisorOptions> options, FakeGuest? guest = null)
@@ -27,6 +31,9 @@ public sealed class FakeHypervisor : IHypervisor
         var handle = VmHandle.For(spec.TaskId);
         _off.TryRemove(handle.Name, out _);
         _running[handle.Name] = handle;
+        var running = _running.Keys.Count(name => !_off.ContainsKey(name));
+        int seen;
+        while (running > (seen = Volatile.Read(ref _maxRunning)) && Interlocked.CompareExchange(ref _maxRunning, running, seen) != seen) { }
         return Task.FromResult(handle);
     }
 

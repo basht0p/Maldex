@@ -31,6 +31,7 @@ public sealed class TemplateCoordinator(
     IDiskSpaceProbe disk,
     TemplateSealer sealer,
     TemplateVerifier verifier,
+    VmSlotGate slotGate,
     IOptions<OrchestratorOptions> orchestrator,
     IOptions<TemplateJobOptions> options,
     IOptions<LibvirtOptions> libvirt,
@@ -43,6 +44,8 @@ public sealed class TemplateCoordinator(
     public const string AlreadyRunning = "a job is already running for this template";
 
     private const int MaxSaveAttempts = 5;
+    /// <summary>Tries to record a terminal state (the database may be briefly unreachable), waiting 1, 2, 4 … s in between.</summary>
+    private const int MaxTerminalSaveAttempts = 6;
     private const int MaxMessageLength = 500, MaxReasonLength = 1000;
 
     private static readonly TemplateJobState[] Active =
@@ -161,7 +164,12 @@ public sealed class TemplateCoordinator(
         if (baseVersion is null || baseVersion.TemplateId != job.TemplateId) return "the base version does not belong to this template";
         if (baseVersion.Status != TemplateVersionStatus.Ready) return $"the base version v{baseVersion.Number} is {baseVersion.Status}";
         if (!catalog.DiskPresent(baseVersion.FileStem)) return BaseDiskMissing;
-        if (await db.TemplateJobs.AsNoTracking().AnyAsync(j => j.TemplateId == job.TemplateId && j.Id != job.Id && Active.Contains(j.State), ct).ConfigureAwait(false))
+        // Another active job blocks this one when it is already past Queued or was queued earlier (ties: the lower id), so of
+        // two raced queued jobs the older one runs.
+        var others = await db.TemplateJobs.AsNoTracking()
+            .Where(j => j.TemplateId == job.TemplateId && j.Id != job.Id && Active.Contains(j.State))
+            .Select(j => new { j.Id, j.State, j.CreatedAt }).ToListAsync(ct).ConfigureAwait(false);
+        if (others.Any(j => j.State != TemplateJobState.Queued || j.CreatedAt < job.CreatedAt || (j.CreatedAt == job.CreatedAt && j.Id.CompareTo(job.Id) < 0)))
             return AlreadyRunning;
 
         var freeMiB = disk.FreeMiB(Path.GetFullPath(libvirt.Value.BaseImageDir));
@@ -206,7 +214,7 @@ public sealed class TemplateCoordinator(
         held.FilesCreated = true; // a partial copy is deleted too
         await store.CreateWorkingCopyAsync(baseVersion.FileStem, stem, ct).ConfigureAwait(false);
 
-        await WaitForVmSlotAsync(db, job.Id, ct).ConfigureAwait(false);
+        await TakeVmSlotAsync(db, job.Id, ct).ConfigureAwait(false);
 
         var mode = job.Kind == TemplateJobKind.Edit ? job.Network : NetworkMode.None;
         held.Lease = await egress.CreateAsync(job.Id, mode, null, ct).ConfigureAwait(false);
@@ -265,14 +273,23 @@ public sealed class TemplateCoordinator(
     }
 
     /// <summary>
-    /// A job VM counts against <c>MaxConcurrentVms</c> from Configuring on; an analysis may have taken the slot while the
-    /// disk was copied, so wait (in Preparing) until one is free.
+    /// Takes a VM slot before anything boots: under the <see cref="VmSlotGate"/> (which the analysis claimer holds around its
+    /// own count and claim), counts the busy slots and, when one is free, saves <see cref="TemplateJob.SlotHeldAt"/>. From then
+    /// on <see cref="VmSlots"/> counts the job until it is terminal. Until a slot is free the job waits in Preparing.
     /// </summary>
-    private async Task WaitForVmSlotAsync(MaldexDbContext db, Guid jobId, CancellationToken ct)
+    private async Task TakeVmSlotAsync(MaldexDbContext db, Guid jobId, CancellationToken ct)
     {
         var said = false;
-        while (await VmSlots.BusyAsync(db, ct).ConfigureAwait(false) >= orchestrator.Value.MaxConcurrentVms)
+        while (true)
         {
+            using (await slotGate.EnterAsync(ct).ConfigureAwait(false))
+            {
+                if (await VmSlots.BusyAsync(db, ct).ConfigureAwait(false) < orchestrator.Value.MaxConcurrentVms)
+                {
+                    await SaveJobAsync(db, jobId, j => { j.SlotHeldAt = time.GetUtcNow(); return true; }, [], ct).ConfigureAwait(false);
+                    return;
+                }
+            }
             if (!said)
             {
                 await SaveJobAsync(db, jobId, j => { j.Message = "waiting for a free VM slot"; return true; }, [], ct).ConfigureAwait(false);
@@ -414,19 +431,35 @@ public sealed class TemplateCoordinator(
     private async Task EndAsync(MaldexDbContext db, TemplateJob job, Held held, TemplateJobState to, string message, string? failureReason, AuditLog audit)
     {
         var egressStop = await ReleaseAsync(job, held, deleteFiles: true).ConfigureAwait(false);
-        try
+        IReadOnlyList<AuditLog> audits = egressStop is null ? [audit] : [egressStop, audit];
+        var delay = TimeSpan.FromSeconds(1);
+        for (var attempt = 1; ; attempt++)
         {
-            await SaveJobAsync(db, job.Id, j =>
+            try
             {
-                if (TemplateJobStateMachine.IsTerminal(j.State)) return false;
-                j.TransitionTo(to, message, time.GetUtcNow());
-                j.FailureReason = failureReason;
-                return true;
-            }, egressStop is null ? [audit] : [egressStop, audit], CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Could not record template job {JobId} as {State}: {Message}", job.Id, to, message);
+                await SaveJobAsync(db, job.Id, j =>
+                {
+                    if (TemplateJobStateMachine.IsTerminal(j.State)) return false;
+                    j.TransitionTo(to, message, time.GetUtcNow());
+                    j.FailureReason = failureReason;
+                    return true;
+                }, audits, CancellationToken.None).ConfigureAwait(false);
+                return;
+            }
+            catch (Exception ex) when (attempt < MaxTerminalSaveAttempts)
+            {
+                logger.LogWarning(ex, "Recording template job {JobId} as {State} failed (attempt {Attempt}); retrying in {Delay}.", job.Id, to, attempt, delay);
+                await Task.Delay(delay, time).ConfigureAwait(false);
+                delay *= 2;
+            }
+            catch (Exception ex)
+            {
+                // The VM, lease and files are already gone. The row stays non-terminal and keeps counting as a busy slot until
+                // the next start, when the reconciler fails it as interrupted; nothing in this process tracks it any more
+                // (the worker forgets the run when it returns).
+                logger.LogError(ex, "Could not record template job {JobId} as {State}: {Message}; the reconciler fails it on the next start.", job.Id, to, message);
+                return;
+            }
         }
     }
 
