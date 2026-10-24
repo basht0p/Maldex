@@ -4,8 +4,10 @@ using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
 using Maldex.Core.Scheduling;
 using Maldex.Data;
+using Maldex.Data.Templates;
 using Maldex.Web.Audit;
 using Maldex.Web.Auth;
+using Maldex.Web.Templates;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Data.SqlClient;
@@ -49,8 +51,10 @@ public static class TaskEndpoints
             var page = await query.Include(t => t.Org).OrderByDescending(t => t.CreatedAt).ThenByDescending(t => t.Id)
                 .Skip(skip ?? 0).Take(takeN).ToListAsync(ct);
             var queued = await QueuedAsync(db, ct);
+            var templates = await TemplateProvenance.LoadAsync(db, page.Select(t => t.TemplateVersionId), ct); // one query for the whole page
             return Results.Ok(new TaskListDto(
-                page.Select(t => TaskDto.From(t, t.Org!.Name, PositionOf(t, queued))).ToList(), total));
+                page.Select(t => TaskDto.From(t, t.Org!.Name, PositionOf(t, queued),
+                    t.TemplateVersionId is { } v && templates.TryGetValue(v, out var tpl) ? tpl : null)).ToList(), total));
         });
 
         g.MapGet("{id:guid}", async (Guid id, MaldexDbContext db, CancellationToken ct) =>
@@ -58,7 +62,7 @@ public static class TaskEndpoints
             var t = await db.Tasks.AsNoTracking().Include(t => t.Org).FirstOrDefaultAsync(t => t.Id == id, ct);
             if (t is null) return Results.NotFound();
             var position = t.Status == RunStatus.Queued ? PositionOf(t, await QueuedAsync(db, ct)) : 0;
-            return Results.Ok(TaskDto.From(t, t.Org!.Name, position));
+            return Results.Ok(TaskDto.From(t, t.Org!.Name, position, await TemplateProvenance.LoadAsync(db, t.TemplateVersionId, ct)));
         });
 
         g.MapPost("{id:guid}/cancel", async (Guid id, MaldexDbContext db, AuditWriter audit, TimeProvider time, CancellationToken ct) =>
@@ -95,7 +99,7 @@ public static class TaskEndpoints
 
     private static async Task<IResult> SubmitAsync(
         HttpContext ctx, MaldexDbContext db, IArtifactStore store, AuditWriter audit, CurrentUser user, TimeProvider time,
-        IOptions<SubmissionOptions> submissionOptions, IOptions<EgressOptions> egressOptions, CancellationToken ct)
+        IOptions<SubmissionOptions> submissionOptions, IOptions<EgressOptions> egressOptions, TemplateCatalog templates, CancellationToken ct)
     {
         var opts = submissionOptions.Value;
         var vpnCountries = egressOptions.Value.VpnCountries;
@@ -188,8 +192,15 @@ public static class TaskEndpoints
         if (blob is { Size: 0 }) errors["file"] = ["The file is empty."];
 
         var image = fields.GetValueOrDefault("image");
-        if (string.IsNullOrWhiteSpace(image)) image = opts.Images[0];
-        else if (!opts.Images.Contains(image)) errors["image"] = ["Unknown image."];
+        var noTemplate = false;
+        if (string.IsNullOrWhiteSpace(image))
+        {
+            image = (await templates.DefaultAsync(ct))?.Id;
+            noTemplate = image is null;
+        }
+        else if (await templates.FindAvailableAsync(image.Trim(), ct) is { } found) image = found.Id;
+        else if ((await templates.AvailableAsync(ct)).Count == 0) noTemplate = true;
+        else errors["image"] = ["Unknown or disabled template."];
 
         var duration = 300;
         if (fields.TryGetValue("durationSec", out var durRaw) &&
@@ -203,6 +214,8 @@ public static class TaskEndpoints
         ValidateNetwork(fields, isUrl: url is not null, vpnCountries, errors, out var mode, out var exitCountry);
 
         if (errors.Count > 0) return Results.ValidationProblem(errors);
+        if (noTemplate)
+            return Results.Problem(title: "No sandbox template is available; ask an admin.", statusCode: StatusCodes.Status409Conflict);
 
         // ---- persist ----
         if (blob is not null) await EnsureSampleAsync(db, blob, fileName, time, ct);

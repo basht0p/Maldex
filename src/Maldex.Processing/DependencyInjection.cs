@@ -1,3 +1,4 @@
+using Maldex.Data.Templates;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -14,6 +15,7 @@ public static class DependencyInjection
     {
         services.TryAddSingleton(TimeProvider.System);
         services.AddSingleton<HttpFlowIndexer>();
+        services.AddMaldexTemplateCatalog(configuration);
         services.Configure<ProcessingOptions>(configuration.GetSection(ProcessingOptions.SectionName));
         services.AddSingleton<ProcessingPipeline>();
         services.AddSingleton<IProcessingPipeline>(sp => sp.GetRequiredService<ProcessingPipeline>());

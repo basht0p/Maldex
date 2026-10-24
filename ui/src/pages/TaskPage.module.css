@@ -1,11 +1,13 @@
 .header { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; margin-bottom: 0.5rem; }
 .header h1 { margin: 0; font-size: 1.25rem; }
 .spacer { flex: 1; }
-.countdown { font-variant-numeric: tabular-nums; font-weight: 600; }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; overflow-wrap: anywhere; }
-.offline { color: #92400e; font-size: 0.85rem; }
+.countdown { font-family: var(--mx-font-mono); font-variant-numeric: tabular-nums; font-weight: 700; }
+.mono { font-family: var(--mx-font-mono); font-size: 0.8rem; overflow-wrap: anywhere; }
+.offline { color: var(--mx-muted); font-size: 0.85rem; }
 .links { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; margin: 0.5rem 0 1rem; }
-.error { color: #b91c1c; margin: 0.5rem 0; }
+.error { color: var(--mx-critical); margin: 0.5rem 0; }
 .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; margin-bottom: 1rem; }
 .panel h2 { font-size: 1rem; margin: 0 0 0.5rem; }
 @media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+.meta { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: baseline; margin: 0.25rem 0; }
+.metaLabel { font-family: var(--mx-font-mono); font-size: 0.7rem; text-transform: uppercase; color: var(--mx-muted); }

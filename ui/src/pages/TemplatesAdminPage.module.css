@@ -1,0 +1,11 @@
+.card { margin: 0 0 1.25rem; padding: 1rem; border: 1px solid var(--mx-border); border-radius: var(--mx-radius-panel); background: var(--mx-surface); }
+.head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; }
+.head h2 { margin: 0; font-size: 1.1rem; }
+.id { font-family: var(--mx-font-mono); font-size: 0.8rem; color: var(--mx-muted); }
+.spacer { flex: 1; }
+/* The default is a state of the catalog, not an action: neutral outline, with the word itself carrying the meaning. */
+.badge { padding: 0.05rem 0.5rem; border: 1px solid var(--mx-control); border-radius: 999px; font-family: var(--mx-font-mono); font-size: 0.7rem; text-transform: uppercase; }
+.toggle { display: inline-flex; align-items: center; gap: 0.4rem; font-weight: 600; font-size: 0.9rem; }
+.summary { margin: 0.25rem 0; }
+.warn { color: var(--mx-warning); font-weight: 600; }
+.warn::before { content: '\26A0\00a0'; }

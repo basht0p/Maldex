@@ -1,6 +1,7 @@
 using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
 using Maldex.Data;
+using Maldex.Web.Templates;
 using Microsoft.EntityFrameworkCore;
 
 namespace Maldex.Web.Reports;
@@ -24,6 +25,7 @@ public sealed record ReportModel(
     string? Md5,
     long? SampleSize,
     string Image,
+    string? TemplateSummary,
     NetworkMode NetworkMode,
     string? ExitCountry,
     int DurationSec,
@@ -84,10 +86,14 @@ public sealed class ReportModelBuilder(MaldexDbContext db, IArtifactStore store,
 
         return new ReportModel(
             task.Id, task.Org?.Name ?? "", task.OriginalFileName, task.Url, task.SampleSha256, task.Sample?.Sha1, task.Sample?.Md5, task.Sample?.Size,
-            task.Image, task.NetworkMode, task.ExitCountry, task.DurationSec, task.CreatedAt, task.StartedAt, task.CompletedAt,
+            task.Image, await TemplateSummaryAsync(task, ct), task.NetworkMode, task.ExitCountry, task.DurationSec, task.CreatedAt, task.StartedAt, task.CompletedAt,
             task.Verdict, task.ProcessingWarnings.ToList(), totalEvents, timeline, FlattenTree(nodes), network, dns, detections,
             await LoadScreenshotsAsync(taskId, ct), time.GetUtcNow());
     }
+
+    /// <summary>The provenance line for a task bound to a template version; null for tasks that predate templates.</summary>
+    private async Task<string?> TemplateSummaryAsync(AnalysisTask task, CancellationToken ct) =>
+        (await TemplateProvenance.LoadAsync(db, task.TemplateVersionId, ct))?.Summary;
 
     /// <summary>Depth-first order, roots first. A node whose parent is unknown is a root; a cycle can never loop (each node is emitted once).</summary>
     internal static List<ReportProcessRow> FlattenTree(List<ProcessNode> nodes)

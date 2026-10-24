@@ -5,6 +5,7 @@ using Maldex.Core.Domain;
 using Maldex.Core.Live;
 using Maldex.Core.Text;
 using Maldex.Data;
+using Maldex.Data.Templates;
 using Maldex.Infrastructure.Isolation;
 using Maldex.Infrastructure.Net;
 using Microsoft.EntityFrameworkCore;
@@ -69,6 +70,19 @@ public sealed class RunCoordinator(
         var capture = new CaptureSession();
         try
         {
+            TemplateVersion version;
+            try
+            {
+                // A resumed run keeps the version it already bound; otherwise bind whatever is current now.
+                var catalog = scope.ServiceProvider.GetRequiredService<TemplateCatalog>();
+                version = await catalog.BindTaskVersionAsync(task, ct).ConfigureAwait(false);
+            }
+            catch (TemplateUnavailableException ex)
+            {
+                await FailAsync(db, task, ex.Message).ConfigureAwait(false);
+                return;
+            }
+
             try
             {
                 lease = await egress.CreateAsync(task.Id, task.NetworkMode, task.ExitCountry, ct).ConfigureAwait(false);
@@ -91,7 +105,7 @@ public sealed class RunCoordinator(
             for (var attempt = 1; attempt <= MaxAttempts; attempt++)
             {
                 await SetAttemptAsync(db, task, attempt, ct).ConfigureAwait(false);
-                var outcome = await AttemptAsync(db, task, lease, command, capture, ct).ConfigureAwait(false);
+                var outcome = await AttemptAsync(db, task, version.FileStem, lease, command, capture, ct).ConfigureAwait(false);
                 if (outcome == AttemptOutcome.Completed) break;
 
                 if (outcome == AttemptOutcome.Stopped)
@@ -154,7 +168,7 @@ public sealed class RunCoordinator(
     private enum AttemptOutcome { Completed, VmStartFailed, AgentNotReady, Stopped }
 
     /// <summary>One try on a fresh VM. The VM and agent channel are always released before this returns.</summary>
-    private async Task<AttemptOutcome> AttemptAsync(MaldexDbContext db, AnalysisTask task, NetworkLease lease, AgentCommand command, CaptureSession capture, CancellationToken ct)
+    private async Task<AttemptOutcome> AttemptAsync(MaldexDbContext db, AnalysisTask task, string diskStem, NetworkLease lease, AgentCommand command, CaptureSession capture, CancellationToken ct)
     {
         VmHandle? vm = null;
         IAgentChannel? channel = null;
@@ -163,7 +177,7 @@ public sealed class RunCoordinator(
             try
             {
                 vm = await hypervisor.StartAsync(
-                    new VmSpec(task.Id, task.Image, _options.VmMemoryMiB, _options.VmVCpus, lease.NetworkId), ct).ConfigureAwait(false);
+                    new VmSpec(task.Id, diskStem, _options.VmMemoryMiB, _options.VmVCpus, lease.NetworkId), ct).ConfigureAwait(false);
             }
             catch (VmStartException ex)
             {

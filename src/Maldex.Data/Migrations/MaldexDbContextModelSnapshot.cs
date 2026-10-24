@@ -102,6 +102,9 @@ namespace Maldex.Data.Migrations
                     b.Property<Guid>("SubmittedByUserId")
                         .HasColumnType("uniqueidentifier");
 
+                    b.Property<Guid?>("TemplateVersionId")
+                        .HasColumnType("uniqueidentifier");
+
                     b.Property<string>("Url")
                         .HasColumnType("nvarchar(max)");
 
@@ -117,6 +120,8 @@ namespace Maldex.Data.Migrations
                     b.HasIndex("SampleSha256");
 
                     b.HasIndex("SubmittedByUserId");
+
+                    b.HasIndex("TemplateVersionId");
 
                     b.HasIndex("Status", "Interactive", "CreatedAt");
 
@@ -562,6 +567,142 @@ namespace Maldex.Data.Migrations
                     b.ToTable("TaskStatusHistory", (string)null);
                 });
 
+            modelBuilder.Entity("Maldex.Core.Domain.Template", b =>
+                {
+                    b.Property<string>("Id")
+                        .HasMaxLength(64)
+                        .HasColumnType("nvarchar(64)");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<Guid?>("CurrentVersionId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<string>("Description")
+                        .HasMaxLength(1000)
+                        .HasColumnType("nvarchar(1000)");
+
+                    b.Property<string>("DisplayName")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("nvarchar(100)");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("bit");
+
+                    b.Property<bool>("IsDefault")
+                        .HasColumnType("bit");
+
+                    b.Property<byte[]>("RowVersion")
+                        .IsConcurrencyToken()
+                        .IsRequired()
+                        .ValueGeneratedOnAddOrUpdate()
+                        .HasColumnType("rowversion");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CurrentVersionId");
+
+                    b.HasIndex("IsDefault")
+                        .IsUnique()
+                        .HasDatabaseName("IX_Templates_IsDefault")
+                        .HasFilter("[IsDefault] = 1");
+
+                    b.ToTable("Templates", (string)null);
+                });
+
+            modelBuilder.Entity("Maldex.Core.Domain.TemplateVersion", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<string>("AgentVersion")
+                        .HasMaxLength(32)
+                        .HasColumnType("nvarchar(32)");
+
+                    b.Property<string>("FileStem")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("nvarchar(64)");
+
+                    b.Property<string>("MitmCaSha256")
+                        .HasMaxLength(64)
+                        .IsUnicode(false)
+                        .HasColumnType("char(64)")
+                        .IsFixedLength();
+
+                    b.Property<string>("Note")
+                        .HasMaxLength(1000)
+                        .HasColumnType("nvarchar(1000)");
+
+                    b.Property<int>("Number")
+                        .HasColumnType("int");
+
+                    b.Property<bool?>("OfficePresent")
+                        .HasColumnType("bit");
+
+                    b.Property<string>("Origin")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("nvarchar(32)");
+
+                    b.Property<Guid?>("ParentVersionId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<DateTimeOffset>("SealedAt")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<Guid?>("SealedByUserId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<long?>("SizeBytes")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("SourceMediaIds")
+                        .IsRequired()
+                        .HasMaxLength(1000)
+                        .HasColumnType("nvarchar(1000)");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("nvarchar(32)");
+
+                    b.Property<string>("SysmonConfigSha256")
+                        .HasMaxLength(64)
+                        .IsUnicode(false)
+                        .HasColumnType("char(64)")
+                        .IsFixedLength();
+
+                    b.Property<string>("TemplateId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("nvarchar(64)");
+
+                    b.Property<string>("WindowsBuild")
+                        .HasMaxLength(32)
+                        .HasColumnType("nvarchar(32)");
+
+                    b.Property<string>("WindowsEdition")
+                        .HasMaxLength(100)
+                        .HasColumnType("nvarchar(100)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("FileStem")
+                        .IsUnique();
+
+                    b.HasIndex("ParentVersionId");
+
+                    b.HasIndex("SealedByUserId");
+
+                    b.HasIndex("TemplateId", "Number")
+                        .IsUnique();
+
+                    b.ToTable("TemplateVersions", (string)null);
+                });
+
             modelBuilder.Entity("Maldex.Core.Domain.AnalysisTask", b =>
                 {
                     b.HasOne("Maldex.Core.Domain.Org", "Org")
@@ -580,6 +721,11 @@ namespace Maldex.Data.Migrations
                         .HasForeignKey("SubmittedByUserId")
                         .OnDelete(DeleteBehavior.Restrict)
                         .IsRequired();
+
+                    b.HasOne("Maldex.Core.Domain.TemplateVersion", null)
+                        .WithMany()
+                        .HasForeignKey("TemplateVersionId")
+                        .OnDelete(DeleteBehavior.Restrict);
 
                     b.Navigation("Org");
 
@@ -666,6 +812,33 @@ namespace Maldex.Data.Migrations
                         .WithMany("StatusHistory")
                         .HasForeignKey("TaskId")
                         .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("Maldex.Core.Domain.Template", b =>
+                {
+                    b.HasOne("Maldex.Core.Domain.TemplateVersion", null)
+                        .WithMany()
+                        .HasForeignKey("CurrentVersionId")
+                        .OnDelete(DeleteBehavior.Restrict);
+                });
+
+            modelBuilder.Entity("Maldex.Core.Domain.TemplateVersion", b =>
+                {
+                    b.HasOne("Maldex.Core.Domain.TemplateVersion", null)
+                        .WithMany()
+                        .HasForeignKey("ParentVersionId")
+                        .OnDelete(DeleteBehavior.Restrict);
+
+                    b.HasOne("Maldex.Core.Domain.AppUser", null)
+                        .WithMany()
+                        .HasForeignKey("SealedByUserId")
+                        .OnDelete(DeleteBehavior.Restrict);
+
+                    b.HasOne("Maldex.Core.Domain.Template", null)
+                        .WithMany()
+                        .HasForeignKey("TemplateId")
+                        .OnDelete(DeleteBehavior.Restrict)
                         .IsRequired();
                 });
 

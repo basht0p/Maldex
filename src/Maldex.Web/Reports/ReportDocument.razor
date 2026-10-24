@@ -62,7 +62,14 @@ tr { page-break-inside: avoid; }
 {
     <tr><td class="k">Size</td><td>@size bytes</td></tr>
 }
-<tr><td class="k">Image</td><td>@Model.Image</td></tr>
+@if (Model.TemplateSummary is { } templateSummary)
+{
+    <tr><td class="k">Template</td><td>@templateSummary</td></tr>
+}
+else
+{
+    <tr><td class="k">Image</td><td>@Model.Image</td></tr>
+}
 <tr><td class="k">Network</td><td>@Model.NetworkMode@(Model.ExitCountry is null ? "" : " (" + Model.ExitCountry + ")")</td></tr>
 <tr><td class="k">Planned duration</td><td>@Model.DurationSec s</td></tr>
 <tr><td class="k">Submitted</td><td>@Fmt(Model.CreatedAt)</td></tr>

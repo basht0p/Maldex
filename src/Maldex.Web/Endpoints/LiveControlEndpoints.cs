@@ -3,6 +3,7 @@ using Maldex.Core.Live;
 using Maldex.Data;
 using Maldex.Web.Audit;
 using Maldex.Web.Auth;
+using Maldex.Web.Templates;
 using Microsoft.EntityFrameworkCore;
 
 namespace Maldex.Web.Endpoints;
@@ -82,7 +83,7 @@ public static class LiveControlEndpoints
                 try
                 {
                     await audit.WriteAsync("task.extend", t.Id.ToString(), $"seconds={seconds}; deadline={next:O}", ct);
-                    return Results.Ok(TaskDto.From(t, t.Org!.Name, 0));
+                    return Results.Ok(TaskDto.From(t, t.Org!.Name, 0, await TemplateProvenance.LoadAsync(db, t.TemplateVersionId, ct)));
                 }
                 catch (DbUpdateConcurrencyException) when (attempt < MaxSaveAttempts)
                 {

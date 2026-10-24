@@ -44,6 +44,61 @@ export interface TaskDto {
   completedAt?: string | null
   failureReason?: string | null
   processingWarnings: string[]
+  /** The template version the run used; absent for tasks created before templates (show `image` instead). */
+  template?: TaskTemplateDto | null
+}
+
+export type TemplateVersionOrigin = 'IsoBuild' | 'Edit' | 'Refresh' | 'Imported'
+export type TemplateVersionStatus = 'Ready' | 'Retired' | 'Deleted'
+
+/** GET /api/templates: the enabled templates an analyst may pick. */
+export interface TemplateSummaryDto {
+  id: string
+  displayName: string
+  isDefault: boolean
+}
+
+/** What a task shows about the template version it used (TaskDto.template). */
+export interface TaskTemplateDto {
+  id: string
+  displayName: string
+  versionNumber: number
+  origin: string
+  windowsEdition?: string | null
+  windowsBuild?: string | null
+  officePresent?: boolean | null
+  agentVersion?: string | null
+  sealedAt: string
+  sealedBy?: string | null
+  summary: string
+}
+
+export interface TemplateVersionDto {
+  id: string
+  number: number
+  origin: TemplateVersionOrigin
+  status: TemplateVersionStatus
+  isCurrent: boolean
+  diskPresent: boolean
+  windowsEdition?: string | null
+  windowsBuild?: string | null
+  officePresent?: boolean | null
+  agentVersion?: string | null
+  sealedBy?: string | null
+  sealedAt: string
+  note?: string | null
+  sizeBytes?: number | null
+}
+
+/** GET /api/admin/templates (Admin only). */
+export interface AdminTemplateDto {
+  id: string
+  displayName: string
+  description?: string | null
+  isDefault: boolean
+  enabled: boolean
+  current?: TemplateVersionDto | null
+  versions: TemplateVersionDto[]
 }
 
 export interface TaskListDto {

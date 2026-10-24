@@ -4,7 +4,10 @@ using Maldex.Core.Domain;
 using Maldex.Integration.Tests.Fixtures;
 using Maldex.Integration.Tests.Orchestrator;
 using Maldex.Processing;
+using Maldex.Data.Templates;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Xunit;
 using OrgEntity = Maldex.Core.Domain.Org;
 
@@ -244,6 +247,111 @@ public class RetentionTests(SqlServerFixture sql)
             Assert.True(store.Exists(shared.BlobKey));
         }
         Assert.False(store.Exists(expired.ArtifactKeys[1]));
+    }
+
+    private sealed class RecordingTemplateStore : ITemplateStore
+    {
+        public List<string> Deleted { get; } = [];
+        public bool Exists(string fileStem) => true;
+        public long? SizeOf(string fileStem) => null;
+        public Task DeleteAsync(string fileStem, CancellationToken ct) { lock (Deleted) Deleted.Add(fileStem); return Task.CompletedTask; }
+    }
+
+    private static Task<OrchestratorHarness> TemplateHarnessAsync(SqlServerFixture sql, RecordingTemplateStore store) =>
+        OrchestratorHarness.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Templates:KeepPrevious"] = "0" },
+            s => s.Replace(ServiceDescriptor.Singleton<ITemplateStore>(store)));
+
+    /// <summary>Adds Ready v2 to "win10" and makes it current directly (v1 stays Ready).</summary>
+    private static async Task<TemplateVersion> AddCurrentV2Async(OrchestratorHarness h)
+    {
+        await using var db = h.NewContext();
+        var v2 = h.NewVersion("win10", 2);
+        db.TemplateVersions.Add(v2);
+        await db.SaveChangesAsync(Ct);
+        (await db.Templates.SingleAsync(t => t.Id == "win10", Ct)).CurrentVersionId = v2.Id;
+        await db.SaveChangesAsync(Ct);
+        return v2;
+    }
+
+    [Fact]
+    public async Task RetentionWorker_SweepsRetiredUnusedVersion()
+    {
+        var store = new RecordingTemplateStore();
+        await using var h = await TemplateHarnessAsync(sql, store);
+        var v2 = await AddCurrentV2Async(h);
+        await using (var scope = h.Services.CreateAsyncScope())
+            await scope.ServiceProvider.GetRequiredService<TemplateCatalog>().PublishAsync("win10", v2.Id, Ct); // KeepPrevious 0: v1 retired
+        Guid v1Id, v2Id = v2.Id;
+        string v1Stem;
+        await using (var db = h.NewContext())
+        {
+            var v1 = await db.TemplateVersions.SingleAsync(v => v.TemplateId == "win10" && v.Number == 1, Ct);
+            Assert.Equal(TemplateVersionStatus.Retired, v1.Status);
+            (v1Id, v1Stem) = (v1.Id, v1.FileStem);
+        }
+        var worker = h.Get<RetentionWorker>();
+
+        await worker.StartAsync(Ct);
+        try
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (true)
+            {
+                await using var db = h.NewContext();
+                if (await db.TemplateVersions.AnyAsync(v => v.Id == v1Id && v.Status == TemplateVersionStatus.Deleted, Ct)) break;
+                Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30), "Worker did not sweep within 30 s of real time.");
+                h.Time.Advance(TimeSpan.FromMinutes(1));
+                await Task.Delay(50, Ct);
+            }
+        }
+        finally
+        {
+            await worker.StopAsync(CancellationToken.None);
+        }
+
+        await using var check = h.NewContext();
+        Assert.Equal([v1Stem], store.Deleted);
+        Assert.Equal(TemplateVersionStatus.Ready, (await check.TemplateVersions.SingleAsync(v => v.Id == v2Id, Ct)).Status);
+        var audit = await check.AuditLogs.SingleAsync(a => a.Action == "template.version.delete", Ct);
+        Assert.Equal(v1Id.ToString(), audit.Target);
+        Assert.Equal("template=win10; v=1", audit.Details);
+        Assert.Null(audit.UserId);
+    }
+
+    [Fact]
+    public async Task RollBack_DuringRunningTask_DoesNotDeleteItsVersion()
+    {
+        var store = new RecordingTemplateStore();
+        await using var h = await TemplateHarnessAsync(sql, store);
+        var v2 = await AddCurrentV2Async(h);
+        var taskId = await h.SeedTaskAsync(RunStatus.Running);
+        await using (var db = h.NewContext())
+        {
+            (await db.Tasks.SingleAsync(t => t.Id == taskId, Ct)).TemplateVersionId = v2.Id;
+            await db.SaveChangesAsync(Ct);
+        }
+        await using (var scope = h.Services.CreateAsyncScope())
+            await scope.ServiceProvider.GetRequiredService<TemplateCatalog>().RollBackAsync("win10", Ct); // v1 current again; v2 retired
+        var worker = h.Get<RetentionWorker>();
+
+        await worker.SweepTemplatesAsync(Ct);
+
+        Assert.Empty(store.Deleted);
+        await using (var db = h.NewContext())
+        {
+            Assert.Equal(TemplateVersionStatus.Retired, (await db.TemplateVersions.SingleAsync(v => v.Id == v2.Id, Ct)).Status);
+            var task = await db.Tasks.SingleAsync(t => t.Id == taskId, Ct);
+            foreach (var step in new[] { RunStatus.Collecting, RunStatus.Processing, RunStatus.Completed })
+                task.TransitionTo(step, "done", h.Time.GetUtcNow());
+            await db.SaveChangesAsync(Ct);
+        }
+
+        await worker.SweepTemplatesAsync(Ct);
+
+        Assert.Equal([v2.FileStem], store.Deleted);
+        await using var check = h.NewContext();
+        Assert.Equal(TemplateVersionStatus.Deleted, (await check.TemplateVersions.SingleAsync(v => v.Id == v2.Id, Ct)).Status);
+        Assert.Equal(v2.Id.ToString(), (await check.AuditLogs.SingleAsync(a => a.Action == "template.version.delete", Ct)).Target);
     }
 
     [Fact]

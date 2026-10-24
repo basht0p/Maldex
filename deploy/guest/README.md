@@ -56,7 +56,11 @@ hand on a copy of the base image:
 
 `./build.sh build-guest` produces a fresh unattended base and loses these changes: prepare and finalize again after it.
 
+Images built by `build-guest.sh` are imported as templates (v1) on the next start of Maldex; the ids listed in `Maldex:Images` are the ones imported.
+
 Both `build-guest` and `finalize-guest` replace the base in place, so both refuse (exit 2) while any analysis run exists (a `maldex-<32 hex>` domain or run directory): every run's overlay reads the base as its backing file. They check before starting and again right before the swap.
+
+Once an image has been imported as template v1, running `build-guest` or `finalize-guest` again replaces that template's disk in place: v1 keeps its id and number, but its recorded provenance (Windows build, size, sealed date) no longer matches the disk. Until Build and Edit in the app exist (later plans), do this only while no analysis is running, and accept that v1 is redefined by it.
 
 ## Running the E2E suite
 
