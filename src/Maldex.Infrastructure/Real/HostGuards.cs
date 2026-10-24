@@ -191,15 +191,6 @@ public sealed class HostGuardProbe(IProcessRunner runner, IOptions<LibvirtOption
 
         var o = libvirt.Value;
         results.Add(await RunAsync($"virsh -c {o.Uri} version", o.VirshBinary, ["-c", o.Uri, "version"], ct));
-
-        var images = configuration.GetSection("Maldex:Images").Get<string[]>() is { Length: > 0 } configured ? configured : ["win11-26h2"];
-        foreach (var image in images)
-        {
-            var path = Path.Combine(Path.GetFullPath(o.BaseImageDir), image + ".qcow2");
-            results.Add(File.Exists(path)
-                ? new GuardResult($"base image {image}", GuardSeverity.Ok, path)
-                : new GuardResult($"base image {image}", GuardSeverity.Warn, $"{path} does not exist; real runs of this image will fail until it is built (./build.sh build-guest)."));
-        }
         return results;
     }
 

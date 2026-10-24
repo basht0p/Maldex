@@ -289,17 +289,15 @@ public sealed class RealWiringTests
         Assert.Contains("absolute", Assert.Throws<InvalidOperationException>(() => Build(Config(("Maldex:Real:Root", "relative/dir")))).Message);
 
     [Fact]
-    public async Task HostGuardProbe_FailsWhenNftTablesMissing_WarnsOnMissingImage()
+    public async Task HostGuardProbe_FailsWhenNftTablesMissing()
     {
         var runner = new FailingNftRunner();
-        var config = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { ["Maldex:Images:0"] = "no-such-image" }).Build();
-        var probe = new HostGuardProbe(runner, Options.Create(new LibvirtOptions { BaseImageDir = Path.GetTempPath() }), config);
+        var probe = new HostGuardProbe(runner, Options.Create(new LibvirtOptions { BaseImageDir = Path.GetTempPath() }), new ConfigurationBuilder().Build());
         var results = await probe.CheckAsync(CancellationToken.None);
         Assert.Contains(results, r => r.Severity == GuardSeverity.Fail && r.Name.Contains("inet"));
         Assert.Contains(results, r => r.Severity == GuardSeverity.Fail && r.Name.Contains("bridge"));
         Assert.Contains(runner.Calls, c => c == "sudo -n nft list table inet maldex_guard");
         Assert.Contains(runner.Calls, c => c == "sudo -n nft list table bridge maldex_guard");
-        Assert.Contains(results, r => r.Name.Contains("base image") && r.Severity == GuardSeverity.Warn);
     }
 
     /// <summary>Until INetSim runs in a per-run PID namespace, one real run's INetSim could tamper with another's: one VM at a time.</summary>
