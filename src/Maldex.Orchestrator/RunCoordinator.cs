@@ -75,7 +75,7 @@ public sealed class RunCoordinator(
             {
                 // A resumed run keeps the version it already bound; otherwise bind whatever is current now.
                 var catalog = scope.ServiceProvider.GetRequiredService<TemplateCatalog>();
-                version = await catalog.BindAsync(task, ct).ConfigureAwait(false);
+                version = await catalog.BindTaskVersionAsync(task, ct).ConfigureAwait(false);
             }
             catch (TemplateUnavailableException ex)
             {

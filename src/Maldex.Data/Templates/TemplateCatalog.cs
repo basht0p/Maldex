@@ -47,7 +47,8 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
     /// lock is taken is resolved once more; if that fails too the task stays unbound.
     /// </summary>
     /// <exception cref="TemplateUnavailableException">No Ready version could be bound.</exception>
-    public async Task<TemplateVersion> BindAsync(AnalysisTask task, CancellationToken ct)
+    // Not named BindAsync: minimal APIs treat that name on an injected type as a custom parameter binder.
+    public async Task<TemplateVersion> BindTaskVersionAsync(AnalysisTask task, CancellationToken ct)
     {
         if (task.TemplateVersionId is { } bound)
             return await db.TemplateVersions.AsNoTracking().SingleAsync(v => v.Id == bound, ct).ConfigureAwait(false);

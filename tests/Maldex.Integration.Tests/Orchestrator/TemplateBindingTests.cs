@@ -170,7 +170,7 @@ public class TemplateBindingTests(SqlServerFixture sql)
         await using var db = ContextWith(h, interceptor);
         var task = await db.Tasks.SingleAsync(t => t.Id == taskId, Ct);
 
-        var bound = await Catalog(db, h.Time).BindAsync(task, Ct);
+        var bound = await Catalog(db, h.Time).BindTaskVersionAsync(task, Ct);
 
         Assert.Equal(v2.Id, bound.Id);
         await using var check = h.NewContext();
@@ -193,7 +193,7 @@ public class TemplateBindingTests(SqlServerFixture sql)
         await using var db = ContextWith(h, interceptor);
         var task = await db.Tasks.SingleAsync(t => t.Id == taskId, Ct);
 
-        var ex = await Assert.ThrowsAsync<TemplateUnavailableException>(() => Catalog(db, h.Time).BindAsync(task, Ct));
+        var ex = await Assert.ThrowsAsync<TemplateUnavailableException>(() => Catalog(db, h.Time).BindTaskVersionAsync(task, Ct));
 
         Assert.Equal("template 'win10' is not available", ex.Message);
         await using var check = h.NewContext();
