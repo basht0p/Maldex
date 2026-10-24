@@ -92,4 +92,50 @@ public class AgentMessageValidatorTests
         Assert.NotNull(AgentMessageValidator.Validate(new DnsEventMessage(T, 1, "a.com", null, ["1.1.1.1", null!])));
         Assert.Null(AgentMessageValidator.Validate(new DnsEventMessage(T, 1, "a.com", null, ["1.1.1.1"])));
     }
+
+    private const string GoodV = "1.0.0+3fa9c1d2e4b5";
+
+    [Fact]
+    public void Provenance_ValidatesFields()
+    {
+        Assert.Null(AgentMessageValidator.Validate(new ProvenanceMessage("c", "Windows 11 Pro", "26300.1", GoodV, null, null)));
+        Assert.Null(AgentMessageValidator.Validate(new ProvenanceMessage("c", new string('e', 100), new string('1', 32), "1.0.0-preview.1+3fa9c1d2e4b5", true, false)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("", "e", "1", GoodV, null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", new string('e', 101), "1", GoodV, null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", "e", new string('1', 33), GoodV, null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", "  ", "1", GoodV, null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", "e", "", GoodV, null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", null!, "1", GoodV, null, null)));
+    }
+
+    [Theory]
+    [InlineData("Windows \u202E11")]
+    [InlineData("Windows\u200B11")]
+    [InlineData("Windows\u0007")]
+    [InlineData(" x")]
+    [InlineData("x ")]
+    public void Provenance_RejectsUnsafeText(string bad)
+    {
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", bad, "1", GoodV, null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", "e", bad, GoodV, null, null)));
+    }
+
+    [Fact]
+    public void Provenance_RejectsUnpairedSurrogates_AcceptsPairs()
+    {
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", "Windows " + (char)0xD800, "1", GoodV, null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", "e", ((char)0xDC00).ToString(), GoodV, null, null)));
+        Assert.Null(AgentMessageValidator.Validate(new ProvenanceMessage("c", "Windows \U0001F600", "1", GoodV, null, null)));
+    }
+
+    [Theory]
+    [InlineData("1.0.0")]
+    [InlineData("1.0.0+3FA9C1D2E4B5")]
+    [InlineData("1.0.0+3fa9c1d2e4b")]
+    [InlineData("1.0.0+3fa9c1d2e4b5x")]
+    [InlineData("+3fa9c1d2e4b5")]
+    [InlineData("1.0.0 +3fa9c1d2e4b5")]
+    [InlineData("12345678901234567890+3fa9c1d2e4b5")]
+    public void Provenance_AgentVersion_MustBeVersionPlusHash(string v) =>
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", "e", "1", v, null, null)));
 }

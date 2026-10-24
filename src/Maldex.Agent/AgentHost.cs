@@ -19,6 +19,32 @@ public sealed class AgentHost(Stream channel, IEventSource source, CommandDispat
         ?? typeof(AgentHost).Assembly.GetName().Version?.ToString()
         ?? "0.0.0";
 
+    /// <summary>
+    /// <c>Version+</c> the first 12 lowercase hex characters of the SHA-256 of the running agent exe (e.g. <c>1.0.0+3fa9c1d2e4b5</c>),
+    /// computed once at startup. Identifies the exact build, which the version alone cannot.
+    /// </summary>
+    public static string BuildId { get; } = ComputeBuildId(Version, Environment.ProcessPath);
+
+    public static string ComputeBuildId(string version, string? exePath)
+    {
+        try
+        {
+            if (exePath is null) return Fallback(version, "no process path");
+            using var stream = File.OpenRead(exePath);
+            return version + "+" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(stream))[..12].ToLowerInvariant();
+        }
+        catch (Exception ex)
+        {
+            return Fallback(version, ex.Message);
+        }
+    }
+
+    private static string Fallback(string version, string reason)
+    {
+        try { AgentLog.Write("Build hash unavailable, using zeros: " + reason); } catch { }
+        return version + "+" + new string('0', 12);
+    }
+
     public async Task RunAsync(CancellationToken ct)
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);

@@ -57,4 +57,78 @@ public class CommandDispatcherTests
         Assert.False(res.Success);
         Assert.Contains("incomplete transfer", res.Error);
     }
+
+    private sealed class FakeProbe(ProvenanceReport report) : IProvenanceProbe
+    {
+        public int Calls;
+        public ProvenanceReport Probe() { Calls++; return report; }
+    }
+
+    [Fact]
+    public async Task Dispatcher_Provenance_EmitsProbeValuesThenSucceeds()
+    {
+        var probe = new FakeProbe(new ProvenanceReport("Windows 11 Pro", "26300.1", true, null));
+        var d = new CommandDispatcher(new NoopSampleOpener(), new RecordingUrlOpener(), () => { }, provenance: probe);
+        var emitted = new List<AgentMessage>();
+        var res = await d.DispatchAsync(new ProvenanceCommand("p1"), CancellationToken.None, (m, _) => { emitted.Add(m); return Task.CompletedTask; });
+        Assert.Equal(new CommandResultMessage("p1", true), res);
+        Assert.Equal(new ProvenanceMessage("p1", "Windows 11 Pro", "26300.1", AgentHost.BuildId, true, null), Assert.Single(emitted));
+        Assert.Equal(1, probe.Calls);
+    }
+
+    [Fact]
+    public async Task Dispatcher_Provenance_WithoutEmitOrProbe_Fails()
+    {
+        var withProbe = new CommandDispatcher(new NoopSampleOpener(), new RecordingUrlOpener(), () => { }, provenance: new FakeProbe(new ProvenanceReport("e", "b", null, null)));
+        Assert.False((await withProbe.DispatchAsync(new ProvenanceCommand("p2"), CancellationToken.None)).Success);
+        var noProbe = Make(new RecordingUrlOpener());
+        Assert.False((await noProbe.DispatchAsync(new ProvenanceCommand("p3"), CancellationToken.None, (_, _) => Task.CompletedTask)).Success);
+    }
+
+    private sealed class ThrowingProbe : IProvenanceProbe
+    {
+        public ProvenanceReport Probe() => throw new InvalidOperationException("CurrentBuild is missing from the registry");
+    }
+
+    [Fact]
+    public async Task Dispatcher_Provenance_ProbeThrows_FailsWithClearError_AndEmitsNothing()
+    {
+        var d = new CommandDispatcher(new NoopSampleOpener(), new RecordingUrlOpener(), () => { }, provenance: new ThrowingProbe());
+        var emitted = new List<AgentMessage>();
+        var res = await d.DispatchAsync(new ProvenanceCommand("p4"), CancellationToken.None, (m, _) => { emitted.Add(m); return Task.CompletedTask; });
+        Assert.False(res.Success);
+        Assert.Contains("CurrentBuild", res.Error);
+        Assert.Empty(emitted);
+    }
+
+    [Theory]
+    [InlineData("Windows 10 Pro", "Professional", "26300", "Windows 11 Pro")]
+    [InlineData("Windows 10 Enterprise", "Enterprise", "26300", "Windows 11 Enterprise")]
+    [InlineData("Windows 10 Pro", "Professional", "19045", "Windows 10 Pro")]
+    [InlineData(null, "Professional", "26300", "Windows 11 Pro")]
+    [InlineData(null, "EnterpriseEval", "19045", "Windows 10 Enterprise Evaluation")]
+    [InlineData(null, "Core", "22631", "Windows 11 Home")]
+    [InlineData(null, "ServerStandard", "19045", "Windows 10 ServerStandard")]
+    public void FormatEdition_UsesProductName_AndCorrectsWindows11(string? product, string? editionId, string build, string expected) =>
+        Assert.Equal(expected, EditionFormat.FormatEdition(product, editionId, build));
+
+    [Fact]
+    public void ComputeBuildId_HashesTheFile_AndFallsBackToZeros()
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllBytes(path, "abc"u8.ToArray());
+            Assert.Equal("1.2.3+ba7816bf8f01", AgentHost.ComputeBuildId("1.2.3", path));
+        }
+        finally { File.Delete(path); }
+        Assert.Equal("1.2.3+000000000000", AgentHost.ComputeBuildId("1.2.3", Path.Combine(Path.GetTempPath(), "maldex-no-such-file.exe")));
+        Assert.Equal("1.2.3+000000000000", AgentHost.ComputeBuildId("1.2.3", null));
+    }
+
+    [Fact]
+    public void AgentBuildId_HasVersionPlusHash()
+    {
+        Assert.Matches("^" + System.Text.RegularExpressions.Regex.Escape(AgentHost.Version) + @"\+[0-9a-f]{12}$", AgentHost.BuildId);
+    }
 }

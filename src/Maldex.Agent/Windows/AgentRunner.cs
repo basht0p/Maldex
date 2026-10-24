@@ -34,7 +34,7 @@ public static class AgentRunner
             var started = time.GetTimestamp();
             await using (port)
             {
-                using var dispatcher = new CommandDispatcher(new ShellSampleOpener(), new ShellUrlOpener(), () => shutdown = true);
+                using var dispatcher = new CommandDispatcher(new ShellSampleOpener(), new ShellUrlOpener(), () => shutdown = true, provenance: new WindowsProvenanceProbe());
                 var source = new CompositeEventSource([
                     SysmonPresent() ? new SysmonEventSource() : new ProcessPollingSource(time),
                     new ScreenshotEventSource(new GdiScreenshotGrabber(), time),

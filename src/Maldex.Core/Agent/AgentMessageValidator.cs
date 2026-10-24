@@ -25,6 +25,7 @@ public static class AgentMessageValidator
         CommandResultMessage m => Req(m.CommandId, "CommandId"),
         FileChunkMessage m => ValidateFileChunk(m),
         SelfTestResultMessage m => ValidateSelfTest(m),
+        ProvenanceMessage m => ValidateProvenance(m),
         _ => "Unknown message type.",
     };
 
@@ -36,6 +37,34 @@ public static class AgentMessageValidator
     private const int MaxEchoChars = 256;
     private const int MaxGuestAddresses = 16;
     private const int MaxIpChars = 45;
+
+    private const int MaxEditionChars = 100;
+    private const int MaxVersionChars = 32;
+
+    private static string? ValidateProvenance(ProvenanceMessage m) =>
+        (string.IsNullOrEmpty(m.CommandId) || m.CommandId.Length > MaxIdChars ? "CommandId is missing or too long." : null)
+        ?? PrintableText(m.WindowsEdition, "WindowsEdition", MaxEditionChars)
+        ?? PrintableText(m.WindowsBuild, "WindowsBuild", MaxVersionChars)
+        ?? PrintableText(m.AgentVersion, "AgentVersion", MaxVersionChars)
+        ?? (BuildIdPattern.IsMatch(m.AgentVersion) ? null : "AgentVersion is not version+hash.");
+
+    private static readonly System.Text.RegularExpressions.Regex BuildIdPattern =
+        new(@"^[0-9A-Za-z.\-]{1,19}\+[0-9a-f]{12}$", System.Text.RegularExpressions.RegexOptions.CultureInvariant | System.Text.RegularExpressions.RegexOptions.NonBacktracking);
+
+    private static string? PrintableText(string? s, string name, int max)
+    {
+        if (s is null || s.Trim().Length == 0) return $"{name} is missing.";
+        if (s.Length > max) return $"{name} is too long.";
+        if (s.Trim() != s) return $"{name} is not trimmed.";
+        for (var i = 0; i < s.Length; i++)
+        {
+            var c = s[i];
+            if (char.IsHighSurrogate(c) && i + 1 < s.Length && char.IsLowSurrogate(s[i + 1])) { i++; continue; }
+            if (char.IsSurrogate(c)) return $"{name} has an unpaired surrogate.";
+            if (char.IsControl(c) || char.GetUnicodeCategory(c) == System.Globalization.UnicodeCategory.Format) return $"{name} is not printable.";
+        }
+        return null;
+    }
 
     private static string? ValidateSelfTest(SelfTestResultMessage m)
     {
