@@ -6,6 +6,7 @@ using Maldex.Core.Scheduling;
 using Maldex.Data;
 using Maldex.Web.Audit;
 using Maldex.Web.Auth;
+using Maldex.Web.Templates;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Data.SqlClient;
@@ -49,8 +50,10 @@ public static class TaskEndpoints
             var page = await query.Include(t => t.Org).OrderByDescending(t => t.CreatedAt).ThenByDescending(t => t.Id)
                 .Skip(skip ?? 0).Take(takeN).ToListAsync(ct);
             var queued = await QueuedAsync(db, ct);
+            var templates = await TemplateProvenance.LoadAsync(db, page.Select(t => t.TemplateVersionId), ct); // one query for the whole page
             return Results.Ok(new TaskListDto(
-                page.Select(t => TaskDto.From(t, t.Org!.Name, PositionOf(t, queued))).ToList(), total));
+                page.Select(t => TaskDto.From(t, t.Org!.Name, PositionOf(t, queued),
+                    t.TemplateVersionId is { } v && templates.TryGetValue(v, out var tpl) ? tpl : null)).ToList(), total));
         });
 
         g.MapGet("{id:guid}", async (Guid id, MaldexDbContext db, CancellationToken ct) =>
@@ -58,7 +61,7 @@ public static class TaskEndpoints
             var t = await db.Tasks.AsNoTracking().Include(t => t.Org).FirstOrDefaultAsync(t => t.Id == id, ct);
             if (t is null) return Results.NotFound();
             var position = t.Status == RunStatus.Queued ? PositionOf(t, await QueuedAsync(db, ct)) : 0;
-            return Results.Ok(TaskDto.From(t, t.Org!.Name, position));
+            return Results.Ok(TaskDto.From(t, t.Org!.Name, position, await TemplateProvenance.LoadAsync(db, t.TemplateVersionId, ct)));
         });
 
         g.MapPost("{id:guid}/cancel", async (Guid id, MaldexDbContext db, AuditWriter audit, TimeProvider time, CancellationToken ct) =>
