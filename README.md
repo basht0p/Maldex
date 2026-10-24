@@ -248,4 +248,8 @@ If you find a way for a guest to reach the host, the control plane or the LAN, o
 
 Licensed under the [Apache License 2.0](LICENSE).
 
+## Shamelessly AI Developed Code
+
+MALdex is written almost entirely by AI coding agents. Every design, plan and change is closely overseen by a Security Engineer with years of professional, non-AI software development experience, who reviews and approves everything before it merges.
+
 <p align="center"><sub><code>4D 5A</code> · Built for the SOC, kept on our own metal.</sub></p>
