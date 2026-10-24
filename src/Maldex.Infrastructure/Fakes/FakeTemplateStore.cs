@@ -21,8 +21,12 @@ public sealed class FakeTemplateStore : ITemplateStore
 
     public long? SizeOf(string fileStem) => null;
 
+    /// <summary>Runs when a working copy is made (a test can change the world between the bundle load and the install).</summary>
+    public Action? OnCreateWorkingCopy { get; set; }
+
     public Task CreateWorkingCopyAsync(string fromStem, string toStem, CancellationToken ct)
     {
+        OnCreateWorkingCopy?.Invoke();
         lock (WorkingCopies) WorkingCopies.Add((fromStem, toStem));
         return Task.CompletedTask;
     }

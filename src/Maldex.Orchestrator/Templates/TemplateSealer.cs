@@ -15,7 +15,7 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
     private const string DidNotPowerOff = "the guest did not power off; not sealing a possibly dirty disk";
 
     /// <summary>
-    /// Waits for the agent's ready message on <paramref name="ch"/> (this reads the channel; the caller must not have consumed it),
+    /// Checks the agent answers on <paramref name="ch"/> (a provenance round trip bounded by ProvenanceTimeout; ready is not needed),
     /// delivers the agent exe, Sysmon config and CA, applies them, powers the guest off and seals <paramref name="stem"/>.
     /// The caller owns <paramref name="ch"/> and <paramref name="vm"/> and releases them afterwards.
     /// </summary>
@@ -25,17 +25,23 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
         var o = options.Value;
         await using var session = new GuestSession(ch);
 
-        try
+        // Liveness is proven by a round trip, never by waiting for ready: the agent says ready once per session, and a host that
+        // connects later (or reconnects) may never see it. Queued ready messages and other frames are skipped by the session.
+        using (var askBudget = new CancellationTokenSource(o.ProvenanceTimeout, time))
+        using (var askLinked = CancellationTokenSource.CreateLinkedTokenSource(ct, askBudget.Token))
         {
-            await session.Ready.WaitAsync(o.AgentReadyTimeout, time, ct).ConfigureAwait(false);
-        }
-        catch (TimeoutException)
-        {
-            throw new TemplateSealException($"the guest agent was not ready within {o.AgentReadyTimeout.TotalSeconds:0} s; not sealing");
-        }
-        catch (InvalidOperationException ex)
-        {
-            throw new TemplateSealException($"the guest agent never became ready ({ex.Message}); not sealing");
+            try
+            {
+                await session.AskProvenanceAsync(askLinked.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (askBudget.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                throw new TemplateSealException($"the guest agent did not answer: no reply within {o.ProvenanceTimeout.TotalSeconds:0} s; not sealing");
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or IOException or ObjectDisposedException or ChannelClosedException)
+            {
+                throw new TemplateSealException($"the guest agent did not answer: {GuestText.Clean(ex.Message, 200)}; not sealing", ex);
+            }
         }
 
         var delivery = new SampleDelivery(time, o.ChunkTimeout);

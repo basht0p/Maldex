@@ -21,6 +21,9 @@ public sealed class GuestfishDiskEditor(IProcessRunner runner, IOptions<LibvirtO
     /// <summary>Where the agent lives in the image (Provision.ps1 <c>$AgentDir</c>); libguestfs addresses the C: volume as the root.</summary>
     public const string GuestAgentPath = "/Program Files/Maldex/Maldex.Agent.exe";
 
+    /// <summary>One install at a time per process: each guestfish starts a 1 GB appliance VM, next to the analysis VM.</summary>
+    private static readonly SemaphoreSlim OneAtATime = new(1, 1);
+
     private static readonly TimeSpan HardCap = TimeSpan.FromMinutes(15);
     private const UnixFileMode OwnerWrite = UnixFileMode.UserWrite;
     private const string Failed = "writing the agent into the working copy failed";
@@ -46,6 +49,7 @@ public sealed class GuestfishDiskEditor(IProcessRunner runner, IOptions<LibvirtO
         }
 
         ProcessResult result;
+        await OneAtATime.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             result = await runner.RunAsync("env",
@@ -63,6 +67,14 @@ public sealed class GuestfishDiskEditor(IProcessRunner runner, IOptions<LibvirtO
         {
             throw new TemplateAgentInstallException($"{Failed}: guestfish could not be started ({OneLine(ex.Message)}); run ./build.sh real-setup", ex);
         }
+        finally
+        {
+            OneAtATime.Release();
+        }
+
+        // env itself exits 127 (not found) or 126 (not executable) when guestfish is not there; no process error is raised.
+        if (result.ExitCode is 126 or 127)
+            throw new TemplateAgentInstallException($"{Failed}: guestfish is not installed; run ./build.sh real-setup");
 
         if (result.ExitCode != 0)
             throw new TemplateAgentInstallException($"{Failed} (guestfish exit {result.ExitCode}): {OneLine(result.Stderr)}");

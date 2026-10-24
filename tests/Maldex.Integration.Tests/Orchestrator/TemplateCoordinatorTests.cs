@@ -67,9 +67,12 @@ internal sealed class RecordingEgress(IEgressRouter inner) : IEgressRouter
 internal sealed class SilenceableChannels(IAgentChannelFactory inner, FakeGuest guest, TimeProvider time) : IAgentChannelFactory
 {
     public Func<VmHandle, bool>? Silent { get; set; }
+    /// <summary>Guests whose connection attempt fails (the agent socket is not there).</summary>
+    public Func<VmHandle, bool>? Unreachable { get; set; }
 
     public Task<IAgentChannel> ConnectAsync(VmHandle vm, CancellationToken ct) =>
-        Silent?.Invoke(vm) == true
+        Unreachable?.Invoke(vm) == true ? throw new IOException("the agent socket is not there")
+        : Silent?.Invoke(vm) == true
             ? Task.FromResult<IAgentChannel>(new ReplayAgentChannel([], 1, holdOpen: true, time, guest, vm.TaskId))
             : inner.ConnectAsync(vm, ct);
 }
@@ -559,8 +562,12 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         await using var rig = await TemplateJobRig.CreateAsync(sql);
         var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
         var connects = 0;
-        // The job's guest says ready for the provenance check, then never again: the sealer's own connection keeps waiting.
-        rig.Channels.Silent = vm => vm.TaskId == id && Interlocked.Increment(ref connects) > 1;
+        // The first connection is the provenance check; once the sealer connects (the second), the guest stops answering it.
+        rig.Channels.Silent = vm =>
+        {
+            if (vm.TaskId == id && Interlocked.Increment(ref connects) == 2) rig.Guest.SilentProvenance = true;
+            return false;
+        };
         var run = rig.Start(id);
         await rig.PumpUntilAsync(id, TemplateJobState.Sealing, run);
         await rig.IdleAsync(10);
@@ -677,8 +684,13 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         var id = await rig.SeedJobAsync(kind);
         var stem = TemplateCoordinator.StemOf(id);
         (string State, string? Message, string[] Copies, int Vms, string[] Egress)? seen = null;
+        byte[]? installedBytes = null;
+        UnixFileMode installedMode = 0;
         rig.DiskEditor.OnInstall = async (_, _) =>
         {
+            var file = rig.DiskEditor.Installs.Single().AgentExePath;
+            installedBytes = await File.ReadAllBytesAsync(file, Ct);
+            if (!OperatingSystem.IsWindows()) installedMode = File.GetUnixFileMode(file);
             var job = await rig.JobAsync(id);
             seen = (job.State.ToString(), job.Message, rig.Store.WorkingCopies.Select(c => c.To).ToArray(), (await rig.Hypervisor.ListAsync(Ct)).Count, [.. rig.Egress.Calls]);
         };
@@ -690,7 +702,11 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         }
         await rig.PumpAsync(run);
 
-        Assert.Equal([(stem, rig.AgentExePath)], rig.DiskEditor.Installs);
+        var install = Assert.Single(rig.DiskEditor.Installs);
+        Assert.Equal(stem, install.Stem);
+        Assert.Equal(rig.AgentExe, installedBytes); // the bundle's bytes, from a private temp file
+        if (!OperatingSystem.IsWindows()) Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, installedMode);
+        Assert.False(File.Exists(install.AgentExePath)); // removed afterwards
         Assert.Equal(("Preparing", "installing the current agent into the working copy", new[] { stem }, 0, Array.Empty<string>()), seen);
         Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
     }
@@ -755,6 +771,50 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         await rig.PumpAsync(rig.Start(id));
 
         Assert.Empty(rig.DiskEditor.Installs);
+        Assert.Empty(rig.Store.WorkingCopies); // not even the copy
+    }
+
+    [Fact]
+    public async Task AgentInstall_UsesTheBundlesBytes_EvenIfTheExeIsReplacedMeanwhile()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        byte[]? installed = null;
+        rig.DiskEditor.OnInstall = async (_, _) => installed = await File.ReadAllBytesAsync(rig.DiskEditor.Installs.Single().AgentExePath, Ct);
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
+        rig.Store.OnCreateWorkingCopy = () => File.WriteAllBytes(rig.AgentExePath, [1, 2, 3]); // ./build.sh agent runs between load and install
+
+        await rig.PumpAsync(rig.Start(id));
+
+        Assert.Equal(rig.AgentExe, installed);
+        Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
+    }
+
+    [Fact]
+    public async Task Sealer_SecondConnectionGetsNoReady_StillSealsAndPublishes() // R25
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
+        var connects = 0;
+        rig.Channels.Silent = vm => vm.TaskId == id && Interlocked.Increment(ref connects) > 1; // no ready on the sealer's connection
+
+        await rig.PumpAsync(rig.Start(id));
+
+        Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
+    }
+
+    [Fact]
+    public async Task CheckAgent_ConnectFailure_FailsTheJob()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit);
+        rig.Channels.Unreachable = vm => vm.TaskId == id;
+
+        await rig.PumpAsync(rig.Start(id));
+
+        var job = await rig.JobAsync(id);
+        Assert.Equal(TemplateJobState.Failed, job.State);
+        Assert.Equal("could not connect to the guest agent (the agent socket is not there); the agent could not be checked", job.FailureReason);
+        await rig.AssertDiscardedAsync(id);
     }
 
     [Theory]

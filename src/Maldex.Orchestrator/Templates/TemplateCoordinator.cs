@@ -221,7 +221,7 @@ public sealed class TemplateCoordinator(
 
         // Whatever agent the base version carries, the working copy boots with the current one (R24: always, one path).
         await SaveJobAsync(db, job.Id, j => { j.Message = "installing the current agent into the working copy"; return true; }, [], ct).ConfigureAwait(false);
-        await InstallAgentAsync(stem, o, ct).ConfigureAwait(false);
+        await InstallAgentAsync(stem, bundle, o, ct).ConfigureAwait(false);
 
         await TakeVmSlotAsync(db, job.Id, ct).ConfigureAwait(false);
 
@@ -289,17 +289,32 @@ public sealed class TemplateCoordinator(
     }
 
     /// <summary>Writes the current agent into the working copy's disk, bounded by <see cref="TemplateJobOptions.AgentInstallTimeout"/>.</summary>
-    private async Task InstallAgentAsync(string stem, TemplateJobOptions o, CancellationToken ct)
+    private async Task InstallAgentAsync(string stem, ComponentBundle bundle, TemplateJobOptions o, CancellationToken ct)
     {
-        using var timeout = new CancellationTokenSource(o.AgentInstallTimeout, time);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
+        // The bundle's own bytes (what the later checks compare against), not a re-read of AgentExePath, which a rebuild could replace.
+        var file = Path.Combine(Path.GetTempPath(), "maldex-agent-" + Guid.NewGuid().ToString("N") + ".exe");
         try
         {
-            await diskEditor.InstallAgentAsync(stem, Path.GetFullPath(o.AgentExePath), linked.Token).ConfigureAwait(false);
+            var fileOptions = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
+            if (!OperatingSystem.IsWindows()) fileOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+            await using (var stream = new FileStream(file, fileOptions))
+                await stream.WriteAsync(bundle.AgentExe, ct).ConfigureAwait(false);
+
+            using var timeout = new CancellationTokenSource(o.AgentInstallTimeout, time);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
+            try
+            {
+                await diskEditor.InstallAgentAsync(stem, file, linked.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested && !ct.IsCancellationRequested)
+            {
+                throw new JobFailedException($"writing the agent into the working copy did not finish within {o.AgentInstallTimeout.TotalSeconds:0} s");
+            }
         }
-        catch (OperationCanceledException) when (timeout.IsCancellationRequested && !ct.IsCancellationRequested)
+        finally
         {
-            throw new JobFailedException($"writing the agent into the working copy did not finish within {o.AgentInstallTimeout.TotalSeconds:0} s");
+            try { File.Delete(file); }
+            catch (Exception ex) { logger.LogWarning(ex, "Deleting the temporary agent copy {File} failed.", file); }
         }
     }
 

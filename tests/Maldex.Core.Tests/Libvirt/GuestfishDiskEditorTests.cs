@@ -122,6 +122,80 @@ public sealed class GuestfishDiskEditorTests : IDisposable
         Assert.Contains("did not finish", ex.Message);
     }
 
+    [Theory]
+    [InlineData(127)]
+    [InlineData(126)]
+    public async Task Install_GuestfishNotInstalled_EnvExits126Or127_NamesTheFix(int exit)
+    {
+        WorkingCopy();
+        _runner.Handler = (_, _) => new(exit, "", "env: 'guestfish': No such file or directory");
+
+        var ex = await Assert.ThrowsAsync<TemplateAgentInstallException>(() => Editor().InstallAgentAsync(Stem, _exe, Ct));
+
+        Assert.Contains("not installed", ex.Message);
+        Assert.Contains("./build.sh real-setup", ex.Message);
+    }
+
+    [Fact]
+    public async Task Install_RunsOneGuestfishAtATime_PerProcess()
+    {
+        WorkingCopy();
+        var concurrent = 0;
+        var most = 0;
+        var gate = new SemaphoreSlim(0);
+        var slow = new SlowRecorder(async () =>
+        {
+            var now = Interlocked.Increment(ref concurrent);
+            lock (this) most = Math.Max(most, now);
+            await gate.WaitAsync(Ct);
+            Interlocked.Decrement(ref concurrent);
+        });
+        var a = new GuestfishDiskEditor(slow, Options.Create(new LibvirtOptions { BaseImageDir = _dir }));
+        var b = new GuestfishDiskEditor(slow, Options.Create(new LibvirtOptions { BaseImageDir = _dir }));
+
+        var first = a.InstallAgentAsync(Stem, _exe, Ct);
+        var second = b.InstallAgentAsync(Stem, _exe, Ct); // another editor instance: the limit is per process
+        await Task.Delay(300, Ct);
+        Assert.Equal(1, slow.Started); // the second waits for the first
+        gate.Release();
+        await Task.Delay(300, Ct);
+        Assert.Equal(2, slow.Started);
+        gate.Release();
+        await Task.WhenAll(first, second);
+
+        Assert.Equal(1, most);
+    }
+
+    [Fact]
+    public async Task Install_WaitingForTheTurn_CanBeCancelled()
+    {
+        WorkingCopy();
+        var gate = new SemaphoreSlim(0);
+        var slow = new SlowRecorder(() => gate.WaitAsync(Ct));
+        var editor = new GuestfishDiskEditor(slow, Options.Create(new LibvirtOptions { BaseImageDir = _dir }));
+        var first = editor.InstallAgentAsync(Stem, _exe, Ct);
+        await Task.Delay(200, Ct);
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => editor.InstallAgentAsync(Stem, _exe, cts.Token));
+
+        gate.Release();
+        await first;
+    }
+
+    private sealed class SlowRecorder(Func<Task> onRun) : IProcessRunner
+    {
+        private int _started;
+        public int Started => Volatile.Read(ref _started);
+
+        public async Task<ProcessResult> RunAsync(string file, IReadOnlyList<string> args, CancellationToken ct, string? stdin = null, TimeSpan? timeout = null)
+        {
+            Interlocked.Increment(ref _started);
+            await onRun();
+            return new ProcessResult(0, "1234\n", "");
+        }
+    }
+
     [Fact]
     public async Task Install_CannotStartGuestfish_FailsAsAnInstallError()
     {
