@@ -1,5 +1,6 @@
 using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
+using Maldex.Core.Lifecycle;
 using Maldex.Data;
 using Maldex.Data.Templates;
 using Maldex.Infrastructure.Guacamole;
@@ -190,10 +191,10 @@ public static class TemplateEndpoints
         // GuacamoleTunnelEndpoint.
         jobGroup.MapGet("{jobId:guid}/tunnel-token", async (Guid jobId, MaldexDbContext db, CurrentUser user, GuacamoleTokenService tokens, TimeProvider time, CancellationToken ct) =>
         {
-            var state = await db.TemplateJobs.AsNoTracking().Where(j => j.Id == jobId).Select(j => (TemplateJobState?)j.State).SingleOrDefaultAsync(ct);
-            if (state is null) return Results.NotFound();
-            if (state != TemplateJobState.Configuring)
-                return Results.Problem(title: "The console is only available while the job is configuring.", statusCode: StatusCodes.Status409Conflict);
+            if (!await db.TemplateJobs.AsNoTracking().AnyAsync(j => j.Id == jobId, ct)) return Results.NotFound();
+            // Not once a seal or cancel is requested either (R22): the guest is about to be sealed or destroyed.
+            if (!await db.TemplateJobs.AsNoTracking().Where(j => j.Id == jobId).Where(TemplateJob.ConsoleOpen).AnyAsync(ct))
+                return Results.Problem(title: "The console is only available while the job is configuring and not being sealed or cancelled.", statusCode: StatusCodes.Status409Conflict);
 
             var token = tokens.Issue(TunnelTokenKind.TemplateJob, jobId, user.UserId);
             db.AuditLogs.Add(await JobAuditAsync(db, jobId, ActorOf(user), "template.console.token", "", time, ct)); // never log the token itself
@@ -206,8 +207,8 @@ public static class TemplateEndpoints
 
     private const int RecentJobs = 20, MaxNoteLength = 1000;
 
-    private static readonly TemplateJobState[] ActiveStates =
-        [TemplateJobState.Queued, TemplateJobState.Preparing, TemplateJobState.Configuring, TemplateJobState.Sealing, TemplateJobState.Verifying];
+    private static readonly TemplateJobState[] ActiveStates = TemplateJobStateMachine.ActiveStates;
+
 
     private const int SqlDuplicateKeyIndex = 2601, SqlDuplicateKeyConstraint = 2627;
 
@@ -266,7 +267,7 @@ public static class TemplateEndpoints
             Target = await db.TemplateJobs.AsNoTracking().Where(j => j.Id == jobId).Select(j => j.TemplateId).SingleAsync(ct),
         };
 
-    private static async Task<List<TemplateJobDto>> JobDtosAsync(MaldexDbContext db, IReadOnlyList<TemplateJob> jobs, TemplateJobOptions options, CancellationToken ct)
+    internal static async Task<List<TemplateJobDto>> JobDtosAsync(MaldexDbContext db, IReadOnlyList<TemplateJob> jobs, TemplateJobOptions options, CancellationToken ct)
     {
         var versionIds = jobs.Select(j => j.BaseVersionId).Concat(jobs.Where(j => j.ResultVersionId != null).Select(j => j.ResultVersionId!.Value)).Distinct().ToList();
         var numbers = await db.TemplateVersions.AsNoTracking().Where(v => versionIds.Contains(v.Id)).ToDictionaryAsync(v => v.Id, v => v.Number, ct);

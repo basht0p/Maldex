@@ -37,7 +37,8 @@ public sealed class TemplateCoordinator(
     IOptions<LibvirtOptions> libvirt,
     TimeProvider time,
     ILogger<TemplateCoordinator> logger,
-    ITemplateJobPublisher? publisher = null)
+    ITemplateJobPublisher? publisher = null,
+    JobConsoleRegistry? consoles = null)
 {
     public const string InterruptedReason = "interrupted";
     public const string CancelledByAdmin = "cancelled by an admin";
@@ -49,8 +50,7 @@ public sealed class TemplateCoordinator(
     private const int MaxTerminalSaveAttempts = 6;
     private const int MaxMessageLength = 500, MaxReasonLength = 1000;
 
-    private static readonly TemplateJobState[] Active =
-        [TemplateJobState.Queued, TemplateJobState.Preparing, TemplateJobState.Configuring, TemplateJobState.Sealing, TemplateJobState.Verifying];
+    private static readonly TemplateJobState[] Active = TemplateJobStateMachine.ActiveStates;
 
     /// <summary>The file stem of the job's working copy, and of the version it produces.</summary>
     public static string StemOf(Guid jobId) => jobId.ToString("N");
@@ -240,6 +240,10 @@ public sealed class TemplateCoordinator(
             }, [], ct).ConfigureAwait(false);
 
             if (await WaitForSealAsync(db, job.Id, ct).ConfigureAwait(false) is { } idle) return idle;
+
+            // Nobody may keep driving the guest while it is sealed (R22): close the job's open consoles and wait, bounded, for them to go.
+            if (consoles is not null && !await consoles.CloseAsync(job.Id, o.ConsoleCloseTimeout, ct).ConfigureAwait(false))
+                logger.LogWarning("A console of template job {JobId} was still open {Timeout} after it was told to close; sealing anyway.", job.Id, o.ConsoleCloseTimeout);
 
             // Sealing runs without any network: cut the running guest off before anything is installed.
             await egress.IsolateAsync(held.Lease, ct).ConfigureAwait(false);
@@ -497,6 +501,7 @@ public sealed class TemplateCoordinator(
 
     private async Task ReleaseGuestAsync(TemplateJob job, Held held)
     {
+        consoles?.Close(job.Id); // no wait: the VM is about to go, but no console may send input meanwhile
         if (held.Vm is { } vm)
         {
             try

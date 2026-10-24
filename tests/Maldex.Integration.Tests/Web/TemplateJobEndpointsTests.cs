@@ -530,6 +530,23 @@ public sealed class TemplateJobEndpointsTests(SqlServerFixture sql) : IDisposabl
         Assert.Equal(0, r.Factory.Services.GetRequiredService<GuacamoleTokenService>().PendingCount);
     }
 
+    [Theory]
+    [InlineData("seal")]
+    [InlineData("cancel")]
+    public async Task TunnelToken_AfterASealOrCancelRequest_Is409(string request)
+    {
+        var r = NewRig();
+        var id = await SeedJobAsync(r, TemplateJobState.Configuring);
+        using var client = Admin(r);
+        Assert.Equal(HttpStatusCode.Accepted, (await client.PostAsync($"/api/admin/template-jobs/{id}/{request}", null, Ct)).StatusCode);
+
+        var resp = await client.GetAsync($"/api/admin/template-jobs/{id}/tunnel-token", Ct);
+
+        Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode); // the job is still Configuring, but the guest is about to be sealed or destroyed
+        Assert.Equal(0, r.Factory.Services.GetRequiredService<GuacamoleTokenService>().PendingCount);
+        Assert.Empty(await AuditsAsync(r, "template.console.token"));
+    }
+
     [Fact]
     public async Task TunnelToken_Unknown_Is404()
     {

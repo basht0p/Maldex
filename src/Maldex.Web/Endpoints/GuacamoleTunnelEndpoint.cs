@@ -5,6 +5,7 @@ using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
 using Maldex.Data;
 using Maldex.Infrastructure.Guacamole;
+using Maldex.Orchestrator.Templates;
 using Maldex.Web.Audit;
 using Maldex.Web.Auth;
 using Microsoft.EntityFrameworkCore;
@@ -45,7 +46,7 @@ public static class GuacamoleTunnelEndpoint
         /// <summary>The audit row's target: the task's id, or a job's template id.</summary>
         public required Func<MaldexDbContext, CancellationToken, Task<string>> AuditTarget { get; init; }
         /// <summary>Marks the console as in use (a job's <c>LastConsoleAt</c>); null for a task.</summary>
-        public Func<MaldexDbContext, DateTimeOffset, CancellationToken, Task>? Touch { get; init; }
+        public Func<MaldexDbContext, DateTimeOffset, CancellationToken, Task<int>>? Touch { get; init; }
 
         public string? Details(string? reason) => DetailPrefix is null ? reason : reason is null ? DetailPrefix : $"{DetailPrefix}; {reason}";
     }
@@ -75,7 +76,7 @@ public static class GuacamoleTunnelEndpoint
         NotActiveDetail = "job is not configuring",
         NotActiveClose = "The job is not configuring.",
         EndedClose = "The job is no longer configuring.",
-        IsActive = (db, ct) => db.TemplateJobs.AsNoTracking().AnyAsync(j => j.Id == id && j.State == TemplateJobState.Configuring, ct),
+        IsActive = (db, ct) => db.TemplateJobs.AsNoTracking().Where(j => j.Id == id).Where(TemplateJob.ConsoleOpen).AnyAsync(ct),
         AuditTarget = async (db, ct) => await db.TemplateJobs.AsNoTracking().Where(j => j.Id == id).Select(j => j.TemplateId).FirstOrDefaultAsync(ct) ?? id.ToString(),
         // One column and no row-version check: the coordinator writes this row too, and a console touch must not collide with it.
         Touch = (db, now, ct) => db.TemplateJobs.Where(j => j.Id == id && j.State == TemplateJobState.Configuring)
@@ -109,18 +110,18 @@ public static class GuacamoleTunnelEndpoint
         app.MapGet("/api/tasks/{id:guid}/tunnel", (Guid id, string? token, int? width, int? height, HttpContext ctx, GuacamoleTokenService tokens,
             IVmConsoleLocator locator, IOptions<GuacamoleOptions> options, IServiceScopeFactory scopes, MaldexDbContext db, TimeProvider time,
             ILogger<GuacamoleTunnelLog> log) =>
-            TunnelAsync(TaskTarget(id), token, width, height, ctx, tokens, locator, options, scopes, db, time, log)).AllowAnonymous();
+            TunnelAsync(TaskTarget(id), null, token, width, height, ctx, tokens, locator, options, scopes, db, time, log)).AllowAnonymous();
 
         // The configure console of a template job: the token (issued to an authenticated Admin for this job) is the credential here too.
         app.MapGet("/api/admin/template-jobs/{id:guid}/tunnel", (Guid id, string? token, int? width, int? height, HttpContext ctx, GuacamoleTokenService tokens,
             IVmConsoleLocator locator, IOptions<GuacamoleOptions> options, IServiceScopeFactory scopes, MaldexDbContext db, TimeProvider time,
-            ILogger<GuacamoleTunnelLog> log) =>
-            TunnelAsync(JobTarget(id), token, width, height, ctx, tokens, locator, options, scopes, db, time, log)).AllowAnonymous();
+            ILogger<GuacamoleTunnelLog> log, JobConsoleRegistry registry) =>
+            TunnelAsync(JobTarget(id), registry, token, width, height, ctx, tokens, locator, options, scopes, db, time, log)).AllowAnonymous();
         return app;
     }
 
     private static async Task<IResult> TunnelAsync(
-        TunnelTarget target, string? token, int? width, int? height, HttpContext ctx, GuacamoleTokenService tokens,
+        TunnelTarget target, JobConsoleRegistry? registry, string? token, int? width, int? height, HttpContext ctx, GuacamoleTokenService tokens,
         IVmConsoleLocator locator, IOptions<GuacamoleOptions> options, IServiceScopeFactory scopes, MaldexDbContext db, TimeProvider time,
         ILogger<GuacamoleTunnelLog> log)
     {
@@ -148,6 +149,8 @@ public static class GuacamoleTunnelEndpoint
                 await CloseAsync(ws, WebSocketCloseStatus.PolicyViolation, "Invalid tunnel token.");
                 return Results.Empty;
             }
+            // Registered before the open check, so a seal requested meanwhile either refuses this tunnel or finds it and closes it (R22).
+            using var registration = registry?.Register(id);
             if (!await IsActiveAsync(scopes, target, ct))
             {
                 await AuditAsync(db, time, userId, target, target.DeniedAction, target.NotActiveDetail, ct);
@@ -179,7 +182,7 @@ public static class GuacamoleTunnelEndpoint
 
                 await AuditAsync(db, time, userId, target, target.JoinAction, null, ct);
                 await TouchAsync(scopes, target, time, ct);
-                await RunAsync(ws, stream, reader, ready, target, options.Value, scopes, time, ct);
+                await RunAsync(ws, stream, reader, ready, target, options.Value, scopes, time, ct, registration?.Closing ?? CancellationToken.None);
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
             {
@@ -238,9 +241,9 @@ public static class GuacamoleTunnelEndpoint
 
     private static async Task RunAsync(
         WebSocket ws, Stream guacd, GuacamoleInstructionReader reader, string[] ready, TunnelTarget target, GuacamoleOptions options,
-        IServiceScopeFactory scopes, TimeProvider time, CancellationToken requestAborted)
+        IServiceScopeFactory scopes, TimeProvider time, CancellationToken requestAborted, CancellationToken closing)
     {
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(requestAborted);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(requestAborted, closing);
         var ct = cts.Token;
         using var sendGate = new SemaphoreSlim(1, 1);
 
@@ -283,7 +286,9 @@ public static class GuacamoleTunnelEndpoint
                     else if (!AllowedUpstreamOpcodes.Contains(instruction[0])) throw new PolicyViolationException(instruction[0]);
                     else forward.Append(GuacamoleProtocol.Encode(instruction));
                 }
-                if (forward.Length > 0) await WriteAsync(guacd, forward.ToString(), ct);
+                if (forward.Length == 0) continue;
+                ct.ThrowIfCancellationRequested(); // told to close (R22): nothing more reaches the guest
+                await WriteAsync(guacd, forward.ToString(), ct);
             }
         }, ct);
 
@@ -336,7 +341,23 @@ public static class GuacamoleTunnelEndpoint
     {
         if (target.Touch is null) return;
         await using var scope = scopes.CreateAsyncScope();
-        await target.Touch(scope.ServiceProvider.GetRequiredService<MaldexDbContext>(), time.GetUtcNow(), ct);
+        var sp = scope.ServiceProvider;
+        var db = sp.GetRequiredService<MaldexDbContext>();
+        if (await target.Touch(db, time.GetUtcNow(), ct) == 0) return;
+
+        // The touch moves the job's idle deadline: tell the watchers (best effort).
+        if (sp.GetService<ITemplateJobPublisher>() is not { } publisher) return;
+        try
+        {
+            var job = await db.TemplateJobs.AsNoTracking().SingleOrDefaultAsync(j => j.Id == target.Id, ct);
+            if (job is null) return;
+            var dto = (await TemplateEndpoints.JobDtosAsync(db, [job], sp.GetRequiredService<IOptions<TemplateJobOptions>>().Value, ct)).Single();
+            await publisher.PublishAsync(dto, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            sp.GetService<ILogger<GuacamoleTunnelLog>>()?.LogWarning(ex, "Publishing the console touch of job {JobId} failed.", target.Id);
+        }
     }
 
     private static async Task WriteAsync(Stream stream, string text, CancellationToken ct)

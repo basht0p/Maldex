@@ -16,6 +16,8 @@ public sealed class TemplateJobOptions
     public TimeSpan AgentReadyTimeout { get; set; } = TimeSpan.FromMinutes(5);
     public TimeSpan PowerOffTimeout { get; set; } = TimeSpan.FromMinutes(3);
     public TimeSpan VerifyTimeout { get; set; } = TimeSpan.FromMinutes(5);
+    /// <summary>How long the coordinator waits for the open consoles of a job to close once a seal is requested, before sealing anyway.</summary>
+    public TimeSpan ConsoleCloseTimeout { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan ConfigureIdleTimeout { get; set; } = TimeSpan.FromHours(2);
     /// <summary><c>apply_components</c> clears every Windows event log (about 1000 channels, about a minute), so its reply gets a generous timeout.</summary>
     public TimeSpan ApplyComponentsTimeout { get; set; } = TimeSpan.FromMinutes(10);

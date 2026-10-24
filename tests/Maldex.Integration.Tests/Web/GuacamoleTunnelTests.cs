@@ -37,7 +37,7 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
         public Task<VncEndpoint?> GetAsync(VmHandle vm, CancellationToken ct) => Task.FromResult(endpoint);
     }
 
-    private sealed class TunnelFactory(SqlServerFixture sql, int guacdPort, VncEndpoint? endpoint, string authMode = "Dev", FakeTimeProvider? clock = null, string keepAlive = "00:01:00")
+    private sealed class TunnelFactory(SqlServerFixture sql, int guacdPort, VncEndpoint? endpoint, string authMode = "Dev", FakeTimeProvider? clock = null, string keepAlive = "00:01:00", Maldex.Orchestrator.Templates.ITemplateJobPublisher? publisher = null)
         : MaldexAppFactory(sql, authMode: authMode, settings: new Dictionary<string, string?>
         {
             ["Maldex:Guacamole:GuacdPort"] = guacdPort.ToString(),
@@ -56,6 +56,7 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
             {
                 s.AddSingleton<IVmConsoleLocator>(new StubLocator(endpoint));
                 if (clock is not null) s.Replace(ServiceDescriptor.Singleton<TimeProvider>(clock));
+                if (publisher is not null) s.Replace(ServiceDescriptor.Singleton(publisher));
             });
         }
     }
@@ -663,6 +664,90 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
         var denied = Assert.Single(await db.AuditLogs.Where(a => a.Action == "template.console.denied").ToListAsync(Ct));
         Assert.Equal($"job={id}; job is not configuring", denied.Details);
         Assert.Equal(SeededTemplate, denied.Target);
+    }
+
+    [Theory]
+    [InlineData("seal")]
+    [InlineData("cancel")]
+    public async Task JobTunnel_IsRefusedAfterASealOrCancelRequest(string request)
+    {
+        var f = Factory(1);
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        var token = await GetJobTokenAsync(admin, id); // valid when issued
+        Assert.Equal(HttpStatusCode.Accepted, (await admin.PostAsync($"/api/admin/template-jobs/{id}/{request}", null, Ct)).StatusCode);
+
+        using (var ws = await ConnectJobAsync(f, id, token))
+            Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
+
+        Assert.Null(await LastConsoleAtAsync(f, id));
+        Assert.Equal(0, f.Services.GetRequiredService<Maldex.Orchestrator.Templates.JobConsoleRegistry>().OpenCount(id));
+    }
+
+    [Fact]
+    public async Task JobTunnel_OpenWhenASealIsRequested_IsClosedAtOnce_AndNoMoreInputReachesTheGuest()
+    {
+        using var guacd = new FakeGuacd();
+        var f = Factory(guacd.Port);
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        using var ws = await ConnectJobAsync(f, id, await GetJobTokenAsync(admin, id));
+        await ReceiveTextAsync(ws);
+        await ReceiveTextAsync(ws);
+        var registry = f.Services.GetRequiredService<Maldex.Orchestrator.Templates.JobConsoleRegistry>();
+        Assert.Equal(1, registry.OpenCount(id));
+        await WaitForAsync(() => Task.FromResult(guacd.Received.Count >= 6), "the handshake");
+        var received = guacd.Received.Count;
+
+        // What the coordinator does once a seal is requested, before it isolates the guest: no waiting for the 2 s poll.
+        Assert.True(await registry.CloseAsync(id, TimeSpan.FromSeconds(10), Ct));
+        try { await SendTextAsync(ws, GuacamoleProtocol.Encode("key", "65", "1")); } catch (Exception ex) when (ex is WebSocketException or IOException or ObjectDisposedException) { }
+
+        Assert.Equal(0, registry.OpenCount(id));
+        Assert.StartsWith("<close:", await ReceiveTextAsync(ws));
+        await Task.Delay(200, Ct);
+        Assert.Equal(received, guacd.Received.Count); // the key press never reached guacd
+    }
+
+    [Fact]
+    public async Task JobTunnel_KeepAlive_PublishesTheMovedIdleDeadline()
+    {
+        using var guacd = new FakeGuacd();
+        var clock = new FakeTimeProvider(new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        var publisher = new CollectingPublisher();
+        var f = new TunnelFactory(sql, guacd.Port, new VncEndpoint("127.0.0.1", 5901, VncPassword), clock: clock, publisher: publisher);
+        _disposables.Add(f);
+        var since = clock.GetUtcNow();
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring, since);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        using var ws = await ConnectJobAsync(f, id, await GetJobTokenAsync(admin, id));
+        await ReceiveTextAsync(ws);
+        await ReceiveTextAsync(ws);
+        await WaitForAsync(() => Task.FromResult(publisher.Count > 0), "the push for the connect");
+        Assert.Equal(since + TimeSpan.FromHours(2), publisher.Last!.IdleDeadline);
+
+        for (var i = 0; i < 100 && publisher.Last!.IdleDeadline == since + TimeSpan.FromHours(2); i++)
+        {
+            clock.Advance(TimeSpan.FromSeconds(61));
+            await Task.Delay(30, Ct);
+        }
+
+        Assert.True(publisher.Last!.IdleDeadline > since + TimeSpan.FromHours(2));
+        Assert.Equal(id, publisher.Last.Id);
+        Assert.Equal("Configuring", publisher.Last.State);
+    }
+
+    private sealed class CollectingPublisher : Maldex.Orchestrator.Templates.ITemplateJobPublisher
+    {
+        private readonly object _gate = new();
+        private readonly List<Maldex.Orchestrator.Templates.TemplateJobDto> _all = [];
+        public int Count { get { lock (_gate) return _all.Count; } }
+        public Maldex.Orchestrator.Templates.TemplateJobDto? Last { get { lock (_gate) return _all.LastOrDefault(); } }
+        public Task PublishAsync(Maldex.Orchestrator.Templates.TemplateJobDto job, CancellationToken ct)
+        {
+            lock (_gate) _all.Add(job);
+            return Task.CompletedTask;
+        }
     }
 
     [Fact]

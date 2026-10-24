@@ -416,6 +416,69 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         Assert.Equal(["template.seal"], (await rig.AuditsAsync()).Select(a => a.Action));
     }
 
+    [Fact]
+    public async Task Seal_ClosesTheOpenConsole_AndWaitsForIt_BeforeTheGuestIsIsolated()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Templates:Jobs:ConsoleCloseTimeout"] = "01:00:00" });
+        var consoles = rig.H.Get<JobConsoleRegistry>();
+        rig.Egress.DescribeAtIsolate = jobId => Task.FromResult($"consoles={consoles.OpenCount(jobId)}");
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit);
+        var run = rig.Start(id);
+        await rig.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+
+        // An open console that takes a moment (real time) to wind down once it is told to close.
+        var console = consoles.Register(id);
+        var winding = Task.Run(async () =>
+        {
+            await Task.Delay(Timeout.Infinite, console.Closing).ContinueWith(_ => { }, TaskScheduler.Default);
+            await Task.Delay(150, Ct);
+            console.Dispose();
+        }, Ct);
+        await rig.RequestSealAsync(id);
+        await rig.PumpAsync(run);
+        await winding;
+
+        Assert.True(console.Closing.IsCancellationRequested);
+        Assert.Contains("isolate consoles=0", rig.Egress.Calls); // gone before the guest was cut off and sealed
+        Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
+    }
+
+    [Fact]
+    public async Task Seal_WithAConsoleThatWillNotClose_ProceedsAfterTheBoundedWait()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Templates:Jobs:ConsoleCloseTimeout"] = "00:00:05" });
+        var consoles = rig.H.Get<JobConsoleRegistry>();
+        rig.Egress.DescribeAtIsolate = jobId => Task.FromResult($"consoles={consoles.OpenCount(jobId)}");
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit);
+        var run = rig.Start(id);
+        await rig.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+        using var stuck = consoles.Register(id); // never disposed by its "tunnel"
+        await rig.RequestSealAsync(id);
+
+        await rig.PumpAsync(run);
+
+        Assert.True(stuck.Closing.IsCancellationRequested); // it was told to close
+        Assert.Contains("isolate consoles=1", rig.Egress.Calls); // and the seal went on anyway
+        Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
+    }
+
+    [Fact]
+    public async Task Cancel_SignalsTheOpenConsole_BeforeTheVmIsDestroyed()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        var consoles = rig.H.Get<JobConsoleRegistry>();
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit);
+        var run = rig.Start(id);
+        await rig.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+        using var console = consoles.Register(id);
+
+        await rig.RequestCancelAsync(id);
+        await rig.PumpAsync(run);
+
+        Assert.True(console.Closing.IsCancellationRequested);
+        Assert.Equal(TemplateJobState.Cancelled, (await rig.JobAsync(id)).State);
+    }
+
     private sealed class RecordingJobPublisher : ITemplateJobPublisher
     {
         public List<TemplateJobDto> Updates { get; } = [];

@@ -35,4 +35,7 @@ public static class TemplateJobStateMachine
     }
 
     public static bool IsTerminal(TemplateJobState s) => s is Published or Sealed or Failed or Cancelled;
+
+    /// <summary>The non-terminal states: the one list the endpoints and the coordinator count "a job is active" by.</summary>
+    public static readonly TemplateJobState[] ActiveStates = [Queued, Preparing, Configuring, Sealing, Verifying];
 }
