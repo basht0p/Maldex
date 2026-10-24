@@ -71,6 +71,25 @@ public sealed class LibvirtHypervisorTests : IDisposable
 
     [Fact]
     [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public async Task Start_Writable_BootsTheDiskDirectly_NoOverlay()
+    {
+        SeedBase();
+        var h = await Hv().StartAsync(Spec() with { Writable = true }, CancellationToken.None);
+        var dir = RunDirOf(h);
+        var call = Assert.Single(_runner.Calls);
+        Assert.Equal("virsh", call.File);
+        var xml = File.ReadAllText(Path.Combine(dir, "domain.xml"));
+        Assert.Contains(Path.Combine(_opts.BaseImageDir, "win11-26h2.qcow2"), xml);
+        Assert.Contains(Path.Combine(_opts.BaseImageDir, "win11-26h2.vars.fd"), xml);
+        Assert.DoesNotContain("overlay.qcow2", xml);
+        Assert.False(File.Exists(Path.Combine(dir, "overlay.qcow2")));
+        Assert.False(File.Exists(Path.Combine(dir, "nvram.fd")));
+        Assert.True(File.Exists(Path.Combine(dir, "vnc.pass")));
+        Assert.True(File.Exists(Path.Combine(dir, "domain.xml")));
+    }
+
+    [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
     public async Task Start_NvramIsWritable_EvenThoughTheVarsTemplateIsReadOnly()
     {
         SeedBase();

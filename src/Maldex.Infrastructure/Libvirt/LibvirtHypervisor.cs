@@ -53,17 +53,27 @@ public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcess
         {
             if (OperatingSystem.IsWindows()) Directory.CreateDirectory(runDir);
             else Directory.CreateDirectory(runDir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-            var overlay = Path.Combine(runDir, "overlay.qcow2");
-            var nvram = Path.Combine(runDir, "nvram.fd");
-            await new QemuImageCli(runner, _o.QemuImgBinary).CreateOverlayAsync(basePath, overlay, ct);
-            // Not File.Copy: it keeps the template's mode, and the template is finalised read-only (0444) while QEMU must write
-            // the run's UEFI variable store. 0600 from creation; chmod as well in case a retry finds the file already there.
-            var nvramOptions = new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.Write };
-            if (!OperatingSystem.IsWindows()) nvramOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
-            await using (var src = File.OpenRead(varsPath))
-            await using (var dst = new FileStream(nvram, nvramOptions))
-                await src.CopyToAsync(dst, ct);
-            if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(nvram, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            string diskPath, nvram;
+            if (spec.Writable)
+            {
+                // A template working copy: QEMU writes the disk and its UEFI variable store in place; nothing to create here.
+                diskPath = basePath;
+                nvram = varsPath;
+            }
+            else
+            {
+                diskPath = Path.Combine(runDir, "overlay.qcow2");
+                nvram = Path.Combine(runDir, "nvram.fd");
+                await new QemuImageCli(runner, _o.QemuImgBinary).CreateOverlayAsync(basePath, diskPath, ct);
+                // Not File.Copy: it keeps the template's mode, and the template is finalised read-only (0444) while QEMU must write
+                // the run's UEFI variable store. 0600 from creation; chmod as well in case a retry finds the file already there.
+                var nvramOptions = new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.Write };
+                if (!OperatingSystem.IsWindows()) nvramOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+                await using (var src = File.OpenRead(varsPath))
+                await using (var dst = new FileStream(nvram, nvramOptions))
+                    await src.CopyToAsync(dst, ct);
+                if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(nvram, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
 
             var password = RandomNumberGenerator.GetString(VncAlphabet, 8);
             var passFile = Path.Combine(runDir, "vnc.pass");
@@ -82,7 +92,7 @@ public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcess
             try
             {
                 var port = FindFreeVncPort();
-                var paths = new DomainPaths(overlay, nvram, sockPath, port, password);
+                var paths = new DomainPaths(diskPath, nvram, sockPath, port, password);
                 var xmlOptions = new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.Write };
                 if (!OperatingSystem.IsWindows()) xmlOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
                 await using (var xfs = new FileStream(xmlPath, xmlOptions))

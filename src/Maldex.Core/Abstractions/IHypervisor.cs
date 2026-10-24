@@ -1,6 +1,7 @@
 namespace Maldex.Core.Abstractions;
 
-public sealed record VmSpec(Guid TaskId, string DiskStem, int MemoryMiB, int VCpus, string NetworkId);
+public sealed record VmSpec(Guid TaskId, string DiskStem, int MemoryMiB, int VCpus, string NetworkId, bool Writable = false);
+// Writable: boot base/<DiskStem>.qcow2 and its .vars.fd directly (a template working copy) instead of a throwaway overlay.
 
 public sealed record VmHandle(Guid TaskId, string Name)
 {
