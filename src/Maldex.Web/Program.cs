@@ -1,6 +1,7 @@
 using System.Text.Json.Serialization;
 using Maldex.Core.Abstractions;
 using Maldex.Data;
+using Maldex.Data.Templates;
 using Maldex.Infrastructure;
 using Maldex.Infrastructure.Real;
 using Maldex.Orchestrator;
@@ -13,6 +14,7 @@ using Maldex.Web.Reports;
 using Maldex.Web.Security;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 
 // `dotnet run --project src/Maldex.Web -- --install-browsers` (./build.sh setup) installs the Chromium used for PDF reports.
 if (args.Contains("--install-browsers"))
@@ -61,6 +63,10 @@ await using (var scope = app.Services.CreateAsyncScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
     await db.Database.MigrateAsync();
+    await TemplateImporter.ImportAsync(db, scope.ServiceProvider.GetRequiredService<ITemplateStore>(),
+        scope.ServiceProvider.GetRequiredService<IOptions<SubmissionOptions>>().Value.Images,
+        scope.ServiceProvider.GetRequiredService<TimeProvider>(),
+        scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("Maldex.TemplateImport"), CancellationToken.None);
     if (app.Environment.IsDevelopment()) await DevSeed.SeedAsync(db);
 }
 
