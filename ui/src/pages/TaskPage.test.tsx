@@ -102,4 +102,27 @@ describe('TaskPage', () => {
     await screen.findByText('Running')
     expect(screen.queryByRole('link', { name: 'HTML report' })).toBeNull()
   })
+
+  it('shows the template provenance summary when the task has one', async () => {
+    const summary = 'win11-golden v3 (Windows 11 Pro 26300, agent 1.0.0, sealed 2026-10-24 by basht0p)'
+    getTask.mockResolvedValue(task({
+      template: {
+        id: 'win11-golden', displayName: 'Windows 11 Golden', versionNumber: 3, origin: 'Edit', sealedAt: '2026-10-24T00:00:00Z', summary,
+      },
+    }))
+    renderPage()
+    await screen.findByText('Running')
+    expect(screen.getByText('Template')).toBeInTheDocument()
+    expect(screen.getByText(summary)).toBeInTheDocument()
+    expect(screen.queryByText('Image')).toBeNull()
+  })
+
+  it('falls back to the image name for tasks that predate templates', async () => {
+    getTask.mockResolvedValue(task({ image: 'win10-legacy', template: null }))
+    renderPage()
+    await screen.findByText('Running')
+    expect(screen.getByText('Image')).toBeInTheDocument()
+    expect(screen.getByText('win10-legacy')).toBeInTheDocument()
+    expect(screen.queryByText('Template')).toBeNull()
+  })
 })
