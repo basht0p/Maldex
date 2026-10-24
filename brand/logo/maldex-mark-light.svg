@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<rect x="3" y="3" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="15.75" y="3.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="27.75" y="3.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="39.75" y="3.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="51" y="3" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="3" y="15" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="15" y="15" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="27.75" y="15.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="39" y="15" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="51" y="15" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="3" y="27" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="15.75" y="27.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="27" y="27" width="10" height="10" rx="1.5" fill="#2B65E3"/>
+<rect x="39.75" y="27.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="51" y="27" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="3" y="39" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="15.75" y="39.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="27.75" y="39.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="39.75" y="39.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="51" y="39" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="3" y="51" width="10" height="10" rx="1.5" fill="#121829"/>
+<rect x="15.75" y="51.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="27.75" y="51.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="39.75" y="51.75" width="8.5" height="8.5" rx="1.2" fill="none" stroke="#121829" stroke-width="1.5" opacity=".28"/>
+<rect x="51" y="51" width="10" height="10" rx="1.5" fill="#121829"/>
+</svg>
