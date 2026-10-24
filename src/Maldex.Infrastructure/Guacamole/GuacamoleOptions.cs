@@ -14,4 +14,10 @@ public sealed class GuacamoleOptions
 
     /// <summary>How often an open tunnel re-checks that its task is still Running.</summary>
     public TimeSpan StatusPollInterval { get; set; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// How often an open template-job console marks the job as in use. A Configuring job is discarded after
+    /// <c>ConfigureIdleTimeout</c> (2 h) without a console, counted from the last mark, so this must stay far below that.
+    /// </summary>
+    public TimeSpan ConsoleKeepAliveInterval { get; set; } = TimeSpan.FromSeconds(60);
 }
