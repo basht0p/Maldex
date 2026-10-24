@@ -36,8 +36,34 @@ public sealed class SampleDelivery(TimeProvider time, TimeSpan? chunkTimeout = n
     public async Task DeliverAsync(IAgentChannel ch, TransferInbox inbox, string blobKey, string fileName, Stream blob, long size, string sha256, CancellationToken ct,
         Func<CancellationToken, Task<bool>>? stopRequested = null)
     {
-        if (size <= 0) throw new SampleDeliveryException("the sample is empty");
-        if (size > AgentLimits.MaxInboundBytes) throw new SampleDeliveryException($"the sample is {size} bytes; the limit is {AgentLimits.MaxInboundBytes}");
+        await SendChunksAsync(ch, inbox, blobKey, blob, size, sha256, AgentLimits.MaxInboundBytes, "sample", stopRequested, m => new SampleDeliveryException(m), ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Sends one Maldex component file (up to <see cref="AgentLimits.MaxComponentBytes"/>) the same way: chunked, each chunk acknowledged.
+    /// <paramref name="transferId"/> must start with <see cref="AgentLimits.ComponentTransferPrefix"/>.
+    /// </summary>
+    /// <param name="fail">Builds the exception for any failure (too large, refused, timed out, disconnected).</param>
+    public async Task DeliverComponentAsync(IAgentChannel ch, TransferInbox inbox, string transferId, byte[] data, string sha256, Func<string, Exception> fail, CancellationToken ct)
+    {
+        if (!AgentLimits.IsComponentTransfer(transferId)) throw fail(AgentLimits.NotComponentTransferMessage(transferId));
+        using var stream = new MemoryStream(data, writable: false);
+        await SendChunksAsync(ch, inbox, transferId, stream, data.Length, sha256, AgentLimits.MaxComponentBytes, "component", null, fail, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Sends <paramref name="command"/> and waits up to <paramref name="timeout"/> for its command result.</summary>
+    /// <exception cref="Exception">Whatever <paramref name="fail"/> builds, for a refusal, a timeout or a disconnect.</exception>
+    public async Task CommandAsync(IAgentChannel ch, TransferInbox inbox, AgentCommand command, string what, TimeSpan timeout, Func<string, Exception> fail, CancellationToken ct)
+    {
+        using var lease = inbox.Open();
+        await SendAndAwaitAsync(ch, lease.Reader, command, what, null, fail, ct, timeout).ConfigureAwait(false);
+    }
+
+    private async Task SendChunksAsync(IAgentChannel ch, TransferInbox inbox, string transferId, Stream blob, long size, string sha256, long maxBytes, string kind,
+        Func<CancellationToken, Task<bool>>? stopRequested, Func<string, Exception> fail, CancellationToken ct)
+    {
+        if (size <= 0) throw fail($"the {kind} is empty");
+        if (size > maxBytes) throw fail($"the {kind} is {size} bytes; the limit is {maxBytes}");
         var count = (int)((size + AgentLimits.ChunkBytes - 1) / AgentLimits.ChunkBytes);
         var sha = sha256.ToLowerInvariant();
 
@@ -52,11 +78,11 @@ public sealed class SampleDelivery(TimeProvider time, TimeSpan? chunkTimeout = n
             }
             catch (EndOfStreamException)
             {
-                throw new SampleDeliveryException("the stored sample is shorter than its recorded size");
+                throw fail($"the stored {kind} is shorter than its recorded size");
             }
 
-            var command = new PutFileChunkCommand(NewId(), blobKey, i, count, size, sha, Convert.ToBase64String(buffer.AsSpan(0, length)));
-            await SendAndAwaitAsync(ch, lease.Reader, command, $"chunk {i + 1} of {count}", stopRequested, m => new SampleDeliveryException(m), ct).ConfigureAwait(false);
+            var command = new PutFileChunkCommand(NewId(), transferId, i, count, size, sha, Convert.ToBase64String(buffer.AsSpan(0, length)));
+            await SendAndAwaitAsync(ch, lease.Reader, command, $"chunk {i + 1} of {count}", stopRequested, fail, ct).ConfigureAwait(false);
         }
     }
 
@@ -71,11 +97,12 @@ public sealed class SampleDelivery(TimeProvider time, TimeSpan? chunkTimeout = n
     }
 
     private async Task SendAndAwaitAsync(IAgentChannel ch, ChannelReader<AgentMessage> replies, AgentCommand command, string what,
-        Func<CancellationToken, Task<bool>>? stopRequested, Func<string, Exception> fail, CancellationToken ct)
+        Func<CancellationToken, Task<bool>>? stopRequested, Func<string, Exception> fail, CancellationToken ct, TimeSpan? timeoutOverride = null)
     {
+        var limit = timeoutOverride ?? _chunkTimeout;
         // Checked before the timeout starts: the timeout bounds the agent's answer, not our own database read.
         if (stopRequested is not null && await stopRequested(ct).ConfigureAwait(false)) throw new DeliveryStoppedException();
-        using var timeout = new CancellationTokenSource(_chunkTimeout, time);
+        using var timeout = new CancellationTokenSource(limit, time);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
         try
         {
@@ -106,7 +133,7 @@ public sealed class SampleDelivery(TimeProvider time, TimeSpan? chunkTimeout = n
         }
         catch (OperationCanceledException) when (timeout.IsCancellationRequested && !ct.IsCancellationRequested)
         {
-            throw fail($"{what}: no answer from the agent within {_chunkTimeout.TotalSeconds:0} s");
+            throw fail($"{what}: no answer from the agent within {limit.TotalSeconds:0} s");
         }
         catch (ChannelClosedException)
         {

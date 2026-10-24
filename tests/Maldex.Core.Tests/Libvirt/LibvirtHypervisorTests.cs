@@ -189,6 +189,40 @@ public sealed class LibvirtHypervisorTests : IDisposable
         Assert.Contains(VmHandle.For(orphan), list);
     }
 
+    [Theory]
+    [InlineData("running", true)]
+    [InlineData("paused", true)]
+    [InlineData("in shutdown", true)]
+    [InlineData("blocked", true)]
+    [InlineData("shut off", false)]
+    [InlineData("crashed", false)]
+    [InlineData("pmsuspended", false)]
+    public async Task IsRunning_MapsDomstate(string state, bool expected)
+    {
+        _runner.Handler = (_, _) => new(0, state + "\n\n", "");
+        var vm = VmHandle.For(Id);
+        Directory.CreateDirectory(RunDirOf(vm)); // the run dir lingers after shutdown; it must not count
+
+        Assert.Equal(expected, await Hv().IsRunningAsync(vm, CancellationToken.None));
+        Assert.Equal(["-c", "qemu:///session", "domstate", vm.Name], _runner.Calls[0].Args);
+    }
+
+    [Fact]
+    public async Task IsRunning_UnknownDomain_IsFalse()
+    {
+        _runner.Handler = (_, _) => new(1, "", "error: failed to get domain 'maldex-x'\nerror: Domain not found: no domain with matching name\n");
+
+        Assert.False(await Hv().IsRunningAsync(VmHandle.For(Id), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task IsRunning_OtherVirshFailure_Throws()
+    {
+        _runner.Handler = (_, _) => new(1, "", "error: failed to connect to the hypervisor");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Hv().IsRunningAsync(VmHandle.For(Id), CancellationToken.None));
+    }
+
     [Fact]
     public async Task VncLocator_ParsesDisplay_AndReadsPassword()
     {

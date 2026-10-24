@@ -214,6 +214,7 @@ public class OrchestratorWorkerTests(SqlServerFixture sql)
         public int ListCalls;
         public Task<Maldex.Core.Abstractions.VmHandle> StartAsync(Maldex.Core.Abstractions.VmSpec spec, CancellationToken ct) => inner.StartAsync(spec, ct);
         public Task DestroyAsync(Maldex.Core.Abstractions.VmHandle vm, CancellationToken ct) => inner.DestroyAsync(vm, ct);
+        public Task<bool> IsRunningAsync(Maldex.Core.Abstractions.VmHandle vm, CancellationToken ct) => inner.IsRunningAsync(vm, ct);
         public Task<IReadOnlyList<Maldex.Core.Abstractions.VmHandle>> ListAsync(CancellationToken ct) =>
             Interlocked.Increment(ref ListCalls) <= failures ? throw new IOException("virsh: failed to connect to the hypervisor") : inner.ListAsync(ct);
     }

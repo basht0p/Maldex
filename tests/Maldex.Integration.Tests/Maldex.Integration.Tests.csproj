@@ -15,5 +15,6 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Maldex.Data\Maldex.Data.csproj" />
     <ProjectReference Include="..\..\src\Maldex.Web\Maldex.Web.csproj" />
+    <ProjectReference Include="..\..\src\Maldex.Agent\Maldex.Agent.csproj" />
   </ItemGroup>
 </Project>

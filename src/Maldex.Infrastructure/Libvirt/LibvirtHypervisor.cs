@@ -134,6 +134,21 @@ public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcess
         }
     }
 
+    public async Task<bool> IsRunningAsync(VmHandle vm, CancellationToken ct)
+    {
+        var r = await runner.RunAsync(_o.VirshBinary, ["-c", _o.Uri, "domstate", vm.Name], ct);
+        if (r.ExitCode != 0)
+        {
+            // A transient domain disappears when it shuts off.
+            if (r.Stderr.Contains("failed to get domain", StringComparison.OrdinalIgnoreCase)
+                || r.Stderr.Contains("domain not found", StringComparison.OrdinalIgnoreCase)) return false;
+            throw new InvalidOperationException($"virsh domstate {vm.Name} failed ({r.ExitCode}): {r.Stderr.Trim()}");
+        }
+
+        // Anything not known to be off counts as running: sealing must never start while the guest might still write.
+        return r.Stdout.Trim().ToLowerInvariant() is not ("shut off" or "crashed" or "pmsuspended");
+    }
+
     public async Task<IReadOnlyList<VmHandle>> ListAsync(CancellationToken ct)
     {
         var r = await runner.RunAsync(_o.VirshBinary, ["-c", _o.Uri, "list", "--all", "--name"], ct);

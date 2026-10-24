@@ -103,7 +103,7 @@ rm -f "$BUILDING_DISK" "$BUILDING_VARS"
 
 # ---- 1. Guest agent ----
 log "Publishing the guest agent"
-dotnet publish src/Maldex.Agent -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o "$ROOT/.data/agent" --nologo -v q
+"$ROOT/build.sh" agent
 [ -f .data/agent/Maldex.Agent.exe ] || { echo "Agent publish did not produce Maldex.Agent.exe" >&2; exit 1; }
 
 # ---- 2. Sysmon, mitmproxy CA ----

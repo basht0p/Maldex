@@ -329,6 +329,11 @@ public sealed class ReplayAgentChannelTests : IDisposable
 
         await ch.SendAsync(new PowerOffCommand("p1"), TestContext.Current.CancellationToken);
 
+        // Like libvirt: not running any more, but still listed until it is destroyed.
+        Assert.False(await hv.IsRunningAsync(vm, TestContext.Current.CancellationToken));
+        Assert.True(await hv.IsRunningAsync(other, TestContext.Current.CancellationToken));
+        Assert.Equal(2, (await hv.ListAsync(TestContext.Current.CancellationToken)).Count);
+        await hv.DestroyAsync(vm, TestContext.Current.CancellationToken);
         Assert.Equal([other], await hv.ListAsync(TestContext.Current.CancellationToken));
     }
 

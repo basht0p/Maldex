@@ -169,6 +169,10 @@ public static class AgentLimits
     /// <summary>Most chunks in one component transfer: <see cref="MaxComponentBytes"/> in full chunks.</summary>
     public const int MaxComponentChunks = (int)(MaxComponentBytes / ChunkBytes);
 
+    /// <summary>The refusal text for an <c>apply_components</c> transfer id that is not a component transfer (shared by the agent and the fake guest).</summary>
+    public static string NotComponentTransferMessage(string? transferId) =>
+        $"transfer id '{transferId}' is not a component transfer (it must start with {ComponentTransferPrefix})";
+
     public static bool IsComponentTransfer(string? transferId) =>
         transferId is not null && transferId.StartsWith(ComponentTransferPrefix, StringComparison.Ordinal);
 }

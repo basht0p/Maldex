@@ -22,4 +22,22 @@ public class FakeHypervisorTests
         await h.DestroyAsync(vm, TestContext.Current.CancellationToken);
         Assert.Empty(await h.ListAsync(TestContext.Current.CancellationToken));
     }
+
+    [Fact]
+    public async Task PoweredOffGuest_IsNotRunning_ButStaysListedUntilDestroyed()
+    {
+        var guest = new FakeGuest();
+        var h = new FakeHypervisor(Options.Create(new FakeHypervisorOptions()), guest);
+        var id = Guid.NewGuid();
+        var vm = await h.StartAsync(new VmSpec(id, "win10", 4096, 2, "net"), TestContext.Current.CancellationToken);
+        Assert.True(await h.IsRunningAsync(vm, TestContext.Current.CancellationToken));
+
+        guest.NotifyPoweredOff(id);
+
+        Assert.False(await h.IsRunningAsync(vm, TestContext.Current.CancellationToken));
+        Assert.Single(await h.ListAsync(TestContext.Current.CancellationToken));
+        await h.DestroyAsync(vm, TestContext.Current.CancellationToken);
+        Assert.Empty(await h.ListAsync(TestContext.Current.CancellationToken));
+        Assert.False(await h.IsRunningAsync(vm, TestContext.Current.CancellationToken));
+    }
 }
