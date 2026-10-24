@@ -20,6 +20,12 @@ module.exports = {
         'warning': 'var(--mx-warning)',
         'success': 'var(--mx-success)',
         'info': 'var(--mx-info)',
+        'chart-1': 'var(--mx-chart-1)',
+        'chart-2': 'var(--mx-chart-2)',
+        'chart-3': 'var(--mx-chart-3)',
+        'chart-4': 'var(--mx-chart-4)',
+        'chart-highlight': 'var(--mx-chart-highlight)',
+        'chart-context': 'var(--mx-chart-context)',
       },
       fontFamily: {
         ui: 'var(--mx-font-ui)',

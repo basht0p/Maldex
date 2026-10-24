@@ -17,6 +17,12 @@
   --mx-warning: #F4B740;
   --mx-success: #3FCF8E;
   --mx-info: #56C8E8;
+  --mx-chart-1: #C440E0;
+  --mx-chart-2: #009490;
+  --mx-chart-3: #7B56A2;
+  --mx-chart-4: #928401;
+  --mx-chart-highlight: #8F54F9;
+  --mx-chart-context: #5A6585;
   --mx-font-ui: 'Instrument Sans', system-ui, sans-serif;
   --mx-font-mono: 'Martian Mono', ui-monospace, Menlo, monospace;
   --mx-radius-control: 4px;
@@ -43,6 +49,12 @@
     --mx-warning: #94620A;
     --mx-success: #137A4F;
     --mx-info: #0E7490;
+    --mx-chart-1: #DC59F9;
+    --mx-chart-2: #03A4A1;
+    --mx-chart-3: #744F9A;
+    --mx-chart-4: #A49500;
+    --mx-chart-highlight: #6238EE;
+    --mx-chart-context: #7C869E;
     color-scheme: light;
   }
 }
@@ -64,6 +76,12 @@
   --mx-warning: #94620A;
   --mx-success: #137A4F;
   --mx-info: #0E7490;
+  --mx-chart-1: #DC59F9;
+  --mx-chart-2: #03A4A1;
+  --mx-chart-3: #744F9A;
+  --mx-chart-4: #A49500;
+  --mx-chart-highlight: #6238EE;
+  --mx-chart-context: #7C869E;
   color-scheme: light;
 }
 :root[data-theme="dark"] { color-scheme: dark; }

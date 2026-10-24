@@ -15,7 +15,7 @@ Dark mode is the primary theme.
 | `icons/app-icon.svg`, `icon-{180,192,512}.png` | App icon (rounded square), Apple touch and web manifest sizes |
 | `icons/maskable-icon.svg`, `maskable-512.png` | Maskable icon with the mark inside the safe zone |
 | `icons/favicon.svg`, `favicon-{16,32,48}.png` | Tab icon built from the compact mark |
-| `tokens/maldex-tokens.css` | Color, font and radius tokens as CSS variables (dark default, light via `prefers-color-scheme` or `data-theme="light"`) |
+| `tokens/maldex-tokens.css` | Color (including chart), font and radius tokens as CSS variables (dark default, light via `prefers-color-scheme` or `data-theme="light"`) |
 | `tokens/tailwind.preset.cjs` | Tailwind theme extension that reads the CSS variables |
 
 ## Wordmark
@@ -35,6 +35,23 @@ Both can be self-hosted so the console works on an isolated network.
 - Critical, warning, success and info describe analysis state only. Never show severity by color alone.
 - Text pairs meet WCAG AA 4.5:1 and control borders meet 3:1 in both themes.
 
+## Chart colors
+
+Charts never use the status colors or the accent. They have their own tokens.
+
+| Token | Dark | Light | Use |
+| --- | --- | --- | --- |
+| `--mx-chart-1` | `#C440E0` | `#DC59F9` | Series 1 (orchid) |
+| `--mx-chart-2` | `#009490` | `#03A4A1` | Series 2 (teal) |
+| `--mx-chart-3` | `#7B56A2` | `#744F9A` | Series 3 (dusk violet) |
+| `--mx-chart-4` | `#928401` | `#A49500` | Series 4 (olive) |
+| `--mx-chart-highlight` | `#8F54F9` | `#6238EE` | The one series that matters |
+| `--mx-chart-context` | `#5A6585` | `#7C869E` | Every other series beside the highlight |
+
+- Assign series 1–4 in order and keep a series' color when filters hide others. Never cycle the colors. More than four series become an "Other" bucket, small multiples or a table.
+- When one series is the point (this run against the rest), use the highlight and context pair instead of series colors.
+- Every pair of series colors stays apart under protanopia and deuteranopia (OKLab ΔE ≥ 10) and meets 3:1 against the surface in both themes. Still label series with a legend, and with direct labels when there are four or fewer.
+
 ## Mark rules
 
 - Clear space is two cells (about 31% of the mark width). Minimum size is 24 px, below that use the compact mark (down to 14 px).
@@ -42,5 +59,4 @@ Both can be self-hosted so the console works on an isolated network.
 
 ## Not yet defined
 
-- A categorical chart palette that stays distinct from the four status colors and works for color-blind viewers.
 - Outlined wordmark artwork for print.
