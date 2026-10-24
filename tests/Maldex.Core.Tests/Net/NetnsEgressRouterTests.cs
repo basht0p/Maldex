@@ -1062,6 +1062,7 @@ public sealed class NetnsEgressRouterTests : IDisposable
         var delTable = _r.Calls.FindIndex(c => c == $"sudo -n nft delete table inet {n.DirectTable}");
         var delLink = _r.Calls.FindIndex(c => c == $"sudo -n ip link del {n.UplinkHost}");
         Assert.True(apply < delRoute && delTable >= 0 && delLink >= 0, string.Join('\n', _r.Calls));
+        Assert.True(delRoute < delLink && delLink < delTable, "teardown order must match release (uplink link, then host table):\n" + string.Join('\n', _r.Calls));
         // the VM's own attachment (tap, bridge, guest veth), dnsmasq and the namespace are untouched
         Assert.DoesNotContain(_r.Calls, c => c.Contains($"link del {n.Tap}") || c.Contains($"link del {n.Bridge}") || c.Contains($"link del {n.VethHost}") || c.Contains("netns del") || c.Contains("kill"));
     }

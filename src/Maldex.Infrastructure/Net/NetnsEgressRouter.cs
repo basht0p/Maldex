@@ -703,8 +703,9 @@ public sealed partial class NetnsEgressRouter(
         }
         if (directLease)
         {
-            await Run(PrivilegedCommands.Sudo("nft", "delete", "table", "inet", names.DirectTable), none);
+            // Same order as ReleaseCoreAsync: the uplink link first, then the host table.
             await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.UplinkHost), none);
+            await Run(PrivilegedCommands.Sudo("nft", "delete", "table", "inet", names.DirectTable), none);
         }
         if (failure is not null) throw new EgressUnavailableException("Isolating the lease failed: " + failure.Message);
     }
