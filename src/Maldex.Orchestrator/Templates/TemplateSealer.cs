@@ -60,7 +60,14 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
         if (!stopped) throw new TemplateSealException(DidNotPowerOff);
 
         // Clears whatever remains of a shut-off domain (idempotent); then the disk can no longer change.
-        await hypervisor.DestroyAsync(vm, ct).ConfigureAwait(false);
+        try
+        {
+            await hypervisor.DestroyAsync(vm, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new TemplateSealException($"cleaning up the powered-off guest failed: {GuestText.Clean(ex.Message, 200)}", ex);
+        }
         await store.SealAsync(stem, ct).ConfigureAwait(false);
     }
 
@@ -94,12 +101,31 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
     {
         while (!ct.IsCancellationRequested)
         {
-            if (!await hypervisor.IsRunningAsync(vm, ct).ConfigureAwait(false)) return true;
-            try { await Task.Delay(o.PollInterval, time, ct).ConfigureAwait(false); }
-            catch (OperationCanceledException) { break; }
+            try
+            {
+                if (!await hypervisor.IsRunningAsync(vm, ct).ConfigureAwait(false)) return true;
+                await Task.Delay(o.PollInterval, time, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                throw new TemplateSealException($"could not check whether the guest stopped: {GuestText.Clean(ex.Message, 200)}", ex);
+            }
         }
-        // Out of time: one last look, so a guest that stopped just now is not reported as dirty.
-        return !await hypervisor.IsRunningAsync(vm, CancellationToken.None).ConfigureAwait(false);
+
+        // Out of time: one short last look, so a guest that stopped just now is not reported as dirty.
+        using var last = new CancellationTokenSource(o.PollInterval * 5, time);
+        try
+        {
+            return !await hypervisor.IsRunningAsync(vm, last.Token).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     private static string NewId() => Guid.NewGuid().ToString("N");

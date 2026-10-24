@@ -27,7 +27,7 @@ public sealed class TemplateJobOptions
 }
 
 /// <summary>The template could not be sealed. The message is safe to store as the job's failure reason.</summary>
-public sealed class TemplateSealException(string message) : Exception(message);
+public sealed class TemplateSealException(string message, Exception? inner = null) : Exception(message, inner);
 
 /// <summary>The sealed template failed verification. The message is safe to store as the job's failure reason.</summary>
 public sealed class TemplateVerifyException(string message) : Exception(message);

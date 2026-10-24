@@ -235,6 +235,79 @@ public class TemplateSealerTests
         Assert.Empty(kit.Store.Seals);
     }
 
+    private sealed class HypervisorWithIsRunning(IHypervisor inner, Func<VmHandle, CancellationToken, Task<bool>> isRunning, Func<VmHandle, Task>? destroy = null) : IHypervisor
+    {
+        public Task<VmHandle> StartAsync(VmSpec spec, CancellationToken ct) => inner.StartAsync(spec, ct);
+        public Task DestroyAsync(VmHandle vm, CancellationToken ct) => destroy is null ? inner.DestroyAsync(vm, ct) : destroy(vm);
+        public Task<bool> IsRunningAsync(VmHandle vm, CancellationToken ct) => isRunning(vm, ct);
+        public Task<IReadOnlyList<VmHandle>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
+    }
+
+    private static TemplateSealer SealerOver(TemplateJobKit kit, IHypervisor hv) =>
+        new(hv, kit.Store, Microsoft.Extensions.Options.Options.Create(kit.Options), TimeProvider.System);
+
+    [Fact]
+    public async Task Seal_DeadlineFiresDuringIsRunning_IsADidNotPowerOffFailure()
+    {
+        await using var kit = new TemplateJobKit();
+        kit.Options.PowerOffTimeout = TimeSpan.FromMilliseconds(300);
+        var (ch, vm) = await kit.StartTemplateVmAsync();
+        // Honours the token and blocks until it is cancelled, like a virsh call that is killed at the deadline.
+        var hv = new HypervisorWithIsRunning(kit.Hypervisor, async (_, token) => { await Task.Delay(Timeout.Infinite, token); return true; });
+
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => SealerOver(kit, hv).SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
+
+        Assert.Equal("the guest did not power off; not sealing a possibly dirty disk", ex.Message);
+        Assert.Empty(kit.Store.Seals);
+    }
+
+    [Fact]
+    public async Task Seal_CallerCancelsDuringIsRunning_PropagatesCancellation()
+    {
+        await using var kit = new TemplateJobKit();
+        var (ch, vm) = await kit.StartTemplateVmAsync();
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        var hv = new HypervisorWithIsRunning(kit.Hypervisor, async (_, token) =>
+        {
+            await cts.CancelAsync();
+            await Task.Delay(Timeout.Infinite, token);
+            return true;
+        });
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => SealerOver(kit, hv).SealAsync(ch, vm, "win11-edit", kit.Bundle, cts.Token));
+
+        Assert.Empty(kit.Store.Seals);
+    }
+
+    [Fact]
+    public async Task Seal_IsRunningThrows_BecomesSealExceptionWithInner_NotSealed()
+    {
+        await using var kit = new TemplateJobKit();
+        var (ch, vm) = await kit.StartTemplateVmAsync();
+        var hv = new HypervisorWithIsRunning(kit.Hypervisor, (_, _) => throw new InvalidOperationException("virsh domstate failed (1): no connection"));
+
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => SealerOver(kit, hv).SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
+
+        Assert.Contains("could not check whether the guest stopped", ex.Message);
+        Assert.IsType<InvalidOperationException>(ex.InnerException);
+        Assert.Empty(kit.Store.Seals);
+    }
+
+    [Fact]
+    public async Task Seal_DestroyFails_BecomesSealExceptionWithInner_NotSealed()
+    {
+        await using var kit = new TemplateJobKit();
+        var (ch, vm) = await kit.StartTemplateVmAsync();
+        var hv = new HypervisorWithIsRunning(kit.Hypervisor, (v, t) => kit.Hypervisor.IsRunningAsync(v, t),
+            _ => throw new InvalidOperationException("virsh destroy failed"));
+
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => SealerOver(kit, hv).SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
+
+        Assert.Contains("cleaning up", ex.Message);
+        Assert.IsType<InvalidOperationException>(ex.InnerException);
+        Assert.Empty(kit.Store.Seals);
+    }
+
     [Fact]
     public async Task DeliverComponent_NonComponentId_UsesTheSharedRefusalText()
     {
