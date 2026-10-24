@@ -1,6 +1,6 @@
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
-using Maldex.Agent;
+using Maldex.Core.Agent;
 
 namespace Maldex.Orchestrator.Templates;
 
@@ -21,6 +21,8 @@ public sealed class ComponentBundle
     public static async Task<ComponentBundle> LoadAsync(TemplateJobOptions options, CancellationToken ct)
     {
         var agent = await ReadAsync(options.AgentExePath, "the guest agent", "run ./build.sh agent", ct).ConfigureAwait(false);
+        var versionText = await ReadAsync(options.AgentVersionPath, "the guest agent's version record", "run ./build.sh agent", ct).ConfigureAwait(false);
+        var version = AgentIdentity.VersionOf(System.Text.Encoding.UTF8.GetString(versionText));
         var sysmon = await ReadAsync(options.SysmonConfigPath, "the Sysmon configuration", "run from the Maldex repository root", ct).ConfigureAwait(false);
         var pem = await ReadAsync(options.MitmCaPemPath, "the mitmproxy CA certificate", "run ./build.sh real-setup", ct).ConfigureAwait(false);
 
@@ -38,7 +40,7 @@ public sealed class ComponentBundle
         return new ComponentBundle
         {
             AgentExe = agent,
-            AgentBuildId = AgentHost.Version + "+" + Hex(agent)[..12],
+            AgentBuildId = AgentIdentity.BuildId(version, agent),
             SysmonConfig = sysmon,
             SysmonConfigSha256 = Hex(sysmon),
             CaDer = der,

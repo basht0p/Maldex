@@ -440,6 +440,12 @@ SYSMON_SHA256="00ecf1b46aec99299d3ae0bca79dc621458bd014b20b509d7c5c8e8c8611aa54"
 cmd_agent() {
   dotnet publish src/Maldex.Agent -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o "$PWD/.data/agent" --nologo -v q
   [ -f .data/agent/Maldex.Agent.exe ] || { echo "Agent publish did not produce Maldex.Agent.exe" >&2; return 1; }
+  # The agent reports "<version>+<12 hex of its exe>"; the hash half the host computes from the exe, the version half is
+  # recorded here from the same project properties the exe was just compiled with (a Windows exe's file version is the .NET host's).
+  local version
+  version="$(dotnet msbuild src/Maldex.Agent -getProperty:Version -p:Configuration=Release -p:RuntimeIdentifier=win-x64 --nologo | head -n 1 | cut -d+ -f1 | tr -d '[:space:]')"
+  [ -n "$version" ] || { echo "Could not read the agent version" >&2; return 1; }
+  printf '%s\n' "$version" > .data/agent/Maldex.Agent.version
 }
 
 cmd_build_guest() {

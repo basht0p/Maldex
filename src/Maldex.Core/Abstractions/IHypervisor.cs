@@ -21,5 +21,11 @@ public interface IHypervisor
     /// <summary>Idempotent.</summary>
     Task DestroyAsync(VmHandle handle, CancellationToken ct);
 
+    /// <summary>
+    /// True while the guest is executing (running, paused, shutting down); false once it has shut off, crashed or no longer exists.
+    /// Unlike <see cref="ListAsync"/>, a VM that is off but not yet destroyed (its run directory still exists) is not running.
+    /// </summary>
+    Task<bool> IsRunningAsync(VmHandle vm, CancellationToken ct);
+
     Task<IReadOnlyList<VmHandle>> ListAsync(CancellationToken ct);
 }

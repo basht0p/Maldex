@@ -46,7 +46,7 @@ public sealed class SampleDelivery(TimeProvider time, TimeSpan? chunkTimeout = n
     /// <param name="fail">Builds the exception for any failure (too large, refused, timed out, disconnected).</param>
     public async Task DeliverComponentAsync(IAgentChannel ch, TransferInbox inbox, string transferId, byte[] data, string sha256, Func<string, Exception> fail, CancellationToken ct)
     {
-        if (!AgentLimits.IsComponentTransfer(transferId)) throw fail($"transfer id '{transferId}' is not a component transfer");
+        if (!AgentLimits.IsComponentTransfer(transferId)) throw fail(AgentLimits.NotComponentTransferMessage(transferId));
         using var stream = new MemoryStream(data, writable: false);
         await SendChunksAsync(ch, inbox, transferId, stream, data.Length, sha256, AgentLimits.MaxComponentBytes, "component", null, fail, ct).ConfigureAwait(false);
     }

@@ -29,6 +29,7 @@ public class TemplateBindingTests(SqlServerFixture sql)
         }
         public Task DestroyAsync(VmHandle vm, CancellationToken ct) => inner.DestroyAsync(vm, ct);
         public Task<IReadOnlyList<VmHandle>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
+        public Task<bool> IsRunningAsync(VmHandle vm, CancellationToken ct) => inner.IsRunningAsync(vm, ct);
     }
 
     private static Task<OrchestratorHarness> HarnessAsync(SqlServerFixture sql, Action<SpyHypervisor> spy) =>

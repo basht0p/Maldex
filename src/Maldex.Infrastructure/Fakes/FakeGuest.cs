@@ -79,7 +79,7 @@ public sealed class FakeGuest
         _applied.Enqueue(c.CaCertTransferId);
     }
 
-    internal void NotifyPoweredOff(Guid taskId) => PoweredOff?.Invoke(taskId);
+    public void NotifyPoweredOff(Guid taskId) => PoweredOff?.Invoke(taskId);
 
     public void SetReachable(string probe) => _reachable[probe] = 0;
 

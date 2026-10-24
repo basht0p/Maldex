@@ -20,9 +20,9 @@ internal sealed class TemplateJobKit : IAsyncDisposable
     public SpyTemplateStore Store { get; }
     public TemplateJobOptions Options { get; } = new()
     {
-        AgentReadyTimeout = TimeSpan.FromMilliseconds(300),
-        PowerOffTimeout = TimeSpan.FromMilliseconds(300),
-        VerifyTimeout = TimeSpan.FromMilliseconds(500),
+        AgentReadyTimeout = TimeSpan.FromSeconds(10), // generous: the timeout tests shorten it; a loaded machine must not trip the passing ones
+        PowerOffTimeout = TimeSpan.FromSeconds(10),
+        VerifyTimeout = TimeSpan.FromSeconds(10),
         ApplyComponentsTimeout = TimeSpan.FromSeconds(10),
         ChunkTimeout = TimeSpan.FromSeconds(10),
         PollInterval = TimeSpan.FromMilliseconds(10),
@@ -83,16 +83,17 @@ internal sealed class TemplateJobKit : IAsyncDisposable
     private sealed class Factory(TemplateJobKit kit) : IAgentChannelFactory
     {
         public Task<IAgentChannel> ConnectAsync(VmHandle vm, CancellationToken ct) =>
-            Task.FromResult<IAgentChannel>(kit.NewChannel(vm.TaskId, kit.VerifyAgentReady));
+            kit.ConnectFails ? throw new IOException("the agent socket is not there") : Task.FromResult<IAgentChannel>(kit.NewChannel(vm.TaskId, kit.VerifyAgentReady));
     }
 
     public bool VerifyAgentReady { get; set; } = true;
+    public bool ConnectFails { get; set; }
 }
 
 /// <summary>Records the seal calls and whether the guest was already gone when each happened.</summary>
 internal sealed class SpyTemplateStore(IHypervisor hypervisor) : ITemplateStore
 {
-    public List<(string Stem, int VmsRunning)> Seals { get; } = [];
+    public List<(string Stem, int VmsListed)> Seals { get; } = [];
     public bool Exists(string fileStem) => true;
     public long? SizeOf(string fileStem) => null;
     public async Task SealAsync(string fileStem, CancellationToken ct) =>
@@ -151,6 +152,7 @@ public class TemplateSealerTests
     public async Task Seal_AgentNeverReady_FailsWithoutSealing()
     {
         await using var kit = new TemplateJobKit();
+        kit.Options.AgentReadyTimeout = TimeSpan.FromMilliseconds(300);
         var (ch, vm) = await kit.StartTemplateVmAsync(ready: false);
 
         var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
@@ -163,7 +165,8 @@ public class TemplateSealerTests
     [Fact]
     public async Task Seal_NoPowerOff_FailsAndDoesNotSeal()
     {
-        await using var kit = new TemplateJobKit(hypervisorSeesPowerOff: false); // the VM stays listed after power_off
+        await using var kit = new TemplateJobKit(hypervisorSeesPowerOff: false); // the VM stays running after power_off
+        kit.Options.PowerOffTimeout = TimeSpan.FromMilliseconds(300);
         var (ch, vm) = await kit.StartTemplateVmAsync();
 
         var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
@@ -171,6 +174,77 @@ public class TemplateSealerTests
         Assert.Equal("the guest did not power off; not sealing a possibly dirty disk", ex.Message);
         Assert.Empty(kit.Store.Seals);
         Assert.Single(ch.SentCommands.OfType<PowerOffCommand>());
+        Assert.True(await kit.Hypervisor.IsRunningAsync(vm, Ct)); // still running...
+        Assert.Contains(vm, await kit.Hypervisor.ListAsync(Ct)); // ...and never destroyed
+    }
+
+    [Fact]
+    public async Task Seal_VmStillListedAfterPowerOff_StillSeals()
+    {
+        // Like libvirt: the run directory keeps the VM in ListAsync after it shut off, until DestroyAsync.
+        await using var kit = new TemplateJobKit();
+        var (ch, vm) = await kit.StartTemplateVmAsync();
+        var listedWhenOff = false;
+        kit.Guest.PoweredOff += _ => listedWhenOff = !kit.Hypervisor.IsRunningAsync(vm, Ct).Result && kit.Hypervisor.ListAsync(Ct).Result.Contains(vm);
+
+        await kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct);
+
+        Assert.True(listedWhenOff);
+        Assert.Equal([("win11-edit", 0)], kit.Store.Seals); // destroyed (cleaned up) before the seal
+    }
+
+    [Fact]
+    public async Task Seal_DisconnectInsteadOfPowerOffAck_CountsAsAcknowledged()
+    {
+        await using var kit = new TemplateJobKit();
+        var (inner, vm) = await kit.StartTemplateVmAsync();
+        var ch = new DropsPowerOffAck(inner, swallow: false);
+
+        await kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct);
+
+        Assert.Single(kit.Store.Seals);
+    }
+
+    [Fact]
+    public async Task Seal_DisconnectButStillRunning_FailsWithoutSealing()
+    {
+        await using var kit = new TemplateJobKit(hypervisorSeesPowerOff: false);
+        kit.Options.PowerOffTimeout = TimeSpan.FromMilliseconds(300);
+        var (inner, vm) = await kit.StartTemplateVmAsync();
+        var ch = new DropsPowerOffAck(inner, swallow: false);
+
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
+
+        Assert.Contains("did not power off", ex.Message);
+        Assert.Empty(kit.Store.Seals);
+    }
+
+    [Fact]
+    public async Task Seal_PowerOffNeverAnswered_OneDeadlineCoversAckAndWait()
+    {
+        await using var kit = new TemplateJobKit(hypervisorSeesPowerOff: false);
+        kit.Options.PowerOffTimeout = TimeSpan.FromMilliseconds(500);
+        var (inner, vm) = await kit.StartTemplateVmAsync();
+        var ch = new DropsPowerOffAck(inner, swallow: true); // channel stays open, nobody answers
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
+
+        Assert.Contains("did not power off", ex.Message);
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(900), $"took {sw.Elapsed}: the ack wait and the running wait each used a full timeout");
+        Assert.Empty(kit.Store.Seals);
+    }
+
+    [Fact]
+    public async Task DeliverComponent_NonComponentId_UsesTheSharedRefusalText()
+    {
+        var inbox = new TransferInbox();
+        var channel = new ScriptedChannel(inbox, c => [new CommandResultMessage(c.CommandId, true)]);
+
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => new SampleDelivery(TimeProvider.System)
+            .DeliverComponentAsync(channel, inbox, "samples/ab/cd", [1], "00", m => new TemplateSealException(m), Ct));
+
+        Assert.Equal(AgentLimits.NotComponentTransferMessage("samples/ab/cd"), ex.Message);
     }
 
     [Fact]
@@ -221,6 +295,32 @@ public class TemplateSealerTests
     }
 }
 
+/// <summary>Wraps a replay channel: the power_off answer never reaches the host (the guest vanishes, or never answers).</summary>
+internal sealed class DropsPowerOffAck(ReplayAgentChannel inner, bool swallow) : IAgentChannel
+{
+    private string? _powerOffId;
+    public int Violations => inner.Violations;
+    public IReadOnlyList<AgentCommand> SentCommands => inner.SentCommands;
+
+    public Task SendAsync(AgentCommand command, CancellationToken ct)
+    {
+        if (command is PowerOffCommand p)
+        {
+            _powerOffId = p.CommandId;
+            if (swallow) return Task.CompletedTask;
+        }
+        return inner.SendAsync(command, ct);
+    }
+
+    public async IAsyncEnumerable<AgentMessage> ReadAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+    {
+        await foreach (var m in inner.ReadAsync(ct))
+            if (m is not CommandResultMessage r || r.CommandId != _powerOffId) yield return m;
+    }
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
 public class ComponentBundleTests : IDisposable
 {
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
@@ -228,15 +328,17 @@ public class ComponentBundleTests : IDisposable
 
     public void Dispose() => Directory.Delete(_dir, recursive: true);
 
-    private TemplateJobOptions Options(bool agent = true, bool sysmon = true, bool ca = true)
+    private TemplateJobOptions Options(bool agent = true, bool sysmon = true, bool ca = true, string? version = "7.8.9\n")
     {
         var o = new TemplateJobOptions
         {
             AgentExePath = Path.Combine(_dir, "Maldex.Agent.exe"),
+            AgentVersionPath = Path.Combine(_dir, "Maldex.Agent.version"),
             SysmonConfigPath = Path.Combine(_dir, "sysmon-config.xml"),
             MitmCaPemPath = Path.Combine(_dir, "ca.pem"),
         };
         if (agent) File.WriteAllBytes(o.AgentExePath, [.. "MZ fake agent bytes"u8]);
+        if (version is not null) File.WriteAllText(o.AgentVersionPath, version);
         if (sysmon) File.WriteAllText(o.SysmonConfigPath, "<Sysmon/>");
         if (ca) File.WriteAllText(o.MitmCaPemPath, NewCert().ExportCertificatePem());
         return o;
@@ -269,11 +371,31 @@ public class ComponentBundleTests : IDisposable
     public async Task Load_AgentBuildId_MatchesWhatTheAgentReportsForTheSameBytes()
     {
         var o = Options();
+        File.WriteAllText(o.AgentVersionPath, AgentHost.Version); // what ./build.sh agent records for the agent it compiled
 
         var b = await ComponentBundle.LoadAsync(o, Ct);
 
         Assert.Equal(AgentHost.ComputeBuildId(AgentHost.Version, o.AgentExePath), b.AgentBuildId);
         Assert.Matches(@"^.+\+[0-9a-f]{12}$", b.AgentBuildId);
+    }
+
+    [Fact]
+    public async Task Load_AgentVersion_ComesFromTheBuildRecord_NotFromThisServer()
+    {
+        var b = await ComponentBundle.LoadAsync(Options(version: "7.8.9+meta\n"), Ct);
+
+        Assert.StartsWith("7.8.9+", b.AgentBuildId);
+    }
+
+    [Fact]
+    public async Task Load_MissingVersionRecord_NamesTheFix()
+    {
+        var o = Options(version: null);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ComponentBundle.LoadAsync(o, Ct));
+
+        Assert.Contains(o.AgentVersionPath, ex.Message);
+        Assert.Contains("./build.sh agent", ex.Message);
     }
 
     [Fact]

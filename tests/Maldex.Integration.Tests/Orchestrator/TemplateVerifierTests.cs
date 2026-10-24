@@ -67,6 +67,7 @@ public class TemplateVerifierTests
     {
         await using var kit = Kit();
         kit.VerifyAgentReady = false;
+        kit.Options.VerifyTimeout = TimeSpan.FromMilliseconds(400);
 
         var ex = await Assert.ThrowsAsync<TemplateVerifyException>(() => kit.Verifier.VerifyAsync("win11-v3", kit.Bundle, Ct));
 
@@ -79,10 +80,23 @@ public class TemplateVerifierTests
     {
         await using var kit = Kit();
         kit.Guest.SilentProvenance = true;
+        kit.Options.VerifyTimeout = TimeSpan.FromMilliseconds(400);
 
         var ex = await Assert.ThrowsAsync<TemplateVerifyException>(() => kit.Verifier.VerifyAsync("win11-v3", kit.Bundle, Ct));
 
         Assert.Contains("provenance", ex.Message);
+        Assert.Empty(await kit.Hypervisor.ListAsync(Ct));
+    }
+
+    [Fact]
+    public async Task Verify_ConnectFails_BecomesAVerifyException_AndCleansUp()
+    {
+        await using var kit = Kit();
+        kit.ConnectFails = true;
+
+        var ex = await Assert.ThrowsAsync<TemplateVerifyException>(() => kit.Verifier.VerifyAsync("win11-v3", kit.Bundle, Ct));
+
+        Assert.Contains("agent socket", ex.Message);
         Assert.Empty(await kit.Hypervisor.ListAsync(Ct));
     }
 }

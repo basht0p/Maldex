@@ -33,7 +33,14 @@ public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactor
                 throw new TemplateVerifyException($"the sealed disk could not be booted: {ex.Message}");
             }
 
-            channel = await channels.ConnectAsync(vm, ct).ConfigureAwait(false);
+            try
+            {
+                channel = await channels.ConnectAsync(vm, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                throw new TemplateVerifyException($"could not connect to the sealed guest agent: {ex.Message}");
+            }
             await using var session = new GuestSession(channel);
 
             // One budget for "ready" and "provenance" together.

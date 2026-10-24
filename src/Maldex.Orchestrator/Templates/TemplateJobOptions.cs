@@ -7,6 +7,8 @@ public sealed class TemplateJobOptions
 
     /// <summary>The published guest agent (<c>./build.sh agent</c>).</summary>
     public string AgentExePath { get; set; } = ".data/agent/Maldex.Agent.exe";
+    /// <summary>The agent's version, written next to the exe by <c>./build.sh agent</c> from the project properties the exe was compiled with.</summary>
+    public string AgentVersionPath { get; set; } = ".data/agent/Maldex.Agent.version";
     public string SysmonConfigPath { get; set; } = "deploy/guest/provision/sysmon-config.xml";
     /// <summary>The mitmproxy CA certificate as PEM (created by <c>./build.sh real-setup</c> / <c>build-guest</c>).</summary>
     public string MitmCaPemPath { get; set; } = ".data/mitm/ca/mitmproxy-ca-cert.pem";
