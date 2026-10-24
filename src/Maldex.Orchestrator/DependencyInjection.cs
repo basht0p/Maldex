@@ -1,3 +1,4 @@
+using Maldex.Data.Templates;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -13,6 +14,7 @@ public static class DependencyInjection
     public static IServiceCollection AddMaldexOrchestrator(this IServiceCollection services, IConfiguration configuration)
     {
         services.TryAddSingleton(TimeProvider.System);
+        services.AddMaldexTemplateCatalog(configuration);
         services.Configure<OrchestratorOptions>(configuration.GetSection(OrchestratorOptions.SectionName));
         services.AddSingleton<RunCoordinator>();
         services.AddSingleton<Reconciler>();
