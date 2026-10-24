@@ -85,9 +85,15 @@ public sealed partial class LibvirtTemplateStore(IOptions<LibvirtOptions> option
     /// <summary>Rejects anything but a lowercase slug so a stem can never escape the base image directory.</summary>
     private (string Disk, string Vars) Paths(string fileStem)
     {
+        var root = LibvirtPaths.BaseRoot(_o);
+        return (DiskPath(_o, fileStem), Path.Combine(root, fileStem + ".vars.fd"));
+    }
+
+    /// <summary>The stem's disk file in the base image directory; the stem is validated like every other use of it.</summary>
+    internal static string DiskPath(LibvirtOptions o, string fileStem)
+    {
         if (fileStem is null || !StemPattern().IsMatch(fileStem))
             throw new ArgumentException($"Invalid template file stem '{fileStem}'.", nameof(fileStem));
-        var root = LibvirtPaths.BaseRoot(_o);
-        return (Path.Combine(root, fileStem + ".qcow2"), Path.Combine(root, fileStem + ".vars.fd"));
+        return Path.Combine(LibvirtPaths.BaseRoot(o), fileStem + ".qcow2");
     }
 }
