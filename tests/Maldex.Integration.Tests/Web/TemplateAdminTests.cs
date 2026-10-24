@@ -199,6 +199,78 @@ public sealed class TemplateAdminTests(SqlServerFixture sql) : IDisposable
         Assert.Contains("no previous version", problem.GetProperty("title").GetString());
     }
 
+    private static async Task<List<AuditLog>> TemplateAuditsAsync(MaldexAppFactory f)
+    {
+        using var scope = f.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        return await db.AuditLogs.AsNoTracking().Where(a => a.Action.StartsWith("template.")).ToListAsync(Ct);
+    }
+
+    [Fact]
+    public async Task RefusedChange_Returns409_AndWritesNothing()
+    {
+        var f = Factory();
+        using var client = f.CreateClient(UserRole.Admin);
+
+        Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsJsonAsync($"/api/admin/templates/{Seeded}/enabled", new { enabled = false }, Ct)).StatusCode);
+        Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsync($"/api/admin/templates/{Seeded}/rollback", null, Ct)).StatusCode);
+
+        Assert.Empty(await TemplateAuditsAsync(f));
+        var seeded = (await client.GetFromJsonAsync<JsonElement>("/api/admin/templates", Ct)).EnumerateArray().Single(t => t.GetProperty("id").GetString() == Seeded);
+        Assert.True(seeded.GetProperty("enabled").GetBoolean());
+        Assert.Equal(1, seeded.GetProperty("current").GetProperty("number").GetInt32());
+    }
+
+    [Fact]
+    public async Task NoOpChange_Returns204_AndWritesNoAudit()
+    {
+        var f = Factory();
+        using var client = f.CreateClient(UserRole.Admin);
+
+        Assert.Equal(HttpStatusCode.NoContent, (await client.PostAsync($"/api/admin/templates/{Seeded}/default", null, Ct)).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, (await client.PostAsJsonAsync($"/api/admin/templates/{Seeded}/enabled", new { enabled = true }, Ct)).StatusCode);
+
+        Assert.Empty(await TemplateAuditsAsync(f));
+    }
+
+    /// <summary>Answers normally until <see cref="Fail"/> is set, then throws an InvalidOperationException that is no rule refusal.</summary>
+    private sealed class FailingAfterArmStore : ITemplateStore
+    {
+        public volatile bool Fail;
+        public bool Exists(string fileStem) => Fail ? throw new InvalidOperationException("store broke") : true;
+        public long? SizeOf(string fileStem) => null;
+        public Task DeleteAsync(string fileStem, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task Rollback_UnexpectedInvalidOperationAfterCommit_IsNotA409()
+    {
+        var store = new FailingAfterArmStore();
+        var baseFactory = Factory();
+        await SeedOtherAsync(baseFactory);
+        var f = baseFactory.WithWebHostBuilder(b => b.ConfigureServices(s => s.Replace(ServiceDescriptor.Singleton<ITemplateStore>(store))));
+        _disposables.Add(f);
+        using var client = f.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Dev-Role", nameof(UserRole.Admin));
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/admin/templates", Ct)).StatusCode); // host started, user resolved
+        store.Fail = true; // the rollback commits, then reading the result back fails
+
+        HttpStatusCode? status = null;
+        try
+        {
+            status = (await client.PostAsync("/api/admin/templates/other/rollback", null, Ct)).StatusCode;
+        }
+        catch (InvalidOperationException e) when (e.Message == "store broke")
+        {
+            // The test server rethrows an unhandled exception instead of answering 500; either way it is not a 409.
+        }
+
+        Assert.NotEqual(HttpStatusCode.Conflict, status);
+        Assert.True(status is null or HttpStatusCode.InternalServerError, $"unexpected status {status}");
+        var audit = await AuditAsync(baseFactory, "template.rollback", "other"); // committed with its audit row
+        Assert.Equal("from=v2; to=v1", audit.Details);
+    }
+
     [Fact]
     public async Task UnknownTemplate_Returns404()
     {

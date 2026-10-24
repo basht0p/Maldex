@@ -280,8 +280,8 @@ public class TemplateCatalogTests(SqlServerFixture sql)
             var other = await AddVersionAsync(db, "b", 1);
             var retired = await AddVersionAsync(db, "a", 1, TemplateVersionStatus.Retired);
             var catalog = Catalog(db);
-            await Assert.ThrowsAsync<InvalidOperationException>(() => catalog.PublishAsync("a", other.Id, Ct));
-            await Assert.ThrowsAsync<InvalidOperationException>(() => catalog.PublishAsync("a", retired.Id, Ct));
+            await Assert.ThrowsAsync<TemplateRuleException>(() => catalog.PublishAsync("a", other.Id, Ct));
+            await Assert.ThrowsAsync<TemplateRuleException>(() => catalog.PublishAsync("a", retired.Id, Ct));
             Assert.Null(await CurrentAsync(db, "a"));
         }
     }
@@ -316,7 +316,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
             await AddTemplateAsync(db, "a");
             await AddVersionAsync(db, "a", 1, TemplateVersionStatus.Retired);
             var v2 = await AddVersionAsync(db, "a", 2, current: true);
-            await Assert.ThrowsAsync<InvalidOperationException>(() => Catalog(db).RollBackAsync("a", Ct));
+            await Assert.ThrowsAsync<TemplateRuleException>(() => Catalog(db).RollBackAsync("a", Ct));
             Assert.Equal(v2.Id, await CurrentAsync(db, "a"));
         }
     }
@@ -347,7 +347,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
             await AddTemplateAsync(db, "a", isDefault: true);
             await AddVersionAsync(db, "a", 1, current: true);
             await AddTemplateAsync(db, "b", enabled: false);
-            await Assert.ThrowsAsync<InvalidOperationException>(() => Catalog(db).SetDefaultAsync("b", Ct));
+            await Assert.ThrowsAsync<TemplateRuleException>(() => Catalog(db).SetDefaultAsync("b", Ct));
             Assert.Equal("a", (await Catalog(db).DefaultAsync(Ct))?.Id);
         }
     }
@@ -359,7 +359,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         await using (db)
         {
             await AddTemplateAsync(db, "a", isDefault: true);
-            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => Catalog(db).SetEnabledAsync("a", false, Ct));
+            var ex = await Assert.ThrowsAsync<TemplateRuleException>(() => Catalog(db).SetEnabledAsync("a", false, Ct));
             Assert.Equal("choose another default first", ex.Message);
         }
     }
@@ -419,6 +419,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         {
             RunStatus.Preparing => [RunStatus.Preparing],
             RunStatus.Running => [RunStatus.Preparing, RunStatus.Running],
+            RunStatus.Collecting => [RunStatus.Preparing, RunStatus.Running, RunStatus.Collecting],
             RunStatus.Completed => [RunStatus.Preparing, RunStatus.Running, RunStatus.Collecting, RunStatus.Processing, RunStatus.Completed],
             _ => throw new ArgumentOutOfRangeException(nameof(status)),
         };
@@ -451,6 +452,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
     [Theory]
     [InlineData(RunStatus.Running)]
     [InlineData(RunStatus.Preparing)]
+    [InlineData(RunStatus.Collecting)]
     public async Task Sweep_KeepsRetiredVersion_UsedByActiveTask(RunStatus status)
     {
         var (db, _) = await FreshAsync();
@@ -522,6 +524,199 @@ public class TemplateCatalogTests(SqlServerFixture sql)
             var s = await StatusesAsync(db, "a");
             Assert.Equal(TemplateVersionStatus.Retired, s[1]);
             Assert.Equal(TemplateVersionStatus.Deleted, s[2]);
+        }
+    }
+
+    // --- audit ---
+
+    /// <summary>Fails any save that carries an audit row, as a failing audit write would.</summary>
+    private sealed class FailingAuditInterceptor : Microsoft.EntityFrameworkCore.Diagnostics.SaveChangesInterceptor
+    {
+        public override ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int>> SavingChangesAsync(
+            Microsoft.EntityFrameworkCore.Diagnostics.DbContextEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            if (eventData.Context!.ChangeTracker.Entries<AuditLog>().Any(e => e.State == EntityState.Added))
+                throw new DbUpdateException("audit write failed");
+            return base.SavingChangesAsync(eventData, result, cancellationToken);
+        }
+    }
+
+    private static async Task<Guid> AddUserAsync(MaldexDbContext db)
+    {
+        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "Admin", Role = UserRole.Admin };
+        db.Users.Add(user);
+        await db.SaveChangesAsync(Ct);
+        return user.Id;
+    }
+
+    private static async Task<List<AuditLog>> AuditsAsync(MaldexDbContext db)
+    {
+        await using var fresh = new MaldexDbContext(new DbContextOptionsBuilder<MaldexDbContext>().UseSqlServer(db.Database.GetConnectionString()).Options);
+        return await fresh.AuditLogs.AsNoTracking().OrderBy(a => a.Id).ToListAsync(Ct);
+    }
+
+    /// <summary>"a": default, Ready v1 and Ready v2 (current). "b": enabled, Ready v1 current. Returns a's v1.</summary>
+    private static async Task<TemplateVersion> SeedAuditCaseAsync(MaldexDbContext db)
+    {
+        await AddTemplateAsync(db, "a", isDefault: true);
+        var a1 = await AddVersionAsync(db, "a", 1);
+        await AddVersionAsync(db, "a", 2, current: true);
+        await AddTemplateAsync(db, "b");
+        await AddVersionAsync(db, "b", 1, current: true);
+        return a1;
+    }
+
+    /// <summary>Runs one admin change through <paramref name="catalog"/>, audited as <paramref name="userId"/>.</summary>
+    private static Task ChangeAsync(TemplateCatalog catalog, string change, Guid userId, Guid aV1) => change switch
+    {
+        "default" => catalog.SetDefaultAsync("b", Ct, new TemplateAudit(userId, "template.default")),
+        "disable" => catalog.SetEnabledAsync("b", false, Ct, new TemplateAudit(userId, "template.disable")),
+        "publish" => catalog.PublishAsync("a", aV1, Ct, new TemplateAudit(userId, "template.publish", "v=1")),
+        "rollback" => catalog.RollBackAsync("a", Ct, r => new TemplateAudit(userId, "template.rollback", $"from=v{r.From}; to=v{r.To}")),
+        _ => throw new ArgumentOutOfRangeException(nameof(change)),
+    };
+
+    [Theory]
+    [InlineData("default", "template.default", "b", null)]
+    [InlineData("disable", "template.disable", "b", null)]
+    [InlineData("publish", "template.publish", "a", "v=1")]
+    [InlineData("rollback", "template.rollback", "a", "from=v2; to=v1")]
+    public async Task Change_WritesItsAuditRow(string change, string action, string target, string? details)
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            var aV1 = await SeedAuditCaseAsync(db);
+            var userId = await AddUserAsync(db);
+
+            await ChangeAsync(Catalog(db), change, userId, aV1.Id);
+
+            var audit = Assert.Single(await AuditsAsync(db));
+            Assert.Equal((Now, (Guid?)userId, action, target, details), (audit.At, audit.UserId, audit.Action, audit.Target, audit.Details));
+        }
+    }
+
+    [Theory]
+    [InlineData("default")]
+    [InlineData("disable")]
+    [InlineData("publish")]
+    [InlineData("rollback")]
+    public async Task Change_FailingAuditWrite_RollsBackTheChange(string change)
+    {
+        var (db, cs) = await FreshAsync();
+        await using (db)
+        {
+            var aV1 = await SeedAuditCaseAsync(db);
+            var userId = await AddUserAsync(db);
+            var a2 = (await CurrentAsync(db, "a"))!.Value;
+            await using var ctx = new MaldexDbContext(new DbContextOptionsBuilder<MaldexDbContext>().UseSqlServer(cs).AddInterceptors(new FailingAuditInterceptor()).Options);
+
+            await Assert.ThrowsAsync<DbUpdateException>(() => ChangeAsync(Catalog(ctx), change, userId, aV1.Id));
+
+            await using var check = sql.CreateContext(cs);
+            Assert.Equal(["a"], await check.Templates.Where(t => t.IsDefault).Select(t => t.Id).ToListAsync(Ct));
+            Assert.True((await check.Templates.SingleAsync(t => t.Id == "b", Ct)).Enabled);
+            Assert.Equal(a2, await CurrentAsync(db, "a"));
+            Assert.Empty(await AuditsAsync(db));
+        }
+    }
+
+    [Fact]
+    public async Task RollBack_ReturnsTheVersionNumbersItApplied()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await SeedAuditCaseAsync(db);
+            Assert.Equal(new RollBackResult(2, 1), await Catalog(db).RollBackAsync("a", Ct));
+        }
+    }
+
+    [Fact]
+    public async Task NoOpChange_WritesNoAuditRow()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await SeedAuditCaseAsync(db);
+            var userId = await AddUserAsync(db);
+            var catalog = Catalog(db);
+
+            await catalog.SetDefaultAsync("a", Ct, new TemplateAudit(userId, "template.default")); // already the default
+            await catalog.SetEnabledAsync("b", true, Ct, new TemplateAudit(userId, "template.enable")); // already enabled
+
+            Assert.Empty(await AuditsAsync(db));
+        }
+    }
+
+    [Theory]
+    [InlineData("disable-default")]
+    [InlineData("default-disabled")]
+    [InlineData("rollback-no-previous")]
+    [InlineData("publish-foreign")]
+    [InlineData("publish-retired")]
+    public async Task RefusedChange_ThrowsTemplateRuleException_AndWritesNothing(string change)
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await SeedAuditCaseAsync(db);
+            await AddTemplateAsync(db, "off", enabled: false);
+            var retired = await AddVersionAsync(db, "a", 3, TemplateVersionStatus.Retired);
+            var bV1 = (await CurrentAsync(db, "b"))!.Value;
+            var userId = await AddUserAsync(db);
+            var audit = new TemplateAudit(userId, "template.x");
+            var catalog = Catalog(db);
+
+            await Assert.ThrowsAsync<TemplateRuleException>(() => change switch
+            {
+                "disable-default" => catalog.SetEnabledAsync("a", false, Ct, audit),
+                "default-disabled" => catalog.SetDefaultAsync("off", Ct, audit),
+                "rollback-no-previous" => catalog.RollBackAsync("b", Ct, _ => audit),
+                "publish-foreign" => catalog.PublishAsync("a", bV1, Ct, audit),
+                "publish-retired" => catalog.PublishAsync("a", retired.Id, Ct, audit),
+                _ => throw new ArgumentOutOfRangeException(nameof(change)),
+            });
+
+            Assert.Empty(await AuditsAsync(db));
+            Assert.Equal(TemplateVersionStatus.Ready, (await StatusesAsync(db, "a"))[2]);
+        }
+    }
+
+    [Fact]
+    public async Task Sweep_AuditsEveryDeletedVersion_EvenWhenALaterDeleteFails()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            var good = await AddVersionAsync(db, "a", 1, TemplateVersionStatus.Retired);
+            var bad = await AddVersionAsync(db, "a", 2, TemplateVersionStatus.Retired);
+            var store = new RecordingStore { FailStems = { bad.FileStem } };
+
+            await Catalog(db, store: store).SweepAsync(Ct);
+
+            var audit = Assert.Single(await AuditsAsync(db));
+            Assert.Equal((Now, (Guid?)null, "template.version.delete", good.Id.ToString(), "template=a; v=1"),
+                (audit.At, audit.UserId, audit.Action, audit.Target, audit.Details));
+        }
+    }
+
+    [Fact]
+    public async Task Sweep_FailingAuditWrite_LeavesTheVersionRetired()
+    {
+        var (db, cs) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            await AddVersionAsync(db, "a", 1, TemplateVersionStatus.Retired);
+            await using var ctx = new MaldexDbContext(new DbContextOptionsBuilder<MaldexDbContext>().UseSqlServer(cs).AddInterceptors(new FailingAuditInterceptor()).Options);
+
+            Assert.Empty(await Catalog(ctx).SweepAsync(Ct));
+
+            Assert.Equal(TemplateVersionStatus.Retired, (await StatusesAsync(db, "a"))[1]); // the next sweep tries again
+            Assert.Empty(await AuditsAsync(db));
         }
     }
 

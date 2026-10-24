@@ -1,6 +1,3 @@
-using Maldex.Core.Abstractions;
-using Maldex.Core.Domain;
-using Maldex.Data;
 using Maldex.Data.Templates;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -18,22 +15,13 @@ public sealed class RetentionWorker(RetentionService retention, BlobGarbageColle
     public static readonly TimeSpan Interval = TimeSpan.FromHours(24);
 
     /// <summary>
-    /// Deletes the disks of Retired template versions no Preparing/Running task uses and writes one system audit row
-    /// (no user) per deleted version.
+    /// Deletes the disks of Retired template versions no active task uses; the catalog writes each deletion's system
+    /// audit row in the same save that marks the version Deleted.
     /// </summary>
     public async Task SweepTemplatesAsync(CancellationToken ct)
     {
         await using var scope = scopes.CreateAsyncScope();
-        var catalog = scope.ServiceProvider.GetRequiredService<TemplateCatalog>();
-        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
-
-        var deleted = await catalog.SweepAsync(ct).ConfigureAwait(false);
-        if (deleted.Count == 0) return;
-
-        var at = time.GetUtcNow();
-        foreach (var v in deleted)
-            db.AuditLogs.Add(new AuditLog { At = at, UserId = null, Action = "template.version.delete", Target = v.Id.ToString(), Details = $"template={v.TemplateId}; v={v.Number}" });
-        await db.SaveChangesAsync(ct).ConfigureAwait(false);
+        await scope.ServiceProvider.GetRequiredService<TemplateCatalog>().SweepAsync(ct).ConfigureAwait(false);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
