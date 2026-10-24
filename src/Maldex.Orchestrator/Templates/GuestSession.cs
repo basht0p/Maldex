@@ -17,6 +17,9 @@ internal sealed class GuestSession : IAsyncDisposable
     private readonly Task _pump;
     private readonly TaskCompletionSource<ReadyMessage> _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly ConcurrentDictionary<string, TaskCompletionSource<ProvenanceMessage>> _provenance = new();
+    /// <summary>Ids of finished provenance requests: late frames for them are dropped, never passed on to the next step.</summary>
+    private readonly ConcurrentDictionary<string, byte> _retired = new();
+    private TaskCompletionSource _readyTick = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public GuestSession(IAgentChannel channel)
     {
@@ -46,6 +49,52 @@ internal sealed class GuestSession : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Asks for the provenance report until any answer arrives: sends a request with a fresh id, then again every
+    /// <paramref name="retryInterval"/> and at once whenever a <c>ready</c> frame arrives (the agent has just reconnected). After a host
+    /// reconnect the agent needs 1-10 s to come back, and a request sent in that gap is lost, so one send is not enough. The first
+    /// reply to any sent id wins; replies to the others are dropped here, also after this returns.
+    /// </summary>
+    /// <exception cref="TimeoutException">No answer within <paramref name="timeout"/> (<paramref name="time"/> measures it).</exception>
+    /// <exception cref="InvalidOperationException">The agent refused the request, or went away.</exception>
+    public async Task<ProvenanceMessage> AskProvenanceWithRetryAsync(TimeSpan retryInterval, TimeSpan timeout, TimeProvider time, CancellationToken ct)
+    {
+        var answer = new TaskCompletionSource<ProvenanceMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sent = new List<string>();
+        using var deadline = new CancellationTokenSource(timeout, time);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, deadline.Token);
+        try
+        {
+            while (true)
+            {
+                var tick = Volatile.Read(ref _readyTick).Task; // taken before the send: a ready during it still resends
+                var command = new ProvenanceCommand(Guid.NewGuid().ToString("N"));
+                sent.Add(command.CommandId);
+                _provenance[command.CommandId] = answer;
+                await _channel.SendAsync(command, linked.Token).ConfigureAwait(false);
+
+                using var wait = CancellationTokenSource.CreateLinkedTokenSource(linked.Token);
+                var pause = Task.Delay(retryInterval, time, wait.Token);
+                var first = await Task.WhenAny(answer.Task, tick, pause).ConfigureAwait(false);
+                await wait.CancelAsync().ConfigureAwait(false);
+                if (first == answer.Task) return await answer.Task.ConfigureAwait(false);
+                linked.Token.ThrowIfCancellationRequested();
+            }
+        }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            throw new TimeoutException($"no provenance answer within {timeout.TotalSeconds:0} s");
+        }
+        finally
+        {
+            foreach (var id in sent)
+            {
+                _retired[id] = 0;
+                _provenance.TryRemove(id, out _);
+            }
+        }
+    }
+
     private async Task PumpAsync()
     {
         Exception? error = null;
@@ -57,7 +106,11 @@ internal sealed class GuestSession : IAsyncDisposable
                 {
                     case ReadyMessage r:
                         _ready.TrySetResult(r);
+                        Interlocked.Exchange(ref _readyTick, new(TaskCreationOptions.RunContinuationsAsynchronously)).TrySetResult();
                         break;
+                    case ProvenanceMessage p when _retired.ContainsKey(p.CommandId):
+                    case CommandResultMessage r when _retired.ContainsKey(r.CommandId):
+                        break; // a late frame of a finished request
                     case ProvenanceMessage p when _provenance.TryGetValue(p.CommandId, out var waiting):
                         waiting.TrySetResult(p);
                         break;

@@ -27,21 +27,18 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
 
         // Liveness is proven by a round trip, never by waiting for ready: the agent says ready once per session, and a host that
         // connects later (or reconnects) may never see it. Queued ready messages and other frames are skipped by the session.
-        using (var askBudget = new CancellationTokenSource(o.ProvenanceTimeout, time))
-        using (var askLinked = CancellationTokenSource.CreateLinkedTokenSource(ct, askBudget.Token))
+        // A request sent while the agent is reconnecting is lost, so it is resent (see AskProvenanceWithRetryAsync).
+        try
         {
-            try
-            {
-                await session.AskProvenanceAsync(askLinked.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (askBudget.IsCancellationRequested && !ct.IsCancellationRequested)
-            {
-                throw new TemplateSealException($"the guest agent did not answer: no reply within {o.ProvenanceTimeout.TotalSeconds:0} s; not sealing");
-            }
-            catch (Exception ex) when (ex is InvalidOperationException or IOException or ObjectDisposedException or ChannelClosedException)
-            {
-                throw new TemplateSealException($"the guest agent did not answer: {GuestText.Clean(ex.Message, 200)}; not sealing", ex);
-            }
+            await session.AskProvenanceWithRetryAsync(o.ProvenanceRetryInterval, o.ProvenanceTimeout, time, ct).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            throw new TemplateSealException($"the guest agent did not answer: no reply within {o.ProvenanceTimeout.TotalSeconds:0} s; not sealing");
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or ObjectDisposedException or ChannelClosedException)
+        {
+            throw new TemplateSealException($"the guest agent did not answer: {GuestText.Clean(ex.Message, 200)}; not sealing", ex);
         }
 
         var delivery = new SampleDelivery(time, o.ChunkTimeout);

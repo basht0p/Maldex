@@ -160,7 +160,7 @@ public class TemplateSealerTests
 
         Assert.StartsWith("the guest agent did not answer", ex.Message);
         Assert.Empty(kit.Store.Seals);
-        Assert.IsType<ProvenanceCommand>(Assert.Single(ch.SentCommands)); // nothing was delivered
+        Assert.All(ch.SentCommands, c => Assert.IsType<ProvenanceCommand>(c)); // resent, but nothing was delivered
     }
 
     [Fact]
