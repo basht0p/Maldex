@@ -9,3 +9,6 @@ public enum DetectionSource { Suricata, Yara, Heuristic }
 public enum ArtifactKind { Sample, Dropped, Pcap, Screenshot, Report, MitmFlows }
 public enum TemplateVersionOrigin { IsoBuild, Edit, Refresh, Imported }
 public enum TemplateVersionStatus { Ready, Retired, Deleted }
+
+public enum TemplateJobKind { Edit, Refresh }
+public enum TemplateJobState { Queued, Preparing, Configuring, Sealing, Verifying, Published, Sealed, Failed, Cancelled }

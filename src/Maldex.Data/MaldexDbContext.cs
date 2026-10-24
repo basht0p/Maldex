@@ -19,6 +19,7 @@ public class MaldexDbContext(DbContextOptions<MaldexDbContext> options) : DbCont
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
     public DbSet<Template> Templates => Set<Template>();
     public DbSet<TemplateVersion> TemplateVersions => Set<TemplateVersion>();
+    public DbSet<TemplateJob> TemplateJobs => Set<TemplateJob>();
 
     protected override void ConfigureConventions(ModelConfigurationBuilder configurationBuilder)
     {
@@ -32,6 +33,8 @@ public class MaldexDbContext(DbContextOptions<MaldexDbContext> options) : DbCont
         configurationBuilder.Properties<ArtifactKind>().HaveConversion<string>().HaveMaxLength(32);
         configurationBuilder.Properties<TemplateVersionOrigin>().HaveConversion<string>().HaveMaxLength(32);
         configurationBuilder.Properties<TemplateVersionStatus>().HaveConversion<string>().HaveMaxLength(32);
+        configurationBuilder.Properties<TemplateJobKind>().HaveConversion<string>().HaveMaxLength(32);
+        configurationBuilder.Properties<TemplateJobState>().HaveConversion<string>().HaveMaxLength(32);
     }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder) =>

@@ -31,8 +31,6 @@ public sealed class OrchestratorWorker(
 
     private const int CandidateWindow = 100;
 
-    private static readonly RunStatus[] InFlight = [RunStatus.Preparing, RunStatus.Running, RunStatus.Collecting];
-
     private readonly OrchestratorOptions _options = options.Value;
     private readonly CancellationTokenSource _runsCts = new();
     private readonly ConcurrentDictionary<Guid, Task> _runs = new();
@@ -112,7 +110,7 @@ public sealed class OrchestratorWorker(
         await using var scope = scopes.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
 
-        var busy = await db.Tasks.AsNoTracking().CountAsync(t => InFlight.Contains(t.Status), ct).ConfigureAwait(false);
+        var busy = await VmSlots.BusyAsync(db, ct).ConfigureAwait(false);
         var slots = _options.MaxConcurrentVms - busy;
         if (slots <= 0) return [];
 

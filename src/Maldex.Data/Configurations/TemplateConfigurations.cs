@@ -48,3 +48,28 @@ public sealed class TemplateVersionConfiguration : IEntityTypeConfiguration<Temp
         b.HasIndex(x => x.FileStem).IsUnique();
     }
 }
+
+public sealed class TemplateJobConfiguration : IEntityTypeConfiguration<TemplateJob>
+{
+    public void Configure(EntityTypeBuilder<TemplateJob> b)
+    {
+        b.ToTable("TemplateJobs");
+        b.HasKey(x => x.Id);
+        b.Property(x => x.Id).ValueGeneratedNever();
+        b.Property(x => x.TemplateId).HasMaxLength(64).IsRequired();
+        b.Property(x => x.Message).HasMaxLength(500);
+        b.Property(x => x.FailureReason).HasMaxLength(1000);
+        b.Property(x => x.Note).HasMaxLength(1000);
+        b.Property(x => x.RowVersion).IsRowVersion();
+
+        b.HasOne<Template>().WithMany().HasForeignKey(x => x.TemplateId).OnDelete(DeleteBehavior.Restrict);
+        b.HasOne<TemplateVersion>().WithMany().HasForeignKey(x => x.BaseVersionId).OnDelete(DeleteBehavior.Restrict);
+        b.HasOne<TemplateVersion>().WithMany().HasForeignKey(x => x.ResultVersionId).OnDelete(DeleteBehavior.Restrict);
+        b.HasOne<AppUser>().WithMany().HasForeignKey(x => x.RequestedByUserId).OnDelete(DeleteBehavior.Restrict);
+
+        // One active (non-terminal) job per template. SQL Server filtered indexes reject NOT IN, so this spells it as <> terms.
+        b.HasIndex(x => x.TemplateId).IsUnique()
+            .HasFilter("[State] <> 'Published' AND [State] <> 'Sealed' AND [State] <> 'Failed' AND [State] <> 'Cancelled'")
+            .HasDatabaseName("IX_TemplateJobs_TemplateId_Active");
+    }
+}
