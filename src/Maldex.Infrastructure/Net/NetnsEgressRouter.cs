@@ -17,6 +17,10 @@ public sealed record NetnsRouterTuning
     public TimeSpan HandshakeWait { get; init; } = TimeSpan.FromSeconds(10);
     public TimeSpan KillGrace { get; init; } = TimeSpan.FromSeconds(5);
     public string BrNetfilterPath { get; init; } = "/proc/sys/net/bridge/bridge-nf-call-iptables";
+    /// <summary>Where <see cref="NetworkMode.Direct"/> reads the host's upstream resolvers from when <see cref="NetOptions.DirectDnsServers"/> is empty.</summary>
+    public string ResolvConfPath { get; init; } = "/run/systemd/resolve/resolv.conf";
+    /// <summary><see cref="NetworkMode.Direct"/> needs the host to forward packets.</summary>
+    public string IpForwardPath { get; init; } = "/proc/sys/net/ipv4/ip_forward";
     /// <summary>Where the live mitm flows file is (tests point it at a scratch file).</summary>
     public Func<Guid, string> FlowsSource { get; init; } = NetnsEgressRouter.MitmFlowsPath;
 }
@@ -37,8 +41,13 @@ public sealed partial class NetnsEgressRouter(
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly Dictionary<Guid, (int Index, string? Country)> _active = [];
 
+    /// <summary>What a <see cref="NetworkMode.Direct"/> lease is built from, read from the host when the lease is created.</summary>
+    private sealed record DirectPlan(string DefaultIface, IReadOnlyList<string> DnsServers);
+
     [GeneratedRegex("^mxn[0-9a-f]{12}$")] private static partial Regex NsName();
-    [GeneratedRegex("^mx[bvtw]([0-9a-f]{12})$")] private static partial Regex HostLink();
+    [GeneratedRegex("^mx[bvtwu]([0-9a-f]{12})$")] private static partial Regex HostLink();
+    [GeneratedRegex("^maldex_direct_([0-9a-f]{12})$")] private static partial Regex DirectTableName();
+    [GeneratedRegex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$")] private static partial Regex IfaceName();
     [GeneratedRegex("^[A-Za-z0-9_-]{1,32}$")] private static partial Regex CountryName();
     [GeneratedRegex("^[a-z_][a-z0-9_-]{0,31}$")] private static partial Regex UserName();
 
@@ -212,7 +221,7 @@ public sealed partial class NetnsEgressRouter(
     public async Task<NetworkLease> CreateAsync(Guid taskId, NetworkMode mode, string? exitCountry, CancellationToken ct)
     {
         if (mode == NetworkMode.LiveTor) throw new EgressUnavailableException("LiveTor is not available");
-        if (mode is not (NetworkMode.None or NetworkMode.Simulated or NetworkMode.LiveVpn))
+        if (mode is not (NetworkMode.None or NetworkMode.Simulated or NetworkMode.LiveVpn or NetworkMode.Direct))
             throw new EgressUnavailableException($"Network mode {mode} is not available");
 
         // Validate the exit before touching the host.
@@ -232,6 +241,7 @@ public sealed partial class NetnsEgressRouter(
         var guard = await Run(PrivilegedCommands.Sudo("nft", "list", "table", "inet", "maldex_guard"), ct);
         if (guard.ExitCode != 0) throw new EgressUnavailableException("Host guard table 'inet maldex_guard' is not loaded.");
 
+        var direct = mode == NetworkMode.Direct ? await PlanDirectAsync(ct) : null; // before anything on the host is touched
         if (mode != NetworkMode.LiveVpn) exitCountry = null; // an exit country only means something for LiveVpn
         var names = RunNetNames.For(taskId);
         int index;
@@ -253,7 +263,7 @@ public sealed partial class NetnsEgressRouter(
 
         try
         {
-            await BuildAsync(taskId, mode, exitCountry, wg, names, RunSubnet.For(index), ct);
+            await BuildAsync(taskId, mode, exitCountry, wg, direct, names, RunSubnet.For(index), ct);
             return new NetworkLease(taskId, names.Tap);
         }
         catch (Exception ex)
@@ -265,7 +275,7 @@ public sealed partial class NetnsEgressRouter(
         }
     }
 
-    private async Task BuildAsync(Guid taskId, NetworkMode mode, string? exitCountry, WireGuardConf? wg,
+    private async Task BuildAsync(Guid taskId, NetworkMode mode, string? exitCountry, WireGuardConf? wg, DirectPlan? direct,
         RunNetNames names, RunSubnet subnet, CancellationToken ct)
     {
         var ns = names.Namespace;
@@ -279,7 +289,8 @@ public sealed partial class NetnsEgressRouter(
         await File.WriteAllTextAsync(Path.Combine(dir, "lease.json"), JsonSerializer.Serialize(new LeaseFile(
             taskId, subnet.Index, mode.ToString(), exitCountry, names.Bridge, names.Tap, names.VethHost, names.VethNs, names.Namespace, names.WgIface)), ct);
 
-        var topology = new EgressTopology(names, subnet, mode, _o.ControlPlaneIps, _o.SinkholeIp, _o.MitmPort, wg?.Dns);
+        var uplink = direct is null ? null : UplinkSubnet.For(_o.DirectUplinkPool, subnet.Index);
+        var topology = new EgressTopology(names, subnet, mode, _o.ControlPlaneIps, _o.SinkholeIp, _o.MitmPort, wg?.Dns, uplink, direct?.DnsServers);
         var ruleset = NftRulesetBuilder.Build(topology);
         var gw = subnet.GatewayIp;
         var user = Environment.UserName;
@@ -291,6 +302,12 @@ public sealed partial class NetnsEgressRouter(
         await Must(PrivilegedCommands.InNs(ns, "sysctl", "-w", "net.ipv6.conf.default.disable_ipv6=1"), ct);
         await Must(PrivilegedCommands.InNs(ns, "nft", "-f", "-"), ct, ruleset);
         await Must(PrivilegedCommands.InNs(ns, "ip", "link", "set", "lo", "up"), ct);
+        if (direct is not null)
+        {
+            // The host's forward/NAT table for this lease's uplink, also loaded before any link exists. The namespace must route.
+            await Must(PrivilegedCommands.Sudo("nft", "-f", "-"), ct, DirectUplinkRuleset.Build(names, direct.DefaultIface, _o.ControlPlaneIps, direct.DnsServers));
+            await Must(PrivilegedCommands.InNs(ns, "sysctl", "-w", "net.ipv4.ip_forward=1"), ct);
+        }
 
         // 2. links. The host bridge never gets an address.
         await Must(PrivilegedCommands.Sudo("ip", "link", "add", names.Bridge, "type", "bridge"), ct);
@@ -306,12 +323,14 @@ public sealed partial class NetnsEgressRouter(
         await Must(PrivilegedCommands.Sudo("ip", "link", "set", names.Tap, "up"), ct);
         await Must(PrivilegedCommands.Sudo("ip", "link", "set", names.VethHost, "up"), ct);
         await Must(PrivilegedCommands.InNs(ns, "ip", "link", "set", names.VethNs, "up"), ct);
+        if (uplink is not null) await StartUplinkAsync(names, uplink, ct);
 
         // 3. DNS + DHCP.
         string[] dnsArgs = mode switch
         {
             NetworkMode.Simulated => ["--no-resolv", $"--address=/#/{_o.SinkholeIp}"],
             NetworkMode.LiveVpn => ["--no-resolv", $"--server={wg!.Dns}"],
+            NetworkMode.Direct => ["--no-resolv", .. direct!.DnsServers.Select(d => $"--server={d}")],
             _ => ["--no-resolv"],
         };
         // dnsmasq parses guest-controlled DHCP/DNS, so it starts already unprivileged (dedicated user, no groups, no new
@@ -332,6 +351,8 @@ public sealed partial class NetnsEgressRouter(
             $"--dhcp-range={subnet.GuestIp},{subnet.GuestIp},255.255.255.252,12h", $"--dhcp-host={RunNetNames.GuestMac(taskId)},{subnet.GuestIp}",
             $"--dhcp-leasefile={ddir}/dnsmasq.leases", $"--dhcp-option=3,{gw}", $"--dhcp-option=6,{gw}",
             $"--pid-file={ddir}/dnsmasq.pid", $"--log-facility={ddir}/dnsmasq.log", .. dnsArgs]), ct);
+
+        if (mode == NetworkMode.Direct) return; // known-good images doing updates: no mitmproxy, capture or INetSim
 
         // 4. MITM proxy, TCP only, bound to the gateway address. It parses hostile traffic and runs our addon, so it runs as
         //    the dedicated powerless user with no groups, no new privileges and an empty capability bounding set.
@@ -378,6 +399,79 @@ public sealed partial class NetnsEgressRouter(
                 await StartVpnAsync(names, dir, wg!, ct);
                 break;
         }
+    }
+
+    /// <summary>
+    /// The uplink: a veth pair whose host end sits in the host namespace (addressed .1 of the lease's /30) and whose namespace end
+    /// (.2) carries the namespace's default route. The host end is <c>mxu*</c>, so the host guard drops its input, and only the
+    /// lease's <c>maldex_direct_*</c> table forwards it (to the default-route interface, masqueraded).
+    /// </summary>
+    private async Task StartUplinkAsync(RunNetNames names, UplinkSubnet up, CancellationToken ct)
+    {
+        var ns = names.Namespace;
+        await Must(PrivilegedCommands.Sudo("ip", "link", "add", names.UplinkHost, "type", "veth", "peer", "name", names.UplinkNs, "netns", ns), ct);
+        await Must(PrivilegedCommands.Sudo("sysctl", "-w", $"net.ipv6.conf.{names.UplinkHost}.disable_ipv6=1"), ct);
+        await Must(PrivilegedCommands.Sudo("ip", "addr", "add", $"{up.HostIp}/30", "dev", names.UplinkHost), ct);
+        await Must(PrivilegedCommands.Sudo("ip", "link", "set", names.UplinkHost, "up"), ct);
+        await Must(PrivilegedCommands.InNs(ns, "ip", "addr", "add", $"{up.NsIp}/30", "dev", names.UplinkNs), ct);
+        await Must(PrivilegedCommands.InNs(ns, "ip", "link", "set", names.UplinkNs, "up"), ct);
+        await Must(PrivilegedCommands.InNs(ns, "ip", "route", "add", "default", "via", up.HostIp, "dev", names.UplinkNs), ct);
+    }
+
+    /// <summary>
+    /// Reads what Direct needs from the host and fails closed when any of it is missing: the pool, IPv4 forwarding, the interface
+    /// of the default route (read now, per lease: the host may have changed networks) and the resolvers dnsmasq will forward to.
+    /// </summary>
+    private async Task<DirectPlan> PlanDirectAsync(CancellationToken ct)
+    {
+        try { UplinkSubnet.For(_o.DirectUplinkPool, 0); }
+        catch (ArgumentException e) { throw new EgressUnavailableException($"Direct uplink pool is unusable: {e.Message}"); }
+
+        string forwarding;
+        try { forwarding = (await File.ReadAllTextAsync(_t.IpForwardPath, ct)).Trim(); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { forwarding = ""; }
+        if (forwarding != "1") throw new EgressUnavailableException("The host does not forward IPv4 (net.ipv4.ip_forward is not 1); Direct egress needs it.");
+
+        var route = await Run(("ip", ["-4", "-o", "route", "show", "default"]), ct);
+        string? iface = null;
+        var line = route.ExitCode != 0 ? null : route.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(l => l.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries)).FirstOrDefault(f => f.Length > 0 && f[0] == "default");
+        if (line is not null)
+        {
+            var at = Array.IndexOf(line, "dev");
+            if (at >= 0 && at + 1 < line.Length) iface = line[at + 1];
+        }
+        if (iface is null || !IfaceName().IsMatch(iface) || iface == "lo" || iface.StartsWith("mx", StringComparison.Ordinal))
+            throw new EgressUnavailableException("Direct egress needs a default route on a real host interface, and the host has none.");
+
+        // Docker leaves the host's FORWARD policy at DROP; its DOCKER-USER chain is where an operator may allow other traffic.
+        // ./build.sh real-setup installs exactly these two rules (deploy/host/maldex-docker-user.sh); the router only checks (-C).
+        var outRule = await Run(PrivilegedCommands.Sudo("iptables", "-C", "DOCKER-USER", "-i", "mxu+", "-o", iface, "-m", "comment", "--comment", "maldex-direct", "-j", "ACCEPT"), ct);
+        var backRule = await Run(PrivilegedCommands.Sudo("iptables", "-C", "DOCKER-USER", "-i", iface, "-o", "mxu+", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED",
+            "-m", "comment", "--comment", "maldex-direct", "-j", "ACCEPT"), ct);
+        if (outRule.ExitCode != 0 || backRule.ExitCode != 0)
+            throw new EgressUnavailableException("Direct egress needs the Maldex exception in Docker's DOCKER-USER chain; run ./build.sh real-setup");
+
+        var servers = _o.DirectDnsServers.Length > 0 ? _o.DirectDnsServers.ToList() : ReadHostResolvers();
+        if (servers.Count == 0)
+            throw new EgressUnavailableException("Direct egress has no DNS servers: DirectDnsServers is empty and the host lists no IPv4 upstream resolver.");
+        try { servers = NftRulesetBuilder.ValidateDirectDns(servers, _o.ControlPlaneIps); }
+        catch (ArgumentException e) { throw new EgressUnavailableException($"Direct DNS servers are unusable: {e.Message}"); }
+        return new DirectPlan(iface, servers);
+    }
+
+    /// <summary>IPv4 <c>nameserver</c> lines of the host's upstream resolver list (loopback stubs such as 127.0.0.53 are skipped: they are the host).</summary>
+    private List<string> ReadHostResolvers()
+    {
+        try
+        {
+            return File.ReadAllLines(_t.ResolvConfPath)
+                .Select(l => l.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries))
+                .Where(f => f.Length >= 2 && f[0] == "nameserver" && System.Net.IPAddress.TryParse(f[1], out var ip)
+                    && ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !System.Net.IPAddress.IsLoopback(ip) && ip.ToString() == f[1])
+                .Select(f => f[1]).Distinct().ToList();
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return []; }
     }
 
     private async Task StartSimulatedAsync(string ns, string dir, CancellationToken ct)
@@ -517,6 +611,8 @@ public sealed partial class NetnsEgressRouter(
             await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.Tap), none);
             await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.VethHost), none);
             await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.WgIface), none);
+            await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.UplinkHost), none);
+            await Run(PrivilegedCommands.Sudo("nft", "delete", "table", "inet", names.DirectTable), none);
             await Run(PrivilegedCommands.Sudo("ip", "netns", "del", ns), none);
             await KeepFlowsAsync(taskId, ns, flowsCt);
             await Run(PrivilegedCommands.Sudo("rm", "-rf", "--", MitmDir(ns)), none);
@@ -571,6 +667,48 @@ public sealed partial class NetnsEgressRouter(
             .Select(s => int.TryParse(s, NumberStyles.None, CultureInfo.InvariantCulture, out var p) ? p : 0).Where(p => p > 1).ToList();
     }
 
+    /// <summary>
+    /// Cuts the lease off from all egress while it keeps running: the no-egress ruleset replaces the namespace's (atomically; established
+    /// flows die with it), then, for a Direct lease, the uplink route, the host forward/NAT table and the uplink link go. The VM's
+    /// attachment (tap, bridge, guest veth), dnsmasq and the namespace stay, so the agent channel (virtio-serial) is unaffected.
+    /// Idempotent. Not cancellable once started (a half-isolated lease is worse than a slow one). If the ruleset cannot be replaced the
+    /// host side is still cut, and the failure is then thrown.
+    /// </summary>
+    public async Task IsolateAsync(NetworkLease lease, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(lease);
+        ct.ThrowIfCancellationRequested();
+        var none = CancellationToken.None;
+        var names = RunNetNames.For(lease.TaskId);
+        var ns = names.Namespace;
+        var live = (await NamespacesAsync(none)).Contains(ns);
+        var file = live ? ReadLease(ns) : null;
+        // Without a readable lease the mode is unknown: clean up as for Direct (harmless when there is nothing to remove).
+        var directLease = !live || file is null || file.Mode == nameof(NetworkMode.Direct);
+
+        Exception? failure = null;
+        if (live)
+        {
+            try
+            {
+                if (file is null) throw new EgressUnavailableException("The lease file is missing or unreadable, so the no-egress ruleset cannot be built.");
+                var topology = new EgressTopology(names, RunSubnet.For(file.Index), NetworkMode.None, _o.ControlPlaneIps, _o.SinkholeIp, _o.MitmPort);
+                await Must(PrivilegedCommands.InNs(ns, "nft", "-f", "-"), none, NftRulesetBuilder.Build(topology));
+            }
+            catch (Exception e) when (e is EgressUnavailableException or ArgumentException)
+            {
+                failure = e;
+            }
+            if (directLease) await Run(PrivilegedCommands.InNs(ns, "ip", "route", "del", "default"), none);
+        }
+        if (directLease)
+        {
+            await Run(PrivilegedCommands.Sudo("nft", "delete", "table", "inet", names.DirectTable), none);
+            await Run(PrivilegedCommands.Sudo("ip", "link", "del", names.UplinkHost), none);
+        }
+        if (failure is not null) throw new EgressUnavailableException("Isolating the lease failed: " + failure.Message);
+    }
+
     public async Task<IReadOnlyList<NetworkLease>> ListAsync(CancellationToken ct)
     {
         await ReleaseOrphansAsync(ct);
@@ -594,15 +732,29 @@ public sealed partial class NetnsEgressRouter(
             var live = (await NamespacesAsync(ct)).Select(n => n[3..]).ToHashSet();
             foreach (var id in _active.Keys) live.Add(id.ToString("N")[..12]);
             var links = await Run(PrivilegedCommands.Sudo("ip", "-o", "link", "show"), ct);
-            if (links.ExitCode != 0) return;
-            foreach (var line in links.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            if (links.ExitCode == 0)
             {
-                var parts = line.Split(':', 3);
-                if (parts.Length < 2) continue;
-                var name = parts[1].Trim().Split('@')[0];
-                var m = HostLink().Match(name);
+                foreach (var line in links.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var parts = line.Split(':', 3);
+                    if (parts.Length < 2) continue;
+                    var name = parts[1].Trim().Split('@')[0];
+                    var m = HostLink().Match(name);
+                    if (!m.Success || live.Contains(m.Groups[1].Value)) continue;
+                    await Run(PrivilegedCommands.Sudo("ip", "link", "del", name), ct);
+                }
+            }
+
+            // Direct leases' host tables (one per lease): only ours, only those of runs that no longer exist.
+            var tables = await Run(PrivilegedCommands.Sudo("nft", "list", "tables"), ct);
+            if (tables.ExitCode != 0) return;
+            foreach (var line in tables.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var f = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (f.Length != 3 || f[0] != "table" || f[1] != "inet") continue;
+                var m = DirectTableName().Match(f[2]);
                 if (!m.Success || live.Contains(m.Groups[1].Value)) continue;
-                await Run(PrivilegedCommands.Sudo("ip", "link", "del", name), ct);
+                await Run(PrivilegedCommands.Sudo("nft", "delete", "table", "inet", f[2]), ct);
             }
         }
         finally { _gate.Release(); }

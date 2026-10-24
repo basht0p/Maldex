@@ -34,7 +34,7 @@ public sealed record IsolationProbePlan(IReadOnlyList<ProbeTarget> Targets, stri
         targets.Add(new ProbeTarget("rfc1918_172", "172.16.0.1", WebPorts));
         targets.Add(new ProbeTarget("rfc1918_192", "192.168.1.1", WebPorts));
         targets.Add(new ProbeTarget("link_local", "169.254.169.254", WebPorts));
-        return new IsolationProbePlan(targets, net.EchoUrl, run.GuestIp);
+        return new IsolationProbePlan(targets, run.Mode == NetworkMode.Direct ? net.DirectProbeUrl : net.EchoUrl, run.GuestIp);
     }
 }
 
@@ -97,6 +97,10 @@ public static class IsolationVerifier
                 return Normalize(got).Equals(Normalize(want))
                     ? IsolationVerdict.Pass
                     : IsolationVerdict.Fail($"the egress IP {got} is not the VPN exit {want}");
+
+            case NetworkMode.Direct:
+                // Internal isolation was proven above; the internet must be reachable (any HTTP answer from the probe URL).
+                return echo is null ? IsolationVerdict.Fail("the guest could not reach a public address in direct mode") : IsolationVerdict.Pass;
 
             default:
                 return IsolationVerdict.Fail($"no isolation check exists for network mode {mode}");

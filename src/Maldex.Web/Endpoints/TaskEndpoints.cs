@@ -291,6 +291,9 @@ public static class TaskEndpoints
             case NetworkMode.LiveTor:
                 errors["networkMode"] = ["LiveTor is not available yet"];
                 break;
+            case NetworkMode.Direct:
+                errors["networkMode"] = ["Direct is only available to template edit sessions."];
+                break;
             case NetworkMode.LiveVpn:
                 if (vpnCountries.Count == 0)
                     errors["networkMode"] = ["LiveVpn is not available: no VPN exit countries are configured."];
