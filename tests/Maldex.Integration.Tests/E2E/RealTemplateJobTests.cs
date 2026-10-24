@@ -11,6 +11,8 @@ using Maldex.Infrastructure.Net;
 using Maldex.Integration.Tests.Fixtures;
 using Maldex.Orchestrator;
 using Maldex.Orchestrator.Templates;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
@@ -289,7 +291,8 @@ public sealed partial class RealTemplateJobTests(SqlServerFixture sql, ITestOutp
         var domainsBefore = await DomainsAsync(CancellationToken.None);
         var runNetBefore = RunNetDirs();
         var jobs = new List<Guid>();
-        var f = new MaldexAppFactory(sql, workers: true, settings: new Dictionary<string, string?>
+        var roundTrips = new ProvenanceRoundTrips();
+        var f = new RecordingHost(sql, roundTrips, new Dictionary<string, string?>
         {
             ["Maldex:Mode"] = "Real",
             ["Maldex:Workers:Enabled"] = "true",
@@ -312,6 +315,9 @@ public sealed partial class RealTemplateJobTests(SqlServerFixture sql, ITestOutp
         {
             failure = ex;
         }
+
+        foreach (var line in roundTrips.Describe(vm => jobs.Any(j => vm == VmHandle.For(j).Name) ? $"job {vm[7..15]}" : $"verification boot {vm[7..15]}"))
+            Progress("provenance: " + line);
 
         var problems = new List<string>();
         foreach (var job in jobs)
@@ -422,5 +428,22 @@ public sealed partial class RealTemplateJobTests(SqlServerFixture sql, ITestOutp
         var text = $"{DateTimeOffset.UtcNow:HH:mm:ss} {line}";
         output.WriteLine(text);
         Console.WriteLine(text);
+    }
+
+    /// <summary>The real-mode host with its agent channel factory wrapped by <see cref="ProvenanceRoundTrips"/>.</summary>
+    private sealed class RecordingHost(SqlServerFixture sql, ProvenanceRoundTrips roundTrips, IReadOnlyDictionary<string, string?> settings)
+        : MaldexAppFactory(sql, workers: true, settings: settings)
+    {
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            base.ConfigureWebHost(builder);
+            builder.ConfigureTestServices(services =>
+            {
+                var real = services.Last(d => d.ServiceType == typeof(IAgentChannelFactory));
+                services.Remove(real);
+                services.AddSingleton(real.ImplementationType!);
+                services.AddSingleton<IAgentChannelFactory>(sp => roundTrips.Wrap((IAgentChannelFactory)sp.GetRequiredService(real.ImplementationType!)));
+            });
+        }
     }
 }
