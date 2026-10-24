@@ -89,6 +89,47 @@ public class OrchestratorWorkerTests(SqlServerFixture sql)
         }
     }
 
+    [Theory]
+    [InlineData(TemplateJobState.Configuring, true)]
+    [InlineData(TemplateJobState.Sealing, true)]
+    [InlineData(TemplateJobState.Verifying, true)]
+    [InlineData(TemplateJobState.Preparing, false)] // only copies disks, holds no VM
+    public async Task Worker_CountsJobVmsAgainstMaxConcurrentVms(TemplateJobState jobState, bool blocks)
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql, Settings());
+        var worker = h.Get<OrchestratorWorker>();
+        var id = await h.SeedTaskAsync(RunStatus.Queued);
+        await using (var db = h.NewContext())
+        {
+            var template = await db.Templates.SingleAsync(t => t.Id == "win10", Ct);
+            var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "J", Role = UserRole.Admin };
+            db.Users.Add(user);
+            db.TemplateJobs.Add(new TemplateJob
+            {
+                Id = Guid.NewGuid(), Kind = TemplateJobKind.Edit, TemplateId = template.Id, BaseVersionId = template.CurrentVersionId!.Value,
+                Network = NetworkMode.Simulated, State = jobState, RequestedByUserId = user.Id, CreatedAt = h.Time.GetUtcNow(),
+            });
+            await db.SaveChangesAsync(Ct);
+        }
+        try
+        {
+            var claimed = await worker.ClaimAndStartAsync(Ct);
+            if (blocks)
+            {
+                Assert.Empty(claimed);
+                Assert.Equal(RunStatus.Queued, await h.StatusOfAsync(id));
+            }
+            else
+            {
+                Assert.Equal([id], claimed);
+            }
+        }
+        finally
+        {
+            await worker.StopRunsAsync();
+        }
+    }
+
     [Fact]
     public async Task Worker_LowDisk_ClaimsNothing()
     {
