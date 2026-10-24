@@ -26,7 +26,7 @@ public sealed class SqlServerFixture : IAsyncLifetime
     /// container's 2 GB pool, and with hundreds of them the server starts refusing queries ("insufficient system memory").
     /// Tests in the "sql" collection run one at a time and none uses more than a few databases, so the oldest are done.
     /// </summary>
-    private const int KeptDatabases = 200;
+    private const int KeptDatabases = 40;
 
     private readonly Queue<string> _databases = new();
 
