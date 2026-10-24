@@ -1,7 +1,7 @@
 import { type FormEvent, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ApiError, listOrgs, submitTask } from '../api/client'
-import type { NetworkMode, OrgDto, ProblemDetails } from '../api/types'
+import { ApiError, listOrgs, listTemplates, submitTask } from '../api/client'
+import type { NetworkMode, OrgDto, ProblemDetails, TemplateSummaryDto } from '../api/types'
 import styles from './forms.module.css'
 
 type FieldErrors = Record<string, string[]>
@@ -37,6 +37,8 @@ export default function SubmitPage() {
   const navigate = useNavigate()
   const [orgs, setOrgs] = useState<OrgDto[] | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [templates, setTemplates] = useState<TemplateSummaryDto[]>([])
+  const [image, setImage] = useState('')
   const [orgId, setOrgId] = useState('')
   const [file, setFile] = useState<File | null>(null)
   const [url, setUrl] = useState('')
@@ -54,10 +56,20 @@ export default function SubmitPage() {
       (o) => !cancelled && setOrgs(o),
       (e: unknown) => !cancelled && setLoadError(e instanceof Error ? e.message : 'Could not load organizations.'),
     )
+    listTemplates().then(
+      (t) => {
+        if (cancelled) return
+        setTemplates(t)
+        setImage((t.find((x) => x.isDefault) ?? t[0])?.id ?? '')
+      },
+      (e: unknown) => !cancelled && setLoadError(e instanceof Error ? e.message : 'Could not load templates.'),
+    )
     return () => {
       cancelled = true
     }
   }, [])
+  // A single enabled template is the only choice, so the picker (and the image field) stay out of the way.
+  const pickTemplate = templates.length > 1
 
   function validate(): FieldErrors {
     const e: FieldErrors = {}
@@ -89,6 +101,7 @@ export default function SubmitPage() {
     form.set('networkMode', networkMode)
     form.set('durationSec', String(Number(durationSec)))
     form.set('interactive', String(interactive))
+    if (pickTemplate && image) form.set('image', image)
     if (networkMode === 'LiveVpn') form.set('exitCountry', exitCountry.trim())
 
     setSubmitting(true)
@@ -111,7 +124,7 @@ export default function SubmitPage() {
   const sourceErrors = errors.source ?? (errors.file && errors.url && errors.file[0] === errors.url[0] ? errors.file : undefined)
   const fileErrors = sourceErrors ? undefined : errors.file
   const urlErrors = sourceErrors ? undefined : errors.url
-  const known = new Set(['orgId', 'file', 'url', 'source', 'networkMode', 'exitCountry', 'durationSec', 'interactive'])
+  const known = new Set(['orgId', 'file', 'url', 'source', 'networkMode', 'exitCountry', 'durationSec', 'interactive', 'image'])
   const otherErrors = Object.entries(errors).filter(([k]) => !known.has(k)).flatMap(([k, v]) => v.map((m) => `${k}: ${m}`))
 
   return (
@@ -129,6 +142,18 @@ export default function SubmitPage() {
           </select>
           <Errors id="orgId-error" messages={errors.orgId} />
         </div>
+
+        {pickTemplate && (
+          <div className={styles.field}>
+            <label htmlFor="image">Template</label>
+            <select id="image" value={image} onChange={(e) => setImage(e.target.value)} aria-describedby="image-error">
+              {templates.map((t) => (
+                <option key={t.id} value={t.id}>{t.displayName}</option>
+              ))}
+            </select>
+            <Errors id="image-error" messages={errors.image} />
+          </div>
+        )}
 
         <div className={styles.field}>
           <label htmlFor="file">File</label>

@@ -1,15 +1,16 @@
 .controls { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.5rem; }
 .chips { display: flex; gap: 0.35rem; }
-.chip { padding: 0.15rem 0.7rem; border: 1px solid #cbd5e1; border-radius: 999px; background: #fff; font-size: 0.85rem; }
-.on { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
-.search { padding: 0.3rem 0.5rem; border: 1px solid #cbd5e1; border-radius: 6px; font: inherit; min-width: 14rem; }
-.count { color: #64748b; font-size: 0.85rem; }
-.scroller { overflow-y: auto; border: 1px solid #e2e8f0; background: #fff; }
+.chip { padding: 0.15rem 0.7rem; border: 1px solid var(--mx-control); border-radius: 999px; background: var(--mx-surface); font-size: 0.85rem; }
+.chip:hover { background: var(--mx-raised); }
+.on, .on:hover { background: var(--mx-accent); border-color: var(--mx-accent); color: var(--mx-accent-ink); }
+.search { padding: 0.3rem 0.5rem; border: 1px solid var(--mx-control); border-radius: var(--mx-radius-control); background: var(--mx-surface); font: inherit; min-width: 14rem; }
+.count { color: var(--mx-muted); font-size: 0.85rem; }
+.scroller { overflow-y: auto; border: 1px solid var(--mx-border); border-radius: var(--mx-radius-panel); background: var(--mx-surface); }
 .table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-.table th { position: sticky; top: 0; background: #f8fafc; text-align: left; font-size: 0.75rem; text-transform: uppercase; color: #64748b; padding: 0.35rem 0.5rem; }
+.table th { position: sticky; top: 0; background: var(--mx-raised); text-align: left; font-family: var(--mx-font-mono); font-size: 0.7rem; text-transform: uppercase; color: var(--mx-muted); padding: 0.35rem 0.5rem; }
 .table th:nth-child(1) { width: 6.5rem; }
 .table th:nth-child(2) { width: 5.5rem; }
 .table th:nth-child(3) { width: 4.5rem; }
-.table td { padding: 0 0.5rem; border-bottom: 1px solid #f1f5f9; font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.6; }
-.time { color: #64748b; }
-.summary { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.table td { padding: 0 0.5rem; border-bottom: 1px solid var(--mx-border); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.6; }
+.time { color: var(--mx-muted); font-family: var(--mx-font-mono); font-size: 0.8rem; }
+.summary { font-family: var(--mx-font-mono); font-size: 0.8rem; }

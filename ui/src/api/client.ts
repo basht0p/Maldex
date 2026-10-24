@@ -1,5 +1,6 @@
 import { getAccessToken } from '../auth/auth'
 import type {
+  AdminTemplateDto,
   ArtifactDto,
   EventsQuery,
   LiveEventDto,
@@ -10,6 +11,7 @@ import type {
   TaskDto,
   TaskListDto,
   TaskListQuery,
+  TemplateSummaryDto,
 } from './types'
 
 /** A non-2xx response. `problem` is the parsed body (ProblemDetails for JSON, the raw text otherwise, or undefined when empty). */
@@ -86,3 +88,10 @@ export const getEvents = (id: string, q: EventsQuery = {}) =>
   get<LiveEventDto[]>(`/api/tasks/${encodeURIComponent(id)}/events${query({ afterId: q.afterId, type: q.type, take: q.take })}`)
 export const listArtifacts = (id: string) => get<ArtifactDto[]>(`/api/tasks/${encodeURIComponent(id)}/artifacts`)
 export const getTunnelToken = (id: string) => get<{ token: string }>(`/api/tasks/${encodeURIComponent(id)}/tunnel-token`)
+
+export const listTemplates = () => get<TemplateSummaryDto[]>('/api/templates')
+export const listAdminTemplates = () => get<AdminTemplateDto[]>('/api/admin/templates')
+export const setDefaultTemplate = (id: string) => post<void>(`/api/admin/templates/${encodeURIComponent(id)}/default`)
+export const setTemplateEnabled = (id: string, enabled: boolean) => post<void>(`/api/admin/templates/${encodeURIComponent(id)}/enabled`, { enabled })
+/** Makes the kept previous version current again; returns the updated template. */
+export const rollBackTemplate = (id: string) => post<AdminTemplateDto>(`/api/admin/templates/${encodeURIComponent(id)}/rollback`)

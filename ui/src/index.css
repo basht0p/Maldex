@@ -1,11 +1,19 @@
 :root {
-  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  color: #0f172a;
-  background: #f8fafc;
+  /* The self-hosted variable build registers as "Martian Mono Variable"; the tokens name "Martian Mono". */
+  --mx-font-mono: 'Martian Mono Variable', 'Martian Mono', ui-monospace, Menlo, monospace;
+  font-family: var(--mx-font-ui);
+  color: var(--mx-text);
+  background: var(--mx-bg);
   line-height: 1.45;
 }
 * { box-sizing: border-box; }
-body { margin: 0; }
-a { color: #1d4ed8; }
-h1 { font-size: 1.4rem; margin: 0 0 1rem; }
-button { font: inherit; cursor: pointer; }
+body { margin: 0; background: var(--mx-bg); color: var(--mx-text); }
+a { color: var(--mx-accent); }
+a:hover { color: var(--mx-accent-hover); }
+a:active { color: var(--mx-accent-pressed); }
+h1 { font-size: 1.4rem; font-weight: 600; margin: 0 0 1rem; }
+h2 { font-weight: 600; }
+button, input, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--mx-accent); outline-offset: 2px; }
+::selection { background: var(--mx-accent); color: var(--mx-accent-ink); }

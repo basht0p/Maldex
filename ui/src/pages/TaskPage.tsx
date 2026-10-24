@@ -137,6 +137,12 @@ function LiveTask({ taskId }: { taskId: string }) {
         <button type="button" className={forms.secondary} disabled={!stoppable || busy} onClick={() => act(() => stopTask(taskId))}>Stop</button>
       </div>
       {target && <p className={styles.mono}>{safeText(target)}</p>}
+      {task && (
+        <p className={styles.meta}>
+          <span className={styles.metaLabel}>{task.template ? 'Template' : 'Image'}</span>
+          <span className={styles.mono}>{safeText(task.template ? task.template.summary : task.image)}</span>
+        </p>
+      )}
       {actionError && <p className={styles.error} role="alert">{actionError}</p>}
       {(liveNow?.reason ?? task?.failureReason) && <p className={styles.error}>{safeText(liveNow?.reason ?? task?.failureReason)}</p>}
 
