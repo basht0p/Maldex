@@ -46,6 +46,7 @@ builder.Services.AddSingleton<PdfRenderer>();
 // Real-time surface: the hub carries live status/process/event pushes; enums go over the wire as strings, like the REST DTOs.
 builder.Services.AddSignalR().AddJsonProtocol(o => o.PayloadSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddSingleton<ITaskEventPublisher, SignalRTaskEventPublisher>();
+builder.Services.AddMaldexTemplateCatalog(builder.Configuration);
 builder.Services.AddMaldexOrchestrator(builder.Configuration);
 builder.Services.AddMaldexProcessing(builder.Configuration);
 // The orchestrator and processing workers run inside the web host only when Maldex:Workers:Enabled (default true).
