@@ -355,14 +355,12 @@ public sealed class TemplateCoordinator(
             }
 
             var stale = $"the working copy still runs agent {GuestText.Clean(ready.AgentVersion, 100)}; the agent could not be updated";
-            using var budget = new CancellationTokenSource(o.ProvenanceTimeout, time);
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, budget.Token);
             ProvenanceMessage answer;
             try
             {
-                answer = await session.AskProvenanceAsync(linked.Token).ConfigureAwait(false);
+                answer = await session.AskProvenanceWithRetryAsync(o.ProvenanceRetryInterval, o.ProvenanceTimeout, time, ct).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (budget.IsCancellationRequested && !ct.IsCancellationRequested)
+            catch (TimeoutException)
             {
                 throw new JobFailedException(stale); // too old to know the command, or hung
             }
