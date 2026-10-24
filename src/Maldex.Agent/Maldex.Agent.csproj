@@ -10,6 +10,7 @@
   <ItemGroup>
     <PackageReference Include="System.Diagnostics.EventLog" />
     <PackageReference Include="System.Drawing.Common" />
+    <PackageReference Include="System.Management" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Maldex.Core\Maldex.Core.csproj" />

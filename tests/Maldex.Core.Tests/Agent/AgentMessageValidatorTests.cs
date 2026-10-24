@@ -92,4 +92,20 @@ public class AgentMessageValidatorTests
         Assert.NotNull(AgentMessageValidator.Validate(new DnsEventMessage(T, 1, "a.com", null, ["1.1.1.1", null!])));
         Assert.Null(AgentMessageValidator.Validate(new DnsEventMessage(T, 1, "a.com", null, ["1.1.1.1"])));
     }
+
+    [Fact]
+    public void Provenance_ValidatesFields()
+    {
+        Assert.Null(AgentMessageValidator.Validate(new ProvenanceMessage("c", "Windows 11 Pro", "26300.1", "1.0.0+3fa9c1d2e4b5", null, null)));
+        Assert.Null(AgentMessageValidator.Validate(new ProvenanceMessage("c", new string('e', 100), new string('1', 32), new string('v', 32), true, false)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("", "e", "1", "v", null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", new string('e', 101), "1", "v", null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", "e", new string('1', 33), "v", null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", "e", "1", new string('v', 33), null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", "  ", "1", "v", null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", "e", "", "v", null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", "e", "1", " ", null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", "e", "1", "v\u0007x", null, null)));
+        Assert.NotNull(AgentMessageValidator.Validate(new ProvenanceMessage("c", null!, "1", "v", null, null)));
+    }
 }

@@ -185,6 +185,11 @@ public sealed class ReplayAgentChannel : IAgentChannel
                 Enqueue(new CommandResultMessage(c.CommandId, true));
                 _opened.TrySetResult();
                 break;
+            case ProvenanceCommand c:
+                Enqueue(new ProvenanceMessage(c.CommandId, _guest!.ProvenanceEdition, _guest.ProvenanceBuild, _guest.ProvenanceAgentVersion,
+                    _guest.ProvenanceOfficePresent, _guest.ProvenanceRealTimeProtection));
+                Enqueue(new CommandResultMessage(c.CommandId, true));
+                break;
             case OpenUrlCommand:
                 _opened.TrySetResult();
                 break;

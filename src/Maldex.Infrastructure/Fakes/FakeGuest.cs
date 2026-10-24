@@ -47,6 +47,13 @@ public sealed class FakeGuest
     /// <summary>When true, the fake guest never answers a self-test.</summary>
     public bool SilentSelfTest { get; set; }
 
+    /// <summary>What the fake guest answers to <c>provenance</c>.</summary>
+    public string ProvenanceEdition { get; set; } = "Windows 11 Pro";
+    public string ProvenanceBuild { get; set; } = "26300.1";
+    public string ProvenanceAgentVersion { get; set; } = "0.1.0-fake";
+    public bool? ProvenanceOfficePresent { get; set; } = false;
+    public bool? ProvenanceRealTimeProtection { get; set; } = false;
+
     public void SetReachable(string probe) => _reachable[probe] = 0;
 
     private readonly ConcurrentDictionary<Guid, NetworkMode> _modeByTask = new();

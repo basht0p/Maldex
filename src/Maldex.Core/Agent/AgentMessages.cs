@@ -38,6 +38,7 @@ public static class AgentJson
 [JsonDerivedType(typeof(CommandResultMessage), "command_result")]
 [JsonDerivedType(typeof(FileChunkMessage), "file_chunk")]
 [JsonDerivedType(typeof(SelfTestResultMessage), "self_test_result")]
+[JsonDerivedType(typeof(ProvenanceMessage), "provenance")]
 public abstract record AgentMessage;
 
 /// <param name="Pid">The agent's own process id (additive; null from older agents). Processes it launches (the opened sample)
@@ -82,6 +83,7 @@ public sealed record FileChunkMessage(
 [JsonDerivedType(typeof(PutFileChunkCommand), "put_file_chunk")]
 [JsonDerivedType(typeof(CollectFileCommand), "collect_file")]
 [JsonDerivedType(typeof(SelfTestCommand), "self_test")]
+[JsonDerivedType(typeof(ProvenanceCommand), "provenance")]
 public abstract record AgentCommand(string CommandId);
 
 public sealed record OpenSampleCommand(string CommandId, string FileName, string BlobKey) : AgentCommand(CommandId);
@@ -119,6 +121,16 @@ public sealed record ProbeResult(string Name, bool Reachable);
 /// </summary>
 public sealed record SelfTestResultMessage(DateTimeOffset At, string CommandId, IReadOnlyList<ProbeResult> Probes, string? EchoBody,
     IReadOnlyList<string>? GuestAddresses = null) : AgentMessage;
+
+/// <summary>Asks the guest for a read-only provenance report; it answers with a <see cref="ProvenanceMessage"/> then a command result.</summary>
+public sealed record ProvenanceCommand(string CommandId) : AgentCommand(CommandId);
+
+/// <summary>
+/// The guest's answer to a <see cref="ProvenanceCommand"/> (<c>CommandId</c> is the command's). UNTRUSTED. <c>AgentVersion</c> is the
+/// agent's build identity (<c>version+sha256-prefix</c> of its exe). <c>OfficePresent</c> and <c>RealTimeProtectionEnabled</c> are null when unknown.
+/// </summary>
+public sealed record ProvenanceMessage(string CommandId, string WindowsEdition, string WindowsBuild, string AgentVersion,
+    bool? OfficePresent, bool? RealTimeProtectionEnabled) : AgentMessage;
 
 /// <summary>Limits shared by both ends of a bulk transfer.</summary>
 public static class AgentLimits

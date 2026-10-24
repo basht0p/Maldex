@@ -19,10 +19,11 @@ public sealed class CommandDispatcher : IDisposable
     private readonly InboundTransfers _inbound;
     private readonly TimeProvider _time;
     private readonly ISelfTestProbes _probes;
+    private readonly IProvenanceProbe? _provenance;
 
     /// <param name="desktopDirectory">Where delivered samples are placed; defaults to %USERPROFILE%\Desktop.</param>
     /// <param name="stagingDirectory">Where in-flight chunks are buffered; defaults to a folder under the temp directory.</param>
-    public CommandDispatcher(ISampleOpener sample, IUrlOpener url, Action requestStop, string? desktopDirectory = null, string? stagingDirectory = null, TimeProvider? time = null, ISelfTestProbes? probes = null)
+    public CommandDispatcher(ISampleOpener sample, IUrlOpener url, Action requestStop, string? desktopDirectory = null, string? stagingDirectory = null, TimeProvider? time = null, ISelfTestProbes? probes = null, IProvenanceProbe? provenance = null)
     {
         _sample = sample;
         _url = url;
@@ -32,6 +33,7 @@ public sealed class CommandDispatcher : IDisposable
         _inbound = new InboundTransfers(stagingDirectory ?? Path.Combine(Path.GetTempPath(), "maldex-inbound"));
         _time = time ?? TimeProvider.System;
         _probes = probes ?? new SelfTestProbes();
+        _provenance = provenance;
     }
 
     /// <summary>Called by the host once the result for <paramref name="command"/> has been written.</summary>
@@ -66,6 +68,12 @@ public sealed class CommandDispatcher : IDisposable
                 case SelfTestCommand c:
                     if (emit is null) return new CommandResultMessage(c.CommandId, false, "self_test is not available here");
                     await emit(await _probes.RunAsync(c, ct).ConfigureAwait(false), ct).ConfigureAwait(false);
+                    return new CommandResultMessage(c.CommandId, true);
+                case ProvenanceCommand c:
+                    if (emit is null || _provenance is null) return new CommandResultMessage(c.CommandId, false, "provenance is not available here");
+                    var report = _provenance.Probe();
+                    await emit(new ProvenanceMessage(c.CommandId, report.WindowsEdition, report.WindowsBuild, AgentHost.BuildId,
+                        report.OfficePresent, report.RealTimeProtectionEnabled), ct).ConfigureAwait(false);
                     return new CommandResultMessage(c.CommandId, true);
                 default:
                     return new CommandResultMessage(command.CommandId, false, "unsupported command");

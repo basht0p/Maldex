@@ -25,6 +25,7 @@ public static class AgentMessageValidator
         CommandResultMessage m => Req(m.CommandId, "CommandId"),
         FileChunkMessage m => ValidateFileChunk(m),
         SelfTestResultMessage m => ValidateSelfTest(m),
+        ProvenanceMessage m => ValidateProvenance(m),
         _ => "Unknown message type.",
     };
 
@@ -36,6 +37,24 @@ public static class AgentMessageValidator
     private const int MaxEchoChars = 256;
     private const int MaxGuestAddresses = 16;
     private const int MaxIpChars = 45;
+
+    private const int MaxEditionChars = 100;
+    private const int MaxVersionChars = 32;
+
+    private static string? ValidateProvenance(ProvenanceMessage m) =>
+        (string.IsNullOrEmpty(m.CommandId) || m.CommandId.Length > MaxIdChars ? "CommandId is missing or too long." : null)
+        ?? PrintableText(m.WindowsEdition, "WindowsEdition", MaxEditionChars)
+        ?? PrintableText(m.WindowsBuild, "WindowsBuild", MaxVersionChars)
+        ?? PrintableText(m.AgentVersion, "AgentVersion", MaxVersionChars);
+
+    private static string? PrintableText(string? s, string name, int max)
+    {
+        if (s is null || s.Trim().Length == 0) return $"{name} is missing.";
+        if (s.Length > max) return $"{name} is too long.";
+        foreach (var c in s)
+            if (char.IsControl(c)) return $"{name} is not printable.";
+        return null;
+    }
 
     private static string? ValidateSelfTest(SelfTestResultMessage m)
     {
