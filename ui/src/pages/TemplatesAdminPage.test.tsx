@@ -29,7 +29,7 @@ const version = (over: Partial<TemplateVersionDto>): TemplateVersionDto => ({
 const v3 = version({
   id: 'g3', number: 3, origin: 'Edit', isCurrent: true, windowsEdition: 'Windows 11 Pro', windowsBuild: '26300', agentVersion: '1.0.0', sealedBy: 'basht0p',
 })
-const v2 = version({ id: 'g2', number: 2, origin: 'Refresh', status: 'Retired' })
+const v2 = version({ id: 'g2', number: 2, origin: 'Refresh', status: 'Ready' })
 const v1 = version({ id: 'g1', number: 1, origin: 'IsoBuild', status: 'Deleted', diskPresent: false })
 
 const golden = (over: Partial<AdminTemplateDto> = {}): AdminTemplateDto => ({
@@ -77,11 +77,59 @@ describe('TemplatesAdminPage', () => {
     const rows = within(g).getAllByRole('row').slice(1)
     expect(rows).toHaveLength(3)
     expect(rows[0]).toHaveTextContent(/v3.*Edit.*Ready/)
-    expect(rows[1]).toHaveTextContent(/v2.*Refresh.*Retired.*Disk missing/)
+    expect(rows[1]).toHaveTextContent(/v2.*Refresh.*Ready.*Disk missing/)
     expect(rows[2]).toHaveTextContent(/v1.*IsoBuild.*Deleted/)
     // a Deleted version has no disk by design: no warning there
     expect(within(rows[2]).queryByText('Disk missing')).toBeNull()
     expect(within(g).getAllByText('Disk missing')).toHaveLength(1)
+  })
+
+  it('keeps only a Ready non-current version: Retired history means no previous version and Roll back is disabled', async () => {
+    const retired = version({ id: 'r2', number: 2, status: 'Retired' })
+    listAdminTemplates.mockResolvedValue([golden({ versions: [v3, retired, v1] })])
+    renderPage()
+    const g = await region('Windows 11 Golden')
+    expect(within(g).getByText('No previous version kept')).toBeInTheDocument()
+    expect(within(g).getByRole('button', { name: 'Roll back' })).toBeDisabled()
+  })
+
+  it('names exactly the Ready previous version in the confirmation', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const v4 = version({ id: 'g4', number: 4, isCurrent: true, origin: 'Edit' })
+    const v3r = version({ id: 'r3', number: 3, status: 'Retired' })
+    const v2r = version({ id: 'g2', number: 2, status: 'Ready' })
+    listAdminTemplates.mockResolvedValue([golden({ current: v4, versions: [v4, v3r, v2r] })])
+    renderPage()
+    const g = await region('Windows 11 Golden')
+    expect(within(g).getByText('Previous kept: v2')).toBeInTheDocument()
+    await userEvent.click(within(g).getByRole('button', { name: 'Roll back' }))
+    expect(confirm).toHaveBeenCalledTimes(1)
+    const text = String(confirm.mock.calls[0][0])
+    expect(text).toContain('v2')
+    expect(text).not.toContain('v3')
+  })
+
+  it('shows a Ready previous version whose disk is missing as kept, with a warning, and disables Roll back', async () => {
+    listAdminTemplates.mockResolvedValue([golden({ versions: [v3, version({ ...v2, diskPresent: false })] })])
+    renderPage()
+    const g = await region('Windows 11 Golden')
+    expect(within(g).getByText('Previous kept: v2')).toBeInTheDocument()
+    expect(within(g).getAllByText('Disk missing').length).toBeGreaterThan(0)
+    const btn = within(g).getByRole('button', { name: 'Roll back' })
+    expect(btn).toBeDisabled()
+    expect(btn).toHaveAttribute('title', expect.stringMatching(/disk is missing/i))
+  })
+
+  it.each([
+    [true, 'Office ✓'],
+    [false, 'Office ✗'],
+    [null, 'Office unknown'],
+  ])('shows Office presence (%s) in the current-version summary', async (officePresent, text) => {
+    const cur = version({ ...v3, officePresent })
+    listAdminTemplates.mockResolvedValue([golden({ current: cur, versions: [cur] })])
+    renderPage()
+    const g = await region('Windows 11 Golden')
+    expect(within(g).getByText(text)).toBeInTheDocument()
   })
 
   it('does not warn when every disk is present', async () => {

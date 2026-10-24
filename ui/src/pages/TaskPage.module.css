@@ -3,7 +3,7 @@
 .spacer { flex: 1; }
 .countdown { font-family: var(--mx-font-mono); font-variant-numeric: tabular-nums; font-weight: 700; }
 .mono { font-family: var(--mx-font-mono); font-size: 0.8rem; overflow-wrap: anywhere; }
-.offline { color: var(--mx-warning); font-size: 0.85rem; }
+.offline { color: var(--mx-muted); font-size: 0.85rem; }
 .links { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; margin: 0.5rem 0 1rem; }
 .error { color: var(--mx-critical); margin: 0.5rem 0; }
 .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; margin-bottom: 1rem; }

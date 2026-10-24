@@ -23,15 +23,20 @@ function versionSummary(v: TemplateVersionDto): string {
   return `v${v.number} (${parts.join(', ')})`
 }
 
-/** The version a roll back returns to: the newest non-current version that still has its disk. */
-function rollbackTarget(t: AdminTemplateDto): TemplateVersionDto | undefined {
-  return t.versions.filter((v) => !v.isCurrent && v.status !== 'Deleted' && v.diskPresent).sort((a, b) => b.number - a.number)[0]
+/** The version the server keeps and rolls back to: the newest non-current Ready version (its disk may still be missing). */
+function keptPrevious(t: AdminTemplateDto): TemplateVersionDto | undefined {
+  return t.versions.filter((v) => !v.isCurrent && v.status === 'Ready').sort((a, b) => b.number - a.number)[0]
+}
+
+function officeLabel(present: boolean | null | undefined): string {
+  return present == null ? 'Office unknown' : present ? 'Office ✓' : 'Office ✗'
 }
 
 function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; onChanged: () => Promise<void> }) {
   const [errors, setErrors] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
-  const previous = rollbackTarget(t)
+  const previous = keptPrevious(t)
+  const previousDiskMissing = previous !== undefined && !previous.diskPresent
   const headingId = `template-${t.id}`
 
   async function run(action: () => Promise<unknown>) {
@@ -67,12 +72,15 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
           Enabled
         </label>
         <button type="button" className={styles.secondary} disabled={busy || t.isDefault} onClick={() => void run(() => setDefaultTemplate(t.id))}>Set as default</button>
-        <button type="button" className={styles.secondary} disabled={busy || !previous} onClick={rollBack}>Roll back</button>
+        <button type="button" className={styles.secondary} disabled={busy || !previous || previousDiskMissing} title={previousDiskMissing ? `Cannot roll back: the disk is missing for v${previous.number}.` : undefined} onClick={rollBack}>Roll back</button>
       </div>
       {t.description && <p className={styles.hint}>{t.description}</p>}
       {errors.map((m, i) => <p key={i} className={styles.error} role="alert">{m}</p>)}
       <p className={page.summary}>
-        {t.current ? <span className={styles.mono}>{`Current: ${versionSummary(t.current)}`}</span> : <span className={styles.hint}>No current version</span>}
+        {t.current ? <>
+            <span className={styles.mono}>{`Current: ${versionSummary(t.current)}`}</span>{' '}
+            <span className={styles.hint}>{officeLabel(t.current.officePresent)}</span>
+          </> : <span className={styles.hint}>No current version</span>}
       </p>
       <p className={page.summary}>
         {previous ? <span className={styles.mono}>{`Previous kept: v${previous.number}`}</span> : <span className={styles.hint}>No previous version kept</span>}

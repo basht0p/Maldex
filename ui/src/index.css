@@ -1,4 +1,6 @@
 :root {
+  /* The self-hosted variable build registers as "Martian Mono Variable"; the tokens name "Martian Mono". */
+  --mx-font-mono: 'Martian Mono Variable', 'Martian Mono', ui-monospace, Menlo, monospace;
   font-family: var(--mx-font-ui);
   color: var(--mx-text);
   background: var(--mx-bg);

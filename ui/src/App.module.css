@@ -20,7 +20,7 @@
 }
 :root[data-theme="light"] .markDark { display: none; }
 :root[data-theme="light"] .markLight { display: block; }
-.wordmark { font-family: var(--mx-font-mono); font-weight: 700; font-stretch: 112.5%; letter-spacing: 0.04em; color: var(--mx-text); }
+.wordmark { font-family: var(--mx-font-mono); font-weight: 700; font-stretch: 112.5%; font-variation-settings: "wdth" 112.5; letter-spacing: 0.04em; color: var(--mx-text); }
 .wordmark span { color: var(--mx-accent); }
 .spacer { flex: 1; }
 .user { font-size: 0.85rem; color: var(--mx-muted); }
