@@ -12,19 +12,20 @@ let submitCalls = 0
 const WIN11 = { id: 'win11-26h2', displayName: 'Windows 11 26H2', isDefault: true }
 const GOLDEN = { id: 'win11-golden', displayName: 'Windows 11 Golden', isDefault: false }
 
-let templatesFetched = false
+// Set once the mocked /api/templates response has been sent to the page (not merely requested).
+let templatesAnswered = false
 const server = setupServer(
   http.get('/api/orgs', () => HttpResponse.json([ORG])),
-  http.get('/api/templates', () => {
-    templatesFetched = true
-    return HttpResponse.json([WIN11])
-  }),
+  http.get('/api/templates', () => HttpResponse.json([WIN11])),
 )
+server.events.on('response:mocked', ({ request }) => {
+  if (new URL(request.url).pathname === '/api/templates') templatesAnswered = true
+})
 beforeAll(() => server.listen({ onUnhandledFrame: 'error' }))
 afterEach(() => {
   server.resetHandlers()
   submitCalls = 0
-  templatesFetched = false
+  templatesAnswered = false
 })
 afterAll(() => server.close())
 
@@ -210,12 +211,11 @@ describe('SubmitPage', () => {
         }),
       )
       await renderPage()
-      await waitFor(() => expect(templatesFetched).toBe(true))
-      await new Promise((r) => setTimeout(r, 20))
-      expect(screen.queryByLabelText('Template')).toBeNull()
+      await waitFor(() => expect(templatesAnswered).toBe(true))
 
       await userEvent.selectOptions(screen.getByLabelText(/organization/i), ORG.id)
       await userEvent.type(screen.getByLabelText(/url/i), 'https://example.com/a')
+      expect(screen.queryByLabelText('Template')).toBeNull() // the list has long been applied by now
       await submit()
       await waitFor(() => expect(screen.getByText('task page placeholder')).toBeInTheDocument())
       expect(form?.has('image')).toBe(false)
