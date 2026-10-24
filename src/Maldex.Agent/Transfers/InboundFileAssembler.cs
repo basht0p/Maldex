@@ -5,8 +5,8 @@ namespace Maldex.Agent.Transfers;
 
 /// <summary>
 /// Reassembles a file delivered in sequential chunks (at most <see cref="ChunkBytes"/> raw each) and verifies its SHA-256 before
-/// exposing it. Limits: <see cref="MaxChunks"/> chunks and <see cref="MaxTotalBytes"/> bytes per file; a hash mismatch deletes
-/// the partial data. Everything the host sends is bounds-checked here even though the host is trusted, because this is the
+/// exposing it. Limits: <see cref="MaxChunks"/> chunks and <see cref="MaxTotalBytes"/> bytes per file (component files, see
+/// <see cref="AgentLimits.ComponentTransferPrefix"/>, get the larger component limits); a hash mismatch deletes the partial data. Everything the host sends is bounds-checked here even though the host is trusted, because this is the
 /// last line of defence for the guest's disk.
 /// </summary>
 public sealed class InboundFileAssembler : IDisposable
@@ -22,6 +22,8 @@ public sealed class InboundFileAssembler : IDisposable
 
     private readonly FileStream _file;
     private readonly IncrementalHash _hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+    private readonly int _maxChunks;
+    private readonly long _maxTotalBytes;
     private readonly string _expectedSha256;
     private readonly int _expectedCount;
     private readonly long _expectedTotal;
@@ -33,10 +35,13 @@ public sealed class InboundFileAssembler : IDisposable
 
     /// <param name="expectedCount">Chunk count the sender declared (0 = not declared).</param>
     /// <param name="expectedTotal">Byte count the sender declared (-1 = not declared).</param>
-    public InboundFileAssembler(string directory, string fileName, string expectedSha256Hex, int expectedCount = 0, long expectedTotal = -1)
+    /// <param name="component">True for a Maldex component file, which may be larger than a sample.</param>
+    public InboundFileAssembler(string directory, string fileName, string expectedSha256Hex, int expectedCount = 0, long expectedTotal = -1, bool component = false)
     {
-        if (expectedCount is < 0 or > MaxChunks) throw new InvalidOperationException($"Chunk count {expectedCount} outside 1..{MaxChunks}.");
-        if (expectedTotal is < -1 or > MaxTotalBytes) throw new InvalidOperationException($"Total size {expectedTotal} exceeds {MaxTotalBytes} bytes.");
+        _maxChunks = component ? AgentLimits.MaxComponentChunks : MaxChunks;
+        _maxTotalBytes = component ? AgentLimits.MaxComponentBytes : MaxTotalBytes;
+        if (expectedCount < 0 || expectedCount > _maxChunks) throw new InvalidOperationException($"Chunk count {expectedCount} outside 1..{_maxChunks}.");
+        if (expectedTotal < -1 || expectedTotal > _maxTotalBytes) throw new InvalidOperationException($"Total size {expectedTotal} exceeds {_maxTotalBytes} bytes.");
         var safe = SanitizeFileName(fileName);
         Directory.CreateDirectory(directory);
         Path = System.IO.Path.Combine(directory, safe);
@@ -81,9 +86,9 @@ public sealed class InboundFileAssembler : IDisposable
             throw new InvalidOperationException($"Chunk {index} out of order; expected {_nextIndex}.");
         if (data.Length is 0 or > ChunkBytes)
             throw new InvalidOperationException($"Chunk size {data.Length} outside 1..{ChunkBytes}.");
-        if (_nextIndex >= (_expectedCount > 0 ? _expectedCount : MaxChunks))
+        if (_nextIndex >= (_expectedCount > 0 ? _expectedCount : _maxChunks))
             throw new InvalidOperationException("Too many chunks.");
-        if (_written + data.Length > (_expectedTotal >= 0 ? _expectedTotal : MaxTotalBytes))
+        if (_written + data.Length > (_expectedTotal >= 0 ? _expectedTotal : _maxTotalBytes))
             throw new InvalidOperationException("Transfer exceeds its declared size.");
         _file.Write(data);
         _hash.AppendData(data);

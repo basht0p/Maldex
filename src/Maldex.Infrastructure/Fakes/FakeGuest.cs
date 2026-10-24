@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Maldex.Core.Agent;
 using Maldex.Core.Domain;
 
 namespace Maldex.Infrastructure.Fakes;
@@ -53,6 +54,29 @@ public sealed class FakeGuest
     public string ProvenanceAgentVersion { get; set; } = "0.1.0-fake+000000000000";
     public bool? ProvenanceOfficePresent { get; set; } = false;
     public bool? ProvenanceRealTimeProtection { get; set; } = false;
+
+    private readonly ConcurrentQueue<string> _applied = new();
+
+    /// <summary>Transfer ids (agent, Sysmon config, CA) of every accepted <c>apply_components</c>, in the order the command named them.</summary>
+    public IReadOnlyList<string> AppliedComponentIds => _applied.ToArray();
+
+    /// <summary>When true, <c>apply_components</c> is refused (a guest whose install step fails).</summary>
+    public bool RejectApplyComponents { get; set; }
+
+    /// <summary>
+    /// Raised with the run's task id when a channel handles <c>power_off</c>: the VM has shut itself down. The fake hypervisor
+    /// listens so that it stops listing the VM, as libvirt would.
+    /// </summary>
+    public event Action<Guid>? PoweredOff;
+
+    internal void RecordApplied(ApplyComponentsCommand c)
+    {
+        _applied.Enqueue(c.AgentTransferId);
+        _applied.Enqueue(c.SysmonConfigTransferId);
+        _applied.Enqueue(c.CaCertTransferId);
+    }
+
+    internal void NotifyPoweredOff(Guid taskId) => PoweredOff?.Invoke(taskId);
 
     public void SetReachable(string probe) => _reachable[probe] = 0;
 

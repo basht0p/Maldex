@@ -20,6 +20,8 @@ public static class AgentRunner
         if (!created) return 0; // another instance already owns this machine
 
         AgentLog.Write($"Agent {AgentHost.Version} starting");
+        // A finished apply_components swap leaves the previous build as exe.old; the new build is the one running now.
+        if (Environment.ProcessPath is { } self) AgentExeSwap.DeleteStale(self);
         GdiScreenshotGrabber.EnableDpiAwareness();
         var time = TimeProvider.System;
         var shutdown = false;
@@ -34,7 +36,8 @@ public static class AgentRunner
             var started = time.GetTimestamp();
             await using (port)
             {
-                using var dispatcher = new CommandDispatcher(new ShellSampleOpener(), new ShellUrlOpener(), () => shutdown = true, provenance: new WindowsProvenanceProbe());
+                using var dispatcher = new CommandDispatcher(new ShellSampleOpener(), new ShellUrlOpener(), () => shutdown = true, provenance: new WindowsProvenanceProbe(),
+                    components: new WindowsComponentInstaller(), power: new WindowsPowerController());
                 var source = new CompositeEventSource([
                     SysmonPresent() ? new SysmonEventSource() : new ProcessPollingSource(time),
                     new ScreenshotEventSource(new GdiScreenshotGrabber(), time),

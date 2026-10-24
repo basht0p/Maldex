@@ -84,6 +84,8 @@ public sealed record FileChunkMessage(
 [JsonDerivedType(typeof(CollectFileCommand), "collect_file")]
 [JsonDerivedType(typeof(SelfTestCommand), "self_test")]
 [JsonDerivedType(typeof(ProvenanceCommand), "provenance")]
+[JsonDerivedType(typeof(ApplyComponentsCommand), "apply_components")]
+[JsonDerivedType(typeof(PowerOffCommand), "power_off")]
 public abstract record AgentCommand(string CommandId);
 
 public sealed record OpenSampleCommand(string CommandId, string FileName, string BlobKey) : AgentCommand(CommandId);
@@ -126,6 +128,17 @@ public sealed record SelfTestResultMessage(DateTimeOffset At, string CommandId, 
 public sealed record ProvenanceCommand(string CommandId) : AgentCommand(CommandId);
 
 /// <summary>
+/// Installs the current Maldex components into a template, in order: the CA certificate (DER) into the machine Root store, the
+/// Sysmon configuration, then the new agent exe (swapped in; effective at the next start), then clears event logs and temp files.
+/// Each id names a file already delivered with <see cref="PutFileChunkCommand"/> and must start with
+/// <see cref="AgentLimits.ComponentTransferPrefix"/>. Only the template sealing service sends this; analyses never do.
+/// </summary>
+public sealed record ApplyComponentsCommand(string CommandId, string AgentTransferId, string SysmonConfigTransferId, string CaCertTransferId) : AgentCommand(CommandId);
+
+/// <summary>Acknowledges, then shuts the guest OS down once the result has been written. Only the template sealing service sends this.</summary>
+public sealed record PowerOffCommand(string CommandId) : AgentCommand(CommandId);
+
+/// <summary>
 /// The guest's answer to a <see cref="ProvenanceCommand"/> (<c>CommandId</c> is the command's). UNTRUSTED. <c>AgentVersion</c> is the
 /// agent's build identity (<c>version+sha256-prefix</c> of its exe). <c>OfficePresent</c> and <c>RealTimeProtectionEnabled</c> are null when unknown.
 /// </summary>
@@ -146,6 +159,18 @@ public static class AgentLimits
 
     /// <summary>Largest sample the guest buffers.</summary>
     public const long MaxInboundBytes = 32L * 1024 * 1024;
+
+    /// <summary>Transfer ids of Maldex component files (agent exe, Sysmon config, CA) start with this; samples never do.</summary>
+    public const string ComponentTransferPrefix = "components/";
+
+    /// <summary>Largest component file the guest buffers (the published agent exe is about 77 MB).</summary>
+    public const long MaxComponentBytes = 160L * 1024 * 1024;
+
+    /// <summary>Most chunks in one component transfer: <see cref="MaxComponentBytes"/> in full chunks.</summary>
+    public const int MaxComponentChunks = (int)(MaxComponentBytes / ChunkBytes);
+
+    public static bool IsComponentTransfer(string? transferId) =>
+        transferId is not null && transferId.StartsWith(ComponentTransferPrefix, StringComparison.Ordinal);
 }
 
 /// <summary>
