@@ -28,6 +28,20 @@ function keptPrevious(t: AdminTemplateDto): TemplateVersionDto | undefined {
   return t.versions.filter((v) => !v.isCurrent && v.status === 'Ready').sort((a, b) => b.number - a.number)[0]
 }
 
+/**
+ * What happens to the version a rollback replaces. The server keeps the newest previous Ready versions (KeepPrevious,
+ * at least one while there is a previous version to roll back to), so the replaced current version stays when no
+ * other kept version is newer than it.
+ */
+function replacedNote(t: AdminTemplateDto, target: TemplateVersionDto): string {
+  const current = t.current
+  if (!current) return ''
+  const newerKept = t.versions.some((v) => v.status === 'Ready' && v.id !== current.id && v.id !== target.id && v.number > current.number)
+  return newerKept
+    ? ` v${current.number} becomes a previous version; it is retired if newer previous versions fill the retention limit.`
+    : ` v${current.number} stays available as the previous version.`
+}
+
 function officeLabel(present: boolean | null | undefined): string {
   return present == null ? 'Office unknown' : present ? 'Office ✓' : 'Office ✗'
 }
@@ -55,7 +69,7 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
   function rollBack() {
     if (!previous) return
     const ok = window.confirm(
-      `Roll back ${t.displayName} to v${previous.number}? New tasks will use v${previous.number}. The version being replaced is retired.`,
+      `Roll back ${t.displayName} to v${previous.number}? New tasks will use v${previous.number}.${replacedNote(t, previous)}`,
     )
     if (ok) void run(() => rollBackTemplate(t.id))
   }

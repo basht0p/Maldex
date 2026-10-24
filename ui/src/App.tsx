@@ -44,7 +44,7 @@ export default function App() {
           <Route path="/tasks/:id" element={<TaskPage />} />
           <Route path="/admin/orgs" element={<OrgsAdminPage me={me} />} />
           <Route path="/admin/templates" element={<TemplatesAdminPage me={me} />} />
-        <Route path="*" element={<p>Page not found.</p>} />
+          <Route path="*" element={<p>Page not found.</p>} />
         </Routes>
       </main>
     </BrowserRouter>

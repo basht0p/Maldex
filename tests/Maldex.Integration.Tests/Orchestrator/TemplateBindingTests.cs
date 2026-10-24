@@ -39,15 +39,15 @@ public class TemplateBindingTests(SqlServerFixture sql)
             return h;
         })));
 
-    private static TemplateCatalog Catalog(MaldexDbContext db, TimeProvider time, int keepPrevious = 1) =>
-        new(db, Options.Create(new TemplateOptions { KeepPrevious = keepPrevious }), time);
+    private static TemplateCatalog Catalog(OrchestratorHarness h, MaldexDbContext db, int keepPrevious = 1) =>
+        new(db, h.Get<ITemplateStore>(), Options.Create(new TemplateOptions { KeepPrevious = keepPrevious }), h.Time);
 
     private static async Task PublishAsync(OrchestratorHarness h, TemplateVersion version, int keepPrevious = 1)
     {
         await using var db = h.NewContext();
         db.TemplateVersions.Add(version);
         await db.SaveChangesAsync(Ct);
-        await Catalog(db, h.Time, keepPrevious).PublishAsync(version.TemplateId, version.Id, Ct);
+        await Catalog(h, db, keepPrevious).PublishAsync(version.TemplateId, version.Id, Ct);
     }
 
     private static async Task<TemplateVersion> V1Async(OrchestratorHarness h)
@@ -135,6 +135,50 @@ public class TemplateBindingTests(SqlServerFixture sql)
         Assert.Empty(await h.Get<IEgressRouter>().ListAsync(Ct));
     }
 
+    /// <summary>Real mode on a database a fake-mode run imported into: the version's row is there, its disk is not.</summary>
+    private sealed class MissingStemsStore : ITemplateStore
+    {
+        public HashSet<string> Missing { get; } = [];
+        public bool Exists(string fileStem) => !Missing.Contains(fileStem);
+        public long? SizeOf(string fileStem) => null;
+        public Task DeleteAsync(string fileStem, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Run_DiskMissing_FailsAtOnceWithoutVm(bool alreadyBound)
+    {
+        SpyHypervisor? spy = null;
+        var store = new MissingStemsStore();
+        await using var h = await OrchestratorHarness.CreateAsync(sql, null, s =>
+        {
+            s.Replace(ServiceDescriptor.Singleton<ITemplateStore>(store));
+            s.Replace(ServiceDescriptor.Singleton<IHypervisor>(sp =>
+                spy = new SpyHypervisor(ActivatorUtilities.CreateInstance<Maldex.Infrastructure.Fakes.FakeHypervisor>(sp))));
+        });
+        var v1 = await V1Async(h);
+        store.Missing.Add(v1.FileStem);
+        var id = await h.SeedPreparingTaskAsync();
+        if (alreadyBound)
+        {
+            await using var db0 = h.NewContext();
+            (await db0.Tasks.SingleAsync(t => t.Id == id, Ct)).TemplateVersionId = v1.Id;
+            await db0.SaveChangesAsync(Ct);
+        }
+
+        await h.RunAsync(id);
+
+        await using var db = h.NewContext();
+        var task = await db.Tasks.SingleAsync(t => t.Id == id, Ct);
+        Assert.Equal(RunStatus.Failed, task.Status);
+        Assert.Equal("template 'win10' is not available: its disk is missing", task.FailureReason);
+        Assert.Equal(alreadyBound ? v1.Id : null, task.TemplateVersionId);
+        Assert.Equal(0, task.Attempt);
+        Assert.True(spy is null || spy.Specs.Count == 0, "no VM may be started without the template's disk");
+        Assert.Empty(await h.Get<IEgressRouter>().ListAsync(Ct));
+    }
+
     /// <summary>Runs <paramref name="onLock"/> once, just before the bind's UPDLOCK re-read executes (after it has resolved the version).</summary>
     private sealed class BeforeLockInterceptor(Func<Task> onLock) : DbCommandInterceptor
     {
@@ -170,12 +214,75 @@ public class TemplateBindingTests(SqlServerFixture sql)
         await using var db = ContextWith(h, interceptor);
         var task = await db.Tasks.SingleAsync(t => t.Id == taskId, Ct);
 
-        var bound = await Catalog(db, h.Time).BindTaskVersionAsync(task, Ct);
+        var bound = await Catalog(h, db).BindTaskVersionAsync(task, Ct);
 
         Assert.Equal(v2.Id, bound.Id);
         await using var check = h.NewContext();
         Assert.Equal(TemplateVersionStatus.Retired, (await check.TemplateVersions.SingleAsync(v => v.Id == v1.Id, Ct)).Status);
         Assert.Equal(v2.Id, (await check.Tasks.SingleAsync(t => t.Id == taskId, Ct)).TemplateVersionId);
+    }
+
+    /// <summary>The API's stop request: it writes the task row (and so its row version) while the run is binding.</summary>
+    private static async Task RequestStopAsync(OrchestratorHarness h, Guid taskId)
+    {
+        await using var api = h.NewContext();
+        (await api.Tasks.SingleAsync(t => t.Id == taskId, Ct)).StopRequestedAt = h.Time.GetUtcNow();
+        await api.SaveChangesAsync(Ct);
+    }
+
+    [Fact]
+    public async Task Bind_ConcurrentStop_BindsWithoutConflict_AndKeepsTheStop()
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql);
+        var v1 = await V1Async(h);
+        var taskId = await h.SeedPreparingTaskAsync();
+        var interceptor = new BeforeLockInterceptor(() => RequestStopAsync(h, taskId));
+        await using var db = ContextWith(h, interceptor);
+        var task = await db.Tasks.SingleAsync(t => t.Id == taskId, Ct);
+
+        var bound = await Catalog(h, db).BindTaskVersionAsync(task, Ct);
+
+        Assert.Equal(v1.Id, bound.Id);
+        Assert.Equal(v1.Id, task.TemplateVersionId);
+        Assert.False(db.Entry(task).Property(t => t.TemplateVersionId).IsModified); // already saved; a later save must not resend it
+        await using var check = h.NewContext();
+        var row = await check.Tasks.SingleAsync(t => t.Id == taskId, Ct);
+        Assert.Equal(v1.Id, row.TemplateVersionId);
+        Assert.NotNull(row.StopRequestedAt);
+    }
+
+    [Fact]
+    public async Task Run_StopDuringBind_EndsCancelled_NotFailed()
+    {
+        var dir = Directory.CreateTempSubdirectory("maldex-replay-").FullName;
+        await File.WriteAllLinesAsync(Path.Combine(dir, "slow.jsonl"),
+            ["""{"delayMs":600000,"message":{"type":"ready","agentVersion":"1","hostname":"h"}}"""], Ct);
+        try
+        {
+            OrchestratorHarness? harness = null;
+            Guid taskId = default;
+            var interceptor = new BeforeLockInterceptor(() => RequestStopAsync(harness!, taskId));
+            await using var h = await OrchestratorHarness.CreateAsync(sql, new Dictionary<string, string?>
+            {
+                ["Maldex:Fake:Replay:Directory"] = dir,
+                ["Maldex:Fake:Replay:DefaultFile"] = "slow.jsonl",
+                ["Maldex:Fake:Replay:Speed"] = "1",
+                ["Maldex:Fake:Replay:HoldOpen"] = "true",
+                ["Maldex:Orchestrator:AgentReadyTimeout"] = "01:00:00",
+            }, s => s.ConfigureDbContext<MaldexDbContext>(o => o.AddInterceptors(interceptor)));
+            harness = h;
+            var v1 = await V1Async(h);
+            taskId = await h.SeedPreparingTaskAsync();
+
+            await h.RunAsync(taskId);
+
+            await using var db = h.NewContext();
+            var task = await db.Tasks.SingleAsync(t => t.Id == taskId, Ct);
+            Assert.Equal(RunStatus.Cancelled, task.Status);
+            Assert.Null(task.FailureReason);
+            Assert.Equal(v1.Id, task.TemplateVersionId);
+        }
+        finally { Directory.Delete(dir, true); }
     }
 
     [Fact]
@@ -193,7 +300,7 @@ public class TemplateBindingTests(SqlServerFixture sql)
         await using var db = ContextWith(h, interceptor);
         var task = await db.Tasks.SingleAsync(t => t.Id == taskId, Ct);
 
-        var ex = await Assert.ThrowsAsync<TemplateUnavailableException>(() => Catalog(db, h.Time).BindTaskVersionAsync(task, Ct));
+        var ex = await Assert.ThrowsAsync<TemplateUnavailableException>(() => Catalog(h, db).BindTaskVersionAsync(task, Ct));
 
         Assert.Equal("template 'win10' is not available", ex.Message);
         await using var check = h.NewContext();

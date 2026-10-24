@@ -60,6 +60,8 @@ Images built by `build-guest.sh` are imported as templates (v1) on the next star
 
 Both `build-guest` and `finalize-guest` replace the base in place, so both refuse (exit 2) while any analysis run exists (a `maldex-<32 hex>` domain or run directory): every run's overlay reads the base as its backing file. They check before starting and again right before the swap.
 
+Once an image has been imported as template v1, running `build-guest` or `finalize-guest` again replaces that template's disk in place: v1 keeps its id and number, but its recorded provenance (Windows build, size, sealed date) no longer matches the disk. Until Build and Edit in the app exist (later plans), do this only while no analysis is running, and accept that v1 is redefined by it.
+
 ## Running the E2E suite
 
 `./build.sh e2e` detonates the **harmless** files in `deploy/guest/samples/` (EICAR, a registry-write script, the controlled URL `http://maldex-test.invalid/`) against the real stack: real libvirt VM, namespace networking, agent channel, capture and processing, in `Simulated` network mode through the real DI (`Maldex:Mode=Real`). It never runs malware.

@@ -198,8 +198,8 @@ public static class TaskEndpoints
             image = (await templates.DefaultAsync(ct))?.Id;
             noTemplate = image is null;
         }
-        else if (await templates.FindEnabledAsync(image.Trim(), ct) is { } found) image = found.Id;
-        else if ((await templates.EnabledAsync(ct)).Count == 0) noTemplate = true;
+        else if (await templates.FindAvailableAsync(image.Trim(), ct) is { } found) image = found.Id;
+        else if ((await templates.AvailableAsync(ct)).Count == 0) noTemplate = true;
         else errors["image"] = ["Unknown or disabled template."];
 
         var duration = 300;

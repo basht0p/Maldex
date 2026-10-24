@@ -42,6 +42,8 @@ function LiveTask({ taskId }: { taskId: string }) {
   const [artifacts, setArtifacts] = useState<ArtifactDto[]>([])
   const [now, setNow] = useState(() => Date.now())
   const [busy, setBusy] = useState(false)
+  // Set once when a task first seen Queued is seen leaving it: its template version is bound when the run starts.
+  const [leftQueue, setLeftQueue] = useState(false)
 
   // Fetched on mount and again whenever the hub (re)connects: a status push missed during an outage is not in the
   // hub backlog, so this is what reconciles status, verdict and the report links after a reconnect.
@@ -66,7 +68,7 @@ function LiveTask({ taskId }: { taskId: string }) {
     return () => {
       cancelled = true
     }
-  }, [taskId, connected])
+  }, [taskId, connected, leftQueue])
 
   // A pushed status carries the authoritative deadline (also after someone else extends the run).
   const liveNow = live.status !== fetched?.basis ? live.status : null // a push older than the last fetch is stale
@@ -75,6 +77,8 @@ function LiveTask({ taskId }: { taskId: string }) {
     extended && extended.basis === pushedDeadline ? extended.value : (pushedDeadline ?? task?.deadlineAt ?? null)
 
   const status: RunStatus | null = liveNow?.status ?? task?.status ?? null
+  // Fetch once more after the task leaves Queued, so the Template line appears without a reload.
+  if (!leftQueue && task?.status === 'Queued' && status !== null && status !== 'Queued') setLeftQueue(true)
   const verdict = liveNow?.verdict ?? task?.verdict ?? 'Unknown'
   const completed = status === 'Completed'
 

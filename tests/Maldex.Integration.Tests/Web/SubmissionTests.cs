@@ -10,6 +10,7 @@ using Maldex.Data;
 using Maldex.Integration.Tests.Fixtures;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Xunit;
 
 namespace Maldex.Integration.Tests.Web;
@@ -346,6 +347,43 @@ public sealed class SubmissionTests(SqlServerFixture sql) : IDisposable
         var resp = await client.PostAsync("/api/tasks", Form(org, [1], fields: new() { ["image"] = "nope" }), Ct);
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         Assert.Equal("Unknown or disabled template.", (await Json(resp)).GetProperty("errors").GetProperty("image")[0].GetString());
+    }
+
+    private sealed class MissingStemsStore(params string[] missing) : Maldex.Core.Abstractions.ITemplateStore
+    {
+        public bool Exists(string fileStem) => !missing.Contains(fileStem);
+        public long? SizeOf(string fileStem) => null;
+        public Task DeleteAsync(string fileStem, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task FakeThenReal_SameDatabase_DefaultSubmissionUsesTemplateWithDisk()
+    {
+        // A fake-mode start imports win10-ltsc-2021 (the fake store says every disk exists) and makes it the default.
+        using var fake = Factory();
+        using (var c = fake.CreateClient(UserRole.Analyst))
+            Assert.Equal(["win10-ltsc-2021"], (await c.GetFromJsonAsync<JsonElement>("/api/templates", Ct)).EnumerateArray().Select(t => t.GetProperty("id").GetString()));
+
+        // A real-mode start on the same database: win10-ltsc-2021 has no disk, win11-26h2 has.
+        using var realHost = new MaldexAppFactory(sql, settings: new Dictionary<string, string?> { ["Maldex:Images:0"] = "win11-26h2" }, connectionString: fake.ConnectionString);
+        using var real = realHost.WithWebHostBuilder(b => b.ConfigureServices(s =>
+            s.Replace(ServiceDescriptor.Singleton<Maldex.Core.Abstractions.ITemplateStore>(new MissingStemsStore("win10-ltsc-2021")))));
+        using var analyst = real.CreateClient();
+        analyst.DefaultRequestHeaders.Add("X-Dev-Role", nameof(UserRole.Analyst));
+        using var admin = real.CreateClient();
+        admin.DefaultRequestHeaders.Add("X-Dev-Role", nameof(UserRole.Admin));
+        var org = await CreateOrgAsync(admin);
+
+        var list = await analyst.GetFromJsonAsync<JsonElement>("/api/templates", Ct);
+        Assert.Equal(["win11-26h2"], list.EnumerateArray().Select(t => t.GetProperty("id").GetString()));
+        Assert.True(list[0].GetProperty("isDefault").GetBoolean());
+
+        var resp = await analyst.PostAsync("/api/tasks", Form(org, [1]), Ct);
+        Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+        Assert.Equal("win11-26h2", (await Json(resp)).GetProperty("image").GetString());
+
+        // Asking for the template without a disk by name is refused like a disabled one.
+        await AssertBadRequest(await analyst.PostAsync("/api/tasks", Form(org, [1], fields: new() { ["image"] = "win10-ltsc-2021" }), Ct), "image");
     }
 
     [Fact]

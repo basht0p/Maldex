@@ -75,6 +75,7 @@ public sealed class LibvirtTemplateStoreTests : IDisposable
     [InlineData("a/b")]
     [InlineData("UPPER")]
     [InlineData("")]
+    [InlineData("abc\n")] // `$` would match before a trailing newline
     [InlineData("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")] // 65 chars
     public async Task InvalidStem_Throws(string stem)
     {

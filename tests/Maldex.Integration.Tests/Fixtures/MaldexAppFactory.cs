@@ -7,7 +7,8 @@ namespace Maldex.Integration.Tests.Fixtures;
 
 /// <summary>
 /// Boots Maldex.Web against a fresh database from <see cref="SqlServerFixture"/> (one per factory instance)
-/// with Fake mode, dev auth and a temporary artifact root. Workers are off unless <c>workers</c> is true.
+/// with Fake mode, dev auth and a temporary artifact root. Workers are off unless <c>workers</c> is true. Pass
+/// <c>connectionString</c> to boot a second host on an existing factory's database.
 /// </summary>
 public class MaldexAppFactory : WebApplicationFactory<Program>
 {
@@ -22,7 +23,7 @@ public class MaldexAppFactory : WebApplicationFactory<Program>
     public string ConnectionString { get; }
 
     public MaldexAppFactory(SqlServerFixture sql, string environment = "Testing", bool workers = false, string authMode = "Dev", string? devRole = null,
-        IReadOnlyDictionary<string, string?>? settings = null)
+        IReadOnlyDictionary<string, string?>? settings = null, string? connectionString = null)
     {
         _settings = settings;
         _sql = sql;
@@ -30,7 +31,7 @@ public class MaldexAppFactory : WebApplicationFactory<Program>
         _workers = workers;
         _authMode = authMode;
         _devRole = devRole;
-        ConnectionString = sql.CreateDatabaseConnectionString();
+        ConnectionString = connectionString ?? sql.CreateDatabaseConnectionString();
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)

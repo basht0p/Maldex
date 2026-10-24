@@ -117,6 +117,46 @@ describe('TaskPage', () => {
     expect(screen.queryByText('Image')).toBeNull()
   })
 
+  it('re-fetches once when the task leaves Queued, so the bound template appears without a reload', async () => {
+    const summary = 'win11-golden v3 (Windows 11 Pro 26300, agent 1.0.0, sealed 2026-10-24 by basht0p)'
+    const bound = task({
+      status: 'Preparing',
+      template: { id: 'win11-golden', displayName: 'Windows 11 Golden', versionNumber: 3, origin: 'Edit', sealedAt: '2026-10-24T00:00:00Z', summary },
+    })
+    getTask.mockResolvedValue(task({ status: 'Queued', image: 'win11-golden', template: null, deadlineAt: null }))
+    const view = renderPage()
+    expect(await screen.findByText('Queued')).toBeInTheDocument()
+    expect(screen.getByText('Image')).toBeInTheDocument()
+    expect(getTask).toHaveBeenCalledTimes(1)
+
+    const rerender = () =>
+      view.rerender(
+        <MemoryRouter initialEntries={['/tasks/t1']}>
+          <Routes><Route path="/tasks/:id" element={<TaskPage />} /></Routes>
+        </MemoryRouter>,
+      )
+    getTask.mockResolvedValue(bound)
+    live.value = { status: { taskId: 't1', status: 'Preparing', verdict: 'Unknown', deadlineAt: null }, processes: [], events: [], connected: true }
+    rerender()
+    expect(await screen.findByText(summary)).toBeInTheDocument()
+    expect(getTask).toHaveBeenCalledTimes(2)
+
+    // Later pushes do not fetch again.
+    getTask.mockResolvedValue(task({ ...bound, status: 'Running' }))
+    live.value = { status: { taskId: 't1', status: 'Running', verdict: 'Unknown', deadlineAt: null }, processes: [], events: [], connected: true }
+    rerender()
+    expect(await screen.findByText('Running')).toBeInTheDocument()
+    expect(getTask).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not re-fetch on load for a task that was never seen Queued', async () => {
+    getTask.mockResolvedValue(task({}))
+    renderPage()
+    await screen.findByText('Running')
+    await new Promise((r) => setTimeout(r, 0))
+    expect(getTask).toHaveBeenCalledTimes(1)
+  })
+
   it('falls back to the image name for tasks that predate templates', async () => {
     getTask.mockResolvedValue(task({ image: 'win10-legacy', template: null }))
     renderPage()

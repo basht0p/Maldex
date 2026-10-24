@@ -44,5 +44,7 @@ public sealed class TemplateVersionConfiguration : IEntityTypeConfiguration<Temp
         b.HasOne<AppUser>().WithMany().HasForeignKey(x => x.SealedByUserId).OnDelete(DeleteBehavior.Restrict);
 
         b.HasIndex(x => new { x.TemplateId, x.Number }).IsUnique();
+        // One disk per version: two rows sharing a stem would let deleting one remove the other's disk.
+        b.HasIndex(x => x.FileStem).IsUnique();
     }
 }

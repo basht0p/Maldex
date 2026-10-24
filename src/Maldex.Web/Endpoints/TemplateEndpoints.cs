@@ -2,7 +2,6 @@ using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
 using Maldex.Data;
 using Maldex.Data.Templates;
-using Maldex.Web.Audit;
 using Maldex.Web.Auth;
 using Microsoft.EntityFrameworkCore;
 
@@ -26,7 +25,7 @@ public static class TemplateEndpoints
         var g = app.MapGroup("/api/templates");
 
         g.MapGet("", async (TemplateCatalog catalog, CancellationToken ct) =>
-            (await catalog.EnabledAsync(ct)).Select(t => new TemplateSummaryDto(t.Id, t.DisplayName, t.IsDefault)).ToList())
+            (await catalog.AvailableAsync(ct)).Select(t => new TemplateSummaryDto(t.Id, t.DisplayName, t.IsDefault)).ToList())
             .RequireAuthorization(AuthSetup.AnalystPolicy);
 
         var admin = app.MapGroup("/api/admin/templates").RequireAuthorization(AuthSetup.AdminPolicy);
@@ -34,52 +33,53 @@ public static class TemplateEndpoints
         admin.MapGet("", async (MaldexDbContext db, ITemplateStore store, CancellationToken ct) =>
             await LoadAsync(db, store, null, ct));
 
-        admin.MapPost("{id}/default", async (string id, MaldexDbContext db, TemplateCatalog catalog, AuditWriter audit, CancellationToken ct) =>
+        // Each change and its audit row are saved together by the catalog; a no-op change writes no row.
+        admin.MapPost("{id}/default", async (string id, MaldexDbContext db, TemplateCatalog catalog, CurrentUser user, CancellationToken ct) =>
         {
             if (await CanonicalIdAsync(db, id, ct) is not { } templateId) return Results.NotFound();
             return await ConflictOr(async () =>
             {
-                await catalog.SetDefaultAsync(templateId, ct);
-                await audit.WriteAsync("template.default", templateId, null, ct);
+                await catalog.SetDefaultAsync(templateId, ct, new TemplateAudit(ActorOf(user), "template.default"));
                 return Results.NoContent();
             });
         });
 
-        admin.MapPost("{id}/enabled", async (string id, SetEnabledRequest req, MaldexDbContext db, TemplateCatalog catalog, AuditWriter audit, CancellationToken ct) =>
+        admin.MapPost("{id}/enabled", async (string id, SetEnabledRequest req, MaldexDbContext db, TemplateCatalog catalog, CurrentUser user, CancellationToken ct) =>
         {
             if (await CanonicalIdAsync(db, id, ct) is not { } templateId) return Results.NotFound();
             return await ConflictOr(async () =>
             {
-                await catalog.SetEnabledAsync(templateId, req.Enabled, ct);
-                await audit.WriteAsync(req.Enabled ? "template.enable" : "template.disable", templateId, null, ct);
+                await catalog.SetEnabledAsync(templateId, req.Enabled, ct,
+                    new TemplateAudit(ActorOf(user), req.Enabled ? "template.enable" : "template.disable"));
                 return Results.NoContent();
             });
         });
 
-        admin.MapPost("{id}/rollback", async (string id, MaldexDbContext db, ITemplateStore store, TemplateCatalog catalog, AuditWriter audit, CancellationToken ct) =>
+        admin.MapPost("{id}/rollback", async (string id, MaldexDbContext db, ITemplateStore store, TemplateCatalog catalog, CurrentUser user, CancellationToken ct) =>
         {
             if (await CanonicalIdAsync(db, id, ct) is not { } templateId) return Results.NotFound();
-            return await ConflictOr(async () =>
+            var refused = await ConflictOr(async () =>
             {
-                var from = await CurrentNumberAsync(db, templateId, ct);
-                await catalog.RollBackAsync(templateId, ct);
-                var to = await CurrentNumberAsync(db, templateId, ct);
-                await audit.WriteAsync("template.rollback", templateId, $"from=v{from}; to=v{to}", ct);
-                return Results.Ok((await LoadAsync(db, store, templateId, ct)).Single());
+                await catalog.RollBackAsync(templateId, ct, r => new TemplateAudit(ActorOf(user), "template.rollback", $"from=v{r.From}; to=v{r.To}"));
+                return null;
             });
+            // Outside ConflictOr: once the rollback is committed, a failure here is a 500, never a refusal.
+            return refused ?? Results.Ok((await LoadAsync(db, store, templateId, ct)).Single());
         });
 
         return app;
     }
 
-    /// <summary>The catalog reports a refused change as <see cref="InvalidOperationException"/>; its message becomes the problem title.</summary>
-    private static async Task<IResult> ConflictOr(Func<Task<IResult>> action)
+    private static Guid? ActorOf(CurrentUser user) => user.IsResolved ? user.UserId : null;
+
+    /// <summary>A change the catalog refused (<see cref="TemplateRuleException"/>) is a 409 titled with its message; nothing else is.</summary>
+    private static async Task<IResult?> ConflictOr(Func<Task<IResult?>> action)
     {
         try
         {
             return await action();
         }
-        catch (InvalidOperationException ex)
+        catch (TemplateRuleException ex)
         {
             return Results.Problem(title: ex.Message, statusCode: StatusCodes.Status409Conflict);
         }
@@ -88,13 +88,6 @@ public static class TemplateEndpoints
     /// <summary>The stored id for a (case-insensitive) match, or null when no such template exists.</summary>
     private static Task<string?> CanonicalIdAsync(MaldexDbContext db, string id, CancellationToken ct) =>
         db.Templates.AsNoTracking().Where(t => t.Id == id).Select(t => (string?)t.Id).SingleOrDefaultAsync(ct);
-
-    private static async Task<int?> CurrentNumberAsync(MaldexDbContext db, string templateId, CancellationToken ct)
-    {
-        // No tracking: the audit values must come from the database, not from rows the catalog just changed.
-        var current = await db.Templates.AsNoTracking().Where(t => t.Id == templateId).Select(t => t.CurrentVersionId).SingleAsync(ct);
-        return await db.TemplateVersions.AsNoTracking().Where(v => v.Id == current).Select(v => (int?)v.Number).SingleOrDefaultAsync(ct);
-    }
 
     private static async Task<List<AdminTemplateDto>> LoadAsync(MaldexDbContext db, ITemplateStore store, string? onlyId, CancellationToken ct)
     {

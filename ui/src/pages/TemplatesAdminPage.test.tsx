@@ -109,6 +109,32 @@ describe('TemplatesAdminPage', () => {
     expect(text).not.toContain('v3')
   })
 
+  it('says the replaced version stays available as the previous version', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    renderPage()
+    const g = await region('Windows 11 Golden')
+    await userEvent.click(within(g).getByRole('button', { name: 'Roll back' }))
+    const text = String(confirm.mock.calls[0][0])
+    expect(text).toContain('New tasks will use v2.')
+    expect(text).toContain('v3 stays available as the previous version.')
+    expect(text).not.toMatch(/retired/i)
+  })
+
+  it('does not promise to keep the replaced version when a newer previous version is kept before it', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const c2 = version({ id: 'c2', number: 2, isCurrent: true })
+    const r3 = version({ id: 'r3', number: 3 })
+    const r4 = version({ id: 'r4', number: 4 })
+    listAdminTemplates.mockResolvedValue([golden({ current: c2, versions: [r4, r3, c2] })])
+    renderPage()
+    const g = await region('Windows 11 Golden')
+    await userEvent.click(within(g).getByRole('button', { name: 'Roll back' }))
+    const text = String(confirm.mock.calls[0][0])
+    expect(text).toContain('New tasks will use v4.')
+    expect(text).not.toContain('stays available')
+    expect(text).toContain('v2 becomes a previous version')
+  })
+
   it('shows a Ready previous version whose disk is missing as kept, with a warning, and disables Roll back', async () => {
     listAdminTemplates.mockResolvedValue([golden({ versions: [v3, version({ ...v2, diskPresent: false })] })])
     renderPage()

@@ -1,3 +1,4 @@
+using System.Linq.Expressions;
 using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
 using Microsoft.EntityFrameworkCore;
@@ -7,35 +8,67 @@ using Microsoft.Extensions.Options;
 
 namespace Maldex.Data.Templates;
 
-/// <summary>A template is disabled, missing, has no current version, or its current version is not Ready.</summary>
-public sealed class TemplateUnavailableException(string templateId) : Exception($"template '{templateId}' is not available");
+/// <summary>A template is disabled, missing, has no current version, its current version is not Ready, or its disk is missing.</summary>
+public sealed class TemplateUnavailableException(string templateId, string? reason = null)
+    : Exception(reason is null ? $"template '{templateId}' is not available" : $"template '{templateId}' is not available: {reason}")
+{
+    public const string DiskMissing = "its disk is missing";
+}
+
+/// <summary>A change the catalog refuses by rule (the API answers 409 with the message as the title).</summary>
+public sealed class TemplateRuleException(string message) : InvalidOperationException(message);
+
+/// <summary>
+/// The audit row for an admin change: written with the change, in the same transaction, targeting the template id.
+/// <see cref="UserId"/> null means the system acted.
+/// </summary>
+public sealed record TemplateAudit(Guid? UserId, string Action, string? Details = null);
+
+/// <summary>The version numbers a rollback moved between (<see cref="From"/> is null when there was no current version).</summary>
+public sealed record RollBackResult(int? From, int To);
 
 /// <summary>
 /// Owns every template rule: lookup, publish, rollback, retention marking, default selection and the disk sweep.
 /// Each mutating method saves once (one transaction) and retries on a concurrency conflict, as <see cref="TaskTransitions"/> does.
+/// A template is <em>available</em> (listed for analysts, accepted on submission, usable as the default) only when it is
+/// enabled, its current version is Ready and that version's disk exists in the <see cref="ITemplateStore"/>.
 /// </summary>
-public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions> options, TimeProvider time, ILogger<TemplateCatalog>? log = null)
+public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IOptions<TemplateOptions> options, TimeProvider time, ILogger<TemplateCatalog>? log = null)
 {
     public const int MaxAttempts = 3;
 
-    public async Task<IReadOnlyList<Template>> EnabledAsync(CancellationToken ct) =>
-        await db.Templates.AsNoTracking().Where(t => t.Enabled)
-            .OrderByDescending(t => t.IsDefault).ThenBy(t => t.DisplayName)
-            .ToListAsync(ct).ConfigureAwait(false);
+    /// <summary>Every available template, the default first, then by display name.</summary>
+    public Task<List<Template>> AvailableAsync(CancellationToken ct) => AvailableWhereAsync(_ => true, ct);
 
-    /// <summary>Case-insensitive (database collation); returns the row with its canonical id.</summary>
-    public Task<Template?> FindEnabledAsync(string id, CancellationToken ct) =>
-        db.Templates.AsNoTracking().Where(t => t.Id == id && t.Enabled).SingleOrDefaultAsync(ct);
+    /// <summary>Case-insensitive (database collation); returns the row with its canonical id, or null when it is not available.</summary>
+    public async Task<Template?> FindAvailableAsync(string id, CancellationToken ct) =>
+        (await AvailableWhereAsync(t => t.Id == id, ct).ConfigureAwait(false)).SingleOrDefault();
 
-    public Task<Template?> DefaultAsync(CancellationToken ct) =>
-        db.Templates.AsNoTracking().Where(t => t.IsDefault && t.Enabled).SingleOrDefaultAsync(ct);
+    /// <summary>The default template, or null when it is not available.</summary>
+    public async Task<Template?> DefaultAsync(CancellationToken ct) =>
+        (await AvailableWhereAsync(t => t.IsDefault, ct).ConfigureAwait(false)).SingleOrDefault();
 
+    /// <summary>The one availability rule: enabled, current version Ready, and that version's disk present.</summary>
+    private async Task<List<Template>> AvailableWhereAsync(Expression<Func<Template, bool>> filter, CancellationToken ct)
+    {
+        var rows = await (
+            from t in db.Templates.AsNoTracking().Where(t => t.Enabled).Where(filter)
+            join v in db.TemplateVersions.AsNoTracking() on t.CurrentVersionId equals (Guid?)v.Id
+            where v.Status == TemplateVersionStatus.Ready
+            orderby t.IsDefault descending, t.DisplayName
+            select new { Template = t, v.FileStem }).ToListAsync(ct).ConfigureAwait(false);
+        return rows.Where(r => store.Exists(r.FileStem)).Select(r => r.Template).ToList();
+    }
+
+    /// <summary>The template's current version, when the template is available.</summary>
+    /// <exception cref="TemplateUnavailableException">Unknown, disabled, no Ready current version, or its disk is missing.</exception>
     public async Task<TemplateVersion> CurrentReadyVersionAsync(string templateId, CancellationToken ct)
     {
-        var template = await FindEnabledAsync(templateId, ct).ConfigureAwait(false);
+        var template = await db.Templates.AsNoTracking().Where(t => t.Id == templateId && t.Enabled).SingleOrDefaultAsync(ct).ConfigureAwait(false);
         if (template?.CurrentVersionId is not { } versionId) throw new TemplateUnavailableException(templateId);
         var version = await db.TemplateVersions.AsNoTracking().SingleOrDefaultAsync(v => v.Id == versionId, ct).ConfigureAwait(false);
         if (version is not { Status: TemplateVersionStatus.Ready }) throw new TemplateUnavailableException(templateId);
+        if (!store.Exists(version.FileStem)) throw new TemplateUnavailableException(template.Id, TemplateUnavailableException.DiskMissing);
         return version;
     }
 
@@ -51,7 +84,11 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
     public async Task<TemplateVersion> BindTaskVersionAsync(AnalysisTask task, CancellationToken ct)
     {
         if (task.TemplateVersionId is { } bound)
-            return await db.TemplateVersions.AsNoTracking().SingleAsync(v => v.Id == bound, ct).ConfigureAwait(false);
+        {
+            var kept = await db.TemplateVersions.AsNoTracking().SingleAsync(v => v.Id == bound, ct).ConfigureAwait(false);
+            if (!store.Exists(kept.FileStem)) throw new TemplateUnavailableException(kept.TemplateId, TemplateUnavailableException.DiskMissing);
+            return kept;
+        }
 
         await using var tx = await db.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
         for (var n = 1; ; n++)
@@ -62,9 +99,21 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
                 .AsNoTracking().SingleOrDefaultAsync(ct).ConfigureAwait(false);
             if (locked is { Status: TemplateVersionStatus.Ready })
             {
-                task.TemplateVersionId = locked.Id;
-                await db.SaveChangesAsync(ct).ConfigureAwait(false);
+                // One column, no row-version check: the API may write the task meanwhile (a stop is allowed while
+                // Preparing), and that must not turn into a concurrency failure of the run.
+                var taskId = task.Id;
+                await db.Tasks.Where(t => t.Id == taskId)
+                    .ExecuteUpdateAsync(s => s.SetProperty(t => t.TemplateVersionId, locked.Id), ct).ConfigureAwait(false);
                 await tx.CommitAsync(ct).ConfigureAwait(false);
+                // Mirror the saved value on the entity without leaving it marked modified.
+                task.TemplateVersionId = locked.Id;
+                var entry = db.Entry(task);
+                if (entry.State != EntityState.Detached)
+                {
+                    var column = entry.Property(t => t.TemplateVersionId);
+                    column.OriginalValue = locked.Id;
+                    column.IsModified = false;
+                }
                 return locked;
             }
             if (n == 2) throw new TemplateUnavailableException(task.Image);
@@ -72,62 +121,82 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
     }
 
     /// <summary>Makes <paramref name="versionId"/> current (it must be Ready and belong to the template), then applies retention.</summary>
-    public Task PublishAsync(string templateId, Guid versionId, CancellationToken ct) =>
+    /// <exception cref="TemplateRuleException">The version is not Ready or belongs to another template.</exception>
+    public Task PublishAsync(string templateId, Guid versionId, CancellationToken ct, TemplateAudit? audit = null) =>
         MutateAsync(async () =>
         {
             var template = await GetTemplateAsync(templateId, ct).ConfigureAwait(false);
             await PublishCoreAsync(template, versionId, ct).ConfigureAwait(false);
-        }, ct);
-
-    /// <summary>Publishes the highest-numbered Ready version that is not current.</summary>
-    public Task RollBackAsync(string templateId, CancellationToken ct) =>
-        MutateAsync(async () =>
-        {
-            var template = await GetTemplateAsync(templateId, ct).ConfigureAwait(false);
-            var previous = await db.TemplateVersions
-                .Where(v => v.TemplateId == template.Id && v.Status == TemplateVersionStatus.Ready && v.Id != template.CurrentVersionId)
-                .OrderByDescending(v => v.Number)
-                .FirstOrDefaultAsync(ct).ConfigureAwait(false)
-                ?? throw new InvalidOperationException($"template '{template.Id}' has no previous version to roll back to");
-            await PublishCoreAsync(template, previous.Id, ct).ConfigureAwait(false);
+            AddAudit(audit, template.Id);
         }, ct);
 
     /// <summary>
-    /// Makes the template the default and clears the old default in one transaction. The old default is saved cleared
-    /// first because the unique index is checked per statement, not per transaction.
+    /// Publishes the highest-numbered Ready version that is not current. Returns the version numbers it moved between, as
+    /// read in the attempt that was saved; <paramref name="audit"/> builds the audit row from them.
     /// </summary>
-    public Task SetDefaultAsync(string templateId, CancellationToken ct) =>
+    /// <exception cref="TemplateRuleException">There is no previous Ready version.</exception>
+    public async Task<RollBackResult> RollBackAsync(string templateId, CancellationToken ct, Func<RollBackResult, TemplateAudit>? audit = null)
+    {
+        RollBackResult? result = null;
+        await MutateAsync(async () =>
+        {
+            var template = await GetTemplateAsync(templateId, ct).ConfigureAwait(false);
+            var versions = await db.TemplateVersions.Where(v => v.TemplateId == template.Id).ToListAsync(ct).ConfigureAwait(false);
+            var previous = versions
+                .Where(v => v.Status == TemplateVersionStatus.Ready && v.Id != template.CurrentVersionId)
+                .MaxBy(v => v.Number)
+                ?? throw new TemplateRuleException($"template '{template.Id}' has no previous version to roll back to");
+            result = new RollBackResult(versions.SingleOrDefault(v => v.Id == template.CurrentVersionId)?.Number, previous.Number);
+            await PublishCoreAsync(template, previous.Id, ct).ConfigureAwait(false);
+            if (audit is not null) AddAudit(audit(result), template.Id);
+        }, ct).ConfigureAwait(false);
+        return result!;
+    }
+
+    /// <summary>
+    /// Makes the template the default and clears the old default in one transaction. The old default is saved cleared
+    /// first because the unique index is checked per statement, not per transaction. Already the default: nothing changes
+    /// and nothing is audited.
+    /// </summary>
+    /// <exception cref="TemplateRuleException">The template is disabled.</exception>
+    public Task SetDefaultAsync(string templateId, CancellationToken ct, TemplateAudit? audit = null) =>
         RetryAsync(async () =>
         {
             var template = await GetTemplateAsync(templateId, ct).ConfigureAwait(false);
-            if (!template.Enabled) throw new InvalidOperationException($"template '{template.Id}' is disabled");
+            if (!template.Enabled) throw new TemplateRuleException($"template '{template.Id}' is disabled");
             if (template.IsDefault) return;
             await using var tx = await db.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
             foreach (var old in await db.Templates.Where(t => t.IsDefault && t.Id != template.Id).ToListAsync(ct).ConfigureAwait(false))
                 old.IsDefault = false;
             await db.SaveChangesAsync(ct).ConfigureAwait(false);
             template.IsDefault = true;
+            AddAudit(audit, template.Id);
             await db.SaveChangesAsync(ct).ConfigureAwait(false);
             await tx.CommitAsync(ct).ConfigureAwait(false);
         }, ct);
 
-    public Task SetEnabledAsync(string templateId, bool enabled, CancellationToken ct) =>
+    /// <summary>Enables or disables the template. Already in that state: nothing changes and nothing is audited.</summary>
+    /// <exception cref="TemplateRuleException">Disabling the default.</exception>
+    public Task SetEnabledAsync(string templateId, bool enabled, CancellationToken ct, TemplateAudit? audit = null) =>
         MutateAsync(async () =>
         {
             var template = await GetTemplateAsync(templateId, ct).ConfigureAwait(false);
-            if (!enabled && template.IsDefault) throw new InvalidOperationException("choose another default first");
+            if (!enabled && template.IsDefault) throw new TemplateRuleException("choose another default first");
+            if (template.Enabled == enabled) return;
             template.Enabled = enabled;
+            AddAudit(audit, template.Id);
         }, ct);
 
     /// <summary>
-    /// Deletes the disk of every Retired version that no Preparing or Running task uses, and marks it Deleted.
-    /// Each version is recorded on its own (delete, mark, save); a failing delete is logged and the others carry on.
-    /// Never touches Ready versions. Returns the versions deleted.
+    /// Deletes the disk of every Retired version that no Preparing, Running or Collecting task uses, and marks it Deleted.
+    /// Each version is recorded on its own (delete, then mark it and add its system audit row in one save); a failing
+    /// version is logged, stays Retired, and the others carry on. Never touches Ready versions. Returns the versions deleted.
     /// </summary>
-    public async Task<IReadOnlyList<TemplateVersion>> SweepAsync(ITemplateStore store, CancellationToken ct)
+    public async Task<IReadOnlyList<TemplateVersion>> SweepAsync(CancellationToken ct)
     {
         List<TemplateVersion> deleted = [];
-        var retired = await db.TemplateVersions.Where(v => v.Status == TemplateVersionStatus.Retired).ToListAsync(ct).ConfigureAwait(false);
+        var retired = await db.TemplateVersions.Where(v => v.Status == TemplateVersionStatus.Retired)
+            .OrderBy(v => v.TemplateId).ThenBy(v => v.Number).ToListAsync(ct).ConfigureAwait(false);
         foreach (var version in retired)
         {
             try
@@ -137,11 +206,13 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
                 {
                     done = false;
                     if (version.Status != TemplateVersionStatus.Retired) return;
+                    // Collecting too: the VM is still alive while dropped files are collected.
                     var inUse = await db.Tasks.AnyAsync(t => t.TemplateVersionId == version.Id
-                        && (t.Status == RunStatus.Preparing || t.Status == RunStatus.Running), ct).ConfigureAwait(false);
+                        && (t.Status == RunStatus.Preparing || t.Status == RunStatus.Running || t.Status == RunStatus.Collecting), ct).ConfigureAwait(false);
                     if (inUse) return;
                     await store.DeleteAsync(version.FileStem, ct).ConfigureAwait(false); // idempotent, so safe to repeat on retry
                     version.Status = TemplateVersionStatus.Deleted;
+                    AddAudit(new TemplateAudit(null, "template.version.delete", $"template={version.TemplateId}; v={version.Number}"), version.Id.ToString());
                     await db.SaveChangesAsync(ct).ConfigureAwait(false);
                     done = true;
                 }, ct).ConfigureAwait(false);
@@ -150,6 +221,7 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
             catch (Exception e) when (e is not OperationCanceledException)
             {
                 log?.LogError(e, "Sweep of template version {VersionId} ({FileStem}) failed; it stays Retired", version.Id, version.FileStem);
+                DiscardPendingAudits();
                 if (db.Entry(version).State == EntityState.Modified) await db.Entry(version).ReloadAsync(ct).ConfigureAwait(false);
             }
         }
@@ -164,9 +236,9 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
     {
         var versions = await db.TemplateVersions.Where(v => v.TemplateId == template.Id).ToListAsync(ct).ConfigureAwait(false);
         var target = versions.SingleOrDefault(v => v.Id == versionId)
-            ?? throw new InvalidOperationException($"version {versionId} does not belong to template '{template.Id}'");
+            ?? throw new TemplateRuleException($"version {versionId} does not belong to template '{template.Id}'");
         if (target.Status != TemplateVersionStatus.Ready)
-            throw new InvalidOperationException($"version {versionId} is {target.Status}, not Ready");
+            throw new TemplateRuleException($"version {versionId} is {target.Status}, not Ready");
 
         template.CurrentVersionId = target.Id;
 
@@ -181,6 +253,20 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
             v.Status = TemplateVersionStatus.Retired;
     }
 
+    /// <summary>Adds the change's audit row to the pending save, so it commits (or fails) together with the change.</summary>
+    private void AddAudit(TemplateAudit? audit, string target)
+    {
+        if (audit is null) return;
+        db.AuditLogs.Add(new AuditLog { At = time.GetUtcNow(), UserId = audit.UserId, Action = audit.Action, Target = target, Details = audit.Details });
+    }
+
+    /// <summary>Drops audit rows of an attempt that did not save, so a retry (or the next sweep item) does not write them.</summary>
+    private void DiscardPendingAudits()
+    {
+        foreach (var entry in db.ChangeTracker.Entries<AuditLog>().Where(en => en.State == EntityState.Added).ToList())
+            entry.State = EntityState.Detached;
+    }
+
     /// <summary>Runs <paramref name="apply"/> and saves once.</summary>
     private Task MutateAsync(Func<Task> apply, CancellationToken ct) =>
         RetryAsync(async () =>
@@ -192,7 +278,6 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
     /// <summary>Runs <paramref name="attempt"/>; on a conflict reloads tracked rows and runs it again (max 3 attempts).</summary>
     private async Task RetryAsync(Func<Task> attempt, CancellationToken ct)
     {
-        _ = time; // reserved for audit timestamps in later tasks
         for (var n = 1; ; n++)
         {
             try
@@ -202,7 +287,9 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
             }
             catch (Exception e) when (n < MaxAttempts && IsRetryable(e))
             {
-                // A racing writer won (stale row version, or the single-default unique index): drop this attempt and re-read.
+                // A racing writer won (stale row version, or the single-default unique index): drop this attempt, its
+                // audit row included, and re-read.
+                DiscardPendingAudits();
                 foreach (var entry in db.ChangeTracker.Entries().Where(en => en.Entity is Template or TemplateVersion).ToList())
                 {
                     if (entry.State == EntityState.Added) entry.State = EntityState.Detached;

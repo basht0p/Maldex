@@ -1,7 +1,7 @@
 /// <reference types="vitest/config" />
 import react from '@vitejs/plugin-react'
 import { configDefaults } from 'vitest/config'
-import { defineConfig } from 'vite'
+import { defineConfig, searchForWorkspaceRoot } from 'vite'
 
 const backend = 'http://localhost:5080'
 
@@ -9,8 +9,9 @@ const backend = 'http://localhost:5080'
 export default defineConfig({
   plugins: [react()],
   server: {
-    // The brand tokens, logos and icons live in ../brand (the single source), outside the Vite root.
-    fs: { allow: ['..'] },
+    // The brand tokens, logos and icons live in ../brand (the single source), outside the Vite root. Only that
+    // folder is added: the repo root also holds .data/ (samples, artifacts), which the dev server must never serve.
+    fs: { allow: [searchForWorkspaceRoot(process.cwd()), '../brand'] },
     proxy: {
       // The live-view WebSocket. It must come before '/api' (first match wins) and keep the browser's Host header
       // (changeOrigin: false): the backend only accepts an upgrade whose Origin matches its Host, and the browser sends

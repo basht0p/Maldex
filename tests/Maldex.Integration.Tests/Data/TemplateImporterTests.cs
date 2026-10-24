@@ -101,6 +101,96 @@ public class TemplateImporterTests(SqlServerFixture sql)
         Assert.False((await db.Templates.SingleAsync(t => t.Id == "b", Ct)).IsDefault);
     }
 
+    private sealed class AllPresentStore : ITemplateStore
+    {
+        public bool Exists(string fileStem) => true;
+        public long? SizeOf(string fileStem) => null;
+        public Task DeleteAsync(string fileStem, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private static TemplateCatalog Catalog(MaldexDbContext db, ITemplateStore store) =>
+        new(db, store, Microsoft.Extensions.Options.Options.Create(new TemplateOptions()), new FixedTime(Now));
+
+    private static async Task<string> DefaultIdAsync(MaldexDbContext db) =>
+        await db.Templates.AsNoTracking().Where(t => t.IsDefault).Select(t => t.Id).SingleAsync(Ct);
+
+    [Fact]
+    public async Task Import_FakeThenReal_SameDatabase_MovesDefaultToTemplateWithDisk()
+    {
+        await using var db = await FreshAsync();
+        // Fake mode: every disk "exists", so the configured fake image is imported and becomes the default.
+        Assert.Equal(1, await TemplateImporter.ImportAsync(db, new AllPresentStore(), ["win10-ltsc-2021"], new FixedTime(Now), NullLogger.Instance, Ct));
+        Assert.Equal("win10-ltsc-2021", await DefaultIdAsync(db));
+
+        // Real mode on the same database: the fake image has no disk, the real one has.
+        var real = new FakeStore { Present = { ["win11-26h2"] = 1 } };
+        Assert.Equal(1, await ImportAsync(db, real, "win11-26h2"));
+
+        Assert.Equal("win11-26h2", await DefaultIdAsync(db));
+        var catalog = Catalog(db, real);
+        Assert.Equal("win11-26h2", (await catalog.DefaultAsync(Ct))?.Id);
+        Assert.Equal(["win11-26h2"], (await catalog.AvailableAsync(Ct)).Select(t => t.Id));
+    }
+
+    [Fact]
+    public async Task Import_DefaultDiskMissing_MovesDefaultToExistingEnabledTemplateWithDisk()
+    {
+        await using var db = await FreshAsync();
+        await ImportAsync(db, new FakeStore { Present = { ["a"] = 1, ["b"] = 1, ["c"] = 1 } }, "a", "b", "c");
+        (await db.Templates.SingleAsync(t => t.Id == "b", Ct)).Enabled = false;
+        await db.SaveChangesAsync(Ct);
+        db.ChangeTracker.Clear();
+
+        // Nothing new to import; "a" (default) lost its disk, "b" is disabled, "c" is usable.
+        Assert.Equal(0, await ImportAsync(db, new FakeStore { Present = { ["b"] = 1, ["c"] = 1 } }, "a", "b", "c"));
+
+        Assert.Equal("c", await DefaultIdAsync(db));
+    }
+
+    [Fact]
+    public async Task Import_DefaultDiskMissing_NoTemplateWithDisk_KeepsDefault()
+    {
+        await using var db = await FreshAsync();
+        await ImportAsync(db, new FakeStore { Present = { ["a"] = 1, ["b"] = 1 } }, "a", "b");
+        db.ChangeTracker.Clear();
+
+        Assert.Equal(0, await ImportAsync(db, new FakeStore(), "a", "b"));
+
+        Assert.Equal("a", await DefaultIdAsync(db));
+    }
+
+    [Fact]
+    public async Task Import_DefaultDiskPresent_KeepsDefault()
+    {
+        await using var db = await FreshAsync();
+        await ImportAsync(db, new FakeStore { Present = { ["b"] = 1 } }, "b");
+        db.ChangeTracker.Clear();
+
+        Assert.Equal(1, await ImportAsync(db, new FakeStore { Present = { ["a"] = 1, ["b"] = 1 } }, "a"));
+
+        Assert.Equal("b", await DefaultIdAsync(db));
+    }
+
+    [Fact]
+    public async Task Import_IdNotAValidFileStem_IsSkipped_AndOthersImported()
+    {
+        var dir = Directory.CreateTempSubdirectory("mx-import-").FullName;
+        try
+        {
+            File.WriteAllBytes(Path.Combine(dir, "win11-26h2.qcow2"), [1]);
+            File.WriteAllBytes(Path.Combine(dir, "win11-26h2.vars.fd"), [1]);
+            var store = new Maldex.Infrastructure.Libvirt.LibvirtTemplateStore(
+                Microsoft.Extensions.Options.Options.Create(new Maldex.Infrastructure.Libvirt.LibvirtOptions { BaseImageDir = dir }));
+            await using var db = await FreshAsync();
+
+            var imported = await TemplateImporter.ImportAsync(db, store, ["Win_11", "win11-26h2"], new FixedTime(Now), NullLogger.Instance, Ct);
+
+            Assert.Equal(1, imported);
+            Assert.Equal(["win11-26h2"], await db.Templates.Select(t => t.Id).ToListAsync(Ct));
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
     [Fact]
     public async Task Import_DoesNotTouchExistingTemplate()
     {

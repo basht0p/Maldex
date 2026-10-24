@@ -7,7 +7,7 @@ namespace Maldex.Infrastructure.Libvirt;
 /// <summary>Template version disks in <c>BaseImageDir</c>: <c>{stem}.qcow2</c> and <c>{stem}.vars.fd</c>.</summary>
 public sealed partial class LibvirtTemplateStore(IOptions<LibvirtOptions> options) : ITemplateStore
 {
-    [GeneratedRegex("^[a-z0-9][a-z0-9-]{0,63}$")]
+    [GeneratedRegex(@"^[a-z0-9][a-z0-9-]{0,63}\z")] // \z, not $: $ also matches before a trailing newline
     private static partial Regex StemPattern();
 
     private readonly LibvirtOptions _o = options.Value;

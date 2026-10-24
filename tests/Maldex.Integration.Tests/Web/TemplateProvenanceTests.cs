@@ -29,6 +29,12 @@ public sealed class TemplateProvenanceTests
             TemplateProvenance.Summary("win11-26h2", new TemplateVersion { Number = 1, Origin = TemplateVersionOrigin.Imported }, null));
 
     [Fact]
+    public void Summary_ImportedWithBlankProvenance_CountsAsNotRecorded() =>
+        Assert.Equal("win11-26h2 v1 (imported; provenance not recorded)",
+            TemplateProvenance.Summary("win11-26h2",
+                new TemplateVersion { Number = 1, Origin = TemplateVersionOrigin.Imported, WindowsEdition = "", WindowsBuild = " ", AgentVersion = "" }, null));
+
+    [Fact]
     public void Summary_NoSealer() =>
         Assert.Equal("win11-golden v3 (Windows 11 Pro 26300, agent 1.0.0, sealed 2026-10-24)",
             TemplateProvenance.Summary("win11-golden", Version(), null));
@@ -64,7 +70,7 @@ public sealed class TaskTemplateDtoTests(SqlServerFixture sql) : IDisposable
         Assert.Equal(3, one.GetProperty("versionNumber").GetInt32());
         Assert.Equal("Edit", one.GetProperty("origin").GetString());
         Assert.Equal("basht0p", one.GetProperty("sealedBy").GetString());
-        Assert.StartsWith("win11-golden v3 (Windows 11 Pro 26300, agent 1.0.0, sealed 2026-10-24 by basht0p)", one.GetProperty("summary").GetString());
+        Assert.Equal("win11-golden v3 (Windows 11 Pro 26300, agent 1.0.0, sealed 2026-10-24 by basht0p)", one.GetProperty("summary").GetString());
 
         var list = await client.GetFromJsonAsync<JsonElement>("/api/tasks", Ct);
         var row = list.GetProperty("items").EnumerateArray().Single(i => i.GetProperty("id").GetGuid() == seeded.TaskId);
