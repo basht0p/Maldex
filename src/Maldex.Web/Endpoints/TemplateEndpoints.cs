@@ -26,7 +26,7 @@ public static class TemplateEndpoints
         var g = app.MapGroup("/api/templates");
 
         g.MapGet("", async (TemplateCatalog catalog, CancellationToken ct) =>
-            (await catalog.EnabledAsync(ct)).Select(t => new TemplateSummaryDto(t.Id, t.DisplayName, t.IsDefault)).ToList())
+            (await catalog.AvailableAsync(ct)).Select(t => new TemplateSummaryDto(t.Id, t.DisplayName, t.IsDefault)).ToList())
             .RequireAuthorization(AuthSetup.AnalystPolicy);
 
         var admin = app.MapGroup("/api/admin/templates").RequireAuthorization(AuthSetup.AdminPolicy);

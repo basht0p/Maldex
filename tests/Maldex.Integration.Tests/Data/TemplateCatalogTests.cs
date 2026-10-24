@@ -20,7 +20,8 @@ public class TemplateCatalogTests(SqlServerFixture sql)
     private sealed class RecordingStore : ITemplateStore
     {
         public List<string> Deleted { get; } = [];
-        public bool Exists(string fileStem) => true;
+        public HashSet<string> Missing { get; } = [];
+        public bool Exists(string fileStem) => !Missing.Contains(fileStem);
         public long? SizeOf(string fileStem) => null;
         public HashSet<string> FailStems { get; } = [];
         public Task DeleteAsync(string fileStem, CancellationToken ct)
@@ -52,8 +53,8 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         return (db, cs);
     }
 
-    private static TemplateCatalog Catalog(MaldexDbContext db, int keepPrevious = 1) =>
-        new(db, Options.Create(new TemplateOptions { KeepPrevious = keepPrevious }), new FixedTime(Now));
+    private static TemplateCatalog Catalog(MaldexDbContext db, int keepPrevious = 1, ITemplateStore? store = null) =>
+        new(db, store ?? new RecordingStore(), Options.Create(new TemplateOptions { KeepPrevious = keepPrevious }), new FixedTime(Now));
 
     private sealed class FixedTime(DateTimeOffset now) : TimeProvider
     {
@@ -156,11 +157,13 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         await using (db)
         {
             await AddTemplateAsync(db, "win11-26h2");
+            await AddVersionAsync(db, "win11-26h2", 1, current: true);
             await AddTemplateAsync(db, "off", enabled: false);
-            var found = await Catalog(db).FindEnabledAsync("WIN11-26H2", Ct);
+            await AddVersionAsync(db, "off", 1, current: true);
+            var found = await Catalog(db).FindAvailableAsync("WIN11-26H2", Ct);
             Assert.Equal("win11-26h2", found?.Id);
-            Assert.Null(await Catalog(db).FindEnabledAsync("off", Ct));
-            Assert.Null(await Catalog(db).FindEnabledAsync("nope", Ct));
+            Assert.Null(await Catalog(db).FindAvailableAsync("off", Ct));
+            Assert.Null(await Catalog(db).FindAvailableAsync("nope", Ct));
         }
     }
 
@@ -170,13 +173,54 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         var (db, _) = await FreshAsync();
         await using (db)
         {
-            await AddTemplateAsync(db, "b", name: "Bravo");
-            await AddTemplateAsync(db, "a", name: "Alpha");
-            await AddTemplateAsync(db, "z", isDefault: true, name: "Zulu");
-            await AddTemplateAsync(db, "off", enabled: false, name: "Aaa");
+            foreach (var (id, name, isDefault, enabled) in new[] { ("b", "Bravo", false, true), ("a", "Alpha", false, true), ("z", "Zulu", true, true), ("off", "Aaa", false, false) })
+            {
+                await AddTemplateAsync(db, id, isDefault, enabled, name);
+                await AddVersionAsync(db, id, 1, current: true);
+            }
             var catalog = Catalog(db);
-            Assert.Equal(["z", "a", "b"], (await catalog.EnabledAsync(Ct)).Select(t => t.Id));
+            Assert.Equal(["z", "a", "b"], (await catalog.AvailableAsync(Ct)).Select(t => t.Id));
             Assert.Equal("z", (await catalog.DefaultAsync(Ct))?.Id);
+        }
+    }
+
+    [Fact]
+    public async Task Available_RequiresEnabledReadyCurrentVersionWithItsDisk()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "ok", name: "A ok");
+            await AddVersionAsync(db, "ok", 1, current: true);
+            await AddTemplateAsync(db, "no-current", name: "B no current");
+            await AddVersionAsync(db, "no-current", 1);
+            await AddTemplateAsync(db, "retired", name: "C retired");
+            await AddVersionAsync(db, "retired", 1, TemplateVersionStatus.Retired, current: true);
+            await AddTemplateAsync(db, "no-disk", isDefault: true, name: "D no disk");
+            var noDisk = await AddVersionAsync(db, "no-disk", 1, current: true);
+            await AddVersionAsync(db, "no-disk", 2); // another version's disk does not count
+            var store = new RecordingStore { Missing = { noDisk.FileStem } };
+            var catalog = Catalog(db, store: store);
+
+            Assert.Equal(["ok"], (await catalog.AvailableAsync(Ct)).Select(t => t.Id));
+            Assert.Equal("ok", (await catalog.FindAvailableAsync("ok", Ct))?.Id);
+            foreach (var id in new[] { "no-current", "retired", "no-disk" })
+                Assert.Null(await catalog.FindAvailableAsync(id, Ct));
+            Assert.Null(await catalog.DefaultAsync(Ct)); // the default is not usable without its disk
+        }
+    }
+
+    [Fact]
+    public async Task CurrentReadyVersion_DiskMissing_Throws()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            var v = await AddVersionAsync(db, "a", 1, current: true);
+            var store = new RecordingStore { Missing = { v.FileStem } };
+            var ex = await Assert.ThrowsAsync<TemplateUnavailableException>(() => Catalog(db, store: store).CurrentReadyVersionAsync("a", Ct));
+            Assert.Equal("template 'a' is not available: its disk is missing", ex.Message);
         }
     }
 
@@ -301,6 +345,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         await using (db)
         {
             await AddTemplateAsync(db, "a", isDefault: true);
+            await AddVersionAsync(db, "a", 1, current: true);
             await AddTemplateAsync(db, "b", enabled: false);
             await Assert.ThrowsAsync<InvalidOperationException>(() => Catalog(db).SetDefaultAsync("b", Ct));
             Assert.Equal("a", (await Catalog(db).DefaultAsync(Ct))?.Id);
@@ -327,10 +372,11 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         {
             await AddTemplateAsync(db, "a", isDefault: true);
             await AddTemplateAsync(db, "b");
+            await AddVersionAsync(db, "b", 1, current: true);
             await Catalog(db).SetEnabledAsync("b", false, Ct);
-            Assert.Null(await Catalog(db).FindEnabledAsync("b", Ct));
+            Assert.Null(await Catalog(db).FindAvailableAsync("b", Ct));
             await Catalog(db).SetEnabledAsync("b", true, Ct);
-            Assert.NotNull(await Catalog(db).FindEnabledAsync("b", Ct));
+            Assert.NotNull(await Catalog(db).FindAvailableAsync("b", Ct));
         }
     }
 
@@ -391,13 +437,13 @@ public class TemplateCatalogTests(SqlServerFixture sql)
             var retired = await AddVersionAsync(db, "a", 1, TemplateVersionStatus.Retired);
             var store = new RecordingStore();
 
-            var deleted = await Catalog(db).SweepAsync(store, Ct);
+            var deleted = await Catalog(db, store: store).SweepAsync(Ct);
 
             Assert.Equal([retired.Id], deleted.Select(v => v.Id));
             Assert.Equal([retired.FileStem], store.Deleted);
             Assert.Equal(TemplateVersionStatus.Deleted, (await StatusesAsync(db, "a"))[1]);
             // A second sweep has nothing left to do.
-            Assert.Empty(await Catalog(db).SweepAsync(store, Ct));
+            Assert.Empty(await Catalog(db, store: store).SweepAsync(Ct));
             Assert.Single(store.Deleted);
         }
     }
@@ -415,7 +461,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
             await SeedTaskAsync(db, retired.Id, status);
             var store = new RecordingStore();
 
-            Assert.Empty(await Catalog(db).SweepAsync(store, Ct));
+            Assert.Empty(await Catalog(db, store: store).SweepAsync(Ct));
 
             Assert.Empty(store.Deleted);
             Assert.Equal(TemplateVersionStatus.Retired, (await StatusesAsync(db, "a"))[1]);
@@ -433,7 +479,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
             await SeedTaskAsync(db, retired.Id, RunStatus.Completed);
             var store = new RecordingStore();
 
-            Assert.Single(await Catalog(db).SweepAsync(store, Ct));
+            Assert.Single(await Catalog(db, store: store).SweepAsync(Ct));
 
             Assert.Equal([retired.FileStem], store.Deleted);
             Assert.Equal(TemplateVersionStatus.Deleted, (await StatusesAsync(db, "a"))[1]);
@@ -451,7 +497,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
             await AddVersionAsync(db, "a", 2, current: true);
             var store = new RecordingStore();
 
-            Assert.Empty(await Catalog(db).SweepAsync(store, Ct));
+            Assert.Empty(await Catalog(db, store: store).SweepAsync(Ct));
 
             Assert.Empty(store.Deleted);
             Assert.All(await StatusesAsync(db, "a"), kv => Assert.Equal(TemplateVersionStatus.Ready, kv.Value));
@@ -470,7 +516,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
             var store = new RecordingStore();
             store.FailStems.Add(bad.FileStem);
 
-            var deleted = await Catalog(db).SweepAsync(store, Ct);
+            var deleted = await Catalog(db, store: store).SweepAsync(Ct);
 
             Assert.Equal([good.Id], deleted.Select(v => v.Id));
             var s = await StatusesAsync(db, "a");
@@ -508,12 +554,13 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         {
             await AddTemplateAsync(db, "a");
             var interceptor = new FailingSaveInterceptor(n => n == 1 ? new DbUpdateConcurrencyException("stale") : null);
+            await AddVersionAsync(db, "a", 1, current: true);
             await using var ctx = ContextWith(cs, interceptor);
 
             await Catalog(ctx).SetEnabledAsync("a", false, Ct);
 
             Assert.Equal(2, interceptor.Calls);
-            Assert.Null(await Catalog(db).FindEnabledAsync("a", Ct));
+            Assert.Null(await Catalog(db).FindAvailableAsync("a", Ct));
         }
     }
 }

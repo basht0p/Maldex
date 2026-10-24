@@ -32,8 +32,15 @@ public sealed class TemplateEndpointsTests(SqlServerFixture sql) : IDisposable
         {
             var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
             var now = DateTimeOffset.UtcNow;
-            db.Templates.Add(new Template { Id = "aaa-first", DisplayName = "AAA First", CreatedAt = now });
+            var first = new Template { Id = "aaa-first", DisplayName = "AAA First", CreatedAt = now };
+            db.Templates.Add(first);
             db.Templates.Add(new Template { Id = "zzz-off", DisplayName = "ZZZ Off", Enabled = false, CreatedAt = now });
+            db.Templates.Add(new Template { Id = "aaa-no-version", DisplayName = "AAA No version", CreatedAt = now }); // not available
+            await db.SaveChangesAsync(Ct);
+            var v1 = new TemplateVersion { Id = Guid.NewGuid(), TemplateId = first.Id, Number = 1, Origin = TemplateVersionOrigin.Imported, FileStem = "aaa-first", SealedAt = now };
+            db.TemplateVersions.Add(v1);
+            await db.SaveChangesAsync(Ct);
+            first.CurrentVersionId = v1.Id;
             await db.SaveChangesAsync(Ct);
         }
         using var client = f.CreateClient(UserRole.Analyst);

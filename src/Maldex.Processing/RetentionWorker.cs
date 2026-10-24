@@ -25,10 +25,9 @@ public sealed class RetentionWorker(RetentionService retention, BlobGarbageColle
     {
         await using var scope = scopes.CreateAsyncScope();
         var catalog = scope.ServiceProvider.GetRequiredService<TemplateCatalog>();
-        var store = scope.ServiceProvider.GetRequiredService<ITemplateStore>();
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
 
-        var deleted = await catalog.SweepAsync(store, ct).ConfigureAwait(false);
+        var deleted = await catalog.SweepAsync(ct).ConfigureAwait(false);
         if (deleted.Count == 0) return;
 
         var at = time.GetUtcNow();

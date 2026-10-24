@@ -1,3 +1,4 @@
+using System.Linq.Expressions;
 using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
 using Microsoft.EntityFrameworkCore;
@@ -7,35 +8,55 @@ using Microsoft.Extensions.Options;
 
 namespace Maldex.Data.Templates;
 
-/// <summary>A template is disabled, missing, has no current version, or its current version is not Ready.</summary>
-public sealed class TemplateUnavailableException(string templateId) : Exception($"template '{templateId}' is not available");
+/// <summary>A template is disabled, missing, has no current version, its current version is not Ready, or its disk is missing.</summary>
+public sealed class TemplateUnavailableException(string templateId, string? reason = null)
+    : Exception(reason is null ? $"template '{templateId}' is not available" : $"template '{templateId}' is not available: {reason}")
+{
+    public const string DiskMissing = "its disk is missing";
+}
 
 /// <summary>
 /// Owns every template rule: lookup, publish, rollback, retention marking, default selection and the disk sweep.
 /// Each mutating method saves once (one transaction) and retries on a concurrency conflict, as <see cref="TaskTransitions"/> does.
+/// A template is <em>available</em> (listed for analysts, accepted on submission, usable as the default) only when it is
+/// enabled, its current version is Ready and that version's disk exists in the <see cref="ITemplateStore"/>.
 /// </summary>
-public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions> options, TimeProvider time, ILogger<TemplateCatalog>? log = null)
+public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IOptions<TemplateOptions> options, TimeProvider time, ILogger<TemplateCatalog>? log = null)
 {
     public const int MaxAttempts = 3;
 
-    public async Task<IReadOnlyList<Template>> EnabledAsync(CancellationToken ct) =>
-        await db.Templates.AsNoTracking().Where(t => t.Enabled)
-            .OrderByDescending(t => t.IsDefault).ThenBy(t => t.DisplayName)
-            .ToListAsync(ct).ConfigureAwait(false);
+    /// <summary>Every available template, the default first, then by display name.</summary>
+    public Task<List<Template>> AvailableAsync(CancellationToken ct) => AvailableWhereAsync(_ => true, ct);
 
-    /// <summary>Case-insensitive (database collation); returns the row with its canonical id.</summary>
-    public Task<Template?> FindEnabledAsync(string id, CancellationToken ct) =>
-        db.Templates.AsNoTracking().Where(t => t.Id == id && t.Enabled).SingleOrDefaultAsync(ct);
+    /// <summary>Case-insensitive (database collation); returns the row with its canonical id, or null when it is not available.</summary>
+    public async Task<Template?> FindAvailableAsync(string id, CancellationToken ct) =>
+        (await AvailableWhereAsync(t => t.Id == id, ct).ConfigureAwait(false)).SingleOrDefault();
 
-    public Task<Template?> DefaultAsync(CancellationToken ct) =>
-        db.Templates.AsNoTracking().Where(t => t.IsDefault && t.Enabled).SingleOrDefaultAsync(ct);
+    /// <summary>The default template, or null when it is not available.</summary>
+    public async Task<Template?> DefaultAsync(CancellationToken ct) =>
+        (await AvailableWhereAsync(t => t.IsDefault, ct).ConfigureAwait(false)).SingleOrDefault();
 
+    /// <summary>The one availability rule: enabled, current version Ready, and that version's disk present.</summary>
+    private async Task<List<Template>> AvailableWhereAsync(Expression<Func<Template, bool>> filter, CancellationToken ct)
+    {
+        var rows = await (
+            from t in db.Templates.AsNoTracking().Where(t => t.Enabled).Where(filter)
+            join v in db.TemplateVersions.AsNoTracking() on t.CurrentVersionId equals (Guid?)v.Id
+            where v.Status == TemplateVersionStatus.Ready
+            orderby t.IsDefault descending, t.DisplayName
+            select new { Template = t, v.FileStem }).ToListAsync(ct).ConfigureAwait(false);
+        return rows.Where(r => store.Exists(r.FileStem)).Select(r => r.Template).ToList();
+    }
+
+    /// <summary>The template's current version, when the template is available.</summary>
+    /// <exception cref="TemplateUnavailableException">Unknown, disabled, no Ready current version, or its disk is missing.</exception>
     public async Task<TemplateVersion> CurrentReadyVersionAsync(string templateId, CancellationToken ct)
     {
-        var template = await FindEnabledAsync(templateId, ct).ConfigureAwait(false);
+        var template = await db.Templates.AsNoTracking().Where(t => t.Id == templateId && t.Enabled).SingleOrDefaultAsync(ct).ConfigureAwait(false);
         if (template?.CurrentVersionId is not { } versionId) throw new TemplateUnavailableException(templateId);
         var version = await db.TemplateVersions.AsNoTracking().SingleOrDefaultAsync(v => v.Id == versionId, ct).ConfigureAwait(false);
         if (version is not { Status: TemplateVersionStatus.Ready }) throw new TemplateUnavailableException(templateId);
+        if (!store.Exists(version.FileStem)) throw new TemplateUnavailableException(template.Id, TemplateUnavailableException.DiskMissing);
         return version;
     }
 
@@ -51,7 +72,11 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
     public async Task<TemplateVersion> BindTaskVersionAsync(AnalysisTask task, CancellationToken ct)
     {
         if (task.TemplateVersionId is { } bound)
-            return await db.TemplateVersions.AsNoTracking().SingleAsync(v => v.Id == bound, ct).ConfigureAwait(false);
+        {
+            var kept = await db.TemplateVersions.AsNoTracking().SingleAsync(v => v.Id == bound, ct).ConfigureAwait(false);
+            if (!store.Exists(kept.FileStem)) throw new TemplateUnavailableException(kept.TemplateId, TemplateUnavailableException.DiskMissing);
+            return kept;
+        }
 
         await using var tx = await db.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
         for (var n = 1; ; n++)
@@ -124,7 +149,7 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
     /// Each version is recorded on its own (delete, mark, save); a failing delete is logged and the others carry on.
     /// Never touches Ready versions. Returns the versions deleted.
     /// </summary>
-    public async Task<IReadOnlyList<TemplateVersion>> SweepAsync(ITemplateStore store, CancellationToken ct)
+    public async Task<IReadOnlyList<TemplateVersion>> SweepAsync(CancellationToken ct)
     {
         List<TemplateVersion> deleted = [];
         var retired = await db.TemplateVersions.Where(v => v.Status == TemplateVersionStatus.Retired).ToListAsync(ct).ConfigureAwait(false);
