@@ -24,7 +24,8 @@ public static class TemplateProvenance
     public static string Summary(string templateId, TemplateVersion v, string? sealedBy)
     {
         var head = $"{templateId} v{v.Number}";
-        if (v.Origin == TemplateVersionOrigin.Imported && v.WindowsEdition is null && v.WindowsBuild is null && v.AgentVersion is null)
+        if (v.Origin == TemplateVersionOrigin.Imported
+            && string.IsNullOrWhiteSpace(v.WindowsEdition) && string.IsNullOrWhiteSpace(v.WindowsBuild) && string.IsNullOrWhiteSpace(v.AgentVersion))
             return $"{head} (imported; provenance not recorded)";
 
         var parts = new List<string>(3);
