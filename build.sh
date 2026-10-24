@@ -224,16 +224,24 @@ UNIT
   sudo systemctl restart maldex-host-guard.service
 }
 
+# True when Docker's systemd unit exists on this host.
+docker_installed() { systemctl cat docker.service >/dev/null 2>&1; }
+
 # Direct egress (template edit sessions) needs a narrow exception in Docker's DOCKER-USER chain (Docker's FORWARD policy is DROP):
 # exactly two rules for the default-route interface, tagged maldex-direct (see deploy/host/maldex-docker-user.sh). Re-applied at
 # every docker.service start; nothing else in Docker's chains, tables or settings is touched. (Approved by basht0p, 2026-10-24.)
 install_direct_docker_exception() {
+  if ! docker_installed; then
+    echo "skip Direct egress DOCKER-USER exception: Docker is not installed (the FORWARD drop it works around only exists with Docker)"
+    return 0
+  fi
   sudo install -d -m 0755 /etc/maldex
   sudo install -m 0755 "$DOCKER_USER_SRC" "$DOCKER_USER_DST"
   sudo tee "$DOCKER_USER_UNIT" >/dev/null <<UNIT
 [Unit]
 Description=Maldex Direct egress exception in Docker's DOCKER-USER chain
 Documentation=file://$DOCKER_USER_DST
+Wants=network-online.target
 After=docker.service network-online.target
 PartOf=docker.service
 
@@ -417,7 +425,12 @@ real_verify() {
   real_check "mitmproxy CA present (.data/mitm/ca)" "./build.sh real-setup" \
     bash -c "[ -f $MITM_CA_DIR/mitmproxy-ca.pem ] && [ -f $MITM_CA_DIR/mitmproxy-ca-cert.pem ]"
   real_check "/var/lib/inetsim is root-owned, not group/world-writable, symlink-free" "./build.sh real-setup" inetsim_template_clean
-  real_check "Direct egress exception in DOCKER-USER (both maldex-direct rules, current default interface)" "./build.sh real-setup" direct_docker_exception_present
+  if docker_installed; then
+    real_check "Direct egress exception in DOCKER-USER (both maldex-direct rules, current default interface)" "./build.sh real-setup" direct_docker_exception_present
+    real_check "Direct egress exception enabled at boot (maldex-docker-user)" "./build.sh real-setup" systemctl is-enabled maldex-docker-user
+  else
+    echo "skip Direct egress DOCKER-USER exception checks (Docker is not installed; no FORWARD drop to work around)"
+  fi
   real_check "host guard enabled at boot" "./build.sh real-setup" systemctl is-enabled maldex-host-guard
   return "$REAL_FAILED"
 }

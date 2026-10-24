@@ -280,6 +280,50 @@ public class TemplateSealerTests
     }
 
     [Fact]
+    public async Task Seal_CallerCancelsDuringTheLastLook_PropagatesPromptly_NotDidNotPowerOff()
+    {
+        await using var kit = new TemplateJobKit();
+        kit.Options.PowerOffTimeout = TimeSpan.FromMilliseconds(300);
+        kit.Options.PollInterval = TimeSpan.FromSeconds(4); // the last look would otherwise wait up to 20 s
+        var (ch, vm) = await kit.StartTemplateVmAsync();
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        var calls = 0;
+        var hv = new HypervisorWithIsRunning(kit.Hypervisor, async (_, token) =>
+        {
+            if (Interlocked.Increment(ref calls) > 1) await cts.CancelAsync(); // second call = the last look
+            await Task.Delay(Timeout.Infinite, token);
+            return true;
+        });
+
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => SealerOver(kit, hv).SealAsync(ch, vm, "win11-edit", kit.Bundle, cts.Token));
+
+        Assert.True(started.Elapsed < TimeSpan.FromSeconds(10), $"took {started.Elapsed}");
+        Assert.Empty(kit.Store.Seals);
+    }
+
+    [Fact]
+    public async Task Seal_IsRunningThrowsDuringTheLastLook_IsNotReportedAsDidNotPowerOff()
+    {
+        await using var kit = new TemplateJobKit();
+        kit.Options.PowerOffTimeout = TimeSpan.FromMilliseconds(300);
+        var (ch, vm) = await kit.StartTemplateVmAsync();
+        var calls = 0;
+        var hv = new HypervisorWithIsRunning(kit.Hypervisor, async (_, token) =>
+        {
+            if (Interlocked.Increment(ref calls) > 1) throw new InvalidOperationException("virsh domstate failed (1): no connection");
+            await Task.Delay(Timeout.Infinite, token); // first look runs into the deadline
+            return true;
+        });
+
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => SealerOver(kit, hv).SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
+
+        Assert.Contains("could not check whether the guest stopped", ex.Message);
+        Assert.IsType<InvalidOperationException>(ex.InnerException);
+        Assert.Empty(kit.Store.Seals);
+    }
+
+    [Fact]
     public async Task Seal_IsRunningThrows_BecomesSealExceptionWithInner_NotSealed()
     {
         await using var kit = new TemplateJobKit();

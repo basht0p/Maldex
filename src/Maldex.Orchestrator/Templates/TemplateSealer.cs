@@ -55,7 +55,7 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
         using var deadline = new CancellationTokenSource(o.PowerOffTimeout, time);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, deadline.Token);
         await AwaitPowerOffAckAsync(ch, session, linked.Token).ConfigureAwait(false);
-        var stopped = await WaitUntilStoppedAsync(vm, o, linked.Token).ConfigureAwait(false);
+        var stopped = await WaitUntilStoppedAsync(vm, o, linked.Token, ct).ConfigureAwait(false);
         ct.ThrowIfCancellationRequested();
         if (!stopped) throw new TemplateSealException(DidNotPowerOff);
 
@@ -96,8 +96,11 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
         }
     }
 
-    /// <summary>True once the hypervisor says the guest is not running; false when the deadline passes first.</summary>
-    private async Task<bool> WaitUntilStoppedAsync(VmHandle vm, TemplateJobOptions o, CancellationToken ct)
+    /// <summary>
+    /// True once the hypervisor says the guest is not running; false when the deadline passes first. <paramref name="ct"/> is the
+    /// deadline linked to the caller's token; <paramref name="callerCt"/> is the caller's alone (the last look honours it too).
+    /// </summary>
+    private async Task<bool> WaitUntilStoppedAsync(VmHandle vm, TemplateJobOptions o, CancellationToken ct, CancellationToken callerCt)
     {
         while (!ct.IsCancellationRequested)
         {
@@ -117,14 +120,19 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
         }
 
         // Out of time: one short last look, so a guest that stopped just now is not reported as dirty.
-        using var last = new CancellationTokenSource(o.PollInterval * 5, time);
+        using var lastTimeout = new CancellationTokenSource(o.PollInterval * 5, time);
+        using var last = CancellationTokenSource.CreateLinkedTokenSource(callerCt, lastTimeout.Token);
         try
         {
             return !await hypervisor.IsRunningAsync(vm, last.Token).ConfigureAwait(false);
         }
-        catch (Exception)
+        catch (OperationCanceledException) when (!callerCt.IsCancellationRequested && lastTimeout.IsCancellationRequested)
         {
-            return false;
+            return false; // the last look itself ran out of time: it did not power off
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !callerCt.IsCancellationRequested)
+        {
+            throw new TemplateSealException($"could not check whether the guest stopped: {GuestText.Clean(ex.Message, 200)}", ex);
         }
     }
 
