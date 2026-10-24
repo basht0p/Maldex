@@ -34,6 +34,10 @@ PROV_ISO="$WORK/provision.iso"
 BUILDING_DISK="$BASE_DIR/$IMAGE_ID.building.qcow2"
 BUILDING_VARS="$BASE_DIR/$IMAGE_ID.building.vars.fd"
 
+RUN_DIR="$ROOT/$VM_DIR/run"
+# shellcheck source=deploy/guest/lib.sh
+. deploy/guest/lib.sh
+
 virsh_() { virsh -c "$LIBVIRT_URI" "$@"; }
 log() { echo "[build-guest $(date +%H:%M:%S)] $*"; }
 
@@ -62,6 +66,7 @@ for f in "$OVMF_CODE_SECBOOT" "$OVMF_VARS_TEMPLATE"; do
 done
 { [ -r /dev/kvm ] && [ -w /dev/kvm ]; } || { echo "/dev/kvm is not usable by this session; run ./build.sh real-setup" >&2; exit 2; }
 
+refuse_if_runs_active "$LIBVIRT_URI" "$RUN_DIR" # fail fast; checked again right before the swap
 mkdir -p "$BASE_DIR" "$WORK"
 
 keypress_pid=""
@@ -282,6 +287,7 @@ cp -f "$nvram_path" "$BUILDING_VARS.final"
 virsh_ undefine "$DOMAIN" --keep-nvram >/dev/null 2>&1 || virsh_ undefine "$DOMAIN" >/dev/null
 mv -f "$BUILDING_VARS.final" "$BUILDING_VARS"
 
+refuse_if_runs_active "$LIBVIRT_URI" "$RUN_DIR" # a run may have started during the build
 rm -f "$BASE_DIR/$IMAGE_ID.qcow2" "$BASE_DIR/$IMAGE_ID.vars.fd"
 mv "$BUILDING_DISK" "$BASE_DIR/$IMAGE_ID.qcow2"
 mv "$BUILDING_VARS" "$BASE_DIR/$IMAGE_ID.vars.fd"

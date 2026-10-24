@@ -56,6 +56,8 @@ hand on a copy of the base image:
 
 `./build.sh build-guest` produces a fresh unattended base and loses these changes: prepare and finalize again after it.
 
+Both `build-guest` and `finalize-guest` replace the base in place, so both refuse (exit 2) while any analysis run exists (a `maldex-<32 hex>` domain or run directory): every run's overlay reads the base as its backing file. They check before starting and again right before the swap.
+
 ## Running the E2E suite
 
 `./build.sh e2e` detonates the **harmless** files in `deploy/guest/samples/` (EICAR, a registry-write script, the controlled URL `http://maldex-test.invalid/`) against the real stack: real libvirt VM, namespace networking, agent channel, capture and processing, in `Simulated` network mode through the real DI (`Maldex:Mode=Real`). It never runs malware.

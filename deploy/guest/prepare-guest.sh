@@ -5,7 +5,7 @@
 #   prepare   Copies the read-only base image to $VM_DIR/prepare/ and boots it as domain maldex-prepare: no network,
 #             VNC on the LAN (MALDEX_VNC_LISTEN, default: this host's primary IPv4) with a random password, printed.
 #             The operator makes the changes and shuts Windows down normally (Start > Power > Shut down).
-#   finalize  Requires maldex-prepare to be shut off. Boots the prepared disk once more (VNC on 127.0.0.1 only), waits
+#   finalize  Requires maldex-prepare to be shut off and no analysis run in progress. Boots the prepared disk once more (VNC on 127.0.0.1 only), waits
 #             for the agent's "ready" frame, shuts it down cleanly and replaces the base image (both files 0444). The
 #             previous base is kept as *.prev until the next finalize.
 #   discard   Removes maldex-prepare and its copy without touching the base image.
@@ -27,6 +27,10 @@ BASE_DIR="$ROOT/$VM_DIR/base"
 PREP_DIR="$ROOT/$VM_DIR/prepare"
 PREP_DISK="$PREP_DIR/$IMAGE_ID.qcow2"
 PREP_VARS="$PREP_DIR/$IMAGE_ID.vars.fd"
+
+RUN_DIR="$ROOT/$VM_DIR/run"
+# shellcheck source=deploy/guest/lib.sh
+. deploy/guest/lib.sh
 
 virsh_() { virsh -c "$LIBVIRT_URI" "$@"; }
 log() { echo "[prepare-guest $(date +%H:%M:%S)] $*"; }
@@ -82,6 +86,7 @@ cmd_finalize() {
   exists "$DOMAIN" || { echo "No $DOMAIN to finalize; run ./build.sh prepare-guest first." >&2; exit 2; }
   [ "$(state "$DOMAIN")" = "shut off" ] \
     || { echo "$DOMAIN is $(state "$DOMAIN"); shut Windows down from the Start menu first (a clean shutdown, not a reset)." >&2; exit 2; }
+  refuse_if_runs_active "$LIBVIRT_URI" "$RUN_DIR" # fail fast; checked again right before the swap
   virsh_ undefine "$DOMAIN" --keep-nvram >/dev/null 2>&1 || virsh_ undefine "$DOMAIN" >/dev/null
 
   # Verify on a fresh definition with the console on localhost only: the agent must still come up.
@@ -110,6 +115,7 @@ cmd_finalize() {
   virsh_ undefine "$VERIFY_DOMAIN" --keep-nvram >/dev/null 2>&1 || virsh_ undefine "$VERIFY_DOMAIN" >/dev/null
   trap - EXIT
 
+  refuse_if_runs_active "$LIBVIRT_URI" "$RUN_DIR" # a run may have started during the verification boot
   for f in "$IMAGE_ID.qcow2" "$IMAGE_ID.vars.fd"; do
     rm -f "$BASE_DIR/$f.prev"
     [ -f "$BASE_DIR/$f" ] && mv "$BASE_DIR/$f" "$BASE_DIR/$f.prev"
