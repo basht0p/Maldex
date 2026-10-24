@@ -125,6 +125,35 @@ public sealed class TemplateAdminTests(SqlServerFixture sql) : IDisposable
         Assert.False(current.GetProperty("diskPresent").GetBoolean());
     }
 
+    private sealed class InvalidStemStore : ITemplateStore
+    {
+        public HashSet<string> Invalid { get; } = [];
+        public bool Exists(string fileStem) => Invalid.Contains(fileStem) ? throw new ArgumentException("Invalid template file stem.", nameof(fileStem)) : true;
+        public long? SizeOf(string fileStem) => null;
+        public Task DeleteAsync(string fileStem, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task List_InvalidStem_ShowsDiskAbsent_AndPublicListOmitsIt()
+    {
+        var store = new InvalidStemStore();
+        var f = Factory().WithWebHostBuilder(b => b.ConfigureServices(s => s.Replace(ServiceDescriptor.Singleton<ITemplateStore>(store))));
+        _disposables.Add(f);
+        using var client = f.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Dev-Role", nameof(UserRole.Admin));
+        await client.GetFromJsonAsync<JsonElement>("/api/admin/templates", Ct); // startup import needs the files present
+        store.Invalid.Add(Seeded);
+
+        var resp = await client.GetAsync("/api/admin/templates", Ct);
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var list = await resp.Content.ReadFromJsonAsync<JsonElement>(Ct);
+        Assert.False(list.EnumerateArray().Single(t => t.GetProperty("id").GetString() == Seeded).GetProperty("current").GetProperty("diskPresent").GetBoolean());
+        var open = await client.GetAsync("/api/templates", Ct);
+        Assert.Equal(HttpStatusCode.OK, open.StatusCode);
+        Assert.DoesNotContain(Seeded, await open.Content.ReadAsStringAsync(Ct));
+    }
+
     [Fact]
     public async Task SetDefault_Returns204_AndAudits()
     {

@@ -57,7 +57,23 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
             where v.Status == TemplateVersionStatus.Ready
             orderby t.IsDefault descending, t.DisplayName
             select new { Template = t, v.FileStem }).ToListAsync(ct).ConfigureAwait(false);
-        return rows.Where(r => store.Exists(r.FileStem)).Select(r => r.Template).ToList();
+        return rows.Where(r => DiskPresent(r.FileStem)).Select(r => r.Template).ToList();
+    }
+
+    /// <summary>
+    /// Whether the version's disk exists. A stem the store rejects as invalid (it throws <see cref="ArgumentException"/>) has
+    /// no disk, exactly like a missing one. The one place the catalog and the admin list ask the store.
+    /// </summary>
+    public bool DiskPresent(string fileStem)
+    {
+        try
+        {
+            return store.Exists(fileStem);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
     }
 
     /// <summary>The template's current version, when the template is available.</summary>
@@ -68,7 +84,7 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
         if (template?.CurrentVersionId is not { } versionId) throw new TemplateUnavailableException(templateId);
         var version = await db.TemplateVersions.AsNoTracking().SingleOrDefaultAsync(v => v.Id == versionId, ct).ConfigureAwait(false);
         if (version is not { Status: TemplateVersionStatus.Ready }) throw new TemplateUnavailableException(templateId);
-        if (!store.Exists(version.FileStem)) throw new TemplateUnavailableException(template.Id, TemplateUnavailableException.DiskMissing);
+        if (!DiskPresent(version.FileStem)) throw new TemplateUnavailableException(template.Id, TemplateUnavailableException.DiskMissing);
         return version;
     }
 
@@ -86,7 +102,7 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
         if (task.TemplateVersionId is { } bound)
         {
             var kept = await db.TemplateVersions.AsNoTracking().SingleAsync(v => v.Id == bound, ct).ConfigureAwait(false);
-            if (!store.Exists(kept.FileStem)) throw new TemplateUnavailableException(kept.TemplateId, TemplateUnavailableException.DiskMissing);
+            if (!DiskPresent(kept.FileStem)) throw new TemplateUnavailableException(kept.TemplateId, TemplateUnavailableException.DiskMissing);
             return kept;
         }
 

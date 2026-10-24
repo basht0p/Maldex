@@ -150,6 +150,57 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         }
     }
 
+    /// <summary>Like <c>LibvirtTemplateStore</c>: a stem that is not a valid slug throws instead of answering.</summary>
+    private sealed class InvalidStemStore(string invalid) : ITemplateStore
+    {
+        public bool Exists(string fileStem) => fileStem == invalid ? throw new ArgumentException("Invalid template file stem.", nameof(fileStem)) : true;
+        public long? SizeOf(string fileStem) => fileStem == invalid ? throw new ArgumentException("Invalid template file stem.", nameof(fileStem)) : null;
+        public Task DeleteAsync(string fileStem, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    private static async Task<TemplateVersion> AddInvalidStemTemplateAsync(MaldexDbContext db)
+    {
+        await AddTemplateAsync(db, "good", isDefault: true);
+        await AddVersionAsync(db, "good", 1, current: true);
+        await AddTemplateAsync(db, "weird");
+        var v = await AddVersionAsync(db, "weird", 1, current: true);
+        v.FileStem = "Not_A Stem";
+        await db.SaveChangesAsync(Ct);
+        return v;
+    }
+
+    [Fact]
+    public async Task InvalidStem_IsUnavailable_LikeAMissingDisk()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            var v = await AddInvalidStemTemplateAsync(db);
+            var catalog = Catalog(db, store: new InvalidStemStore(v.FileStem));
+
+            Assert.Equal(["good"], (await catalog.AvailableAsync(Ct)).Select(t => t.Id));
+            Assert.Null(await catalog.FindAvailableAsync("weird", Ct));
+            var ex = await Assert.ThrowsAsync<TemplateUnavailableException>(() => catalog.CurrentReadyVersionAsync("weird", Ct));
+            Assert.Equal("template 'weird' is not available: its disk is missing", ex.Message);
+        }
+    }
+
+    [Fact]
+    public async Task InvalidStem_AlreadyBoundTask_RefusesWithDiskMissing()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            var v = await AddInvalidStemTemplateAsync(db);
+            var task = new AnalysisTask { TemplateVersionId = v.Id, Image = "weird" };
+
+            var ex = await Assert.ThrowsAsync<TemplateUnavailableException>(
+                () => Catalog(db, store: new InvalidStemStore(v.FileStem)).BindTaskVersionAsync(task, Ct));
+
+            Assert.Equal("template 'weird' is not available: its disk is missing", ex.Message);
+        }
+    }
+
     [Fact]
     public async Task FindEnabled_IsCaseInsensitive_ReturnsCanonicalId()
     {

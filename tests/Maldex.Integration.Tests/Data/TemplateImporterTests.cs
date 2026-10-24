@@ -171,6 +171,60 @@ public class TemplateImporterTests(SqlServerFixture sql)
         Assert.Equal("b", await DefaultIdAsync(db));
     }
 
+    /// <summary>Like <c>LibvirtTemplateStore</c>: a stem that is not a valid slug throws instead of answering.</summary>
+    private sealed class InvalidStemStore(string invalid) : ITemplateStore
+    {
+        public bool Exists(string fileStem) => fileStem == invalid ? throw new ArgumentException("Invalid template file stem.", nameof(fileStem)) : true;
+        public long? SizeOf(string fileStem) => null;
+        public Task DeleteAsync(string fileStem, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    /// <summary>A fake-mode start imported "Odd_Image" (default) and "good"; the next start is on a store that rejects "Odd_Image".</summary>
+    private async Task<MaldexDbContext> OddDefaultAsync()
+    {
+        var db = await FreshAsync();
+        Assert.Equal(2, await TemplateImporter.ImportAsync(db, new AllPresentStore(), ["Odd_Image", "good"], new FixedTime(Now), NullLogger.Instance, Ct));
+        Assert.Equal("Odd_Image", await DefaultIdAsync(db));
+        db.ChangeTracker.Clear();
+        return db;
+    }
+
+    [Fact]
+    public async Task Import_DefaultHasInvalidStem_DoesNotThrow_AndMovesDefaultToUsableTemplate()
+    {
+        await using var db = await OddDefaultAsync();
+
+        Assert.Equal(0, await TemplateImporter.ImportAsync(db, new InvalidStemStore("Odd_Image"), ["Odd_Image", "good"], new FixedTime(Now), NullLogger.Instance, Ct));
+
+        Assert.Equal("good", await DefaultIdAsync(db));
+    }
+
+    [Fact]
+    public async Task Import_MovingTheDefault_WritesOneSystemAuditRow()
+    {
+        await using var db = await OddDefaultAsync();
+        var oldId = "Odd_Image";
+
+        await TemplateImporter.ImportAsync(db, new InvalidStemStore(oldId), [oldId, "good"], new FixedTime(Now), NullLogger.Instance, Ct);
+        await TemplateImporter.ImportAsync(db, new InvalidStemStore(oldId), [oldId, "good"], new FixedTime(Now), NullLogger.Instance, Ct); // default now usable: moves nothing
+
+        var row = await db.AuditLogs.AsNoTracking().SingleAsync(a => a.Action == "template.default", Ct);
+        Assert.Null(row.UserId);
+        Assert.Equal("good", row.Target);
+        Assert.Equal($"from={oldId}; reason=disk missing", row.Details);
+        Assert.Equal(Now, row.At);
+    }
+
+    [Fact]
+    public async Task Import_DefaultUsable_WritesNoAuditRow()
+    {
+        await using var db = await FreshAsync();
+        await ImportAsync(db, new FakeStore { Present = { ["a"] = 1 } }, "a");
+        await ImportAsync(db, new FakeStore { Present = { ["a"] = 1 } }, "a");
+
+        Assert.Empty(await db.AuditLogs.AsNoTracking().Where(a => a.Action == "template.default").ToListAsync(Ct));
+    }
+
     [Fact]
     public async Task Import_IdNotAValidFileStem_IsSkipped_AndOthersImported()
     {

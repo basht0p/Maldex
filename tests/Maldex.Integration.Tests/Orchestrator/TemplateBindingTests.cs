@@ -179,6 +179,47 @@ public class TemplateBindingTests(SqlServerFixture sql)
         Assert.Empty(await h.Get<IEgressRouter>().ListAsync(Ct));
     }
 
+    /// <summary>Like <c>LibvirtTemplateStore</c>: a stem that is not a valid slug throws instead of answering.</summary>
+    private sealed class InvalidStemStore : ITemplateStore
+    {
+        public HashSet<string> Invalid { get; } = [];
+        public bool Exists(string fileStem) => Invalid.Contains(fileStem) ? throw new ArgumentException("Invalid template file stem.", nameof(fileStem)) : true;
+        public long? SizeOf(string fileStem) => null;
+        public Task DeleteAsync(string fileStem, CancellationToken ct) => Task.CompletedTask;
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Run_InvalidStem_FailsAsDiskMissing_WithoutVm(bool alreadyBound)
+    {
+        SpyHypervisor? spy = null;
+        var store = new InvalidStemStore();
+        await using var h = await OrchestratorHarness.CreateAsync(sql, null, s =>
+        {
+            s.Replace(ServiceDescriptor.Singleton<ITemplateStore>(store));
+            s.Replace(ServiceDescriptor.Singleton<IHypervisor>(sp =>
+                spy = new SpyHypervisor(ActivatorUtilities.CreateInstance<Maldex.Infrastructure.Fakes.FakeHypervisor>(sp))));
+        });
+        var v1 = await V1Async(h);
+        store.Invalid.Add(v1.FileStem);
+        var id = await h.SeedPreparingTaskAsync();
+        if (alreadyBound)
+        {
+            await using var db0 = h.NewContext();
+            (await db0.Tasks.SingleAsync(t => t.Id == id, Ct)).TemplateVersionId = v1.Id;
+            await db0.SaveChangesAsync(Ct);
+        }
+
+        await h.RunAsync(id);
+
+        await using var db = h.NewContext();
+        var task = await db.Tasks.SingleAsync(t => t.Id == id, Ct);
+        Assert.Equal(RunStatus.Failed, task.Status);
+        Assert.Equal("template 'win10' is not available: its disk is missing", task.FailureReason);
+        Assert.True(spy is null || spy.Specs.Count == 0);
+    }
+
     /// <summary>Runs <paramref name="onLock"/> once, just before the bind's UPDLOCK re-read executes (after it has resolved the version).</summary>
     private sealed class BeforeLockInterceptor(Func<Task> onLock) : DbCommandInterceptor
     {

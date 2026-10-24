@@ -79,7 +79,8 @@ public static class TemplateImporter
         if (next is null) return;
 
         var old = await db.Templates.AsNoTracking().Where(t => t.IsDefault).Select(t => t.Id).SingleOrDefaultAsync(ct);
-        await catalog.SetDefaultAsync(next.Id, ct);
+        // The system moved it: audited with the change, in the same transaction (UserId null).
+        await catalog.SetDefaultAsync(next.Id, ct, new TemplateAudit(null, "template.default", $"from={old ?? "(none)"}; reason=disk missing"));
         logger.LogWarning("The default template {Old} is not available (disabled, no Ready version, or its disk is missing); {New} is now the default.",
             old ?? "(none)", next.Id);
     }

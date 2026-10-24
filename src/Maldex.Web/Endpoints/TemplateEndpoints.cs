@@ -30,8 +30,8 @@ public static class TemplateEndpoints
 
         var admin = app.MapGroup("/api/admin/templates").RequireAuthorization(AuthSetup.AdminPolicy);
 
-        admin.MapGet("", async (MaldexDbContext db, ITemplateStore store, CancellationToken ct) =>
-            await LoadAsync(db, store, null, ct));
+        admin.MapGet("", async (MaldexDbContext db, TemplateCatalog catalog, CancellationToken ct) =>
+            await LoadAsync(db, catalog, null, ct));
 
         // Each change and its audit row are saved together by the catalog; a no-op change writes no row.
         admin.MapPost("{id}/default", async (string id, MaldexDbContext db, TemplateCatalog catalog, CurrentUser user, CancellationToken ct) =>
@@ -55,7 +55,7 @@ public static class TemplateEndpoints
             });
         });
 
-        admin.MapPost("{id}/rollback", async (string id, MaldexDbContext db, ITemplateStore store, TemplateCatalog catalog, CurrentUser user, CancellationToken ct) =>
+        admin.MapPost("{id}/rollback", async (string id, MaldexDbContext db, TemplateCatalog catalog, CurrentUser user, CancellationToken ct) =>
         {
             if (await CanonicalIdAsync(db, id, ct) is not { } templateId) return Results.NotFound();
             var refused = await ConflictOr(async () =>
@@ -64,7 +64,7 @@ public static class TemplateEndpoints
                 return null;
             });
             // Outside ConflictOr: once the rollback is committed, a failure here is a 500, never a refusal.
-            return refused ?? Results.Ok((await LoadAsync(db, store, templateId, ct)).Single());
+            return refused ?? Results.Ok((await LoadAsync(db, catalog, templateId, ct)).Single());
         });
 
         return app;
@@ -89,7 +89,7 @@ public static class TemplateEndpoints
     private static Task<string?> CanonicalIdAsync(MaldexDbContext db, string id, CancellationToken ct) =>
         db.Templates.AsNoTracking().Where(t => t.Id == id).Select(t => (string?)t.Id).SingleOrDefaultAsync(ct);
 
-    private static async Task<List<AdminTemplateDto>> LoadAsync(MaldexDbContext db, ITemplateStore store, string? onlyId, CancellationToken ct)
+    private static async Task<List<AdminTemplateDto>> LoadAsync(MaldexDbContext db, TemplateCatalog catalog, string? onlyId, CancellationToken ct)
     {
         var templates = await db.Templates.AsNoTracking().Where(t => onlyId == null || t.Id == onlyId)
             .OrderByDescending(t => t.IsDefault).ThenBy(t => t.DisplayName).ToListAsync(ct);
@@ -103,7 +103,7 @@ public static class TemplateEndpoints
         {
             var dtos = versions.Where(v => v.TemplateId == t.Id).Select(v => new TemplateVersionDto(
                 v.Id, v.Number, v.Origin.ToString(), v.Status.ToString(), v.Id == t.CurrentVersionId,
-                v.Status != TemplateVersionStatus.Deleted && store.Exists(v.FileStem),
+                v.Status != TemplateVersionStatus.Deleted && catalog.DiskPresent(v.FileStem),
                 v.WindowsEdition, v.WindowsBuild, v.OfficePresent, v.AgentVersion,
                 v.SealedByUserId is { } u && names.TryGetValue(u, out var name) ? name : null,
                 v.SealedAt, v.Note, v.SizeBytes)).ToList();
