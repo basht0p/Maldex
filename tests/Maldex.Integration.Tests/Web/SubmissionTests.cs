@@ -286,6 +286,84 @@ public sealed class SubmissionTests(SqlServerFixture sql) : IDisposable
         await AssertBadRequest(await c2.PostAsync("/api/tasks", Form(org2, [1], fields: new() { ["networkMode"] = "Simulated", ["exitCountry"] = "NL" }), Ct), "exitCountry");
     }
 
+    private static async Task AddTemplateAsync(MaldexAppFactory f, string id, string displayName, bool enabled)
+    {
+        using var scope = f.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        db.Templates.Add(new Template { Id = id, DisplayName = displayName, Enabled = enabled, CreatedAt = DateTimeOffset.UtcNow });
+        await db.SaveChangesAsync(Ct);
+    }
+
+    private static async Task DisableAllTemplatesAsync(MaldexAppFactory f)
+    {
+        using var scope = f.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        await db.Templates.ExecuteUpdateAsync(s => s.SetProperty(t => t.Enabled, false), Ct);
+    }
+
+    [Fact]
+    public async Task Submit_NoImage_UsesDefaultTemplate()
+    {
+        using var f = Factory();
+        await AddTemplateAsync(f, "aaa-other", "AAA Other", true);
+        using var client = f.CreateClient(UserRole.Analyst, "analyst");
+        var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
+        var resp = await client.PostAsync("/api/tasks", Form(org, [1]), Ct);
+        Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+        Assert.Equal("win10-ltsc-2021", (await Json(resp)).GetProperty("image").GetString());
+    }
+
+    [Fact]
+    public async Task Submit_ImageDifferentCase_StoresCanonicalId()
+    {
+        using var f = Factory();
+        using var client = f.CreateClient(UserRole.Analyst, "analyst");
+        var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
+        var resp = await client.PostAsync("/api/tasks", Form(org, [1], fields: new() { ["image"] = "WIN10-LTSC-2021" }), Ct);
+        Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+        Assert.Equal("win10-ltsc-2021", (await Json(resp)).GetProperty("image").GetString());
+    }
+
+    [Fact]
+    public async Task Submit_DisabledTemplate_IsRejected()
+    {
+        using var f = Factory();
+        await AddTemplateAsync(f, "off-template", "Off", false);
+        using var client = f.CreateClient(UserRole.Analyst, "analyst");
+        var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
+        var resp = await client.PostAsync("/api/tasks", Form(org, [1], fields: new() { ["image"] = "off-template" }), Ct);
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        Assert.Equal("Unknown or disabled template.", (await Json(resp)).GetProperty("errors").GetProperty("image")[0].GetString());
+        Assert.Equal(0, await CountTasks(f));
+    }
+
+    [Fact]
+    public async Task Submit_UnknownTemplate_IsRejected()
+    {
+        using var f = Factory();
+        using var client = f.CreateClient(UserRole.Analyst, "analyst");
+        var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
+        var resp = await client.PostAsync("/api/tasks", Form(org, [1], fields: new() { ["image"] = "nope" }), Ct);
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        Assert.Equal("Unknown or disabled template.", (await Json(resp)).GetProperty("errors").GetProperty("image")[0].GetString());
+    }
+
+    [Fact]
+    public async Task Submit_NoTemplates_Returns409()
+    {
+        using var f = Factory();
+        await DisableAllTemplatesAsync(f);
+        using var client = f.CreateClient(UserRole.Analyst, "analyst");
+        var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
+        foreach (var fields in new Dictionary<string, string>?[] { null, new() { ["image"] = "win10-ltsc-2021" } })
+        {
+            var resp = await client.PostAsync("/api/tasks", Form(org, [1], fields: fields), Ct);
+            Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
+            Assert.Equal("No sandbox template is available; ask an admin.", (await Json(resp)).GetProperty("title").GetString());
+        }
+        Assert.Equal(0, await CountTasks(f));
+    }
+
     [Fact]
     public async Task UnknownImage_400()
     {

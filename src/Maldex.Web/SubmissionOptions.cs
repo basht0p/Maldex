@@ -6,7 +6,7 @@ public sealed class SubmissionOptions
     public const string SectionName = "Maldex";
     public const string DefaultImage = "win10-ltsc-2021";
 
-    /// <summary>Empty after binding means "use the default"; see <see cref="ApplyDefaults"/>. (Config binding appends to non-empty lists, so no initializer.)</summary>
+    /// <summary>Only the startup importer's source of the default template; analysts choose from the template catalog, not from this list. Empty after binding means "use the default"; see <see cref="ApplyDefaults"/>. (Config binding appends to non-empty lists, so no initializer.)</summary>
     public List<string> Images { get; set; } = [];
 
     public long MaxUploadBytes { get; set; } = 268_435_456;

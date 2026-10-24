@@ -4,6 +4,7 @@ using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
 using Maldex.Core.Scheduling;
 using Maldex.Data;
+using Maldex.Data.Templates;
 using Maldex.Web.Audit;
 using Maldex.Web.Auth;
 using Maldex.Web.Templates;
@@ -98,7 +99,7 @@ public static class TaskEndpoints
 
     private static async Task<IResult> SubmitAsync(
         HttpContext ctx, MaldexDbContext db, IArtifactStore store, AuditWriter audit, CurrentUser user, TimeProvider time,
-        IOptions<SubmissionOptions> submissionOptions, IOptions<EgressOptions> egressOptions, CancellationToken ct)
+        IOptions<SubmissionOptions> submissionOptions, IOptions<EgressOptions> egressOptions, TemplateCatalog templates, CancellationToken ct)
     {
         var opts = submissionOptions.Value;
         var vpnCountries = egressOptions.Value.VpnCountries;
@@ -191,8 +192,15 @@ public static class TaskEndpoints
         if (blob is { Size: 0 }) errors["file"] = ["The file is empty."];
 
         var image = fields.GetValueOrDefault("image");
-        if (string.IsNullOrWhiteSpace(image)) image = opts.Images[0];
-        else if (!opts.Images.Contains(image)) errors["image"] = ["Unknown image."];
+        var noTemplate = false;
+        if (string.IsNullOrWhiteSpace(image))
+        {
+            image = (await templates.DefaultAsync(ct))?.Id;
+            noTemplate = image is null;
+        }
+        else if (await templates.FindEnabledAsync(image.Trim(), ct) is { } found) image = found.Id;
+        else if ((await templates.EnabledAsync(ct)).Count == 0) noTemplate = true;
+        else errors["image"] = ["Unknown or disabled template."];
 
         var duration = 300;
         if (fields.TryGetValue("durationSec", out var durRaw) &&
@@ -206,6 +214,8 @@ public static class TaskEndpoints
         ValidateNetwork(fields, isUrl: url is not null, vpnCountries, errors, out var mode, out var exitCountry);
 
         if (errors.Count > 0) return Results.ValidationProblem(errors);
+        if (noTemplate)
+            return Results.Problem(title: "No sandbox template is available; ask an admin.", statusCode: StatusCodes.Status409Conflict);
 
         // ---- persist ----
         if (blob is not null) await EnsureSampleAsync(db, blob, fileName, time, ct);
