@@ -110,10 +110,33 @@ internal sealed class OrchestratorHarness : IAsyncDisposable
         var h = new OrchestratorHarness(sql, settings ?? new Dictionary<string, string?>(), configure);
         await using var db = h.NewContext();
         await db.Database.MigrateAsync(TestContext.Current.CancellationToken);
+        await h.SeedTemplateAsync("win10");
         return h;
     }
 
     public IServiceProvider Services => _services;
+
+    /// <summary>Seeds a template with a Ready v1 as its current version, in the circular-FK order (template, version, current).</summary>
+    public async Task<TemplateVersion> SeedTemplateAsync(string id)
+    {
+        await using var db = NewContext();
+        var ct = TestContext.Current.CancellationToken;
+        var template = new Template { Id = id, DisplayName = id, IsDefault = id == "win10", CreatedAt = Time.GetUtcNow() };
+        db.Templates.Add(template);
+        await db.SaveChangesAsync(ct);
+        var v1 = NewVersion(id, 1);
+        db.TemplateVersions.Add(v1);
+        await db.SaveChangesAsync(ct);
+        template.CurrentVersionId = v1.Id;
+        await db.SaveChangesAsync(ct);
+        return v1;
+    }
+
+    public TemplateVersion NewVersion(string templateId, int number) => new()
+    {
+        Id = Guid.NewGuid(), TemplateId = templateId, Number = number, Origin = TemplateVersionOrigin.IsoBuild,
+        FileStem = Guid.NewGuid().ToString("N"), SealedAt = Time.GetUtcNow(), Status = TemplateVersionStatus.Ready,
+    };
 
     public T Get<T>() where T : notnull => _services.GetRequiredService<T>();
 
