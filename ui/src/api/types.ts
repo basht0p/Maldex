@@ -93,6 +93,26 @@ export interface TemplateVersionDto {
   sizeBytes?: number | null
 }
 
+export type TemplateJobKind = 'Edit' | 'Refresh'
+export type TemplateJobNetwork = 'None' | 'Direct'
+export type TemplateJobState = 'Queued' | 'Preparing' | 'Configuring' | 'Sealing' | 'Verifying' | 'Published' | 'Sealed' | 'Failed' | 'Cancelled'
+
+/** An Edit or Refresh job (GET /api/admin/template-jobs/{id}, the `templateJob` hub event). `idleDeadline` is null outside Configuring. */
+export interface TemplateJobDto {
+  id: string
+  kind: TemplateJobKind
+  templateId: string
+  baseVersionNumber: number
+  resultVersionNumber?: number | null
+  network: TemplateJobNetwork
+  state: TemplateJobState
+  message?: string | null
+  failureReason?: string | null
+  createdAt: string
+  endedAt?: string | null
+  idleDeadline?: string | null
+}
+
 /** GET /api/admin/templates (Admin only). */
 export interface AdminTemplateDto {
   id: string

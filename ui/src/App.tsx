@@ -9,6 +9,7 @@ import OrgsAdminPage from './pages/OrgsAdminPage'
 import SubmitPage from './pages/SubmitPage'
 import TaskPage from './pages/TaskPage'
 import TasksPage from './pages/TasksPage'
+import TemplateJobPage from './pages/TemplateJobPage'
 import TemplatesAdminPage from './pages/TemplatesAdminPage'
 
 export default function App() {
@@ -44,6 +45,7 @@ export default function App() {
           <Route path="/tasks/:id" element={<TaskPage />} />
           <Route path="/admin/orgs" element={<OrgsAdminPage me={me} />} />
           <Route path="/admin/templates" element={<TemplatesAdminPage me={me} />} />
+          <Route path="/admin/template-jobs/:id" element={<TemplateJobPage me={me} />} />
           <Route path="*" element={<p>Page not found.</p>} />
         </Routes>
       </main>

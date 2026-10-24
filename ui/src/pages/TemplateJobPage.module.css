@@ -1,0 +1,20 @@
+.head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; }
+.head h1 { margin: 0; font-size: 1.3rem; }
+.meta { font-family: var(--mx-font-mono); font-size: 0.8rem; color: var(--mx-muted); }
+.tracker { display: flex; flex-wrap: wrap; gap: 0.5rem; list-style: none; margin: 0 0 1rem; padding: 0; }
+.step { padding: 0.3rem 0.7rem; border: 1px solid var(--mx-border); border-radius: 999px; font-family: var(--mx-font-mono); font-size: 0.75rem; text-transform: uppercase; color: var(--mx-muted); }
+.step.done { color: var(--mx-text); border-color: var(--mx-control); }
+.step.done::after { content: '\00a0\2713'; }
+.step.current { color: var(--mx-text); border-color: var(--mx-accent); border-width: 2px; font-weight: 700; }
+.step.current::after { content: '\00a0\25CF'; }
+.message { margin: 0 0 1rem; }
+.panel { margin: 0 0 1rem; padding: 1rem; border: 1px solid var(--mx-border); border-radius: var(--mx-radius-panel); background: var(--mx-surface); display: grid; gap: 0.75rem; }
+.badges { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; }
+.badge { padding: 0.05rem 0.5rem; border: 1px solid var(--mx-control); border-radius: 999px; font-family: var(--mx-font-mono); font-size: 0.7rem; text-transform: uppercase; }
+/* Direct (internet on) is a risk state: the warning token plus the words and a mark, never colour alone. */
+.direct { border-color: var(--mx-warning); color: var(--mx-warning); font-weight: 700; }
+.direct::before { content: '\26A0\00a0'; }
+.actions { display: flex; flex-wrap: wrap; align-items: end; gap: 0.75rem; }
+.note { flex: 1; min-width: 14rem; }
+.failure { color: var(--mx-critical); font-weight: 600; }
+.failure::before { content: '\2716\00a0'; }

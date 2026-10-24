@@ -1,18 +1,29 @@
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AdminTemplateDto, MeDto, TemplateVersionDto } from '../api/types'
+import type { AdminTemplateDto, MeDto, TemplateJobDto, TemplateVersionDto } from '../api/types'
 
 const listAdminTemplates = vi.fn()
 const setDefaultTemplate = vi.fn()
 const setTemplateEnabled = vi.fn()
 const rollBackTemplate = vi.fn()
+const listTemplateJobs = vi.fn()
+const startTemplateEdit = vi.fn()
+const startTemplateRefresh = vi.fn()
+const publishTemplateVersion = vi.fn()
+const discardTemplateVersion = vi.fn()
 vi.mock('../api/client', async (orig) => ({
   ...(await orig<typeof import('../api/client')>()),
   listAdminTemplates: (...a: unknown[]) => listAdminTemplates(...a),
   setDefaultTemplate: (...a: unknown[]) => setDefaultTemplate(...a),
   setTemplateEnabled: (...a: unknown[]) => setTemplateEnabled(...a),
   rollBackTemplate: (...a: unknown[]) => rollBackTemplate(...a),
+  listTemplateJobs: (...a: unknown[]) => listTemplateJobs(...a),
+  startTemplateEdit: (...a: unknown[]) => startTemplateEdit(...a),
+  startTemplateRefresh: (...a: unknown[]) => startTemplateRefresh(...a),
+  publishTemplateVersion: (...a: unknown[]) => publishTemplateVersion(...a),
+  discardTemplateVersion: (...a: unknown[]) => discardTemplateVersion(...a),
 }))
 
 import { ApiError } from '../api/client'
@@ -41,12 +52,29 @@ const base = (over: Partial<AdminTemplateDto> = {}): AdminTemplateDto => {
   return { id: 'win11-26h2', displayName: 'Windows 11 26H2', description: null, isDefault: true, enabled: true, current: cur, versions: [cur], ...over }
 }
 
-const renderPage = (me: MeDto | null = admin) => render(<TemplatesAdminPage me={me} />)
+const job = (over: Partial<TemplateJobDto> = {}): TemplateJobDto => ({
+  id: 'job-1', kind: 'Edit', templateId: 'win11-golden', baseVersionNumber: 3, resultVersionNumber: null, network: 'None', state: 'Configuring',
+  message: null, failureReason: null, createdAt: '2026-10-24T10:00:00Z', endedAt: null, idleDeadline: null, ...over,
+})
+
+function Where() {
+  return <p data-testid="where">{useLocation().pathname}</p>
+}
+const renderPage = (me: MeDto | null = admin) =>
+  render(
+    <MemoryRouter initialEntries={['/admin/templates']}>
+      <Routes>
+        <Route path="/admin/templates" element={<TemplatesAdminPage me={me} />} />
+        <Route path="*" element={<Where />} />
+      </Routes>
+    </MemoryRouter>,
+  )
 const region = (name: string) => screen.findByRole('region', { name })
 
 beforeEach(() => {
   vi.clearAllMocks()
   listAdminTemplates.mockResolvedValue([base(), golden()])
+  listTemplateJobs.mockResolvedValue([])
 })
 afterEach(() => vi.restoreAllMocks())
 
@@ -233,5 +261,120 @@ describe('TemplatesAdminPage', () => {
     listAdminTemplates.mockRejectedValue(new ApiError(500, { title: 'Boom' }))
     renderPage()
     expect(await screen.findByRole('alert')).toHaveTextContent('Boom')
+  })
+
+  describe('Edit, Refresh and jobs', () => {
+    it('Edit sends the chosen network and publish flag, then opens the job', async () => {
+      startTemplateEdit.mockResolvedValue(job({ id: 'job-9' }))
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await userEvent.click(within(g).getByRole('button', { name: 'Edit' }))
+      const dlg = within(g).getByRole('dialog')
+      expect(within(dlg).getByLabelText('None')).toBeChecked()
+      expect(within(dlg).getByLabelText('Publish when done')).toBeChecked()
+      await userEvent.click(within(dlg).getByLabelText('Direct: internet on'))
+      await userEvent.click(within(dlg).getByLabelText('Publish when done'))
+      await userEvent.click(within(dlg).getByRole('button', { name: 'Start edit' }))
+      expect(startTemplateEdit).toHaveBeenCalledWith('win11-golden', 'Direct', false)
+      expect(await screen.findByTestId('where')).toHaveTextContent('/admin/template-jobs/job-9')
+    })
+
+    it('Edit defaults to network None and publishing', async () => {
+      startTemplateEdit.mockResolvedValue(job())
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await userEvent.click(within(g).getByRole('button', { name: 'Edit' }))
+      await userEvent.click(within(g).getByRole('button', { name: 'Start edit' }))
+      expect(startTemplateEdit).toHaveBeenCalledWith('win11-golden', 'None', true)
+    })
+
+    it('Refresh components asks for confirmation and sends only the publish flag', async () => {
+      startTemplateRefresh.mockResolvedValue(job({ kind: 'Refresh', id: 'job-r' }))
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await userEvent.click(within(g).getByRole('button', { name: 'Refresh components' }))
+      const dlg = within(g).getByRole('dialog')
+      expect(within(dlg).queryByLabelText('None')).toBeNull()
+      expect(startTemplateRefresh).not.toHaveBeenCalled()
+      await userEvent.click(within(dlg).getByRole('button', { name: 'Start refresh' }))
+      expect(startTemplateRefresh).toHaveBeenCalledWith('win11-golden', true)
+      expect(await screen.findByTestId('where')).toHaveTextContent('/admin/template-jobs/job-r')
+    })
+
+    it('shows the server 409 reason inside the dialog and stays on the page', async () => {
+      startTemplateEdit.mockRejectedValue(new ApiError(409, { title: 'The base disk for v3 is missing.', status: 409 }))
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await userEvent.click(within(g).getByRole('button', { name: 'Edit' }))
+      await userEvent.click(within(g).getByRole('button', { name: 'Start edit' }))
+      expect(await within(g).findByRole('alert')).toHaveTextContent('The base disk for v3 is missing.')
+      expect(screen.queryByTestId('where')).toBeNull()
+    })
+
+    it('disables Edit and Refresh with the reason while a job is active, and links to it', async () => {
+      listTemplateJobs.mockImplementation(async (id: string) => (id === 'win11-golden' ? [job({ state: 'Preparing' })] : []))
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await waitFor(() => expect(within(g).getByRole('button', { name: 'Edit' })).toBeDisabled())
+      expect(within(g).getByRole('button', { name: 'Edit' })).toHaveAttribute('title', expect.stringMatching(/already preparing/i))
+      expect(within(g).getByRole('button', { name: 'Refresh components' })).toBeDisabled()
+      expect(within(g).getByRole('link', { name: 'Open the job' })).toHaveAttribute('href', '/admin/template-jobs/job-1')
+      const other = await region('Windows 11 26H2')
+      expect(within(other).getByRole('button', { name: 'Edit' })).toBeEnabled()
+    })
+
+    it('a finished job does not block Edit and Refresh; the Jobs list links each job', async () => {
+      listTemplateJobs.mockResolvedValue([job({ id: 'j2', state: 'Failed', failureReason: 'Verify failed.' }), job({ id: 'j1', state: 'Published', resultVersionNumber: 4 })])
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      const jobs = await within(g).findByRole('table', { name: 'Jobs' })
+      expect(within(jobs).getByText('Failed: Verify failed.')).toBeInTheDocument()
+      const links = within(jobs).getAllByRole('link')
+      expect(links[0]).toHaveAttribute('href', '/admin/template-jobs/j2')
+      expect(within(g).getByRole('button', { name: 'Edit' })).toBeEnabled()
+    })
+
+    it('a Pending version shows Publish and Discard; Publish calls the route and reloads', async () => {
+      const pending = version({ id: 'p4', number: 4, origin: 'Edit', role: 'Pending' })
+      listAdminTemplates.mockResolvedValue([golden({ versions: [pending, v3] })])
+      publishTemplateVersion.mockResolvedValue(golden())
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await userEvent.click(within(g).getByRole('button', { name: 'Publish v4' }))
+      expect(publishTemplateVersion).toHaveBeenCalledWith('win11-golden', 'p4')
+      await waitFor(() => expect(listAdminTemplates).toHaveBeenCalledTimes(2))
+      expect(within(g).queryByRole('button', { name: 'Publish v3' })).toBeNull()
+    })
+
+    it('Discard asks first and only then calls the route', async () => {
+      const pending = version({ id: 'p4', number: 4, role: 'Pending' })
+      listAdminTemplates.mockResolvedValue([golden({ versions: [pending, v3] })])
+      discardTemplateVersion.mockResolvedValue(undefined)
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true)
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await userEvent.click(within(g).getByRole('button', { name: 'Discard v4' }))
+      expect(discardTemplateVersion).not.toHaveBeenCalled()
+      await userEvent.click(within(g).getByRole('button', { name: 'Discard v4' }))
+      expect(confirm).toHaveBeenCalledTimes(2)
+      expect(discardTemplateVersion).toHaveBeenCalledWith('win11-golden', 'p4')
+    })
+
+    it('shows a 409 from Publish inline', async () => {
+      const pending = version({ id: 'p4', number: 4, role: 'Pending' })
+      listAdminTemplates.mockResolvedValue([golden({ versions: [pending, v3] })])
+      publishTemplateVersion.mockRejectedValue(new ApiError(409, { title: 'Only a held version can be published.', status: 409 }))
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await userEvent.click(within(g).getByRole('button', { name: 'Publish v4' }))
+      expect(await within(g).findByRole('alert')).toHaveTextContent('Only a held version can be published.')
+    })
+
+    it('shows no Publish or Discard on versions that are not Pending', async () => {
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      expect(within(g).queryByRole('button', { name: /^Publish v/ })).toBeNull()
+      expect(within(g).queryByRole('button', { name: /^Discard v/ })).toBeNull()
+    })
   })
 })
