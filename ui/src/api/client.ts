@@ -11,6 +11,8 @@ import type {
   TaskDto,
   TaskListDto,
   TaskListQuery,
+  TemplateJobDto,
+  TemplateJobNetwork,
   TemplateSummaryDto,
 } from './types'
 
@@ -95,3 +97,20 @@ export const setDefaultTemplate = (id: string) => post<void>(`/api/admin/templat
 export const setTemplateEnabled = (id: string, enabled: boolean) => post<void>(`/api/admin/templates/${encodeURIComponent(id)}/enabled`, { enabled })
 /** Makes the kept previous version current again; returns the updated template. */
 export const rollBackTemplate = (id: string) => post<AdminTemplateDto>(`/api/admin/templates/${encodeURIComponent(id)}/rollback`)
+
+const jobPath = (jobId: string) => `/api/admin/template-jobs/${encodeURIComponent(jobId)}`
+/** Starts an Edit job (202); 409 carries the reason (a job is active, the base disk is missing, low disk space). */
+export const startTemplateEdit = (id: string, network: TemplateJobNetwork, publishOnSuccess: boolean) =>
+  post<TemplateJobDto>(`/api/admin/templates/${encodeURIComponent(id)}/edit`, { network, publishOnSuccess })
+export const startTemplateRefresh = (id: string, publishOnSuccess: boolean) =>
+  post<TemplateJobDto>(`/api/admin/templates/${encodeURIComponent(id)}/refresh`, { publishOnSuccess })
+export const listTemplateJobs = (id: string) => get<TemplateJobDto[]>(`/api/admin/templates/${encodeURIComponent(id)}/jobs`)
+export const getTemplateJob = (jobId: string) => get<TemplateJobDto>(jobPath(jobId))
+export const sealTemplateJob = (jobId: string, note?: string) => post<void>(`${jobPath(jobId)}/seal`, { note: note || null })
+export const cancelTemplateJob = (jobId: string) => post<void>(`${jobPath(jobId)}/cancel`)
+export const getTemplateJobTunnelToken = (jobId: string) => get<{ token: string }>(`${jobPath(jobId)}/tunnel-token`)
+/** Publishes a held (Pending) version; returns the updated template. */
+export const publishTemplateVersion = (id: string, versionId: string) =>
+  post<AdminTemplateDto>(`/api/admin/templates/${encodeURIComponent(id)}/versions/${encodeURIComponent(versionId)}/publish`)
+export const discardTemplateVersion = (id: string, versionId: string) =>
+  post<void>(`/api/admin/templates/${encodeURIComponent(id)}/versions/${encodeURIComponent(versionId)}/discard`)

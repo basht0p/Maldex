@@ -1,7 +1,10 @@
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import { ApiError, cancelTask, extendTask, getMe, listTasks, stopTask } from './client'
+import {
+  ApiError, cancelTask, cancelTemplateJob, discardTemplateVersion, extendTask, getMe, getTemplateJobTunnelToken, listTasks, publishTemplateVersion,
+  sealTemplateJob, startTemplateEdit, startTemplateRefresh, stopTask,
+} from './client'
 
 vi.mock('../auth/auth', () => ({ getAccessToken: vi.fn(async () => null) }))
 import { getAccessToken } from '../auth/auth'
@@ -91,5 +94,43 @@ describe('client', () => {
     server.use(http.post('*/api/tasks/*/cancel', ({ request }) => { url = new URL(request.url).pathname; return new HttpResponse(null, { status: 204 }) }))
     await cancelTask('a/b?c#d')
     expect(url).toBe('/api/tasks/a%2Fb%3Fc%23d/cancel')
+  })
+
+  describe('template jobs', () => {
+    const captured = async (method: 'post' | 'get', path: string, call: () => Promise<unknown>) => {
+      let body: unknown = 'unset'
+      let hit = ''
+      server.use(
+        http[method](path, async ({ request }) => {
+          hit = new URL(request.url).pathname
+          body = request.method === 'POST' ? await request.json().catch(() => undefined) : undefined
+          return HttpResponse.json({}, { status: 202 })
+        }),
+      )
+      await call()
+      return { body, hit }
+    }
+
+    it('Edit posts the network and publish flag', async () => {
+      const r = await captured('post', '/api/admin/templates/win11-golden/edit', () => startTemplateEdit('win11-golden', 'Direct', false))
+      expect(r.body).toEqual({ network: 'Direct', publishOnSuccess: false })
+    })
+
+    it('Refresh posts only the publish flag', async () => {
+      const r = await captured('post', '/api/admin/templates/win11-golden/refresh', () => startTemplateRefresh('win11-golden', true))
+      expect(r.body).toEqual({ publishOnSuccess: true })
+    })
+
+    it('Seal posts the note, or null when empty', async () => {
+      expect((await captured('post', '/api/admin/template-jobs/j1/seal', () => sealTemplateJob('j1', 'Installed 7-Zip'))).body).toEqual({ note: 'Installed 7-Zip' })
+      expect((await captured('post', '/api/admin/template-jobs/j1/seal', () => sealTemplateJob('j1', ''))).body).toEqual({ note: null })
+    })
+
+    it('Cancel, publish, discard and the token use the contract routes', async () => {
+      expect((await captured('post', '/api/admin/template-jobs/j1/cancel', () => cancelTemplateJob('j1'))).hit).toBe('/api/admin/template-jobs/j1/cancel')
+      expect((await captured('post', '/api/admin/templates/t/versions/v1/publish', () => publishTemplateVersion('t', 'v1'))).hit).toBe('/api/admin/templates/t/versions/v1/publish')
+      expect((await captured('post', '/api/admin/templates/t/versions/v1/discard', () => discardTemplateVersion('t', 'v1'))).hit).toBe('/api/admin/templates/t/versions/v1/discard')
+      expect((await captured('get', '/api/admin/template-jobs/j1/tunnel-token', () => getTemplateJobTunnelToken('j1'))).hit).toBe('/api/admin/template-jobs/j1/tunnel-token')
+    })
   })
 })
