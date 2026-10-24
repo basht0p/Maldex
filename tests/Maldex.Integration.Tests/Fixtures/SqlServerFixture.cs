@@ -10,7 +10,7 @@ namespace Maldex.Integration.Tests.Fixtures;
 public sealed class SqlServerFixture : IAsyncLifetime
 {
     private readonly MsSqlContainer _container = new MsSqlBuilder("mcr.microsoft.com/mssql/server:2022-latest")
-        .WithEnvironment("MSSQL_MEMORY_LIMIT_MB", "2048")
+        .WithEnvironment("MSSQL_MEMORY_LIMIT_MB", "4096")
         .Build();
 
     public async ValueTask InitializeAsync() => await _container.StartAsync();
@@ -23,7 +23,7 @@ public sealed class SqlServerFixture : IAsyncLifetime
 
     /// <summary>
     /// How many of the most recent test databases are kept. Older ones are dropped: every database holds memory in the
-    /// container's 2 GB pool, and with a couple of hundred the server starts refusing queries ("insufficient system memory").
+    /// container's 4 GB pool, and with a couple of hundred the server starts refusing queries ("insufficient system memory").
     /// Tests in the "sql" collection run one at a time and none uses more than a few databases, so the oldest are done.
     /// </summary>
     private const int KeptDatabases = 40;
