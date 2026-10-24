@@ -114,8 +114,11 @@ public class TemplateSealerTests
         await kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct);
 
         var types = ch.SentCommands.Select(c => c.GetType()).ToList();
-        // The liveness round trip, 3 agent chunks + 1 sysmon + 1 CA, then apply, then power off.
-        Assert.Equal([typeof(ProvenanceCommand), .. Enumerable.Repeat(typeof(PutFileChunkCommand), 5), typeof(ApplyComponentsCommand), typeof(PowerOffCommand)], types);
+        // The liveness round trip (resent when a queued ready arrives, R26: one or more provenance requests), then
+        // 3 agent chunks + 1 sysmon + 1 CA, then apply, then power off.
+        var liveness = types.TakeWhile(t => t == typeof(ProvenanceCommand)).Count();
+        Assert.InRange(liveness, 1, 2);
+        Assert.Equal([.. Enumerable.Repeat(typeof(PutFileChunkCommand), 5), typeof(ApplyComponentsCommand), typeof(PowerOffCommand)], types.Skip(liveness));
         // Sealed once, after the guest was gone.
         Assert.Equal([("win11-edit", 0)], kit.Store.Seals);
         Assert.Empty(await kit.Hypervisor.ListAsync(Ct));
