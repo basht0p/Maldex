@@ -36,7 +36,9 @@ public sealed class TemplateCoordinator(
     IOptions<TemplateJobOptions> options,
     IOptions<LibvirtOptions> libvirt,
     TimeProvider time,
-    ILogger<TemplateCoordinator> logger)
+    ILogger<TemplateCoordinator> logger,
+    ITemplateJobPublisher? publisher = null,
+    JobConsoleRegistry? consoles = null)
 {
     public const string InterruptedReason = "interrupted";
     public const string CancelledByAdmin = "cancelled by an admin";
@@ -48,8 +50,7 @@ public sealed class TemplateCoordinator(
     private const int MaxTerminalSaveAttempts = 6;
     private const int MaxMessageLength = 500, MaxReasonLength = 1000;
 
-    private static readonly TemplateJobState[] Active =
-        [TemplateJobState.Queued, TemplateJobState.Preparing, TemplateJobState.Configuring, TemplateJobState.Sealing, TemplateJobState.Verifying];
+    private static readonly TemplateJobState[] Active = TemplateJobStateMachine.ActiveStates;
 
     /// <summary>The file stem of the job's working copy, and of the version it produces.</summary>
     public static string StemOf(Guid jobId) => jobId.ToString("N");
@@ -172,12 +173,14 @@ public sealed class TemplateCoordinator(
         if (others.Any(j => j.State != TemplateJobState.Queued || j.CreatedAt < job.CreatedAt || (j.CreatedAt == job.CreatedAt && j.Id.CompareTo(job.Id) < 0)))
             return AlreadyRunning;
 
-        var freeMiB = disk.FreeMiB(Path.GetFullPath(libvirt.Value.BaseImageDir));
-        var requiredGiB = options.Value.MinFreeGiB;
-        if (freeMiB < requiredGiB * 1024L)
-            return $"not enough disk space for a template copy: {freeMiB / 1024.0:0.#} GiB free, {requiredGiB} GiB required";
-        return null;
+        return LowDiskSpace(disk.FreeMiB(Path.GetFullPath(libvirt.Value.BaseImageDir)), options.Value.MinFreeGiB);
     }
+
+    /// <summary>The refusal for a template copy that would not fit, or null. One wording for the endpoint's up-front check and the coordinator's.</summary>
+    public static string? LowDiskSpace(long freeMiB, int requiredGiB) =>
+        freeMiB < requiredGiB * 1024L
+            ? $"not enough disk space for a template copy: {freeMiB / 1024.0:0.#} GiB free, {requiredGiB} GiB required"
+            : null;
 
     /// <summary>Queued → Preparing. False when the job is no longer Queued (someone else got there first).</summary>
     private async Task<bool> ClaimAsync(MaldexDbContext db, Guid jobId, CancellationToken ct)
@@ -237,6 +240,10 @@ public sealed class TemplateCoordinator(
             }, [], ct).ConfigureAwait(false);
 
             if (await WaitForSealAsync(db, job.Id, ct).ConfigureAwait(false) is { } idle) return idle;
+
+            // Nobody may keep driving the guest while it is sealed (R22): close the job's open consoles and wait, bounded, for them to go.
+            if (consoles is not null && !await consoles.CloseAsync(job.Id, o.ConsoleCloseTimeout, ct).ConfigureAwait(false))
+                logger.LogWarning("A console of template job {JobId} was still open {Timeout} after it was told to close; sealing anyway.", job.Id, o.ConsoleCloseTimeout);
 
             // Sealing runs without any network: cut the running guest off before anything is installed.
             await egress.IsolateAsync(held.Lease, ct).ConfigureAwait(false);
@@ -407,6 +414,7 @@ public sealed class TemplateCoordinator(
                     await catalog.PublishAsync(row.TemplateId, version.Id, ct, new TemplateAudit(row.RequestedByUserId, "template.publish", $"to=v{number}; job={row.Id}")).ConfigureAwait(false);
 
                 await tx.CommitAsync(ct).ConfigureAwait(false);
+                await PublishAsync(db, row).ConfigureAwait(false);
                 return true;
             }
             catch (DbUpdateConcurrencyException) when (attempt < MaxSaveAttempts)
@@ -423,15 +431,19 @@ public sealed class TemplateCoordinator(
             Audit(job, null, "template.job.fail", Clip($"job={job.Id}; reason={reason}", MaxReasonLength)));
     }
 
+    /// <summary>
+    /// A cancel an admin asked for is audited by the cancel endpoint (with that admin as the actor), so only a system discard
+    /// (the idle timeout; <see cref="Discarded.UserId"/> null) writes <c>template.job.cancel</c> here.
+    /// </summary>
     private Task DiscardAsync(MaldexDbContext db, TemplateJob job, Discarded discarded, Held held) =>
         EndAsync(db, job, held, TemplateJobState.Cancelled, discarded.Message, null,
-            Audit(job, discarded.UserId, "template.job.cancel", $"job={job.Id}; reason={discarded.Message}"));
+            discarded.UserId is null ? Audit(job, null, "template.job.cancel", $"job={job.Id}; reason={discarded.Message}") : null);
 
     /// <summary>Releases what the job holds (deleting its files), then marks it terminal with its audit row.</summary>
-    private async Task EndAsync(MaldexDbContext db, TemplateJob job, Held held, TemplateJobState to, string message, string? failureReason, AuditLog audit)
+    private async Task EndAsync(MaldexDbContext db, TemplateJob job, Held held, TemplateJobState to, string message, string? failureReason, AuditLog? audit)
     {
         var egressStop = await ReleaseAsync(job, held, deleteFiles: true).ConfigureAwait(false);
-        IReadOnlyList<AuditLog> audits = egressStop is null ? [audit] : [egressStop, audit];
+        IReadOnlyList<AuditLog> audits = [.. new[] { egressStop, audit }.OfType<AuditLog>()];
         var delay = TimeSpan.FromSeconds(1);
         for (var attempt = 1; ; attempt++)
         {
@@ -489,6 +501,7 @@ public sealed class TemplateCoordinator(
 
     private async Task ReleaseGuestAsync(TemplateJob job, Held held)
     {
+        consoles?.Close(job.Id); // no wait: the VM is about to go, but no console may send input meanwhile
         if (held.Vm is { } vm)
         {
             try
@@ -552,17 +565,40 @@ public sealed class TemplateCoordinator(
         {
             db.ChangeTracker.Clear();
             var job = await db.TemplateJobs.SingleAsync(j => j.Id == jobId, ct).ConfigureAwait(false);
+            var (stateBefore, messageBefore) = (job.State, job.Message);
             if (!change(job)) return;
             foreach (var audit in audits) db.AuditLogs.Add(new AuditLog { At = audit.At, UserId = audit.UserId, Action = audit.Action, Target = audit.Target, Details = audit.Details });
             try
             {
                 await db.SaveChangesAsync(ct).ConfigureAwait(false);
+                var changed = job.State != stateBefore || job.Message != messageBefore;
+                var saved = job;
                 db.ChangeTracker.Clear();
+                if (changed) await PublishAsync(db, saved).ConfigureAwait(false);
                 return;
             }
             catch (DbUpdateConcurrencyException) when (attempt < MaxSaveAttempts)
             {
             }
+        }
+    }
+
+    /// <summary>Tells the watchers of the job its new state or message. Best effort: a failed push never fails the job.</summary>
+    private async Task PublishAsync(MaldexDbContext db, TemplateJob job)
+    {
+        if (publisher is null) return;
+        try
+        {
+            var numbers = await db.TemplateVersions.AsNoTracking()
+                .Where(v => v.Id == job.BaseVersionId || (job.ResultVersionId != null && v.Id == job.ResultVersionId))
+                .Select(v => new { v.Id, v.Number }).ToListAsync(CancellationToken.None).ConfigureAwait(false);
+            var baseNumber = numbers.FirstOrDefault(n => n.Id == job.BaseVersionId)?.Number ?? 0;
+            int? resultNumber = numbers.FirstOrDefault(n => n.Id == job.ResultVersionId)?.Number;
+            await publisher.PublishAsync(TemplateJobDto.From(job, baseNumber, resultNumber, options.Value.ConfigureIdleTimeout), CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Publishing the update of template job {JobId} failed.", job.Id);
         }
     }
 

@@ -19,6 +19,7 @@ public static class DependencyInjection
         services.Configure<OrchestratorOptions>(configuration.GetSection(OrchestratorOptions.SectionName));
         services.Configure<TemplateJobOptions>(configuration.GetSection(TemplateJobOptions.SectionName));
         services.AddSingleton<VmSlotGate>();
+        services.AddSingleton<JobConsoleRegistry>();
         services.AddSingleton<TemplateSealer>();
         services.AddSingleton<TemplateVerifier>();
         services.AddSingleton<TemplateCoordinator>();

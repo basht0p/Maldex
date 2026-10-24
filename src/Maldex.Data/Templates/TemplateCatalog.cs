@@ -147,6 +147,42 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
         }, ct);
 
     /// <summary>
+    /// Publishes a held version (sealed by a job that was told not to publish, so Ready and never current): as
+    /// <see cref="PublishAsync"/>, but any other version is refused.
+    /// </summary>
+    /// <exception cref="TemplateRuleException">The version is not Pending.</exception>
+    public Task PublishPendingAsync(string templateId, Guid versionId, CancellationToken ct, TemplateAudit? audit = null) =>
+        MutateAsync(async () =>
+        {
+            var template = await GetTemplateAsync(templateId, ct).ConfigureAwait(false);
+            await RequirePendingAsync(template, versionId, ct).ConfigureAwait(false);
+            await PublishCoreAsync(template, versionId, ct).ConfigureAwait(false);
+            AddAudit(audit, template.Id);
+        }, ct);
+
+    /// <summary>Retires a held version; the sweep then deletes its disk.</summary>
+    /// <exception cref="TemplateRuleException">The version is not Pending.</exception>
+    public Task DiscardPendingAsync(string templateId, Guid versionId, CancellationToken ct, TemplateAudit? audit = null) =>
+        MutateAsync(async () =>
+        {
+            var template = await GetTemplateAsync(templateId, ct).ConfigureAwait(false);
+            var version = await RequirePendingAsync(template, versionId, ct).ConfigureAwait(false);
+            version.Status = TemplateVersionStatus.Retired;
+            AddAudit(audit, template.Id);
+        }, ct);
+
+    /// <summary>The version, when it is Pending (<see cref="RolesOf"/>: Ready and never current).</summary>
+    private async Task<TemplateVersion> RequirePendingAsync(Template template, Guid versionId, CancellationToken ct)
+    {
+        var versions = await db.TemplateVersions.Where(v => v.TemplateId == template.Id).ToListAsync(ct).ConfigureAwait(false);
+        var version = versions.SingleOrDefault(v => v.Id == versionId)
+            ?? throw new TemplateRuleException($"version {versionId} does not belong to template '{template.Id}'");
+        var role = RolesOf(versions, template.CurrentVersionId)[version.Id];
+        if (role != "Pending") throw new TemplateRuleException($"version v{version.Number} is {role}, not Pending");
+        return version;
+    }
+
+    /// <summary>
     /// Publishes the Ready version that was current most recently (the latest <see cref="TemplateVersion.CurrentUntil"/>),
     /// and retires the version being rolled back from, so a rollback never keeps the bad version. Returns the version
     /// numbers it moved between, as read in the attempt that was saved; <paramref name="audit"/> builds the audit row from them.

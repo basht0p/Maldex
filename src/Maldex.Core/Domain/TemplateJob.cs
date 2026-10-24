@@ -1,3 +1,4 @@
+using System.Linq.Expressions;
 using Maldex.Core.Lifecycle;
 
 namespace Maldex.Core.Domain;
@@ -27,6 +28,13 @@ public class TemplateJob
     /// <summary>When the job took a VM slot (before its first VM boots). A non-terminal job with this set counts as busy in <c>VmSlots</c>.</summary>
     public DateTimeOffset? SlotHeldAt { get; set; }
     public byte[] RowVersion { get; set; } = [];
+
+    /// <summary>
+    /// When an admin may drive the guest through the console (R22): Configuring and neither a seal nor a cancel requested.
+    /// The token route, the tunnel open check and the open tunnel's watch loop all use this one definition.
+    /// </summary>
+    public static readonly Expression<Func<TemplateJob, bool>> ConsoleOpen =
+        j => j.State == TemplateJobState.Configuring && j.SealRequestedAt == null && j.CancelRequestedAt == null;
 
     public void TransitionTo(TemplateJobState to, string? message, DateTimeOffset at)
     {

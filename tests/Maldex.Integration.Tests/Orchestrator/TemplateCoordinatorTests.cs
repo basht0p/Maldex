@@ -100,7 +100,7 @@ internal sealed class TemplateJobRig : IAsyncDisposable
     public SettableDiskSpace Disk => (SettableDiskSpace)H.Get<IDiskSpaceProbe>();
     public TemplateCoordinator Coordinator => H.Get<TemplateCoordinator>();
 
-    public static async Task<TemplateJobRig> CreateAsync(SqlServerFixture sql, IDictionary<string, string?>? extra = null)
+    public static async Task<TemplateJobRig> CreateAsync(SqlServerFixture sql, IDictionary<string, string?>? extra = null, Action<IServiceCollection>? configure = null)
     {
         var rig = new TemplateJobRig();
         Directory.CreateDirectory(rig._dir);
@@ -136,6 +136,7 @@ internal sealed class TemplateJobRig : IAsyncDisposable
 
         rig.H = await OrchestratorHarness.CreateAsync(sql, settings, services =>
         {
+            configure?.Invoke(services);
             services.Replace(ServiceDescriptor.Singleton<IDiskSpaceProbe>(new SettableDiskSpace()));
             services.Replace(ServiceDescriptor.Singleton<IEgressRouter>(sp =>
                 new RecordingEgress(new NoopEgressRouter(sp.GetRequiredService<IOptions<FakeEgressOptions>>(), sp.GetRequiredService<FakeGuest>()))));
@@ -416,6 +417,121 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
     }
 
     [Fact]
+    public async Task Seal_ClosesTheOpenConsole_AndWaitsForIt_BeforeTheGuestIsIsolated()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Templates:Jobs:ConsoleCloseTimeout"] = "01:00:00" });
+        var consoles = rig.H.Get<JobConsoleRegistry>();
+        rig.Egress.DescribeAtIsolate = jobId => Task.FromResult($"consoles={consoles.OpenCount(jobId)}");
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit);
+        var run = rig.Start(id);
+        await rig.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+
+        // An open console that takes a moment (real time) to wind down once it is told to close.
+        var console = consoles.Register(id);
+        var winding = Task.Run(async () =>
+        {
+            await Task.Delay(Timeout.Infinite, console.Closing).ContinueWith(_ => { }, TaskScheduler.Default);
+            await Task.Delay(150, Ct);
+            console.Dispose();
+        }, Ct);
+        await rig.RequestSealAsync(id);
+        await rig.PumpAsync(run);
+        await winding;
+
+        Assert.True(console.Closing.IsCancellationRequested);
+        Assert.Contains("isolate consoles=0", rig.Egress.Calls); // gone before the guest was cut off and sealed
+        Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
+    }
+
+    [Fact]
+    public async Task Seal_WithAConsoleThatWillNotClose_ProceedsAfterTheBoundedWait()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Templates:Jobs:ConsoleCloseTimeout"] = "00:00:05" });
+        var consoles = rig.H.Get<JobConsoleRegistry>();
+        rig.Egress.DescribeAtIsolate = jobId => Task.FromResult($"consoles={consoles.OpenCount(jobId)}");
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit);
+        var run = rig.Start(id);
+        await rig.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+        using var stuck = consoles.Register(id); // never disposed by its "tunnel"
+        await rig.RequestSealAsync(id);
+
+        await rig.PumpAsync(run);
+
+        Assert.True(stuck.Closing.IsCancellationRequested); // it was told to close
+        Assert.Contains("isolate consoles=1", rig.Egress.Calls); // and the seal went on anyway
+        Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
+    }
+
+    [Fact]
+    public async Task Cancel_SignalsTheOpenConsole_BeforeTheVmIsDestroyed()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        var consoles = rig.H.Get<JobConsoleRegistry>();
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit);
+        var run = rig.Start(id);
+        await rig.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+        using var console = consoles.Register(id);
+
+        await rig.RequestCancelAsync(id);
+        await rig.PumpAsync(run);
+
+        Assert.True(console.Closing.IsCancellationRequested);
+        Assert.Equal(TemplateJobState.Cancelled, (await rig.JobAsync(id)).State);
+    }
+
+    private sealed class RecordingJobPublisher : ITemplateJobPublisher
+    {
+        public List<TemplateJobDto> Updates { get; } = [];
+        public Task PublishAsync(TemplateJobDto job, CancellationToken ct)
+        {
+            lock (Updates) Updates.Add(job);
+            return Task.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task Edit_PublishesEveryStateChangeToTheWatchers_WithTheIdleDeadlineWhileConfiguring()
+    {
+        var publisher = new RecordingJobPublisher();
+        await using var rig = await TemplateJobRig.CreateAsync(sql, configure: s => s.AddSingleton<ITemplateJobPublisher>(publisher));
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit);
+        var run = rig.Start(id);
+        await rig.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+        await rig.RequestSealAsync(id);
+
+        await rig.PumpAsync(run);
+
+        TemplateJobDto[] updates;
+        lock (publisher.Updates) updates = [.. publisher.Updates.Where(u => u.Id == id)];
+        var states = updates.Select(u => u.State).Aggregate(new List<string>(), (all, s) => { if (all.Count == 0 || all[^1] != s) all.Add(s); return all; });
+        Assert.Equal(["Preparing", "Configuring", "Sealing", "Verifying", "Published"], states);
+        var configuring = updates.First(u => u.State == "Configuring");
+        var job = await rig.JobAsync(id);
+        Assert.Equal(job.ConfiguringSince + TimeSpan.FromHours(2), configuring.IdleDeadline);
+        Assert.All(updates.Where(u => u.State != "Configuring"), u => Assert.Null(u.IdleDeadline));
+        var last = updates[^1];
+        Assert.Equal((1, 2), (last.BaseVersionNumber, last.ResultVersionNumber));
+        Assert.NotNull(last.EndedAt);
+        Assert.Equal(updates.Length, updates.Select(u => (u.State, u.Message)).Distinct().Count()); // one push per state or message change
+    }
+
+    [Fact]
+    public async Task APublisherThatThrows_DoesNotFailTheJob()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql, configure: s => s.AddSingleton<ITemplateJobPublisher>(new ThrowingPublisher()));
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
+
+        await rig.PumpAsync(rig.Start(id));
+
+        Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
+    }
+
+    private sealed class ThrowingPublisher : ITemplateJobPublisher
+    {
+        public Task PublishAsync(TemplateJobDto job, CancellationToken ct) => throw new InvalidOperationException("hub is down");
+    }
+
+    [Fact]
     public async Task Cancel_InConfiguring_DiscardsEverything()
     {
         await using var rig = await TemplateJobRig.CreateAsync(sql);
@@ -432,8 +548,8 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         await rig.AssertDiscardedAsync(id);
         Assert.Empty(rig.Store.Sealed);
         var audits = await rig.AuditsAsync();
-        Assert.Equal(["template.egress.start", "template.egress.stop", "template.job.cancel"], audits.Select(a => a.Action));
-        Assert.Equal(rig.AdminId, audits[^1].UserId);
+        // The cancel endpoint audits an admin's cancel (R17); the coordinator writes no second row for it.
+        Assert.Equal(["template.egress.start", "template.egress.stop"], audits.Select(a => a.Action));
     }
 
     [Fact]
@@ -452,7 +568,7 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         Assert.Equal(TemplateJobState.Cancelled, (await rig.JobAsync(id)).State);
         await rig.AssertDiscardedAsync(id);
         Assert.Empty(rig.Store.Sealed);
-        Assert.Equal(["template.job.cancel"], (await rig.AuditsAsync()).Select(a => a.Action));
+        Assert.DoesNotContain(await rig.AuditsAsync(), a => a.Action == "template.job.cancel"); // the endpoint's row, not the coordinator's (R17)
     }
 
     [Fact]

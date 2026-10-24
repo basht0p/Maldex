@@ -12,6 +12,8 @@ using Maldex.Integration.Tests.Fixtures;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Time.Testing;
 using Xunit;
 
 namespace Maldex.Integration.Tests.Web;
@@ -35,11 +37,12 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
         public Task<VncEndpoint?> GetAsync(VmHandle vm, CancellationToken ct) => Task.FromResult(endpoint);
     }
 
-    private sealed class TunnelFactory(SqlServerFixture sql, int guacdPort, VncEndpoint? endpoint, string authMode = "Dev")
+    private sealed class TunnelFactory(SqlServerFixture sql, int guacdPort, VncEndpoint? endpoint, string authMode = "Dev", FakeTimeProvider? clock = null, string keepAlive = "00:01:00", Maldex.Orchestrator.Templates.ITemplateJobPublisher? publisher = null)
         : MaldexAppFactory(sql, authMode: authMode, settings: new Dictionary<string, string?>
         {
             ["Maldex:Guacamole:GuacdPort"] = guacdPort.ToString(),
             ["Maldex:Guacamole:StatusPollInterval"] = "00:00:00.100",
+            ["Maldex:Guacamole:ConsoleKeepAliveInterval"] = keepAlive,
             // Only read in Entra mode: placeholders so the JWT bearer scheme can be built (no token is ever validated here).
             ["AzureAd:Instance"] = "https://login.microsoftonline.com/",
             ["AzureAd:TenantId"] = "00000000-0000-0000-0000-000000000000",
@@ -49,7 +52,12 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             base.ConfigureWebHost(builder);
-            builder.ConfigureServices(s => s.AddSingleton<IVmConsoleLocator>(new StubLocator(endpoint)));
+            builder.ConfigureServices(s =>
+            {
+                s.AddSingleton<IVmConsoleLocator>(new StubLocator(endpoint));
+                if (clock is not null) s.Replace(ServiceDescriptor.Singleton<TimeProvider>(clock));
+                if (publisher is not null) s.Replace(ServiceDescriptor.Singleton(publisher));
+            });
         }
     }
 
@@ -457,5 +465,359 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
         using var ws = await ConnectAsync(f, id, await GetTokenAsync(analyst, id));
         var msg = await ReceiveTextAsync(ws);
         Assert.StartsWith("<close:", msg);
+    }
+
+    // ---- the configure console of a template job ----
+
+    private const string SeededTemplate = "win10-ltsc-2021";
+
+    private static async Task<Guid> CreateJobAsync(MaldexAppFactory f, TemplateJobState state, DateTimeOffset? configuringSince = null)
+    {
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        await admin.GetAsync("/api/me", Ct); // creates the dev user row
+        await using var scope = f.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        var v1 = await db.TemplateVersions.AsNoTracking().SingleAsync(v => v.TemplateId == SeededTemplate && v.Number == 1, Ct);
+        var since = configuringSince ?? DateTimeOffset.UtcNow;
+        var job = new TemplateJob
+        {
+            Id = Guid.NewGuid(), Kind = TemplateJobKind.Edit, TemplateId = SeededTemplate, BaseVersionId = v1.Id, State = state,
+            RequestedByUserId = (await db.Users.AsNoTracking().FirstAsync(Ct)).Id, CreatedAt = since, ConfiguringSince = since,
+        };
+        db.TemplateJobs.Add(job);
+        await db.SaveChangesAsync(Ct);
+        return job.Id;
+    }
+
+    private static async Task SetJobStateAsync(MaldexAppFactory f, Guid id, TemplateJobState state)
+    {
+        await using var scope = f.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        await db.TemplateJobs.Where(j => j.Id == id).ExecuteUpdateAsync(s => s.SetProperty(j => j.State, state), Ct);
+    }
+
+    private static async Task<DateTimeOffset?> LastConsoleAtAsync(MaldexAppFactory f, Guid id)
+    {
+        await using var scope = f.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        return await db.TemplateJobs.AsNoTracking().Where(j => j.Id == id).Select(j => j.LastConsoleAt).SingleAsync(Ct);
+    }
+
+    private static async Task<string> GetJobTokenAsync(HttpClient admin, Guid id)
+    {
+        var resp = await admin.GetAsync($"/api/admin/template-jobs/{id}/tunnel-token", Ct);
+        resp.EnsureSuccessStatusCode();
+        return (await resp.Content.ReadFromJsonAsync<JsonElement>(Ct)).GetProperty("token").GetString()!;
+    }
+
+    private static async Task<WebSocket> ConnectJobAsync(MaldexAppFactory f, Guid id, string token)
+    {
+        var ws = f.Server.CreateWebSocketClient();
+        ws.SubProtocols.Add("guacamole");
+        ws.ConfigureRequest = r =>
+        {
+            r.Headers["X-Dev-Role"] = "Admin";
+            r.Headers["X-Dev-User"] = "admin";
+        };
+        return await ws.ConnectAsync(new Uri(f.Server.BaseAddress, $"/api/admin/template-jobs/{id}/tunnel?token={token}&width=800&height=600"), Ct);
+    }
+
+    private static async Task WaitForAsync(Func<Task<bool>> condition, string what)
+    {
+        var until = DateTime.UtcNow.AddSeconds(20);
+        while (!await condition())
+        {
+            Assert.True(DateTime.UtcNow < until, "timed out waiting for " + what);
+            await Task.Delay(25, Ct);
+        }
+    }
+
+    [Fact]
+    public async Task JobTunnel_ProxiesTheConsole_SetsLastConsoleAt_AndAudits()
+    {
+        using var guacd = new FakeGuacd();
+        var f = Factory(guacd.Port);
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        Assert.Null(await LastConsoleAtAsync(f, id));
+        var before = DateTimeOffset.UtcNow;
+
+        using var ws = await ConnectJobAsync(f, id, await GetJobTokenAsync(admin, id));
+        Assert.Equal("guacamole", ws.SubProtocol);
+        await ReceiveTextAsync(ws); // tunnel uuid
+        Assert.Equal(["ready", "guacd-conn-1"], Assert.Single(await GuacamoleInstructionReader.ParseAllAsync(await ReceiveTextAsync(ws), Ct)));
+
+        Assert.True(await LastConsoleAtAsync(f, id) >= before);
+        var stream = await guacd.Connected.Task.WaitAsync(TimeSpan.FromSeconds(20), Ct);
+        await stream.WriteAsync(Encoding.UTF8.GetBytes(GuacamoleProtocol.Encode("sync", "99")), Ct);
+        Assert.Equal(["sync", "99"], Assert.Single(await GuacamoleInstructionReader.ParseAllAsync(await ReceiveTextAsync(ws), Ct)));
+        await SendTextAsync(ws, GuacamoleProtocol.Encode("key", "65", "1"));
+        await WaitForAsync(() => Task.FromResult(guacd.Received.Count >= 7), "the key instruction");
+        Assert.Equal(["key", "65", "1"], guacd.Received[6]);
+
+        await using var scope = f.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        var join = Assert.Single(await db.AuditLogs.Where(a => a.Action == "template.console.join").ToListAsync(Ct));
+        Assert.Equal(SeededTemplate, join.Target);
+        Assert.NotNull(join.UserId);
+        Assert.Equal($"job={id}", join.Details);
+    }
+
+    [Fact]
+    public async Task JobTunnel_EnforcesTheOpcodeAllowlist()
+    {
+        using var guacd = new FakeGuacd();
+        var f = Factory(guacd.Port);
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        using var ws = await ConnectJobAsync(f, id, await GetJobTokenAsync(admin, id));
+        await ReceiveTextAsync(ws);
+        await ReceiveTextAsync(ws);
+
+        await SendTextAsync(ws, GuacamoleProtocol.Encode("clipboard", "1", "text/plain"));
+
+        Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
+        Assert.DoesNotContain(guacd.Received, i => i[0] == "clipboard");
+    }
+
+    [Fact]
+    public async Task JobTunnel_RejectsCrossOriginUpgrade_With403()
+    {
+        var f = Factory(1);
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        var token = await GetJobTokenAsync(admin, id);
+
+        var ex = await UpgradeWithOriginAsync(f, id, token, "ws://localhost:5173/api/admin/template-jobs/{id}/tunnel", "https://evil.example");
+
+        Assert.NotNull(ex);
+        Assert.Contains("403", ex.Message);
+    }
+
+    [Fact]
+    public async Task Tokens_OfTheOtherKind_OpenNothing()
+    {
+        using var guacd = new FakeGuacd();
+        var f = Factory(guacd.Port);
+        var taskId = await CreateTaskAsync(f, RunStatus.Running);
+        var jobId = await CreateJobAsync(f, TemplateJobState.Configuring);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+
+        // A task token on the job tunnel.
+        using (var ws = await ConnectJobAsync(f, jobId, await GetTokenAsync(admin, taskId)))
+            Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
+        // A job token on the task tunnel.
+        using (var ws = await ConnectAsync(f, taskId, await GetJobTokenAsync(admin, jobId)))
+            Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
+
+        // Even when the id matches (a token of the other kind issued for this very task or job), the kind decides.
+        var tokens = f.Services.GetRequiredService<GuacamoleTokenService>();
+        var someone = Guid.NewGuid();
+        using (var ws = await ConnectJobAsync(f, jobId, tokens.Issue(TunnelTokenKind.Task, jobId, someone)))
+            Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
+        using (var ws = await ConnectAsync(f, taskId, tokens.Issue(TunnelTokenKind.TemplateJob, taskId, someone)))
+            Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
+
+        // Every one was consumed by the refusal, and nothing reached guacd or the audit trail as a join.
+        Assert.Equal(0, f.Services.GetRequiredService<GuacamoleTokenService>().PendingCount);
+        Assert.Empty(guacd.Received);
+        await using var scope = f.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        Assert.DoesNotContain(await db.AuditLogs.ToListAsync(Ct), a => a.Action is "session.join" or "template.console.join");
+        Assert.Null(await LastConsoleAtAsync(f, jobId));
+    }
+
+    [Fact]
+    public async Task JobTunnel_RefusesATokenOfAnotherJob_Audited()
+    {
+        var f = Factory(1);
+        var job = await CreateJobAsync(f, TemplateJobState.Configuring);
+        var other = await CreateJobAsync(f, TemplateJobState.Failed);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        var token = await GetJobTokenAsync(admin, job);
+
+        using (var ws = await ConnectJobAsync(f, other, token))
+            Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
+
+        await using var scope = f.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        var denied = Assert.Single(await db.AuditLogs.Where(a => a.Action == "template.console.denied").ToListAsync(Ct));
+        Assert.Equal($"job={other}; token was issued for another job", denied.Details);
+        Assert.DoesNotContain(await db.AuditLogs.ToListAsync(Ct), a => a.Details?.Contains(token) == true);
+    }
+
+    [Fact]
+    public async Task JobTunnel_IsRefusedOutsideConfiguring_Audited_AndLeavesLastConsoleAtAlone()
+    {
+        var f = Factory(1);
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        var token = await GetJobTokenAsync(admin, id);
+        await SetJobStateAsync(f, id, TemplateJobState.Sealing); // the token was valid when issued
+
+        using (var ws = await ConnectJobAsync(f, id, token))
+            Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
+
+        Assert.Null(await LastConsoleAtAsync(f, id));
+        await using var scope = f.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        var denied = Assert.Single(await db.AuditLogs.Where(a => a.Action == "template.console.denied").ToListAsync(Ct));
+        Assert.Equal($"job={id}; job is not configuring", denied.Details);
+        Assert.Equal(SeededTemplate, denied.Target);
+    }
+
+    [Theory]
+    [InlineData("seal")]
+    [InlineData("cancel")]
+    public async Task JobTunnel_IsRefusedAfterASealOrCancelRequest(string request)
+    {
+        var f = Factory(1);
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        var token = await GetJobTokenAsync(admin, id); // valid when issued
+        Assert.Equal(HttpStatusCode.Accepted, (await admin.PostAsync($"/api/admin/template-jobs/{id}/{request}", null, Ct)).StatusCode);
+
+        using (var ws = await ConnectJobAsync(f, id, token))
+            Assert.StartsWith("<close:PolicyViolation>", await ReceiveTextAsync(ws));
+
+        Assert.Null(await LastConsoleAtAsync(f, id));
+        Assert.Equal(0, f.Services.GetRequiredService<Maldex.Orchestrator.Templates.JobConsoleRegistry>().OpenCount(id));
+    }
+
+    [Fact]
+    public async Task JobTunnel_OpenWhenASealIsRequested_IsClosedAtOnce_AndNoMoreInputReachesTheGuest()
+    {
+        using var guacd = new FakeGuacd();
+        var f = Factory(guacd.Port);
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        using var ws = await ConnectJobAsync(f, id, await GetJobTokenAsync(admin, id));
+        await ReceiveTextAsync(ws);
+        await ReceiveTextAsync(ws);
+        var registry = f.Services.GetRequiredService<Maldex.Orchestrator.Templates.JobConsoleRegistry>();
+        Assert.Equal(1, registry.OpenCount(id));
+        await WaitForAsync(() => Task.FromResult(guacd.Received.Count >= 6), "the handshake");
+        var received = guacd.Received.Count;
+
+        // What the coordinator does once a seal is requested, before it isolates the guest: no waiting for the 2 s poll.
+        Assert.True(await registry.CloseAsync(id, TimeSpan.FromSeconds(10), Ct));
+        try { await SendTextAsync(ws, GuacamoleProtocol.Encode("key", "65", "1")); } catch (Exception ex) when (ex is WebSocketException or IOException or ObjectDisposedException) { }
+
+        Assert.Equal(0, registry.OpenCount(id));
+        Assert.StartsWith("<close:", await ReceiveTextAsync(ws));
+        await Task.Delay(200, Ct);
+        Assert.Equal(received, guacd.Received.Count); // the key press never reached guacd
+    }
+
+    [Fact]
+    public async Task JobTunnel_KeepAlive_PublishesTheMovedIdleDeadline()
+    {
+        using var guacd = new FakeGuacd();
+        var clock = new FakeTimeProvider(new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        var publisher = new CollectingPublisher();
+        var f = new TunnelFactory(sql, guacd.Port, new VncEndpoint("127.0.0.1", 5901, VncPassword), clock: clock, publisher: publisher);
+        _disposables.Add(f);
+        var since = clock.GetUtcNow();
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring, since);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        using var ws = await ConnectJobAsync(f, id, await GetJobTokenAsync(admin, id));
+        await ReceiveTextAsync(ws);
+        await ReceiveTextAsync(ws);
+        await WaitForAsync(() => Task.FromResult(publisher.Count > 0), "the push for the connect");
+        Assert.Equal(since + TimeSpan.FromHours(2), publisher.Last!.IdleDeadline);
+
+        for (var i = 0; i < 100 && publisher.Last!.IdleDeadline == since + TimeSpan.FromHours(2); i++)
+        {
+            clock.Advance(TimeSpan.FromSeconds(61));
+            await Task.Delay(30, Ct);
+        }
+
+        Assert.True(publisher.Last!.IdleDeadline > since + TimeSpan.FromHours(2));
+        Assert.Equal(id, publisher.Last.Id);
+        Assert.Equal("Configuring", publisher.Last.State);
+    }
+
+    private sealed class CollectingPublisher : Maldex.Orchestrator.Templates.ITemplateJobPublisher
+    {
+        private readonly object _gate = new();
+        private readonly List<Maldex.Orchestrator.Templates.TemplateJobDto> _all = [];
+        public int Count { get { lock (_gate) return _all.Count; } }
+        public Maldex.Orchestrator.Templates.TemplateJobDto? Last { get { lock (_gate) return _all.LastOrDefault(); } }
+        public Task PublishAsync(Maldex.Orchestrator.Templates.TemplateJobDto job, CancellationToken ct)
+        {
+            lock (_gate) _all.Add(job);
+            return Task.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task JobTunnel_ClosesWhenTheJobLeavesConfiguring()
+    {
+        using var guacd = new FakeGuacd();
+        var f = Factory(guacd.Port);
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        using var ws = await ConnectJobAsync(f, id, await GetJobTokenAsync(admin, id));
+        await ReceiveTextAsync(ws);
+        await ReceiveTextAsync(ws);
+
+        await SetJobStateAsync(f, id, TemplateJobState.Sealing);
+
+        var close = await ReceiveTextAsync(ws);
+        Assert.StartsWith("<close:", close);
+        Assert.DoesNotContain("PolicyViolation", close);
+    }
+
+    [Fact]
+    public async Task JobTunnel_KeepsTheJobInUse_WhileOpen_AndOnceMoreOnDisconnect()
+    {
+        // Held open past the 2 h idle timeout (fake clock): LastConsoleAt keeps moving, so the coordinator's rule
+        // max(ConfiguringSince, LastConsoleAt) + timeout never discards a job an admin is working in.
+        using var guacd = new FakeGuacd();
+        var clock = new FakeTimeProvider(new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        var f = new TunnelFactory(sql, guacd.Port, new VncEndpoint("127.0.0.1", 5901, VncPassword), clock: clock);
+        _disposables.Add(f);
+        var since = clock.GetUtcNow();
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring, since);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        using var ws = await ConnectJobAsync(f, id, await GetJobTokenAsync(admin, id));
+        await ReceiveTextAsync(ws);
+        await ReceiveTextAsync(ws);
+        Assert.Equal(since, await LastConsoleAtAsync(f, id));
+
+        var timeout = TimeSpan.FromHours(2);
+        for (var i = 0; i < 130 && !(await LastConsoleAtAsync(f, id) > since + timeout); i++)
+        {
+            clock.Advance(TimeSpan.FromSeconds(61));
+            await Task.Delay(30, Ct);
+        }
+        await WaitForAsync(async () => await LastConsoleAtAsync(f, id) > since + timeout, "a keep-alive after the idle timeout");
+
+        var dto = await admin.GetFromJsonAsync<JsonElement>($"/api/admin/template-jobs/{id}", Ct);
+        Assert.Equal("Configuring", dto.GetProperty("state").GetString());
+        Assert.True(dto.GetProperty("idleDeadline").GetDateTimeOffset() > clock.GetUtcNow());
+    }
+
+    [Fact]
+    public async Task JobTunnel_MarksTheJobOnceMore_WhenTheConsoleCloses()
+    {
+        // The keep-alive is a day apart here, so only the disconnect can move LastConsoleAt after the connect.
+        using var guacd = new FakeGuacd();
+        var clock = new FakeTimeProvider(new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        var f = new TunnelFactory(sql, guacd.Port, new VncEndpoint("127.0.0.1", 5901, VncPassword), clock: clock, keepAlive: "1.00:00:00");
+        _disposables.Add(f);
+        var connectedAt = clock.GetUtcNow();
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring, connectedAt);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        using var ws = await ConnectJobAsync(f, id, await GetJobTokenAsync(admin, id));
+        await ReceiveTextAsync(ws);
+        await ReceiveTextAsync(ws);
+        Assert.Equal(connectedAt, await LastConsoleAtAsync(f, id));
+
+        clock.Advance(TimeSpan.FromMinutes(7));
+        var closedAt = clock.GetUtcNow();
+        await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "bye", Ct);
+
+        await WaitForAsync(async () => await LastConsoleAtAsync(f, id) == closedAt, "the disconnect touch");
     }
 }
