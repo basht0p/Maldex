@@ -22,7 +22,26 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         public List<string> Deleted { get; } = [];
         public bool Exists(string fileStem) => true;
         public long? SizeOf(string fileStem) => null;
-        public Task DeleteAsync(string fileStem, CancellationToken ct) { Deleted.Add(fileStem); return Task.CompletedTask; }
+        public HashSet<string> FailStems { get; } = [];
+        public Task DeleteAsync(string fileStem, CancellationToken ct)
+        {
+            if (FailStems.Contains(fileStem)) throw new IOException("disk busy");
+            Deleted.Add(fileStem);
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class FailingSaveInterceptor(Func<int, Exception?> failOnCall) : Microsoft.EntityFrameworkCore.Diagnostics.SaveChangesInterceptor
+    {
+        public int Calls { get; private set; }
+        public override ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int>> SavingChangesAsync(
+            Microsoft.EntityFrameworkCore.Diagnostics.DbContextEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            var ex = failOnCall(++Calls);
+            if (ex is not null) throw ex;
+            return base.SavingChangesAsync(eventData, result, cancellationToken);
+        }
     }
 
     private async Task<(MaldexDbContext db, string cs)> FreshAsync()
@@ -436,6 +455,65 @@ public class TemplateCatalogTests(SqlServerFixture sql)
 
             Assert.Empty(store.Deleted);
             Assert.All(await StatusesAsync(db, "a"), kv => Assert.Equal(TemplateVersionStatus.Ready, kv.Value));
+        }
+    }
+
+    [Fact]
+    public async Task Sweep_FailingDelete_DoesNotStopOthers()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            var bad = await AddVersionAsync(db, "a", 1, TemplateVersionStatus.Retired);
+            var good = await AddVersionAsync(db, "a", 2, TemplateVersionStatus.Retired);
+            var store = new RecordingStore();
+            store.FailStems.Add(bad.FileStem);
+
+            var deleted = await Catalog(db).SweepAsync(store, Ct);
+
+            Assert.Equal([good.Id], deleted.Select(v => v.Id));
+            var s = await StatusesAsync(db, "a");
+            Assert.Equal(TemplateVersionStatus.Retired, s[1]);
+            Assert.Equal(TemplateVersionStatus.Deleted, s[2]);
+        }
+    }
+
+    // --- retry policy ---
+
+    private MaldexDbContext ContextWith(string cs, FailingSaveInterceptor interceptor) =>
+        new(new DbContextOptionsBuilder<MaldexDbContext>().UseSqlServer(cs).AddInterceptors(interceptor).Options);
+
+    [Fact]
+    public async Task Mutation_NonRetryableDbUpdateException_IsNotRetried()
+    {
+        var (db, cs) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            var interceptor = new FailingSaveInterceptor(_ => new DbUpdateException("some other failure"));
+            await using var ctx = ContextWith(cs, interceptor);
+
+            await Assert.ThrowsAsync<DbUpdateException>(() => Catalog(ctx).SetEnabledAsync("a", false, Ct));
+
+            Assert.Equal(1, interceptor.Calls);
+        }
+    }
+
+    [Fact]
+    public async Task Mutation_ConcurrencyConflict_IsRetried()
+    {
+        var (db, cs) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            var interceptor = new FailingSaveInterceptor(n => n == 1 ? new DbUpdateConcurrencyException("stale") : null);
+            await using var ctx = ContextWith(cs, interceptor);
+
+            await Catalog(ctx).SetEnabledAsync("a", false, Ct);
+
+            Assert.Equal(2, interceptor.Calls);
+            Assert.Null(await Catalog(db).FindEnabledAsync("a", Ct));
         }
     }
 }

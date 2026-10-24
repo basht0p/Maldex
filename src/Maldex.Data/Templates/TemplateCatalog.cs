@@ -1,6 +1,8 @@
 using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace Maldex.Data.Templates;
@@ -12,7 +14,7 @@ public sealed class TemplateUnavailableException(string templateId) : Exception(
 /// Owns every template rule: lookup, publish, rollback, retention marking, default selection and the disk sweep.
 /// Each mutating method saves once (one transaction) and retries on a concurrency conflict, as <see cref="TaskTransitions"/> does.
 /// </summary>
-public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions> options, TimeProvider time)
+public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions> options, TimeProvider time, ILogger<TemplateCatalog>? log = null)
 {
     public const int MaxAttempts = 3;
 
@@ -87,25 +89,38 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
 
     /// <summary>
     /// Deletes the disk of every Retired version that no Preparing or Running task uses, and marks it Deleted.
+    /// Each version is recorded on its own (delete, mark, save); a failing delete is logged and the others carry on.
     /// Never touches Ready versions. Returns the versions deleted.
     /// </summary>
     public async Task<IReadOnlyList<TemplateVersion>> SweepAsync(ITemplateStore store, CancellationToken ct)
     {
         List<TemplateVersion> deleted = [];
-        await MutateAsync(async () =>
+        var retired = await db.TemplateVersions.Where(v => v.Status == TemplateVersionStatus.Retired).ToListAsync(ct).ConfigureAwait(false);
+        foreach (var version in retired)
         {
-            deleted = [];
-            var retired = await db.TemplateVersions.Where(v => v.Status == TemplateVersionStatus.Retired).ToListAsync(ct).ConfigureAwait(false);
-            foreach (var version in retired)
+            try
             {
-                var inUse = await db.Tasks.AnyAsync(t => t.TemplateVersionId == version.Id
-                    && (t.Status == RunStatus.Preparing || t.Status == RunStatus.Running), ct).ConfigureAwait(false);
-                if (inUse) continue;
-                await store.DeleteAsync(version.FileStem, ct).ConfigureAwait(false);
-                version.Status = TemplateVersionStatus.Deleted;
-                deleted.Add(version);
+                var done = false;
+                await RetryAsync(async () =>
+                {
+                    done = false;
+                    if (version.Status != TemplateVersionStatus.Retired) return;
+                    var inUse = await db.Tasks.AnyAsync(t => t.TemplateVersionId == version.Id
+                        && (t.Status == RunStatus.Preparing || t.Status == RunStatus.Running), ct).ConfigureAwait(false);
+                    if (inUse) return;
+                    await store.DeleteAsync(version.FileStem, ct).ConfigureAwait(false); // idempotent, so safe to repeat on retry
+                    version.Status = TemplateVersionStatus.Deleted;
+                    await db.SaveChangesAsync(ct).ConfigureAwait(false);
+                    done = true;
+                }, ct).ConfigureAwait(false);
+                if (done) deleted.Add(version);
             }
-        }, ct).ConfigureAwait(false);
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                log?.LogError(e, "Sweep of template version {VersionId} ({FileStem}) failed; it stays Retired", version.Id, version.FileStem);
+                if (db.Entry(version).State == EntityState.Modified) await db.Entry(version).ReloadAsync(ct).ConfigureAwait(false);
+            }
+        }
         return deleted;
     }
 
@@ -153,11 +168,10 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
                 await attempt().ConfigureAwait(false);
                 return;
             }
-            catch (DbUpdateException) when (n < MaxAttempts)
+            catch (Exception e) when (n < MaxAttempts && IsRetryable(e))
             {
                 // A racing writer won (stale row version, or the single-default unique index): drop this attempt and re-read.
-                // DbUpdateConcurrencyException derives from DbUpdateException.
-                foreach (var entry in db.ChangeTracker.Entries().ToList())
+                foreach (var entry in db.ChangeTracker.Entries().Where(en => en.Entity is Template or TemplateVersion).ToList())
                 {
                     if (entry.State == EntityState.Added) entry.State = EntityState.Detached;
                     else await entry.ReloadAsync(ct).ConfigureAwait(false);
@@ -165,4 +179,10 @@ public sealed class TemplateCatalog(MaldexDbContext db, IOptions<TemplateOptions
             }
         }
     }
+
+    private const int SqlDuplicateKeyIndex = 2601, SqlDuplicateKeyConstraint = 2627;
+
+    private static bool IsRetryable(Exception e) =>
+        e is DbUpdateConcurrencyException
+        || (e is DbUpdateException { InnerException: SqlException { Number: SqlDuplicateKeyIndex or SqlDuplicateKeyConstraint } });
 }
