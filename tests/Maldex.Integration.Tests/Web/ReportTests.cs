@@ -184,6 +184,34 @@ public sealed class ReportTests(SqlServerFixture sql) : IDisposable
     }
 
     [Fact]
+    public async Task Report_ShowsTemplateLine()
+    {
+        var f = Factory();
+        var seeded = await CompletedTaskSeed.SeedAsync(f);
+        await TemplateSeed.BindAsync(f, seeded.TaskId);
+        using var client = f.CreateClient(UserRole.Analyst);
+
+        var html = await client.GetStringAsync($"/api/tasks/{seeded.TaskId}/report.html", Ct);
+
+        Assert.Contains(">Template<", html);
+        Assert.Contains("win11-golden v3 (Windows 11 Pro 26300, agent 1.0.0, sealed 2026-10-24 by basht0p)", html);
+        Assert.DoesNotContain(">Image<", html);
+    }
+
+    [Fact]
+    public async Task Report_OldTask_ShowsImage()
+    {
+        var f = Factory();
+        var seeded = await CompletedTaskSeed.SeedAsync(f);
+        using var client = f.CreateClient(UserRole.Analyst);
+
+        var html = await client.GetStringAsync($"/api/tasks/{seeded.TaskId}/report.html", Ct);
+
+        Assert.Contains(">Image<", html);
+        Assert.DoesNotContain(">Template<", html);
+    }
+
+    [Fact]
     public async Task Report_HasStrictCsp()
     {
         var f = Factory();
