@@ -23,7 +23,7 @@ public sealed class SafeHttpFetcher
     private readonly TimeProvider _time;
     private readonly ILogger<SafeHttpFetcher> _log;
     private readonly Func<string, CancellationToken, Task<IPAddress[]>> _resolve;
-    private readonly Func<IPAddress, bool> _isRefused;
+    private readonly Func<IPAddress, bool>? _isRefused;
 
     public SafeHttpFetcher(IOptions<MediaOptions> options, TimeProvider time, ILogger<SafeHttpFetcher> log,
         Func<string, CancellationToken, Task<IPAddress[]>>? resolve = null, Func<IPAddress, bool>? isRefused = null)
@@ -32,9 +32,12 @@ public sealed class SafeHttpFetcher
         _time = time;
         _log = log;
         _resolve = resolve ?? ((host, ct) => Dns.GetHostAddressesAsync(host, ct));
-        _isRefused = isRefused ?? (ip => UrlFetchPolicy.IsRefused(ip, _options.AllowPrivateFetch, HostAddresses()));
+        _isRefused = isRefused;
     }
 
+    /// <summary>
+    /// Bytes already written to <paramref name="destination"/> are partial after a failure; the caller must discard them.
+    /// </summary>
     public async Task<FetchResult> FetchAsync(Uri url, Stream destination, Func<long, Task> progress, CancellationToken ct)
     {
         if (UrlFetchPolicy.RefuseUrl(url) is { } bad) throw new MediaFetchException($"refused: {bad}");
@@ -65,7 +68,12 @@ public sealed class SafeHttpFetcher
         var current = url;
         for (var hops = 0; ; hops++)
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, current);
+            // HTTP/1.1 only: HTTP/3 (QUIC) would bypass the ConnectCallback and with it the address check.
+            using var request = new HttpRequestMessage(HttpMethod.Get, current)
+            {
+                Version = HttpVersion.Version11,
+                VersionPolicy = HttpVersionPolicy.RequestVersionExact,
+            };
             HttpResponseMessage response;
             try
             {
@@ -89,6 +97,10 @@ public sealed class SafeHttpFetcher
                     continue;
                 }
                 if (status != 200) throw new MediaFetchException($"the server answered {status}");
+
+                var encoding = response.Content.Headers.ContentEncoding.FirstOrDefault(e => !e.Equals("identity", StringComparison.OrdinalIgnoreCase));
+                if (encoding is not null)
+                    throw new MediaFetchException($"the server sent a compressed ({encoding}) response; only raw files are supported");
 
                 var max = _options.MaxBytes;
                 if (response.Content.Headers.ContentLength is { } len && len > max)
@@ -148,7 +160,8 @@ public sealed class SafeHttpFetcher
         try { addresses = await _resolve(host, ct); }
         catch (SocketException) { throw new MediaFetchException($"could not resolve {host}"); }
         if (addresses.Length == 0) throw new MediaFetchException($"could not resolve {host}");
-        if (addresses.Any(_isRefused))
+        Func<IPAddress, bool> isRefused = _isRefused ?? DefaultClassifier();
+        if (addresses.Any(isRefused))
         {
             _log.LogWarning("Refused fetch from {Host}: resolves to a private, loopback or link-local address", host);
             throw new MediaFetchException($"refused: {host} resolves to a private, loopback or link-local address");
@@ -169,6 +182,13 @@ public sealed class SafeHttpFetcher
         throw new MediaFetchException($"could not connect to {host}: {last?.Message}");
     }
 
+    /// <summary>The host's own interface addresses are read once per connect, not once per address.</summary>
+    private Func<IPAddress, bool> DefaultClassifier()
+    {
+        var host = HostAddresses();
+        return ip => UrlFetchPolicy.IsRefused(ip, _options.AllowPrivateFetch, host);
+    }
+
     private static string FormatLimit(long bytes) => bytes % (1L << 30) == 0 ? $"{bytes >> 30} GiB" : $"{bytes} byte";
 
     private static string? SuggestedName(HttpResponseMessage response)
@@ -182,8 +202,12 @@ public sealed class SafeHttpFetcher
         }
         if (string.IsNullOrWhiteSpace(name)) return null;
         name = Path.GetFileName(name.Trim().Trim('"').Replace('\\', '/'));
-        return string.IsNullOrWhiteSpace(name) || name is "." or ".." ? null : name;
+        name = new string(name.Where(c => !char.IsControl(c)).ToArray()).Trim();
+        if (name.Length > MaxFileNameLength) name = name[..MaxFileNameLength];
+        return name.Length == 0 || name is "." or ".." ? null : name;
     }
+
+    private const int MaxFileNameLength = 255;
 
     private static IReadOnlySet<IPAddress> HostAddresses()
     {

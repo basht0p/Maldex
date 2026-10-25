@@ -40,10 +40,10 @@ public sealed class SafeHttpFetcherTests : IAsyncLifetime
         return new Uri(app.Urls.First()).Port;
     }
 
-    private static SafeHttpFetcher Fetcher(MediaOptions? options = null, bool seams = true)
+    private static SafeHttpFetcher Fetcher(MediaOptions? options = null, bool seams = true, TimeProvider? time = null)
     {
         options ??= new MediaOptions();
-        return new SafeHttpFetcher(Options.Create(options), TimeProvider.System, NullLogger<SafeHttpFetcher>.Instance,
+        return new SafeHttpFetcher(Options.Create(options), time ?? TimeProvider.System, NullLogger<SafeHttpFetcher>.Instance,
             seams ? Resolve : null,
             seams ? (ip => ip.Equals(Private)) : null);
     }
@@ -159,19 +159,16 @@ public sealed class SafeHttpFetcherTests : IAsyncLifetime
     [Fact]
     public async Task ContentLengthOverCap_FailsWithoutReadingBody()
     {
-        var bodyStarted = false;
         var port = await Serve(Public, app => app.MapGet("/", async (HttpContext c) =>
         {
             c.Response.ContentLength = 1_000_000;
             await c.Response.StartAsync();
-            bodyStarted = true;
             await c.Response.Body.WriteAsync(new byte[1000]);
         }));
         var (_, error, written) = await Run(Fetcher(new MediaOptions { MaxBytes = 1000 }), new Uri($"http://public.test:{port}/"));
         Assert.NotNull(error);
         Assert.Contains("larger than the", error!.Message);
         Assert.Equal(0, written);
-        _ = bodyStarted;
     }
 
     [Fact]
@@ -230,5 +227,153 @@ public sealed class SafeHttpFetcherTests : IAsyncLifetime
         var (_, error, _) = await Run(Fetcher(), new Uri("ftp://public.test/x.iso"));
         Assert.NotNull(error);
         Assert.Contains("only http and https", error!.Message);
+    }
+
+    [Fact]
+    public async Task Fetch_StripsControlCharactersFromTheSuggestedName()
+    {
+        var port = await Serve(Public, app => app.MapGet("/d", (HttpContext c) =>
+        {
+            c.Response.Headers.ContentDisposition = "attachment; filename*=UTF-8''a%0Ab%1Bc%00.iso";
+            return Results.Bytes(_payload);
+        }));
+        var (result, error, _) = await Run(Fetcher(), new Uri($"http://public.test:{port}/d"));
+        Assert.Null(error);
+        Assert.Equal("abc.iso", result!.SuggestedFileName);
+    }
+
+    [Fact]
+    public async Task Fetch_StripsControlCharactersFromTheUrlSegmentName()
+    {
+        var port = await Serve(Public, app => app.MapGet("/files/{name}", () => Results.Bytes(_payload)));
+        var (result, error, _) = await Run(Fetcher(), new Uri($"http://public.test:{port}/files/x%0Ay%1B.iso"));
+        Assert.Null(error);
+        Assert.Equal("xy.iso", result!.SuggestedFileName);
+    }
+
+    [Fact]
+    public async Task Fetch_SuggestedNameWithOnlyControlCharacters_IsNull()
+    {
+        var port = await Serve(Public, app => app.MapGet("/d", (HttpContext c) =>
+        {
+            c.Response.Headers.ContentDisposition = "attachment; filename*=UTF-8''%0A%1B";
+            return Results.Bytes(_payload);
+        }));
+        var (result, error, _) = await Run(Fetcher(), new Uri($"http://public.test:{port}/d"));
+        Assert.Null(error);
+        Assert.Null(result!.SuggestedFileName);
+    }
+
+    [Fact]
+    public async Task Fetch_CapsTheSuggestedNameAt255Characters()
+    {
+        var long400 = new string('a', 400) + ".iso";
+        var port = await Serve(Public, app => app.MapGet("/d", (HttpContext c) =>
+        {
+            c.Response.Headers.ContentDisposition = $"attachment; filename=\"{long400}\"";
+            return Results.Bytes(_payload);
+        }));
+        var (result, error, _) = await Run(Fetcher(), new Uri($"http://public.test:{port}/d"));
+        Assert.Null(error);
+        Assert.Equal(255, result!.SuggestedFileName!.Length);
+    }
+
+    [Theory]
+    [InlineData("http://u:p@public.test:{0}/hit", "refused: credentials in URLs are not supported")]
+    [InlineData("ftp://public.test/hit", "refused: only http and https URLs are supported")]
+    public async Task Redirect_ToDisallowedUrl_IsRefusedByPolicy_WithoutRequestingIt(string targetFormat, string message)
+    {
+        var hits = 0;
+        var port = 0;
+        port = await Serve(Public, app =>
+        {
+            app.MapGet("/", (HttpContext c) => { c.Response.Redirect(string.Format(targetFormat, port)); });
+            app.MapGet("/hit", () => { Interlocked.Increment(ref hits); return Results.Bytes(_payload); });
+        });
+        var (_, error, written) = await Run(Fetcher(), new Uri($"http://public.test:{port}/"));
+        Assert.NotNull(error);
+        Assert.Equal(message, error!.Message);
+        Assert.Equal(0, written);
+        Assert.Equal(0, hits);
+    }
+
+    [Fact]
+    public async Task CompressedResponse_IsRefused()
+    {
+        var port = await Serve(Public, app => app.MapGet("/", (HttpContext c) =>
+        {
+            c.Response.Headers.ContentEncoding = "gzip";
+            return Results.Bytes(_payload);
+        }));
+        var (_, error, written) = await Run(Fetcher(), new Uri($"http://public.test:{port}/"));
+        Assert.NotNull(error);
+        Assert.Equal("the server sent a compressed (gzip) response; only raw files are supported", error!.Message);
+        Assert.Equal(0, written);
+    }
+
+    private static async Task<(FetchResult? Result, MediaFetchException? Error, long Written)> RunWithProgress(SafeHttpFetcher f, Uri url, TaskCompletionSource firstBytes)
+    {
+        var sink = new MemoryStream();
+        try
+        {
+            return (await f.FetchAsync(url, sink, _ => { firstBytes.TrySetResult(); return Task.CompletedTask; }, CancellationToken.None), null, sink.Length);
+        }
+        catch (MediaFetchException e) { return (null, e, sink.Length); }
+    }
+
+    private async Task<(Uri Url, TaskCompletionSource Stalled)> ServeStalled(bool sendHeadersFirst)
+    {
+        var stalled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var port = await Serve(Public, app => app.MapGet("/", async (HttpContext c) =>
+        {
+            if (sendHeadersFirst)
+            {
+                c.Response.ContentLength = 1_000_000;
+                await c.Response.Body.WriteAsync(new byte[100]);
+                await c.Response.Body.FlushAsync();
+            }
+            stalled.TrySetResult();
+            try { await Task.Delay(Timeout.Infinite, c.RequestAborted); } catch (OperationCanceledException) { }
+        }));
+        return (new Uri($"http://public.test:{port}/"), stalled);
+    }
+
+    private static async Task<MediaFetchException> AdvanceUntilFailure(Task<(FetchResult? Result, MediaFetchException? Error, long Written)> run,
+        Microsoft.Extensions.Time.Testing.FakeTimeProvider time, TimeSpan step)
+    {
+        for (var i = 0; i < 100 && !run.IsCompleted; i++)
+        {
+            time.Advance(step);
+            await Task.WhenAny(run, Task.Delay(50));
+        }
+        Assert.True(run.IsCompleted, "the fetch never gave up");
+        var (_, error, _) = await run;
+        return Assert.IsType<MediaFetchException>(error);
+    }
+
+    [Fact]
+    public async Task StalledBody_FailsAfterTheIdleTimeout()
+    {
+        var (url, _) = await ServeStalled(sendHeadersFirst: true);
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        var f = Fetcher(new MediaOptions { FetchIdleTimeout = TimeSpan.FromMinutes(2), FetchTimeout = TimeSpan.FromDays(30) }, time: time);
+        var firstBytes = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var run = RunWithProgress(f, url, firstBytes);
+        await firstBytes.Task;
+        var error = await AdvanceUntilFailure(run, time, TimeSpan.FromMinutes(3));
+        Assert.Equal("the download stalled", error.Message);
+    }
+
+    [Fact]
+    public async Task SlowDownload_FailsAfterTheOverallTimeout()
+    {
+        var (url, _) = await ServeStalled(sendHeadersFirst: true);
+        var time = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        var f = Fetcher(new MediaOptions { FetchIdleTimeout = TimeSpan.FromDays(30), FetchTimeout = TimeSpan.FromMinutes(10) }, time: time);
+        var firstBytes = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var run = RunWithProgress(f, url, firstBytes);
+        await firstBytes.Task;
+        var error = await AdvanceUntilFailure(run, time, TimeSpan.FromMinutes(11));
+        Assert.Equal("the download timed out", error.Message);
     }
 }
