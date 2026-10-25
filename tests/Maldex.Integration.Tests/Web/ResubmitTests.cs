@@ -21,9 +21,9 @@ public sealed class ResubmitTests(SqlServerFixture sql) : IDisposable
 
     public void Dispose() { foreach (var f in _factories) f.Dispose(); }
 
-    private MaldexAppFactory Factory()
+    private MaldexAppFactory Factory(IReadOnlyDictionary<string, string?>? settings = null)
     {
-        var f = new MaldexAppFactory(sql);
+        var f = new MaldexAppFactory(sql, settings: settings);
         _factories.Add(f);
         return f;
     }
@@ -149,5 +149,48 @@ public sealed class ResubmitTests(SqlServerFixture sql) : IDisposable
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
         var row = await db.AuditLogs.SingleAsync(a => a.Action == "task.submit" && a.Target == newId.ToString(), Ct);
         Assert.Contains($"resubmittedFrom={srcId}", row.Details);
+    }
+
+    [Fact]
+    public async Task Resubmit_of_a_sample_over_the_upload_limit_is_413()
+    {
+        using var f = Factory(new Dictionary<string, string?> { ["Maldex:MaxUploadBytes"] = "1024" });
+        using var client = f.CreateClient(UserRole.Analyst, "analyst");
+        var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
+        var src = await SubmitAsync(client, org, file: true);
+
+        // The stored sample is bigger than the cap now (it was lowered after the upload, or the host moved to Real mode).
+        using (var scope = f.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+            await db.Samples.ExecuteUpdateAsync(u => u.SetProperty(x => x.Size, 2048L), Ct);
+        }
+
+        var resp = await client.PostAsJsonAsync($"/api/tasks/{src.GetProperty("id").GetGuid()}/resubmit", new { }, Ct);
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, resp.StatusCode);
+        Assert.Contains("1024 bytes", (await Json(resp)).GetProperty("detail").GetString());
+        using var check = f.Services.CreateScope();
+        Assert.Equal(1, await check.ServiceProvider.GetRequiredService<MaldexDbContext>().Tasks.CountAsync(Ct));
+    }
+
+    [Fact]
+    public async Task Resubmit_requires_analyst_auth()
+    {
+        var f = Factory();
+        using var client = f.CreateClient(UserRole.Analyst, "analyst");
+        var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
+        var src = await SubmitAsync(client, org, file: false);
+        // A second host on the same database, in Entra mode: dev auth would admit an unauthenticated client.
+        var entra = new MaldexAppFactory(sql, authMode: "Entra", connectionString: f.ConnectionString, settings: new Dictionary<string, string?>
+        {
+            ["AzureAd:Instance"] = "https://login.microsoftonline.com/",
+            ["AzureAd:TenantId"] = "00000000-0000-0000-0000-000000000000",
+            ["AzureAd:ClientId"] = "00000000-0000-0000-0000-000000000001",
+        });
+        _factories.Add(entra);
+        using var anonymous = entra.CreateClient();
+
+        var resp = await anonymous.PostAsJsonAsync($"/api/tasks/{src.GetProperty("id").GetGuid()}/resubmit", new { }, Ct);
+        Assert.Equal(HttpStatusCode.Unauthorized, resp.StatusCode);
     }
 }

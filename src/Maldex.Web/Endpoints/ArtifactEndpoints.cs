@@ -46,7 +46,7 @@ public static class ArtifactEndpoints
             await source.CopyToAsync(buffer, ct);
             var bytes = buffer.ToArray();
             var type = bytes is [0x89, 0x50, 0x4E, 0x47, ..] ? "image/png" : bytes is [0xFF, 0xD8, ..] ? "image/jpeg" : null;
-            if (type is null) return Results.StatusCode(StatusCodes.Status415UnsupportedMediaType);
+            if (type is null) return Results.Problem(title: "The screenshot is not a PNG or JPEG image.", statusCode: StatusCodes.Status415UnsupportedMediaType);
             ctx.Response.Headers.ContentDisposition = "inline";
             ctx.Response.Headers.XContentTypeOptions = "nosniff";
             ctx.Response.Headers.CacheControl = "private, max-age=86400";

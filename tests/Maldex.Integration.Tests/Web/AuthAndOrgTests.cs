@@ -26,6 +26,7 @@ public sealed class AuthAndOrgTests(SqlServerFixture sql) : IDisposable
         Assert.Equal("Dev User", me.GetProperty("displayName").GetString());
         Assert.Equal("Admin", me.GetProperty("role").GetString());
         Assert.NotEqual(Guid.Empty, me.GetProperty("id").GetGuid());
+        Assert.Equal(268_435_456, me.GetProperty("maxUploadBytes").GetInt64()); // the effective submit cap
 
         using var named = _factory.CreateClient(UserRole.Analyst, "alice");
         var alice = await named.GetFromJsonAsync<JsonElement>("/api/me", Ct);

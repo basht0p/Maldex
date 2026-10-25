@@ -269,7 +269,10 @@ public sealed class TaskReportTests(SqlServerFixture sql) : IDisposable
         Assert.Equal("image/jpeg", (await client.GetAsync($"/api/artifacts/{jpeg.Id}/image", Ct)).Content.Headers.ContentType!.MediaType);
         Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync($"/api/artifacts/{dropped.Id}/image", Ct)).StatusCode);
         Assert.Equal(HttpStatusCode.NotFound, (await client.GetAsync($"/api/artifacts/{Guid.NewGuid()}/image", Ct)).StatusCode);
-        Assert.Equal(HttpStatusCode.UnsupportedMediaType, (await client.GetAsync($"/api/artifacts/{gif.Id}/image", Ct)).StatusCode);
+        var unsupported = await client.GetAsync($"/api/artifacts/{gif.Id}/image", Ct);
+        Assert.Equal(HttpStatusCode.UnsupportedMediaType, unsupported.StatusCode);
+        Assert.Equal("application/problem+json", unsupported.Content.Headers.ContentType!.MediaType);
+        Assert.Equal(415, (await unsupported.Content.ReadFromJsonAsyncElement()).GetProperty("status").GetInt32());
 
         using var scope = f.Services.CreateScope();
         Assert.Equal(0, await scope.ServiceProvider.GetRequiredService<MaldexDbContext>().AuditLogs.CountAsync(a => a.Action == "artifact.download", Ct));
