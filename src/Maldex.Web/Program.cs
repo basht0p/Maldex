@@ -42,6 +42,7 @@ builder.Services.Configure<FormOptions>(o => o.MultipartBodyLengthLimit =
     new SubmissionOptions { MaxUploadBytes = builder.Configuration.GetValue<long?>("Maldex:MaxUploadBytes") ?? 268_435_456 }.MaxUploadBytes + 65536);
 builder.AddMaldexAuth();
 builder.Services.AddScoped<ReportModelBuilder>();
+builder.Services.AddScoped<TaskReportBuilder>();
 builder.Services.AddSingleton<ReportRenderer>();
 builder.Services.AddSingleton<PdfRenderer>();
 
@@ -92,6 +93,7 @@ app.MapMediaEndpoints();
 app.MapTaskEndpoints();
 app.MapLiveControlEndpoints();
 app.MapReportEndpoints();
+app.MapTaskReportEndpoints();
 app.MapArtifactEndpoints();
 app.MapGuacamoleTunnelEndpoints();
 app.MapHub<TaskHub>("/hubs/tasks");

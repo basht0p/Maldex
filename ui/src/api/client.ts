@@ -15,6 +15,7 @@ import type {
   TaskDto,
   TaskListDto,
   TaskListQuery,
+  TaskReportDto,
   TemplateJobDto,
   TemplateJobNetwork,
   TemplateSummaryDto,
@@ -135,3 +136,7 @@ export const putMediaChunk = (id: string, offset: number, chunk: Blob, signal?: 
 export const fetchMedia = (url: string, kind: MediaKind, fileName?: string) =>
   post<MediaFileDto>('/api/admin/media/fetch', { url, kind, fileName: fileName || null })
 export const deleteMedia = (id: string) => request<void>('DELETE', `/api/admin/media/${encodeURIComponent(id)}`)
+
+export const getTaskReport = (id: string) => get<TaskReportDto>(`/api/tasks/${encodeURIComponent(id)}/report`)
+export const screenshotUrl = (artifactId: string) => `/api/artifacts/${encodeURIComponent(artifactId)}/image`
+export const httpBodyUrl = (taskId: string, txId: number) => `/api/tasks/${encodeURIComponent(taskId)}/http/${txId}/body`
