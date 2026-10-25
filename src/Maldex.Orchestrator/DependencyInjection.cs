@@ -1,6 +1,7 @@
 using Maldex.Data.Templates;
 using Maldex.Infrastructure.Real;
 using Maldex.Orchestrator.Templates;
+using Maldex.Orchestrator.Templates.Build;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -29,6 +30,22 @@ public static class DependencyInjection
             o.SysmonConfigPath = RealPaths.Resolve(root, o.SysmonConfigPath);
             o.MitmCaPemPath = RealPaths.Resolve(root, o.MitmCaPemPath);
         });
+        services.Configure<BuildOptions>(configuration.GetSection(BuildOptions.SectionName));
+        services.PostConfigure<BuildOptions>(o =>
+        {
+            var configuredRoot = configuration[$"{RealOptions.SectionName}:{nameof(RealOptions.Root)}"];
+            var root = string.IsNullOrWhiteSpace(configuredRoot) ? RealPaths.FindRoot(AppContext.BaseDirectory) : Path.GetFullPath(configuredRoot);
+            o.VirtioIsoPath = RealPaths.Resolve(root, o.VirtioIsoPath);
+            o.SysmonZipPath = RealPaths.Resolve(root, o.SysmonZipPath);
+            o.AutounattendPath = RealPaths.Resolve(root, o.AutounattendPath);
+            o.ProvisionScriptPath = RealPaths.Resolve(root, o.ProvisionScriptPath);
+            o.OfficeConfigPath = RealPaths.Resolve(root, o.OfficeConfigPath);
+            o.WorkDir = RealPaths.Resolve(root, o.WorkDir);
+            o.JobLogDir = RealPaths.Resolve(root, o.JobLogDir);
+        });
+        var mode = configuration["Maldex:Mode"];
+        if (string.IsNullOrEmpty(mode) || mode == "Fake") services.TryAddSingleton<IProvisioningMediaBuilder, FakeProvisioningMediaBuilder>();
+        else services.TryAddSingleton<IProvisioningMediaBuilder, XorrisoProvisioningMediaBuilder>();
         services.AddSingleton<VmSlotGate>();
         services.AddSingleton<JobConsoleRegistry>();
         services.AddSingleton<TemplateSealer>();

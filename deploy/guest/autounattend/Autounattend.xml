@@ -4,9 +4,9 @@
   Everything here is for a DISPOSABLE analysis VM that has no network during the build and is reset for every run.
   The "analyst" password below is a fixed throwaway value; it is NOT a secret and protects nothing.
 
-  Image selection: by name ("Windows 11 Enterprise Evaluation"). build-guest.sh rewrites the two marked lines to
-  /IMAGE/INDEX of Enterprise or Pro on multi-edition media (or MALDEX_WIN_IMAGE_INDEX), and fills in ProductKey/Key for
-  non-evaluation editions.
+  Image selection: by name ("Windows 11 Enterprise Evaluation") as checked in. The host (AutounattendRenderer, when a
+  Build from ISO makes the provisioning CD; build-guest.sh until it is retired) rewrites the two marked MetaData lines to
+  /IMAGE/INDEX of the chosen edition, and adds ProductKey/Key (generic KMS client key) for non-evaluation editions.
   No TPM / Secure Boot / RAM bypass (LabConfig) keys on purpose: the OVMF + vTPM domain satisfies the requirements.
 -->
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
