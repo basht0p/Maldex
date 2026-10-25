@@ -246,6 +246,36 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
         }, ct);
 
     /// <summary>
+    /// Deletes a template that never produced a version, together with its (terminal) job rows. One transaction with the template
+    /// row locked (<c>UPDLOCK, HOLDLOCK</c>), so a Build queued meanwhile either finds the template gone or makes this refuse.
+    /// The audit rows that name the template stay: they are the history.
+    /// </summary>
+    /// <exception cref="TemplateRuleException">The template has a version (any status), an active job, or is the default.</exception>
+    public Task DeleteEmptyAsync(string templateId, CancellationToken ct, TemplateAudit? audit = null) =>
+        RetryAsync(async () =>
+        {
+            await using var tx = await db.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
+            var template = await db.Templates
+                .FromSqlInterpolated($"SELECT * FROM Templates WITH (UPDLOCK, HOLDLOCK) WHERE Id = {templateId}")
+                .SingleOrDefaultAsync(ct).ConfigureAwait(false)
+                ?? throw new InvalidOperationException($"template '{templateId}' does not exist");
+            if (await db.TemplateVersions.AnyAsync(v => v.TemplateId == template.Id, ct).ConfigureAwait(false))
+                throw new TemplateRuleException("the template has versions; it cannot be deleted");
+            if (await db.TemplateJobs.AnyAsync(j => j.TemplateId == template.Id && ActiveJobStates.Contains(j.State), ct).ConfigureAwait(false))
+                throw new TemplateRuleException("a job is already running for this template");
+            if (template.IsDefault) throw new TemplateRuleException("choose another default first");
+
+            await db.TemplateJobs.Where(j => j.TemplateId == template.Id).ExecuteDeleteAsync(ct).ConfigureAwait(false);
+            // Gone from the database: stop tracking them, or removing the template would try to delete them once more.
+            foreach (var entry in db.ChangeTracker.Entries<TemplateJob>().Where(en => en.Entity.TemplateId == template.Id).ToList())
+                entry.State = EntityState.Detached;
+            db.Templates.Remove(template);
+            AddAudit(audit, template.Id);
+            await db.SaveChangesAsync(ct).ConfigureAwait(false);
+            await tx.CommitAsync(ct).ConfigureAwait(false);
+        }, ct);
+
+    /// <summary>
     /// Deletes the disk of every Retired version that no Preparing, Running or Collecting task uses and that is not the base
     /// of a non-terminal template job, and marks it Deleted.
     /// Each version is recorded on its own (delete, then mark it and add its system audit row in one save); a failing

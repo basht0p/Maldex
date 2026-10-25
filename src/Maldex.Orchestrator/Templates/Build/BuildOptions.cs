@@ -17,6 +17,9 @@ public sealed class BuildOptions
     public string WorkDir { get; set; } = ".data/vm/build";
     public string JobLogDir { get; set; } = ".data/templates/jobs";
 
+    /// <summary>Where a Build's provisioning log is kept (<c>&lt;JobLogDir&gt;/&lt;jobId:N&gt;/provision.log</c>).</summary>
+    public string ProvisionLogPathOf(Guid jobId) => Path.Combine(JobLogDir, jobId.ToString("N"), "provision.log");
+
     public int DiskGiB { get; set; } = 64;
     public TimeSpan InstallTimeout { get; set; } = TimeSpan.FromHours(3);
     public TimeSpan ProvisionTimeout { get; set; } = TimeSpan.FromHours(2);

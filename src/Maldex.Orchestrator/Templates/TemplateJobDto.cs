@@ -4,16 +4,19 @@ using Maldex.Core.Lifecycle;
 namespace Maldex.Orchestrator.Templates;
 
 /// <summary>
-/// A template job as the admin API and the hub show it. <see cref="IdleDeadline"/> is when a Configuring job is discarded
-/// for want of a console connection (null in every other state).
+/// A template job as the admin API and the hub show it. <see cref="BaseVersionNumber"/> is null for a Build.
+/// <see cref="IdleDeadline"/> is when a Configuring job is discarded for want of a console connection (null in every other state).
+/// <see cref="SealRequested"/> comes from the server so a refused seal (Defender) shows the button again.
 /// </summary>
-public sealed record TemplateJobDto(Guid Id, string Kind, string TemplateId, int BaseVersionNumber, int? ResultVersionNumber, string Network,
-    string State, string? Message, string? FailureReason, DateTimeOffset CreatedAt, DateTimeOffset? EndedAt, DateTimeOffset? IdleDeadline)
+public sealed record TemplateJobDto(Guid Id, string Kind, string TemplateId, int? BaseVersionNumber, int? ResultVersionNumber, string Network,
+    string State, string? Message, string? FailureReason, DateTimeOffset CreatedAt, DateTimeOffset? EndedAt, DateTimeOffset? IdleDeadline,
+    string? Edition, bool HasProvisionLog, bool SealRequested)
 {
     /// <summary>The wire form of <paramref name="job"/>; the version numbers are looked up by the caller.</summary>
-    public static TemplateJobDto From(TemplateJob job, int baseVersionNumber, int? resultVersionNumber, TimeSpan configureIdleTimeout) =>
+    public static TemplateJobDto From(TemplateJob job, int? baseVersionNumber, int? resultVersionNumber, TimeSpan configureIdleTimeout, bool hasProvisionLog = false) =>
         new(job.Id, job.Kind.ToString(), job.TemplateId, baseVersionNumber, resultVersionNumber, job.Network.ToString(), job.State.ToString(),
-            job.Message, job.FailureReason, job.CreatedAt, job.EndedAt, IdleDeadlineOf(job, configureIdleTimeout));
+            job.Message, job.FailureReason, job.CreatedAt, job.EndedAt, IdleDeadlineOf(job, configureIdleTimeout),
+            job.EditionName, hasProvisionLog, job.SealRequestedAt is not null);
 
     /// <summary><c>max(ConfiguringSince, LastConsoleAt) + timeout</c> while Configuring; the same rule the coordinator discards by.</summary>
     public static DateTimeOffset? IdleDeadlineOf(TemplateJob job, TimeSpan configureIdleTimeout) =>
