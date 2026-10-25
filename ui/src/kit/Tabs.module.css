@@ -1,0 +1,9 @@
+.list { display: flex; gap: 4px; border-bottom: 1px solid var(--mx-border); }
+.tab {
+  background: none; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px;
+  padding: 8px 14px; color: var(--mx-text); font: inherit; cursor: pointer; opacity: 0.75;
+}
+.tab:hover { opacity: 1; }
+.tab[aria-selected='true'] { border-bottom-color: var(--mx-accent); opacity: 1; font-weight: 600; }
+.tab:focus-visible { outline: 2px solid var(--mx-accent); outline-offset: -2px; }
+.panel { padding-top: 12px; }
