@@ -46,6 +46,7 @@ public static class DependencyInjection
             o.Root = RealPaths.Resolve(root, o.Root);
         });
         services.AddSingleton<MediaStore>();
+        services.AddSingleton<SafeHttpFetcher>();
         // YARA is real in every mode; the yara binary is a host dependency, not a fake.
         services.AddSingleton<IYaraScanner, YaraCliScanner>();
 
