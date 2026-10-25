@@ -1,4 +1,5 @@
 using Maldex.Core.Domain;
+using Maldex.Core.Lifecycle;
 
 namespace Maldex.Orchestrator.Templates;
 
@@ -15,12 +16,10 @@ public sealed record TemplateJobDto(Guid Id, string Kind, string TemplateId, int
             job.Message, job.FailureReason, job.CreatedAt, job.EndedAt, IdleDeadlineOf(job, configureIdleTimeout));
 
     /// <summary><c>max(ConfiguringSince, LastConsoleAt) + timeout</c> while Configuring; the same rule the coordinator discards by.</summary>
-    public static DateTimeOffset? IdleDeadlineOf(TemplateJob job, TimeSpan configureIdleTimeout)
-    {
-        if (job.State != TemplateJobState.Configuring || job.ConfiguringSince is not { } since) return null;
-        if (job.LastConsoleAt is { } console && console > since) since = console;
-        return since + configureIdleTimeout;
-    }
+    public static DateTimeOffset? IdleDeadlineOf(TemplateJob job, TimeSpan configureIdleTimeout) =>
+        job.State == TemplateJobState.Configuring && job.ConfiguringSince is { } since
+            ? TemplateJobStateMachine.IdleDeadline(since, job.LastConsoleAt, configureIdleTimeout)
+            : null;
 }
 
 /// <summary>Pushes job updates to the clients watching the job (implemented over SignalR by Maldex.Web).</summary>

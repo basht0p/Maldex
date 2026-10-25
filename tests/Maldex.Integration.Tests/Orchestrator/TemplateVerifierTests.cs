@@ -1,5 +1,6 @@
 using Maldex.Core.Abstractions;
 using Maldex.Core.Agent;
+using Maldex.Orchestrator;
 using Maldex.Orchestrator.Templates;
 using Xunit;
 
@@ -86,6 +87,71 @@ public class TemplateVerifierTests
 
         Assert.Contains("provenance", ex.Message);
         Assert.Empty(await kit.Hypervisor.ListAsync(Ct));
+    }
+
+    [Fact]
+    public async Task Verify_AProvenanceRequestLostInTheReconnectGap_IsResent()
+    {
+        await using var kit = Kit();
+        kit.DropProvenanceRequests = 1; // the first request is lost; only a resend is answered
+        kit.Options.ProvenanceRetryInterval = TimeSpan.FromMilliseconds(100);
+
+        var p = await kit.Verifier.VerifyAsync("win11-v3", kit.Bundle, Ct).WaitAsync(TimeSpan.FromSeconds(8), Ct); // well inside VerifyTimeout (10 s)
+
+        Assert.Equal(kit.Bundle.AgentBuildId, p.AgentVersion);
+    }
+
+    private sealed class FailingDestroy(IHypervisor inner) : IHypervisor
+    {
+        public Task<VmHandle> StartAsync(VmSpec spec, CancellationToken ct) => inner.StartAsync(spec, ct);
+        public Task DestroyAsync(VmHandle handle, CancellationToken ct) => throw new IOException("virsh destroy failed");
+        public Task<bool> IsRunningAsync(VmHandle vm, CancellationToken ct) => inner.IsRunningAsync(vm, ct);
+        public Task<IReadOnlyList<VmHandle>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
+    }
+
+    private sealed class FailingDisposeChannels(IAgentChannelFactory inner) : IAgentChannelFactory
+    {
+        public async Task<IAgentChannel> ConnectAsync(VmHandle vm, CancellationToken ct) => new FailingDispose(await inner.ConnectAsync(vm, ct));
+
+        private sealed class FailingDispose(IAgentChannel inner) : IAgentChannel
+        {
+            public int Violations => inner.Violations;
+            public IAsyncEnumerable<AgentMessage> ReadAsync(CancellationToken ct) => inner.ReadAsync(ct);
+            public Task SendAsync(AgentCommand command, CancellationToken ct) => inner.SendAsync(command, ct);
+            public async ValueTask DisposeAsync()
+            {
+                await inner.DisposeAsync();
+                throw new IOException("the socket was already gone");
+            }
+        }
+    }
+
+    private static TemplateVerifier VerifierWith(TemplateJobKit kit, IHypervisor hypervisor, IAgentChannelFactory channels, IEgressRouter egress) =>
+        new(hypervisor, channels, egress, Microsoft.Extensions.Options.Options.Create(new OrchestratorOptions()), Microsoft.Extensions.Options.Options.Create(kit.Options),
+            Microsoft.Extensions.Options.Options.Create(new Maldex.Infrastructure.Net.NetOptions { RunDir = kit.RunDir }), TimeProvider.System);
+
+    [Fact]
+    public async Task Verify_AFailingChannelClose_StillDestroysTheVm_AndReleasesTheLease_AndKeepsTheResult()
+    {
+        await using var kit = Kit();
+        var egress = new Maldex.Infrastructure.Fakes.NoopEgressRouter(Microsoft.Extensions.Options.Options.Create(new Maldex.Infrastructure.Fakes.FakeEgressOptions()), kit.Guest);
+
+        var p = await VerifierWith(kit, kit.Hypervisor, new FailingDisposeChannels(kit.ChannelFactory), egress).VerifyAsync("win11-v3", kit.Bundle, Ct);
+
+        Assert.Equal(kit.Bundle.AgentBuildId, p.AgentVersion);
+        Assert.Empty(await kit.Hypervisor.ListAsync(Ct));
+        Assert.Empty(await egress.ListAsync(Ct));
+    }
+
+    [Fact]
+    public async Task Verify_AFailingDestroy_StillReleasesTheLease()
+    {
+        await using var kit = Kit();
+        var egress = new Maldex.Infrastructure.Fakes.NoopEgressRouter(Microsoft.Extensions.Options.Options.Create(new Maldex.Infrastructure.Fakes.FakeEgressOptions()), kit.Guest);
+
+        await VerifierWith(kit, new FailingDestroy(kit.Hypervisor), kit.ChannelFactory, egress).VerifyAsync("win11-v3", kit.Bundle, Ct);
+
+        Assert.Empty(await egress.ListAsync(Ct));
     }
 
     [Fact]

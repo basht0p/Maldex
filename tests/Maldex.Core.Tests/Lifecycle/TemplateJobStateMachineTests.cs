@@ -47,6 +47,25 @@ public class TemplateJobStateMachineTests
     }
 
     [Fact]
+    public void TheStateLists_PartitionTheStates_FromOneDefinition()
+    {
+        Assert.Equal([Published, Sealed, Failed, Cancelled], TemplateJobStateMachine.TerminalStates);
+        Assert.Equal([Queued, Preparing, Configuring, Sealing, Verifying], TemplateJobStateMachine.ActiveStates);
+        Assert.Equal([Preparing, Configuring, Sealing, Verifying], TemplateJobStateMachine.StartedStates);
+        Assert.Equal(Enum.GetValues<TemplateJobState>().Order(), TemplateJobStateMachine.TerminalStates.Concat(TemplateJobStateMachine.ActiveStates).Order());
+        Assert.All(TemplateJobStateMachine.ActiveStates, s => Assert.False(TemplateJobStateMachine.IsTerminal(s)));
+    }
+
+    [Fact]
+    public void IdleDeadline_CountsFromTheLaterOfConfiguringAndTheLastConsole()
+    {
+        var timeout = TimeSpan.FromHours(2);
+        Assert.Equal(Now + timeout, TemplateJobStateMachine.IdleDeadline(Now, null, timeout));
+        Assert.Equal(Now + timeout, TemplateJobStateMachine.IdleDeadline(Now, Now.AddMinutes(-5), timeout)); // a console before Configuring
+        Assert.Equal(Now.AddMinutes(30) + timeout, TemplateJobStateMachine.IdleDeadline(Now, Now.AddMinutes(30), timeout));
+    }
+
+    [Fact]
     public void Preparing_GoesToConfiguringOnlyForEdit_AndToSealingOnlyForRefresh()
     {
         Assert.True(TemplateJobStateMachine.CanTransition(Preparing, Configuring, TemplateJobKind.Edit));

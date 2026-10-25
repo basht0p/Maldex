@@ -36,6 +36,10 @@ internal sealed class ReconnectGapChannel : IAgentChannel
 
     public int Violations => _inner.Violations;
     public List<ProvenanceCommand> ProvenanceRequests { get; } = [];
+    /// <summary>The provenance requests that got through to the agent (not lost), in order.</summary>
+    public List<ProvenanceCommand> Forwarded { get; } = [];
+    /// <summary>Runs before a command goes to the agent (a test can inject frames at that moment).</summary>
+    public Action<AgentCommand>? BeforeSend { get; set; }
 
     /// <summary>Completes once the first request has been lost.</summary>
     public Task FirstDropped => _firstDropped.Task;
@@ -58,7 +62,9 @@ internal sealed class ReconnectGapChannel : IAgentChannel
                 _firstDropped.TrySetResult();
                 return Task.CompletedTask;
             }
+            lock (_gate) Forwarded.Add(p);
         }
+        BeforeSend?.Invoke(command);
         return _inner.SendAsync(command, ct);
     }
 
@@ -113,8 +119,11 @@ public class ProvenanceRetryTests
         await PumpAsync(time, sealer.SealAsync(channel, vm, "win11-edit", kit.Bundle, Ct));
 
         Assert.Equal([("win11-edit", 0)], kit.Store.Seals);
-        Assert.Equal(3, channel.ProvenanceRequests.Count); // two lost, the third answered
-        Assert.Equal(3, channel.ProvenanceRequests.Select(r => r.CommandId).Distinct().Count()); // a fresh id each time
+        // Two lost, then resent until answered: a slow machine may resend once more before the answer lands, so not an exact count.
+        var requests = channel.ProvenanceRequests;
+        Assert.True(requests.Count >= 3, $"only {requests.Count} provenance requests");
+        Assert.Equal(requests.Count, requests.Select(r => r.CommandId).Distinct().Count()); // a fresh id each time
+        Assert.Equal(requests[2].CommandId, channel.Forwarded[0].CommandId); // the first one the agent saw (and answered) was the third
     }
 
     [Fact]
@@ -153,18 +162,77 @@ public class ProvenanceRetryTests
     {
         var (kit, sealer, time, channel, vm) = await SetUpAsync(drops: 1, retry: TimeSpan.FromSeconds(3));
         await using var _ = kit;
+        var injected = new List<Type>();
+        // Once the round trip is done and the sealer moves on (its first component chunk), late replies to the lost request
+        // arrive: they must be dropped, not taken as the answer to a chunk, apply_components or power_off.
+        channel.BeforeSend = command =>
+        {
+            if (command is ProvenanceCommand || injected.Count > 0) return;
+            var old = channel.ProvenanceRequests[0].CommandId;
+            channel.Inject(new ProvenanceMessage(old, "Windows 11 Pro", "1", "0.0.1+stale", false, false));
+            channel.Inject(new CommandResultMessage(old, false, "late"));
+            injected.Add(command.GetType());
+        };
 
         var run = sealer.SealAsync(channel, vm, "win11-edit", kit.Bundle, Ct);
-        await channel.FirstDropped.WaitAsync(Ct);
-        var old = channel.ProvenanceRequests[0].CommandId;
-        channel.Inject(new ReadyMessage("0.0.1+stale", "h")); // the dropped session's leftover: at most one more resend, never anything else
-
+        await channel.FirstDropped.WaitAsync(TimeSpan.FromSeconds(10), Ct);
+        channel.Inject(new ReadyMessage("0.0.1+stale", "h")); // the agent reconnected: one resend, which is answered
         await PumpAsync(time, run);
-        // Replies to the old id arriving after success are dropped, not mistaken for an answer to apply_components or power_off.
-        channel.Inject(new ProvenanceMessage(old, "Windows 11 Pro", "1", "0.0.1+stale", false, false));
-        channel.Inject(new CommandResultMessage(old, false, "late"));
 
+        Assert.Equal([typeof(PutFileChunkCommand)], injected); // the stale frames came in mid-seal, before it completed
         Assert.Equal([("win11-edit", 0)], kit.Store.Seals);
-        Assert.NotEmpty(kit.Guest.AppliedComponentIds); // apply_components went through
+        Assert.Equal(3, kit.Guest.AppliedComponentIds.Count); // apply_components went through
+    }
+
+    /// <summary>A channel whose agent is already gone: its stream ends at once.</summary>
+    private sealed class EndedChannel : IAgentChannel
+    {
+        public TaskCompletionSource ReadEnded { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int Violations => 0;
+        public Task SendAsync(AgentCommand command, CancellationToken ct) => Task.CompletedTask;
+        public async IAsyncEnumerable<AgentMessage> ReadAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+        {
+            ReadEnded.TrySetResult();
+            await Task.CompletedTask;
+            yield break;
+        }
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>Holds the first timer until <paramref name="until"/> completes (and a moment more): what runs before it then has run.</summary>
+    private sealed class HoldFirstTimer(TimeProvider inner, Task until) : TimeProvider
+    {
+        private int _timers;
+        public override DateTimeOffset GetUtcNow() => inner.GetUtcNow();
+        public override long GetTimestamp() => inner.GetTimestamp();
+        public override long TimestampFrequency => inner.TimestampFrequency;
+        public override TimeZoneInfo LocalTimeZone => inner.LocalTimeZone;
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            if (Interlocked.Increment(ref _timers) == 1)
+            {
+                until.Wait(TimeSpan.FromSeconds(5));
+                Thread.Sleep(200); // the session's read loop finishes ending
+            }
+            return inner.CreateTimer(callback, state, dueTime, period);
+        }
+    }
+
+    [Fact]
+    public async Task AnAgentGoneBeforeTheFirstRequest_FailsAtOnce_NotAfterTheTimeout()
+    {
+        var kit = new TemplateJobKit();
+        await using var _ = kit;
+        kit.Options.ProvenanceTimeout = TimeSpan.FromMinutes(1);
+        var channel = new EndedChannel();
+        var (_, vm) = await kit.StartTemplateVmAsync(ready: false);
+        // The fake clock never moves: only the session noticing the ended stream can end the wait. The first timer is the
+        // request's deadline, created just before the request is registered, so the stream has ended before that.
+        var sealer = new TemplateSealer(kit.Hypervisor, kit.Store, Microsoft.Extensions.Options.Options.Create(kit.Options), new HoldFirstTimer(new FakeTimeProvider(), channel.ReadEnded.Task));
+
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => sealer.SealAsync(channel, vm, "win11-edit", kit.Bundle, Ct).WaitAsync(TimeSpan.FromSeconds(10), Ct));
+
+        Assert.Equal("the guest agent did not answer: the agent disconnected; not sealing", ex.Message);
+        Assert.Empty(kit.Store.Seals);
     }
 }

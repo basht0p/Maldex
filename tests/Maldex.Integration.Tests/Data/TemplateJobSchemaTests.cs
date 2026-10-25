@@ -61,6 +61,18 @@ public class TemplateJobSchemaTests(SqlServerFixture sql)
     }
 
     [Fact]
+    public async Task OneActiveJobIndex_FiltersOutExactlyTheStateMachinesTerminalStates()
+    {
+        var (db, _, _) = await SeedAsync();
+        await using (db)
+        {
+            var index = db.Model.FindEntityType(typeof(TemplateJob))!.GetIndexes().Single(i => i.GetDatabaseName() == "IX_TemplateJobs_TemplateId_Active");
+            var expected = string.Join(" AND ", Maldex.Core.Lifecycle.TemplateJobStateMachine.TerminalStates.Select(s => $"[State] <> '{s}'"));
+            Assert.Equal(expected, index.GetFilter());
+        }
+    }
+
+    [Fact]
     public async Task OneActiveJobPerTemplate_IsEnforced()
     {
         var (db, versionId, userId) = await SeedAsync();

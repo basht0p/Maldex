@@ -34,8 +34,23 @@ public static class TemplateJobStateMachine
         return true;
     }
 
-    public static bool IsTerminal(TemplateJobState s) => s is Published or Sealed or Failed or Cancelled;
+    /// <summary>The terminal states: the one list <see cref="IsTerminal"/>, the slot count and the one-active-job index filter follow.</summary>
+    public static readonly IReadOnlyList<TemplateJobState> TerminalStates = [Published, Sealed, Failed, Cancelled];
+
+    public static bool IsTerminal(TemplateJobState s) => TerminalSet.Contains(s);
+
+    private static readonly FrozenSet<TemplateJobState> TerminalSet = TerminalStates.ToFrozenSet();
 
     /// <summary>The non-terminal states: the one list the endpoints and the coordinator count "a job is active" by.</summary>
-    public static readonly TemplateJobState[] ActiveStates = [Queued, Preparing, Configuring, Sealing, Verifying];
+    public static readonly IReadOnlyList<TemplateJobState> ActiveStates = [.. Enum.GetValues<TemplateJobState>().Where(s => !TerminalSet.Contains(s))];
+
+    /// <summary>The states of a job that has started (past Queued) and not ended: what a restart interrupts.</summary>
+    public static readonly IReadOnlyList<TemplateJobState> StartedStates = [.. ActiveStates.Where(s => s != Queued)];
+
+    /// <summary>
+    /// When a Configuring job is discarded for want of a console: <c>max(configuringSince, lastConsoleAt) + timeout</c>. The one rule
+    /// the coordinator discards by and the API shows.
+    /// </summary>
+    public static DateTimeOffset IdleDeadline(DateTimeOffset configuringSince, DateTimeOffset? lastConsoleAt, TimeSpan timeout) =>
+        (lastConsoleAt is { } console && console > configuringSince ? console : configuringSince) + timeout;
 }

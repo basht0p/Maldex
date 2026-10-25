@@ -1,4 +1,5 @@
 using Maldex.Core.Domain;
+using Maldex.Core.Lifecycle;
 using Microsoft.EntityFrameworkCore;
 
 namespace Maldex.Data;
@@ -11,8 +12,7 @@ public static class VmSlots
 {
     private static readonly RunStatus[] TaskStates = [RunStatus.Preparing, RunStatus.Running, RunStatus.Collecting];
 
-    private static readonly TemplateJobState[] Terminal =
-        [TemplateJobState.Published, TemplateJobState.Sealed, TemplateJobState.Failed, TemplateJobState.Cancelled];
+    private static readonly IReadOnlyList<TemplateJobState> Terminal = TemplateJobStateMachine.TerminalStates;
 
     public static async Task<int> BusyAsync(MaldexDbContext db, CancellationToken ct)
     {

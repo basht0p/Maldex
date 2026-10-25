@@ -138,7 +138,7 @@ public static class TemplateEndpoints
 
         // Both requests are single-column conditional updates (no row-version check): the coordinator writes the same row, and
         // a request must never collide with its progress. The coordinator polls for them.
-        jobGroup.MapPost("{jobId:guid}/seal", async (Guid jobId, SealRequest? req, MaldexDbContext db, CurrentUser user, TimeProvider time, CancellationToken ct) =>
+        jobGroup.MapPost("{jobId:guid}/seal", async (Guid jobId, SealRequest? req, MaldexDbContext db, CurrentUser user, JobConsoleRegistry consoles, TimeProvider time, CancellationToken ct) =>
         {
             var note = string.IsNullOrWhiteSpace(req?.Note) ? null : req!.Note!.Trim();
             if (note is { Length: > MaxNoteLength })
@@ -153,6 +153,7 @@ public static class TemplateEndpoints
                 db.AuditLogs.Add(await JobAuditAsync(db, jobId, ActorOf(user), "template.job.seal", note is null ? "" : "; with a note", time, ct));
                 await db.SaveChangesAsync(ct);
                 await tx.CommitAsync(ct);
+                consoles.Close(jobId); // no console input after the seal decision (R22); the coordinator also waits for them to go
                 return Results.Accepted();
             }
             await tx.RollbackAsync(ct);
@@ -164,7 +165,7 @@ public static class TemplateEndpoints
                 statusCode: StatusCodes.Status409Conflict);
         });
 
-        jobGroup.MapPost("{jobId:guid}/cancel", async (Guid jobId, MaldexDbContext db, CurrentUser user, TimeProvider time, CancellationToken ct) =>
+        jobGroup.MapPost("{jobId:guid}/cancel", async (Guid jobId, MaldexDbContext db, CurrentUser user, JobConsoleRegistry consoles, TimeProvider time, CancellationToken ct) =>
         {
             var now = time.GetUtcNow();
             await using var tx = await db.Database.BeginTransactionAsync(ct);
@@ -177,6 +178,7 @@ public static class TemplateEndpoints
                 db.AuditLogs.Add(await JobAuditAsync(db, jobId, ActorOf(user), "template.job.cancel", "", time, ct));
                 await db.SaveChangesAsync(ct);
                 await tx.CommitAsync(ct);
+                consoles.Close(jobId); // the guest is about to be destroyed: no more console input
                 return Results.Accepted();
             }
             await tx.RollbackAsync(ct);
@@ -207,7 +209,7 @@ public static class TemplateEndpoints
 
     private const int RecentJobs = 20, MaxNoteLength = 1000;
 
-    private static readonly TemplateJobState[] ActiveStates = TemplateJobStateMachine.ActiveStates;
+    private static readonly IReadOnlyList<TemplateJobState> ActiveStates = TemplateJobStateMachine.ActiveStates;
 
 
     private const int SqlDuplicateKeyIndex = 2601, SqlDuplicateKeyConstraint = 2627;

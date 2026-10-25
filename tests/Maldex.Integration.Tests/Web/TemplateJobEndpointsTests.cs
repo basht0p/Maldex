@@ -418,6 +418,26 @@ public sealed class TemplateJobEndpointsTests(SqlServerFixture sql) : IDisposabl
         Assert.Contains(id.ToString(), audit.Details);
     }
 
+    [Theory]
+    [InlineData("seal")]
+    [InlineData("cancel")]
+    public async Task SealAndCancel_TellTheJobsOpenConsolesToClose(string action)
+    {
+        var r = NewRig();
+        var id = await SeedJobAsync(r, TemplateJobState.Configuring);
+        var other = Guid.NewGuid(); // another job's console
+        var consoles = r.Factory.Services.GetRequiredService<JobConsoleRegistry>();
+        using var console = consoles.Register(id);
+        using var otherConsole = consoles.Register(other);
+        using var client = Admin(r);
+
+        var resp = await client.PostAsJsonAsync($"/api/admin/template-jobs/{id}/{action}", new { }, Ct);
+
+        Assert.Equal(HttpStatusCode.Accepted, resp.StatusCode);
+        Assert.True(console.Closing.IsCancellationRequested); // at once, not only when the coordinator gets to it
+        Assert.False(otherConsole.Closing.IsCancellationRequested);
+    }
+
     [Fact]
     public async Task Seal_WithoutABody_IsAccepted()
     {

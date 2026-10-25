@@ -1,6 +1,9 @@
 using Maldex.Core.Abstractions;
 using Maldex.Core.Agent;
 using Maldex.Core.Domain;
+using Maldex.Infrastructure.Net;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
 namespace Maldex.Orchestrator.Templates;
@@ -9,8 +12,11 @@ namespace Maldex.Orchestrator.Templates;
 /// Boots a throwaway overlay of a sealed template (no network), asks the agent for its provenance and checks that the disk
 /// carries the current agent and has Defender real-time protection off. The VM is always destroyed.
 /// </summary>
-public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactory channels, IEgressRouter egress, IOptions<OrchestratorOptions> orchestrator, IOptions<TemplateJobOptions> options, TimeProvider time)
+public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactory channels, IEgressRouter egress, IOptions<OrchestratorOptions> orchestrator,
+    IOptions<TemplateJobOptions> options, IOptions<NetOptions> net, TimeProvider time, ILogger<TemplateVerifier>? logger = null)
 {
+    private readonly ILogger _log = (ILogger?)logger ?? NullLogger.Instance;
+
     public const string DefenderUnreadableNote = "Defender state could not be read";
 
     /// <exception cref="TemplateVerifyException">The disk failed verification or never answered.</exception>
@@ -60,9 +66,11 @@ public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactor
 
                 try
                 {
-                    p = await session.AskProvenanceAsync(linked.Token).ConfigureAwait(false);
+                    // Resent until answered: a request sent while the agent reconnects is lost (as for the sealer and the job's check).
+                    p = await session.AskProvenanceWithRetryAsync(o.ProvenanceRetryInterval, o.VerifyTimeout, time, linked.Token).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException) when (budget.IsCancellationRequested && !ct.IsCancellationRequested)
+                catch (Exception ex) when (ex is TimeoutException
+                    || (ex is OperationCanceledException && budget.IsCancellationRequested && !ct.IsCancellationRequested))
                 {
                     throw new TemplateVerifyException($"no provenance answer from the sealed guest agent within {o.VerifyTimeout.TotalSeconds:0} s");
                 }
@@ -80,9 +88,26 @@ public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactor
         }
         finally
         {
-            if (channel is not null) await channel.DisposeAsync().ConfigureAwait(false);
-            if (vm is not null) await hypervisor.DestroyAsync(vm, CancellationToken.None).ConfigureAwait(false);
-            if (lease is not null) await egress.ReleaseAsync(lease, CancellationToken.None).ConfigureAwait(false);
+            // Each step on its own: a failing one is logged and never skips the others (nor hides the verification's outcome).
+            if (channel is not null)
+            {
+                try { await channel.DisposeAsync().ConfigureAwait(false); }
+                catch (Exception ex) { _log.LogWarning(ex, "Closing the agent channel of verification boot {TaskId} failed.", taskId); }
+            }
+            if (vm is not null)
+            {
+                try { await hypervisor.DestroyAsync(vm, CancellationToken.None).ConfigureAwait(false); }
+                catch (Exception ex) { _log.LogError(ex, "Destroying verification VM {Vm} failed.", vm.Name); }
+            }
+            if (lease is not null)
+            {
+                try
+                {
+                    await egress.ReleaseAsync(lease, CancellationToken.None).ConfigureAwait(false);
+                    TemplateCoordinator.DeleteRunNetDir(net.Value, taskId, _log);
+                }
+                catch (Exception ex) { _log.LogError(ex, "Releasing the network lease of verification boot {TaskId} failed.", taskId); }
+            }
         }
     }
 }

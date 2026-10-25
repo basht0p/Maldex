@@ -133,6 +133,9 @@ internal sealed class TemplateJobRig : IAsyncDisposable
     public SilenceableChannels Channels => (SilenceableChannels)H.Get<IAgentChannelFactory>();
     public SettableDiskSpace Disk => (SettableDiskSpace)H.Get<IDiskSpaceProbe>();
     public TemplateCoordinator Coordinator => H.Get<TemplateCoordinator>();
+    /// <summary>The run directory (libvirt's and the network router's), private to the rig.</summary>
+    public string RunDir => Path.Combine(_dir, "run");
+    public string NetDirOf(Guid leaseId) => Path.Combine(RunDir, "net", Maldex.Infrastructure.Net.RunNetNames.For(leaseId).Namespace);
 
     public static async Task<TemplateJobRig> CreateAsync(SqlServerFixture sql, IDictionary<string, string?>? extra = null, Action<IServiceCollection>? configure = null)
     {
@@ -171,6 +174,8 @@ internal sealed class TemplateJobRig : IAsyncDisposable
         rig.H = await OrchestratorHarness.CreateAsync(sql, settings, services =>
         {
             configure?.Invoke(services);
+            services.Configure<Maldex.Infrastructure.Libvirt.LibvirtOptions>(o => o.RunDir = rig.RunDir);
+            services.Configure<Maldex.Infrastructure.Net.NetOptions>(o => o.RunDir = rig.RunDir);
             services.Replace(ServiceDescriptor.Singleton<IDiskSpaceProbe>(new SettableDiskSpace()));
             services.AddSingleton<FakeTemplateStore>();
             services.Replace(ServiceDescriptor.Singleton<ITemplateStore>(sp => new SizedTemplateStore(sp.GetRequiredService<FakeTemplateStore>())));
@@ -829,6 +834,7 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         Assert.Equal(rig.AgentExe, installedBytes); // the bundle's bytes, from a private temp file
         if (!OperatingSystem.IsWindows()) Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, installedMode);
         Assert.False(File.Exists(install.AgentExePath)); // removed afterwards
+        Assert.Equal(Path.Combine(rig.RunDir, "template-agent"), Path.GetDirectoryName(install.AgentExePath)); // under the run dir, not /tmp
         Assert.Equal(("Preparing", "installing the current agent into the working copy", new[] { stem }, 0, Array.Empty<string>()), seen);
         Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
     }
@@ -881,6 +887,193 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
 
         Assert.Equal(TemplateJobState.Cancelled, (await rig.JobAsync(id)).State);
         await rig.AssertDiscardedAsync(id);
+    }
+
+    [Fact]
+    public async Task TheRunNetDirectories_OfTheJobVmAndTheVerifyVm_AreDeletedAfterTheirLeases()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        var leases = new System.Collections.Concurrent.ConcurrentBag<Guid>();
+        rig.Egress.BeforeCreate = leaseId =>
+        {
+            Directory.CreateDirectory(rig.NetDirOf(leaseId)); // what the router leaves: lease record, logs
+            leases.Add(leaseId);
+            return Task.CompletedTask;
+        };
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
+
+        await rig.PumpAsync(rig.Start(id));
+
+        Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
+        Assert.Equal(2, leases.Count); // the job's VM and the verification boot
+        Assert.Contains(id, leases);
+        Assert.All(leases, l => Assert.False(Directory.Exists(rig.NetDirOf(l)), $"run/net of lease {l} is still there"));
+    }
+
+    [Fact]
+    public async Task ADirectSessionInterruptedWhileConfiguring_IsAuditedAsStopped_ByTheReconciler()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        var open = await rig.SeedJobAsync(TemplateJobKind.Edit, NetworkMode.Direct, state: TemplateJobState.Configuring);
+        var win11 = await rig.H.SeedTemplateAsync("win11");
+        var closed = await rig.SeedJobAsync(TemplateJobKind.Edit, NetworkMode.Direct, state: TemplateJobState.Sealing, templateId: "win11", baseVersionId: win11.Id);
+        await using (var db = rig.H.NewContext())
+        {
+            AuditLog Row(string action, string template, Guid job) => new()
+            {
+                At = rig.H.Time.GetUtcNow(), UserId = rig.AdminId, Action = action, Target = template, Details = TemplateCoordinator.DirectSessionDetails(job),
+            };
+            db.AuditLogs.AddRange(Row("template.egress.start", "win10", open), Row("template.egress.start", "win11", closed), Row("template.egress.stop", "win11", closed));
+            await db.SaveChangesAsync(Ct);
+        }
+
+        await rig.H.Get<Reconciler>().ReconcileAsync(Ct);
+
+        var stops = (await rig.AuditsAsync()).Where(a => a.Action == "template.egress.stop").ToList();
+        Assert.Equal(2, stops.Count); // one new: the session that was still open; the closed one is not stopped twice
+        var added = stops.Single(a => a.Details == TemplateCoordinator.DirectSessionDetails(open));
+        Assert.Equal(((Guid?)null, "win10"), (added.UserId, added.Target));
+        Assert.Equal(TemplateJobState.Failed, (await rig.JobAsync(open)).State);
+    }
+
+    [Fact]
+    public async Task Reconciler_DeletesLeftoverAgentCopies()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        var dir = Path.Combine(rig.RunDir, "template-agent");
+        Directory.CreateDirectory(dir);
+        var leftover = Path.Combine(dir, TemplateCoordinator.AgentCopyPrefix + Guid.NewGuid().ToString("N") + ".exe");
+        var other = Path.Combine(dir, "keep.txt");
+        await File.WriteAllBytesAsync(leftover, [1, 2, 3], Ct);
+        await File.WriteAllBytesAsync(other, [1], Ct);
+
+        await rig.H.Get<Reconciler>().ReconcileAsync(Ct);
+
+        Assert.False(File.Exists(leftover));
+        Assert.True(File.Exists(other)); // only the job's own copies
+    }
+
+    /// <summary>Throws from the commit of the transaction that recorded <see cref="VersionId"/>, after it has committed (the answer is lost).</summary>
+    private sealed class LostCommitAnswer : Microsoft.EntityFrameworkCore.Diagnostics.DbTransactionInterceptor
+    {
+        public Guid VersionId { get; set; }
+        public int Thrown;
+
+        public override Task TransactionCommittedAsync(System.Data.Common.DbTransaction transaction, Microsoft.EntityFrameworkCore.Diagnostics.TransactionEndEventData eventData, CancellationToken cancellationToken = default)
+        {
+            if (eventData.Context?.ChangeTracker.Entries<TemplateVersion>().Any(e => e.Entity.Id == VersionId) == true && Interlocked.Increment(ref Thrown) == 1)
+                throw new InvalidOperationException("the connection broke while the commit was answered");
+            return Task.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task AnErrorAfterTheVersionWasCommitted_KeepsItsFiles_AndTheJobAsRecorded()
+    {
+        var lost = new LostCommitAnswer();
+        await using var rig = await TemplateJobRig.CreateAsync(sql, configure: s => s.ConfigureDbContext<MaldexDbContext>(o => o.AddInterceptors(lost)));
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
+        lost.VersionId = id;
+
+        await rig.PumpAsync(rig.Start(id));
+
+        Assert.Equal(1, lost.Thrown);
+        var job = await rig.JobAsync(id);
+        Assert.Equal((TemplateJobState.Published, (Guid?)id), (job.State, job.ResultVersionId));
+        Assert.Equal(id, await rig.CurrentVersionIdAsync());
+        Assert.DoesNotContain(TemplateCoordinator.StemOf(id), rig.Store.Deleted); // the recorded version's disk stays
+        Assert.DoesNotContain(await rig.AuditsAsync(), a => a.Action == "template.job.fail");
+    }
+
+    /// <summary>Fails every save that would end a template job (the database refuses the terminal write).</summary>
+    private sealed class FailingTerminalSave : Microsoft.EntityFrameworkCore.Diagnostics.SaveChangesInterceptor
+    {
+        public int Failures;
+
+        public override ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int>> SavingChangesAsync(Microsoft.EntityFrameworkCore.Diagnostics.DbContextEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            if (eventData.Context!.ChangeTracker.Entries<TemplateJob>().Any(e => e.State == EntityState.Modified && Maldex.Core.Lifecycle.TemplateJobStateMachine.IsTerminal(e.Entity.State)))
+            {
+                Interlocked.Increment(ref Failures);
+                throw new DbUpdateException("the database is unreachable");
+            }
+            return base.SavingChangesAsync(eventData, result, cancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task TerminalSaveRetries_StopAtHostShutdown_InsteadOfWaitingThemOut()
+    {
+        var failing = new FailingTerminalSave();
+        await using var rig = await TemplateJobRig.CreateAsync(sql, configure: s => s.ConfigureDbContext<MaldexDbContext>(o => o.AddInterceptors(failing)));
+        rig.Store.Missing.Add(rig.V1.FileStem); // the job fails at once
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
+        using var shutdown = new CancellationTokenSource();
+        var run = Task.Run(() => rig.Coordinator.RunAsync(id, shutdown.Token), Ct);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (Volatile.Read(ref failing.Failures) == 0)
+        {
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30), "The terminal save was never tried.");
+            await Task.Delay(10, Ct);
+        }
+
+        // The fake clock stands still, so only the shutdown can end the 1 s retry wait.
+        await shutdown.CancelAsync();
+        await run.WaitAsync(TimeSpan.FromSeconds(10), Ct);
+
+        Assert.Equal(1, failing.Failures);
+        Assert.Equal(TemplateJobState.Queued, (await rig.JobAsync(id)).State); // left for the reconciler
+    }
+
+    [Fact]
+    public async Task WhileTheSlotGateIsHeld_NeitherTheAnalysisNorTheJobTakesTheSlot()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        var analyses = rig.H.Get<OrchestratorWorker>();
+        var gate = rig.H.Get<VmSlotGate>();
+        var task = await rig.H.SeedTaskAsync(RunStatus.Queued);
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
+        var held = await gate.EnterAsync(Ct);
+        Task<IReadOnlyList<Guid>>? claim = null;
+        Task? run = null;
+        try
+        {
+            claim = Task.Run(() => analyses.ClaimAndStartAsync(Ct), Ct);
+            run = rig.Start(id);
+            await rig.PumpUntilAsync(id, TemplateJobState.Preparing, run);
+            await rig.IdleAsync();
+
+            Assert.False(claim.IsCompleted); // the analysis claim waits at the gate
+            Assert.Equal(RunStatus.Queued, await rig.H.StatusOfAsync(task));
+            var job = await rig.JobAsync(id);
+            Assert.Equal((TemplateJobState.Preparing, (DateTimeOffset?)null), (job.State, job.SlotHeldAt)); // so does the job
+            Assert.Empty(await rig.Hypervisor.ListAsync(Ct));
+        }
+        finally
+        {
+            held.Dispose();
+        }
+
+        // Released: exactly one of them gets the one slot.
+        var claimed = await claim!.WaitAsync(TimeSpan.FromSeconds(10), Ct);
+        try
+        {
+            if (claimed.Count == 0) await rig.PumpAsync(run!); // the job won; it runs to the end
+            else
+            {
+                Assert.Equal([task], claimed);
+                await rig.IdleAsync();
+                Assert.Null((await rig.JobAsync(id)).SlotHeldAt); // the analysis won; the job waits
+                await rig.RequestCancelAsync(id);
+                await rig.PumpAsync(run!);
+            }
+            Assert.Equal(1, ((FakeHypervisor)rig.Hypervisor).MaxRunning);
+        }
+        finally
+        {
+            await analyses.StopRunsAsync();
+        }
     }
 
     [Fact]

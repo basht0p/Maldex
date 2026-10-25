@@ -20,6 +20,8 @@ internal sealed class GuestSession : IAsyncDisposable
     /// <summary>Ids of finished provenance requests: late frames for them are dropped, never passed on to the next step.</summary>
     private readonly ConcurrentDictionary<string, byte> _retired = new();
     private TaskCompletionSource _readyTick = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    /// <summary>Set once the pump has ended: a request registered after it can never be answered and fails at once.</summary>
+    private volatile bool _ended;
 
     public GuestSession(IAgentChannel channel)
     {
@@ -37,7 +39,7 @@ internal sealed class GuestSession : IAsyncDisposable
     {
         var command = new ProvenanceCommand(Guid.NewGuid().ToString("N"));
         var answer = new TaskCompletionSource<ProvenanceMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _provenance[command.CommandId] = answer;
+        Register(command.CommandId, answer);
         try
         {
             await _channel.SendAsync(command, ct).ConfigureAwait(false);
@@ -70,7 +72,8 @@ internal sealed class GuestSession : IAsyncDisposable
                 var tick = Volatile.Read(ref _readyTick).Task; // taken before the send: a ready during it still resends
                 var command = new ProvenanceCommand(Guid.NewGuid().ToString("N"));
                 sent.Add(command.CommandId);
-                _provenance[command.CommandId] = answer;
+                Register(command.CommandId, answer);
+                if (answer.Task.IsCompleted) return await answer.Task.ConfigureAwait(false); // the agent is gone
                 await _channel.SendAsync(command, linked.Token).ConfigureAwait(false);
 
                 using var wait = CancellationTokenSource.CreateLinkedTokenSource(linked.Token);
@@ -94,6 +97,18 @@ internal sealed class GuestSession : IAsyncDisposable
             }
         }
     }
+
+    /// <summary>
+    /// Routes answers for <paramref name="commandId"/> to <paramref name="answer"/>. The pump fails every registered request when it
+    /// ends; one registered after that is failed here (checked after registering, so one of the two always sees the other).
+    /// </summary>
+    private void Register(string commandId, TaskCompletionSource<ProvenanceMessage> answer)
+    {
+        _provenance[commandId] = answer;
+        if (_ended) answer.TrySetException(Gone());
+    }
+
+    private static InvalidOperationException Gone() => new("the agent disconnected");
 
     private async Task PumpAsync()
     {
@@ -128,7 +143,8 @@ internal sealed class GuestSession : IAsyncDisposable
         finally
         {
             Inbox.Complete(error);
-            var gone = new InvalidOperationException("the agent disconnected");
+            _ended = true;
+            var gone = Gone();
             _ready.TrySetException(gone);
             foreach (var waiting in _provenance.Values) waiting.TrySetException(gone);
         }
