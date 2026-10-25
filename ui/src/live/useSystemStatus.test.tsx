@@ -28,7 +28,7 @@ const flush = () => act(async () => { await Promise.resolve(); await Promise.res
 const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms) })
 
 beforeEach(() => {
-  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] })
   getSystemStatus.mockReset()
   getSystemStatus.mockResolvedValue(status())
   setHidden(false)
@@ -102,6 +102,36 @@ describe('SystemStatusProvider', () => {
     getSystemStatus.mockResolvedValue(status({ queueDepth: 5 }))
     await tick(5000)
     expect(getSystemStatus).toHaveBeenCalledTimes(2)
+  })
+
+  it('times out a request that never settles after 30 s, aborts it, and fetches again on the next tick', async () => {
+    let signal: AbortSignal | undefined
+    getSystemStatus.mockReset()
+    getSystemStatus.mockImplementationOnce((s?: AbortSignal) => { signal = s; return new Promise(() => undefined) })
+    let resolve!: (v: SystemStatusDto) => void
+    getSystemStatus.mockImplementationOnce(() => new Promise<SystemStatusDto>((r) => { resolve = r }))
+    render(<SystemStatusProvider enabled><Probe /></SystemStatusProvider>)
+    await flush()
+    await tick(25_000)
+    expect(getSystemStatus).toHaveBeenCalledTimes(1)
+    expect(signal?.aborted).toBe(false)
+    await tick(5000)
+    expect(signal?.aborted).toBe(true)
+    expect(screen.getByText(/Status request timed out/)).toBeInTheDocument()
+    // the 30 s poll tick fires right after the timeout and issues a fresh request
+    expect(getSystemStatus).toHaveBeenCalledTimes(2)
+    await act(async () => { resolve(status({ queueDepth: 2 })) })
+    expect(screen.getByText('queued 2|ok|calm')).toBeInTheDocument()
+  })
+
+  it('aborts an in-flight request when disabled', async () => {
+    let signal: AbortSignal | undefined
+    getSystemStatus.mockReset()
+    getSystemStatus.mockImplementationOnce((s?: AbortSignal) => { signal = s; return new Promise(() => undefined) })
+    const { rerender } = render(<SystemStatusProvider enabled><Probe /></SystemStatusProvider>)
+    await flush()
+    rerender(<SystemStatusProvider enabled={false}><Probe /></SystemStatusProvider>)
+    expect(signal?.aborted).toBe(true)
   })
 
   it('flags attention for a disk under 10% free but not at exactly 10%', async () => {
