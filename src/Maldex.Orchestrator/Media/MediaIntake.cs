@@ -496,20 +496,24 @@ public sealed class MediaIntake(
             state.Remove(row.Id);
         }
 
+        // The sweep runs beside the worker's queue, so it lists files BEFORE reading rows: a row is always saved before its file
+        // appears (the upload row before its staging file; Sha256 before Finalize), so any file listed here has its row visible below.
+        var staging = store.StagingIds().ToList();
+        var finals = Directory.Exists(Opt.Root) ? Directory.EnumerateFiles(Opt.Root, "*.iso").ToList() : [];
+
         var receiving = (await db.MediaFiles.AsNoTracking().Where(m => m.Status == MediaStatus.Receiving).Select(m => m.Id).ToListAsync(ct).ConfigureAwait(false)).ToHashSet();
-        foreach (var staged in store.StagingIds().ToList())
+        foreach (var staged in staging)
             if (!receiving.Contains(staged)) DeleteStaging(staged);
 
         // Final files (<sha256>.iso) that no Ready file, and no upload on its way to Ready, holds are leftovers of a stop: delete them.
         var held = (await db.MediaFiles.AsNoTracking()
                 .Where(m => m.Sha256 != null && (m.Status == MediaStatus.Ready || m.Status == MediaStatus.Receiving))
                 .Select(m => m.Sha256!).ToListAsync(ct).ConfigureAwait(false)).ToHashSet();
-        if (Directory.Exists(Opt.Root))
-            foreach (var file in Directory.EnumerateFiles(Opt.Root, "*.iso").ToList())
-            {
-                var sha = Path.GetFileNameWithoutExtension(file);
-                if (sha.Length == 64 && sha.All(c => char.IsAsciiHexDigitLower(c)) && !held.Contains(sha)) DeleteFinal(sha);
-            }
+        foreach (var file in finals)
+        {
+            var sha = Path.GetFileNameWithoutExtension(file);
+            if (sha.Length == 64 && sha.All(c => char.IsAsciiHexDigitLower(c)) && !held.Contains(sha)) DeleteFinal(sha);
+        }
     }
 
     /// <summary>Once at start: fetches cannot resume, so they fail; uploads that had all their bytes are completed.</summary>
