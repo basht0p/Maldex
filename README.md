@@ -219,7 +219,7 @@ Release packages are built and signed by the release workflow: a `.deb` for Ubun
 
 5. **Open the app.** It listens on `http://127.0.0.1:5080` only; reach it through an SSH forward (`ssh -L 5080:127.0.0.1:5080 <host>`) or a reverse proxy you provide. Then build the first guest image under **Admin → Sandbox Templates → New template**.
 
-Restarting or upgrading the maldex package (or restarting `maldex-host-guard`) stops any running analysis VMs; let runs finish first.
+Restarting or upgrading the maldex package, restarting `maldex-host-guard`, or re-running `maldex-setup` (which restarts maldex) stops any running analysis VMs; let runs finish first.
 
 ## Development progress
 
