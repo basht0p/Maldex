@@ -29,7 +29,7 @@ const receivingIso = media({ id: 'os2', fileName: 'half.iso', status: 'Receiving
 const failedIso = media({ id: 'os3', fileName: 'bad.iso', status: 'Failed' })
 const office = media({ id: 'off1', kind: 'Application', fileName: 'office.img', application: 'Office' })
 const otherApp = media({ id: 'app2', kind: 'Application', fileName: 'tools.iso', application: null })
-const template = (id: string, displayName: string): AdminTemplateDto => ({ id, displayName, isDefault: false, enabled: true, current: null, versions: [] })
+const template = (id: string, displayName: string): AdminTemplateDto => ({ id, displayName, isDefault: false, enabled: true, current: null, versions: [], tasksLast30Days: 0, refreshDue: false, activeJobId: null })
 
 const onClose = vi.fn()
 const onStarted = vi.fn()

@@ -38,6 +38,8 @@ builder.Services.Configure<WorkersOptions>(builder.Configuration.GetSection(Work
 builder.Services.Configure<SubmissionOptions>(builder.Configuration.GetSection(SubmissionOptions.SectionName));
 builder.Services.PostConfigure<SubmissionOptions>(o => o.ApplyDefaults());
 builder.Services.Configure<EgressOptions>(builder.Configuration.GetSection(EgressOptions.SectionName));
+builder.Services.AddSingleton<Microsoft.Extensions.Options.IValidateOptions<Maldex.Web.Templates.TemplateAdminOptions>, Maldex.Web.Templates.TemplateAdminOptionsValidation>();
+builder.Services.AddOptions<Maldex.Web.Templates.TemplateAdminOptions>().Bind(builder.Configuration.GetSection(Maldex.Web.Templates.TemplateAdminOptions.SectionName)).ValidateOnStart();
 builder.Services.Configure<FormOptions>(o => o.MultipartBodyLengthLimit =
     new SubmissionOptions { MaxUploadBytes = builder.Configuration.GetValue<long?>("Maldex:MaxUploadBytes") ?? 268_435_456 }.MaxUploadBytes + 65536);
 builder.AddMaldexAuth();

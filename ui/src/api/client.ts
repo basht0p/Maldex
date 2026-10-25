@@ -1,6 +1,7 @@
 import { getAccessToken } from '../auth/auth'
 import type {
   AdminTemplateDto,
+  TemplateDetailDto,
   ArtifactDto,
   EventsQuery,
   LiveEventDto,
@@ -133,6 +134,7 @@ export const getTunnelToken = (id: string) => get<{ token: string }>(`/api/tasks
 
 export const listTemplates = () => get<TemplateSummaryDto[]>('/api/templates')
 export const listAdminTemplates = () => get<AdminTemplateDto[]>('/api/admin/templates')
+export const getAdminTemplate = (id: string) => get<TemplateDetailDto>(`/api/admin/templates/${encodeURIComponent(id)}`)
 export const setDefaultTemplate = (id: string) => post<void>(`/api/admin/templates/${encodeURIComponent(id)}/default`)
 export const setTemplateEnabled = (id: string, enabled: boolean) => post<void>(`/api/admin/templates/${encodeURIComponent(id)}/enabled`, { enabled })
 /** Makes the kept previous version current again; returns the updated template. */
