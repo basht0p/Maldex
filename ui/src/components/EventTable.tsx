@@ -19,7 +19,11 @@ export interface EventFilter {
   text?: string
 }
 
-export function EventTable({ events, filter }: { events: LiveEventDto[]; filter?: EventFilter }) {
+/**
+ * `controls={false}` hides the built-in chips and search (the Events tab and the running layout bring their own bar).
+ * `onCopy` is called with the value after a hover copy button has copied it.
+ */
+export function EventTable({ events, filter, controls = true, onCopy, emptyTitle = 'No events yet.' }: { events: LiveEventDto[]; filter?: EventFilter; controls?: boolean; onCopy?: (value: string) => void; emptyTitle?: string }) {
   const [types, setTypes] = useState<ReadonlySet<EventType>>(() => new Set(filter?.types ?? []))
   const [text, setText] = useState(filter?.text ?? '')
   const [scrollTop, setScrollTop] = useState(0)
@@ -41,11 +45,15 @@ export function EventTable({ events, filter }: { events: LiveEventDto[]; filter?
   const last = virtual ? Math.min(filtered.length, Math.ceil((scrollTop + VIEWPORT_HEIGHT) / ROW_HEIGHT) + OVERSCAN) : filtered.length
   const visible = filtered.slice(first, last)
 
-  if (events.length === 0) return <EmptyState title="No events yet." />
+  const copy = (value: string) => {
+    void navigator.clipboard?.writeText(value).then(() => onCopy?.(value), () => undefined)
+  }
+
+  if (events.length === 0) return <EmptyState title={emptyTitle} />
 
   return (
     <div>
-      <div className={styles.controls}>
+      {controls && <div className={styles.controls}>
         <div className={styles.chips} role="group" aria-label="Event types">
           {EVENT_TYPES.map((t) => (
             <button key={t} type="button" className={`${styles.chip} ${types.has(t) ? styles.on : ''}`} aria-pressed={types.has(t)} onClick={() => toggle(t)}>
@@ -55,7 +63,7 @@ export function EventTable({ events, filter }: { events: LiveEventDto[]; filter?
         </div>
         <input type="search" aria-label="Search events" placeholder="Search summary" value={text} onChange={(e) => setText(e.target.value)} className={styles.search} />
         <span className={styles.count}>{filtered.length === events.length ? `${events.length} events` : `${filtered.length} of ${events.length} events`}</span>
-      </div>
+      </div>}
       <div
         className={styles.scroller}
         style={virtual ? { height: VIEWPORT_HEIGHT } : { maxHeight: VIEWPORT_HEIGHT }}
@@ -80,8 +88,8 @@ export function EventTable({ events, filter }: { events: LiveEventDto[]; filter?
               <tr key={e.id} style={virtual ? { height: ROW_HEIGHT } : undefined}>
                 <td className={styles.time}>{formatTime(e.at)}</td>
                 <td>{e.type}</td>
-                <td>{e.pid}</td>
-                <td className={styles.summary} title={safeText(e.summary)}>{safeText(e.summary)}</td>
+                <td className={styles.value}>{e.pid}<CopyCell label="Copy PID" onCopy={() => copy(String(e.pid))} /></td>
+                <td className={styles.summary} title={safeText(e.summary)}>{safeText(e.summary)}<CopyCell label="Copy summary" onCopy={() => copy(e.summary)} /></td>
               </tr>
             ))}
             {virtual && last < filtered.length && (
@@ -94,6 +102,10 @@ export function EventTable({ events, filter }: { events: LiveEventDto[]; filter?
       </div>
     </div>
   )
+}
+
+function CopyCell({ label, onCopy }: { label: string; onCopy: () => void }) {
+  return <button type="button" className={styles.copy} aria-label={label} title={label} onClick={onCopy}>⧉</button>
 }
 
 function formatTime(at: string): string {
