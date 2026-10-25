@@ -26,11 +26,14 @@ public static partial class WimInfoParser
         int? declaredCount = null;
         var indexLines = 0;
 
+        // False when the image being closed lacks Name or Architecture: wiminfo prints both for every real Windows image, and a
+        // missing key could otherwise be supplied by a line forged inside another value.
         bool Flush()
         {
-            if (block is not null && images.Count < MaxImages) images.Add(block.ToImage());
+            var complete = block is null || block.IsComplete;
+            if (block is not null && complete && images.Count < MaxImages) images.Add(block.ToImage());
             block = null;
-            return true;
+            return complete;
         }
 
         foreach (var raw in output.Split('\n'))
@@ -51,20 +54,20 @@ public static partial class WimInfoParser
 
             if (key == "Index")
             {
-                Flush();
+                if (!Flush()) return [];
                 indexLines++;
-                if (int.TryParse(Clean(value), NumberStyles.None, CultureInfo.InvariantCulture, out var index) && index >= 1)
-                {
-                    if (!seen.Add(index)) return [];
-                    block = new Block(index);
-                }
+                // An invalid index (not digits, signed, zero) is as suspicious as a duplicate: refuse the whole output.
+                if (!int.TryParse(Clean(value), NumberStyles.None, CultureInfo.InvariantCulture, out var index) || index < 1) return [];
+                if (!seen.Add(index)) return [];
+                block = new Block(index);
                 continue;
             }
             if (block is null) continue;
             if (!block.Set(key, Clean(value))) return [];
         }
-        Flush();
-        if (declaredCount is { } d && d != indexLines) return [];
+        if (!Flush()) return [];
+        // The header count is required: without it a forged extra Index line could not be detected.
+        if (declaredCount is not { } d || d != indexLines) return [];
         return images;
     }
 
@@ -91,6 +94,8 @@ public static partial class WimInfoParser
             }
             return true;
         }
+
+        public bool IsComplete => !string.IsNullOrEmpty(_name) && !string.IsNullOrEmpty(_architecture);
 
         public InstallerImage ToImage()
         {
