@@ -52,6 +52,8 @@ depends:
   - sudo
   - iproute2
   - iptables
+  - curl
+  - yara
   # Chromium for PDF reports (Playwright's ubuntu24.04 list), plus a font
   - libasound2t64
   - libatk-bridge2.0-0t64
@@ -110,6 +112,8 @@ overrides:
       - sudo
       - iproute
       - iptables-nft
+      - curl                           # maldex-setup downloads; the INetSim readiness probe
+      - yara                           # AppStream (RHEL 9.x / Rocky 9)
       - policycoreutils-python-utils
       # Chromium for PDF reports, plus a font
       - alsa-lib
@@ -179,6 +183,12 @@ contents:
   - src: /opt/maldex/mitmproxy/mitmdump
     dst: /usr/bin/mitmdump
     type: symlink
+  # RHEL 9 qemu-kvm installs only /usr/libexec/qemu-kvm, but the domain XML names /usr/bin/qemu-system-x86_64 (Ubuntu's path).
+  # An rpm-owned symlink (no RHEL 9 or EPEL package ships that path): rpm -qf and rpm -V see it, and erasing maldex removes it.
+  - src: /usr/libexec/qemu-kvm
+    dst: /usr/bin/qemu-system-x86_64
+    type: symlink
+    packager: rpm
 
   # ---- /etc ----
   - dst: /etc/maldex

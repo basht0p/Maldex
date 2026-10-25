@@ -33,7 +33,7 @@ mkdir -p /stubs
 stub() { printf '#!/bin/sh\necho "%s $*" >> %s\necho "%s $*" >> %s\n%s\n' "$1" "$LOG" "$1" "$ALL" "$2" > "/stubs/$1"; chmod +x "/stubs/$1"; }
 REAL_USERADD="$(command -v useradd)"; REAL_USERMOD="$(command -v usermod)"; REAL_GROUPADD="$(command -v groupadd)"
 [ -n "$REAL_USERADD" ] && [ -n "$REAL_USERMOD" ] && [ -n "$REAL_GROUPADD" ] || { echo "FAIL - [$FMT] the image lacks useradd/usermod/groupadd"; exit 1; }
-stub systemctl 'exit 0'
+stub systemctl 'case "$*" in "is-active --quiet guacd.service") [ -e /tmp/guacd-active ] || exit 3;; esac; exit 0'
 stub udevadm 'exit 0'
 stub visudo '[ ! -e /tmp/visudo-fail ] || exit 1; exit 0'
 stub selinuxenabled 'exit 0'
@@ -93,7 +93,7 @@ check "/var/log/maldex is 0750 maldex" mode_owner "750 maldex:maldex" /var/log/m
 check "/var/lib/maldex/.data/vm exists (0750 maldex)" mode_owner "750 maldex:maldex" /var/lib/maldex/.data/vm
 check "the config is root:maldex 0640" mode_owner "640 root:maldex" /etc/maldex/appsettings.Production.json
 check "host guard enabled and started" logged '^systemctl enable --now maldex-host-guard\.service$'
-check "guacd enabled" logged '^systemctl enable guacd\.service$'
+check "guacd enabled and started when it is not running (EPEL's package does not start it)" logged '^systemctl enable --now guacd\.service$'
 check "inetsim and suricata masked" bash -c "grep -q '^systemctl mask inetsim.service' $LOG && grep -q '^systemctl mask suricata.service' $LOG"
 check "udev rules reloaded and misc triggered" bash -c "grep -q '^udevadm control --reload' $LOG && grep -q '^udevadm trigger -s misc' $LOG"
 check "install: no try-restart of maldex" not_logged 'try-restart maldex\.service'
@@ -118,8 +118,12 @@ if [ "$FMT" = deb ]; then
   run postremove "${OLD_POSTRM_U[@]}"
   check "old postrm (upgrade) keeps sudoers and /etc/maldex" kept_etc
 fi
+touch /tmp/guacd-active
 run postinstall "${UPGRADE[@]}"
+rm -f /tmp/guacd-active
 check "postinstall (upgrade) exits 0" [ "$RC" = 0 ]
+check "a running guacd is restarted for the drop-in, not started again" \
+  bash -c "grep -qx 'systemctl try-restart guacd.service' $LOG && ! grep -q 'enable --now guacd' $LOG"
 check "upgrade: try-restart maldex" logged '^systemctl try-restart maldex\.service$'
 check "upgrade: restart the host guard (a changed ruleset loads)" logged '^systemctl restart maldex-host-guard\.service$'
 check "upgrade: no setup hint" no_hint

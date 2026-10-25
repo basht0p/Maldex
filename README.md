@@ -203,6 +203,8 @@ Release packages are built and signed by the release workflow: a `.deb` for Ubun
 
    On RHEL, first `sudo dnf install epel-release` and enable the CRB repository (`sudo dnf config-manager --set-enabled crb`), then `sudo dnf install ./maldex-*.rpm`. For the rpm you can also `sudo rpm --import maldex-signing-key.asc` and check it with `rpm -K maldex-*.rpm`.
 
+   **RHEL: install INetSim by hand.** EL9 has no INetSim package (not in the base repositories, not in EPEL), so the rpm cannot depend on it. Install it from the [INetSim release tarball](https://www.inetsim.org/downloads.html) and its Perl dependencies so that `/usr/bin/inetsim` and its data directory `/var/lib/inetsim` exist, then create its system user: `sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin inetsim`. `maldex-setup` checks all three. The rpm also links `/usr/bin/qemu-system-x86_64` to RHEL's `/usr/libexec/qemu-kvm`, the emulator path the VMs use.
+
 3. **Configure.** Edit `/etc/maldex/appsettings.Production.json` (mode 0640, `root:maldex`): set the SQL Server connection string and the `AzureAd` section (tenant, client ID, audience).
 
 4. **Run the host setup.**
@@ -211,7 +213,9 @@ Release packages are built and signed by the release workflow: a `.deb` for Ubun
    sudo maldex-setup
    ```
 
-   It installs and checks the rest of the host (libvirt/KVM, mitmproxy, guest tooling, Sysmon and the virtio drivers). On a host without internet access, copy `Sysmon.zip` and `virtio-win.iso` over and run `sudo maldex-setup --offline <dir>`. `maldex-setup --check` re-runs only the read-only checks.
+   It installs and checks the rest of the host (libvirt/KVM, mitmproxy, guest tooling, Sysmon and the virtio drivers), then restarts maldex and checks that it stays up; if it does not, `journalctl -u maldex -n 50` names the problem. `maldex-setup --check` re-runs only the read-only checks.
+
+   **Offline.** On a host without internet access, copy `Sysmon.zip` and `virtio-win.iso` into a directory and run `sudo maldex-setup --offline <dir>`. Offline mode does not cover the OS packages (use a local mirror) or the Playwright Chromium that PDF reports need. To include Chromium, install it on a connected host with the same Maldex version (`PLAYWRIGHT_BROWSERS_PATH=$PWD/ms-playwright /opt/maldex/app/Maldex.Web --install-browsers --no-deps`) and copy that `ms-playwright` directory to `<dir>/ms-playwright`; maldex-setup copies it to `/var/lib/maldex/ms-playwright`. Without it, setup warns, finishes, and everything except PDF reports works; add Chromium later with `sudo maldex-setup` once the host can reach the Playwright CDN.
 
 5. **Open the app.** It listens on `http://127.0.0.1:5080` only; reach it through an SSH forward (`ssh -L 5080:127.0.0.1:5080 <host>`) or a reverse proxy you provide. Then build the first guest image under **Admin → Sandbox Templates → New template**.
 
