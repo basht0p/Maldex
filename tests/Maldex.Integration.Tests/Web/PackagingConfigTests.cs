@@ -78,6 +78,7 @@ public sealed class PackagingConfigTests
         Assert.Equal("/opt/maldex/deploy/net", cfg["Maldex:Real:Net:DeployNetDir"]);
         Assert.StartsWith("/opt/maldex/deploy/net/suricata/", cfg["Maldex:Real:Suricata:ConfigPath"]);
         Assert.StartsWith("/opt/maldex/deploy/net/suricata/", cfg["Maldex:Real:Suricata:RulesPath"]);
+        Assert.Equal("Real", cfg["Maldex:Mode"]);
         Assert.StartsWith("/opt/maldex/rules/", cfg["Maldex:Yara:RulesIndex"]);
     }
 
@@ -96,6 +97,42 @@ public sealed class PackagingConfigTests
             var cfg = builder.Build();
             Assert.Equal("from-b", cfg["Maldex:X"]);
             Assert.Equal("a", cfg["Maldex:OnlyA"]);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Fact]
+    public void Config_layering_matches_Program_cs()
+    {
+        var dir = Directory.CreateTempSubdirectory("maldex-layer-").FullName;
+        const string envKey = "Maldex__Real__Libvirt__MachineType";
+        try
+        {
+            var pkg = Path.Combine(AppContext.BaseDirectory, "appsettings.Package.json");
+            var prod = Path.Combine(dir, "appsettings.Production.json");
+            File.WriteAllText(prod, """{"Maldex":{"Real":{"Root":"/srv/maldex"}}}""");
+            IConfigurationRoot Build(string extra)
+            {
+                var b = new ConfigurationBuilder().SetBasePath(AppContext.BaseDirectory).AddJsonFile("appsettings.json").AddEnvironmentVariables();
+                var at = ExtraConfig.Add(b.Sources, extra);
+                Assert.True(at >= 0);
+                Assert.Equal("Real", b.Build()["Maldex:Mode"]);
+                RealSettings.InsertAt(b.Sources, new Microsoft.Extensions.FileProviders.PhysicalFileProvider(AppContext.BaseDirectory), at);
+                return b.Build();
+            }
+
+            var cfg = Build(pkg);
+            Assert.Equal("Real", cfg["Maldex:Mode"]);
+            Assert.Equal("q35", cfg["Maldex:Real:Libvirt:MachineType"]);           // only Real.json sets it
+            Assert.Equal("/var/lib/maldex", cfg["Maldex:Real:Root"]);              // Package.json over Real.json ("")
+            Assert.Equal("/opt/maldex/deploy/net", cfg["Maldex:Real:Net:DeployNetDir"]);
+
+            cfg = Build($"{pkg}:{prod}");
+            Assert.Equal("/srv/maldex", cfg["Maldex:Real:Root"]);                  // Production.json over Package.json
+
+            Environment.SetEnvironmentVariable(envKey, "env-wins");
+            try { Assert.Equal("env-wins", Build($"{pkg}:{prod}")["Maldex:Real:Libvirt:MachineType"]); }
+            finally { Environment.SetEnvironmentVariable(envKey, null); }
         }
         finally { Directory.Delete(dir, true); }
     }
