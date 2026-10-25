@@ -14,6 +14,7 @@ using Maldex.Web.Endpoints;
 using Maldex.Web.Hubs;
 using Maldex.Web.Reports;
 using Maldex.Web.Security;
+using Maldex.Web.Templates;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -38,6 +39,8 @@ builder.Services.Configure<WorkersOptions>(builder.Configuration.GetSection(Work
 builder.Services.Configure<SubmissionOptions>(builder.Configuration.GetSection(SubmissionOptions.SectionName));
 builder.Services.PostConfigure<SubmissionOptions>(o => o.ApplyDefaults());
 builder.Services.Configure<EgressOptions>(builder.Configuration.GetSection(EgressOptions.SectionName));
+builder.Services.AddSingleton<IValidateOptions<TemplateAdminOptions>, TemplateAdminOptionsValidation>();
+builder.Services.AddOptions<TemplateAdminOptions>().Bind(builder.Configuration.GetSection(TemplateAdminOptions.SectionName)).ValidateOnStart();
 builder.Services.Configure<FormOptions>(o => o.MultipartBodyLengthLimit =
     new SubmissionOptions { MaxUploadBytes = builder.Configuration.GetValue<long?>("Maldex:MaxUploadBytes") ?? 268_435_456 }.MaxUploadBytes + 65536);
 builder.AddMaldexAuth();
@@ -88,6 +91,7 @@ app.UseAuthorization();
 
 app.MapMeEndpoints();
 app.MapOrgEndpoints();
+app.MapStatusEndpoints();
 app.MapTemplateEndpoints();
 app.MapMediaEndpoints();
 app.MapTaskEndpoints();

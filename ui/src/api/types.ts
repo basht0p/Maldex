@@ -96,6 +96,18 @@ export interface TemplateVersionDto {
   sealedAt: string
   note?: string | null
   sizeBytes?: number | null
+  parentVersionId?: string | null
+  parentNumber?: number | null
+  sysmonConfigSha256?: string | null
+  mitmCaSha256?: string | null
+  /** The media the version was built from; a deleted file keeps its id with the name "(deleted)". */
+  sourceMedia: MediaRefDto[]
+  taskCount: number
+}
+
+export interface MediaRefDto {
+  id: string
+  name: string
 }
 
 export type TemplateJobKind = 'Edit' | 'Refresh' | 'Build'
@@ -122,6 +134,17 @@ export interface TemplateJobDto {
   hasProvisionLog?: boolean
   /** A Seal was accepted and has not been acted on yet; false again after a refusal (Defender). */
   sealRequested?: boolean
+  /** The job's transitions in order; empty for a job from before the step history. */
+  steps?: TemplateJobStepDto[]
+  /** The requester's display name; null in hub pushes. */
+  requestedByName?: string | null
+}
+
+/** One transition of a template job: the state it entered, when, and its message then. */
+export interface TemplateJobStepDto {
+  state: TemplateJobState
+  at: string
+  message?: string | null
 }
 
 export type MediaKind = 'OsInstaller' | 'Application'
@@ -154,6 +177,15 @@ export interface MediaFileDto {
   addedBy: string
   addedAt: string
   usedBy: string[]
+  /** Template versions that use this media; `usedBy` also names active jobs. */
+  usedByRefs?: MediaUsageDto[]
+}
+
+export interface MediaUsageDto {
+  templateId: string
+  templateName: string
+  versionNumber: number
+  templateExists: boolean
 }
 
 export interface StartUploadResponse {
@@ -180,6 +212,15 @@ export interface AdminTemplateDto {
   enabled: boolean
   current?: TemplateVersionDto | null
   versions: TemplateVersionDto[]
+  tasksLast30Days: number
+  refreshDue: boolean
+  activeJobId?: string | null
+}
+
+/** GET /api/admin/templates/{id}: the template with up to 100 jobs, newest first. */
+export interface TemplateDetailDto {
+  template: AdminTemplateDto
+  jobs: TemplateJobDto[]
 }
 
 export interface TaskListDto {
@@ -377,4 +418,20 @@ export interface ResubmitRequest {
   exitCountry?: string | null
   durationSec?: number | null
   interactive?: boolean | null
+}
+
+export interface SlotHolderDto { kind: 'task' | 'job'; id: string; label: string; since: string }
+export interface VmSlotStatusDto { capacity: number; busy: number; holders: SlotHolderDto[] }
+export interface DiskStatusDto { name: 'data' | 'vm' | 'media'; path: string; freeBytes: number; totalBytes: number }
+export interface WorkerStatusDto { name: string; lastTickAt: string | null; expectedIntervalSec: number; stalled: boolean }
+export interface RecentFailureDto { kind: 'task' | 'job'; id: string; label: string; reason: string | null; at: string }
+export interface SystemStatusDto {
+  vmSlot: VmSlotStatusDto
+  queueDepth: number
+  runningTasks: number
+  activeJobs: number
+  disks: DiskStatusDto[]
+  workers: WorkerStatusDto[]
+  recentFailures: RecentFailureDto[]
+  generatedAt: string
 }

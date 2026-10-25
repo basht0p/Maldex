@@ -761,7 +761,7 @@ public sealed class TemplateJobEndpointsTests(SqlServerFixture sql) : IDisposabl
     }
 
     private static TemplateJobDto Dto(Guid id, string state, string? message) =>
-        new(id, "Edit", Seeded, 1, null, "None", state, message, null, DateTimeOffset.UtcNow, null, null, null, false, false);
+        new(id, "Edit", Seeded, 1, null, "None", state, message, null, DateTimeOffset.UtcNow, null, null, null, false, false, []);
 
     [Fact]
     public async Task Hub_JoinTemplateJob_RequiresAdmin()

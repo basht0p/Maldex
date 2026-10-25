@@ -1,4 +1,5 @@
 using System.Threading.Channels;
+using Maldex.Core.Health;
 using Maldex.Infrastructure.Media;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -8,11 +9,14 @@ namespace Maldex.Orchestrator.Media;
 
 /// <summary>
 /// Runs the media library's background work: recovers at start, then completes uploads from <see cref="MediaUploadState.Queue"/> one at a time and runs URL fetches
-/// one at a time on a consumer of their own, and sweeps abandoned uploads (and, in Real mode, stale loop mounts) hourly.
+/// one at a time on a consumer of their own, and sweeps abandoned uploads hourly (stale loop mounts are swept by <c>MediaMountSweepService</c>).
 /// </summary>
-public sealed class MediaWorker(IServiceScopeFactory scopes, MediaUploadState state, IServiceProvider services, TimeProvider time, ILogger<MediaWorker> logger) : BackgroundService
+public sealed class MediaWorker(IServiceScopeFactory scopes, MediaUploadState state, TimeProvider time, ILogger<MediaWorker> logger, WorkerHealth? health = null) : BackgroundService
 {
     public static readonly TimeSpan SweepInterval = TimeSpan.FromHours(1);
+
+    // Registered at construction: a worker the start gate never lets run shows up as stalled.
+    private readonly WorkerHealth? _health = WorkerHealth.RegisterOn(health, "media", SweepInterval);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -55,13 +59,8 @@ public sealed class MediaWorker(IServiceScopeFactory scopes, MediaUploadState st
         using var timer = new PeriodicTimer(SweepInterval, time);
         do
         {
+            _health?.Tick("media");
             await RunSafelyAsync("sweep", (intake, token) => intake.SweepAsync(token), ct).ConfigureAwait(false);
-            // The startup sweep of stale mounts is a BackgroundService of its own; this is the hourly one (Real mode only).
-            if (services.GetService<LoopMountMediaInspector>() is { } mounts)
-            {
-                try { await mounts.SweepAsync(ct).ConfigureAwait(false); }
-                catch (Exception e) when (!ct.IsCancellationRequested) { logger.LogWarning(e, "Media mount sweep failed"); }
-            }
         }
         while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false));
     }

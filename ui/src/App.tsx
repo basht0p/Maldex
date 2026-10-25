@@ -1,20 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { BrowserRouter, NavLink, Route, Routes, useNavigate } from 'react-router-dom'
+import { BrowserRouter, NavLink, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { getMe } from './api/client'
 import type { MeDto } from './api/types'
 import styles from './App.module.css'
 import markDark from '../../brand/logo/maldex-mark.svg'
 import markLight from '../../brand/logo/maldex-mark-light.svg'
 import { ConfirmProvider } from './kit/Confirm'
-import { EmptyState } from './kit/EmptyState'
 import { ShortcutHelp } from './kit/ShortcutHelp'
 import { ThemeSwitch } from './kit/ThemeSwitch'
 import { ToastProvider } from './kit/Toaster'
 import { applyTheme, loadTheme } from './kit/theme'
 import { useShortcuts } from './kit/useShortcuts'
+import { SystemStatusProvider } from './live/SystemStatusProvider'
+import { useSystemStatus } from './live/useSystemStatus'
+import MediaPage from './pages/MediaPage'
 import OrgsAdminPage from './pages/OrgsAdminPage'
+import StatusPage from './pages/StatusPage'
 import SubmitPage from './pages/SubmitPage'
 import TaskPage from './pages/TaskPage'
+import TemplateDetailPage from './pages/TemplateDetailPage'
 import TasksPage from './pages/TasksPage'
 import TemplateJobPage from './pages/TemplateJobPage'
 import TemplatesAdminPage from './pages/TemplatesAdminPage'
@@ -37,15 +41,33 @@ function useNarrow(): boolean {
   return narrow
 }
 
-// Media has no route of its own until Plan 4b; its tab on the templates page is local state.
 const ADMIN_LINKS = [
   { to: '/admin/templates', label: 'Templates' },
-  { to: '/admin/templates', label: 'Media' },
+  { to: '/admin/media', label: 'Media' },
   { to: '/admin/orgs', label: 'Organizations' },
   { to: '/admin/status', label: 'Status' },
 ]
 
+function AdminLinks() {
+  const { attention } = useSystemStatus()
+  return (
+    <>
+      {ADMIN_LINKS.map((l) => (
+        <NavLink key={l.label} to={l.to}>
+          {l.label}
+          {l.label === 'Status' && attention && <AttentionDot />}
+        </NavLink>
+      ))}
+    </>
+  )
+}
+
+function AttentionDot() {
+  return <span className={styles.attention} role="img" aria-label="needs attention" />
+}
+
 function AdminMenu({ narrow }: { narrow: boolean }) {
+  const { attention } = useSystemStatus()
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -58,14 +80,14 @@ function AdminMenu({ narrow }: { narrow: boolean }) {
   }, [open])
 
   if (narrow) {
-    return <>{ADMIN_LINKS.map((l) => <NavLink key={l.label} to={l.to}>{l.label}</NavLink>)}</>
+    return <AdminLinks />
   }
   return (
     <div ref={ref} className={styles.menu}>
-      <button type="button" className={styles.menuButton} aria-haspopup="true" aria-expanded={open} onClick={() => setOpen((o) => !o)}>Admin</button>
+      <button type="button" className={styles.menuButton} aria-haspopup="true" aria-expanded={open} onClick={() => setOpen((o) => !o)}>Admin{attention && <AttentionDot />}</button>
       {open && (
         <div className={styles.menuPanel} onClick={() => setOpen(false)}>
-          {ADMIN_LINKS.map((l) => <NavLink key={l.label} to={l.to}>{l.label}</NavLink>)}
+          <AdminLinks />
         </div>
       )}
     </div>
@@ -80,6 +102,7 @@ function Shell() {
   const helpOpener = useRef<HTMLElement | null>(null)
   const narrow = useNarrow()
   const navigate = useNavigate()
+  const location = useLocation()
 
   useEffect(() => {
     getMe().then(setMe, (e: unknown) => setError(e instanceof Error ? e.message : 'Could not load the current user.'))
@@ -116,7 +139,7 @@ function Shell() {
   )
 
   return (
-    <>
+    <SystemStatusProvider enabled={isAdmin && location.pathname.startsWith('/admin')}>
       <nav className={styles.nav} aria-label="Main">
         <span className={styles.brand}>
           <img className={`${styles.mark} ${styles.markDark}`} src={markDark} alt="" />
@@ -139,13 +162,15 @@ function Shell() {
           <Route path="/tasks/:id" element={<TaskPage />} />
           <Route path="/admin/orgs" element={<OrgsAdminPage me={me} />} />
           <Route path="/admin/templates" element={<TemplatesAdminPage me={me} />} />
+          <Route path="/admin/templates/:id" element={<TemplateDetailPage me={me} />} />
+          <Route path="/admin/media" element={<MediaPage />} />
           <Route path="/admin/template-jobs/:id" element={<TemplateJobPage me={me} />} />
-          <Route path="/admin/status" element={<EmptyState title="System status" body="Coming in the next update." />} />
+          <Route path="/admin/status" element={<StatusPage />} />
           <Route path="*" element={<p>Page not found.</p>} />
         </Routes>
       </main>
       {helpOpen && <ShortcutHelp onClose={closeHelp} />}
-    </>
+    </SystemStatusProvider>
   )
 }
 

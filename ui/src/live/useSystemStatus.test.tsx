@@ -1,0 +1,147 @@
+import { act, render, screen } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { SystemStatusDto } from '../api/types'
+
+const getSystemStatus = vi.fn()
+vi.mock('../api/client', async (orig) => ({
+  ...(await orig<typeof import('../api/client')>()),
+  getSystemStatus: (...a: unknown[]) => getSystemStatus(...a),
+}))
+
+import { SystemStatusProvider } from './SystemStatusProvider'
+import { useSystemStatus } from './useSystemStatus'
+
+const status = (over: Partial<SystemStatusDto> = {}): SystemStatusDto => ({
+  vmSlot: { capacity: 1, busy: 0, holders: [] }, queueDepth: 0, runningTasks: 0, activeJobs: 0,
+  disks: [{ name: 'data', path: '/var/lib/maldex', freeBytes: 50, totalBytes: 100 }],
+  workers: [{ name: 'orchestrator', lastTickAt: '2026-10-25T10:00:00Z', expectedIntervalSec: 5, stalled: false }],
+  recentFailures: [], generatedAt: '2026-10-25T10:00:00Z', ...over,
+})
+
+function Probe() {
+  const { status: s, error, attention } = useSystemStatus()
+  return <p>{s ? `queued ${s.queueDepth}` : 'none'}|{error ?? 'ok'}|{attention ? 'attn' : 'calm'}</p>
+}
+
+const setHidden = (hidden: boolean) => Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden })
+const flush = () => act(async () => { await Promise.resolve(); await Promise.resolve() })
+const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms) })
+
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] })
+  getSystemStatus.mockReset()
+  getSystemStatus.mockResolvedValue(status())
+  setHidden(false)
+})
+afterEach(() => { vi.useRealTimers(); setHidden(false) })
+
+describe('SystemStatusProvider', () => {
+  it('polls every 5 s only when enabled and pauses while hidden', async () => {
+    const { rerender } = render(<SystemStatusProvider enabled={false}><Probe /></SystemStatusProvider>)
+    await tick(20_000)
+    expect(getSystemStatus).not.toHaveBeenCalled()
+
+    rerender(<SystemStatusProvider enabled><Probe /></SystemStatusProvider>)
+    await flush()
+    expect(getSystemStatus).toHaveBeenCalledTimes(1)
+    await tick(5000)
+    expect(getSystemStatus).toHaveBeenCalledTimes(2)
+    await tick(10_000)
+    expect(getSystemStatus).toHaveBeenCalledTimes(4)
+
+    setHidden(true)
+    await tick(15_000)
+    expect(getSystemStatus).toHaveBeenCalledTimes(4)
+
+    setHidden(false)
+    await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+    expect(getSystemStatus).toHaveBeenCalledTimes(5)
+
+    rerender(<SystemStatusProvider enabled={false}><Probe /></SystemStatusProvider>)
+    await tick(20_000)
+    expect(getSystemStatus).toHaveBeenCalledTimes(5)
+  })
+
+  it('reports attention for a stalled worker and an error on failure', async () => {
+    getSystemStatus.mockResolvedValueOnce(status({ workers: [{ name: 'w', lastTickAt: null, expectedIntervalSec: 5, stalled: true }] }))
+    render(<SystemStatusProvider enabled><Probe /></SystemStatusProvider>)
+    await flush()
+    expect(screen.getByText(/attn/)).toBeInTheDocument()
+
+    getSystemStatus.mockRejectedValueOnce(new Error('boom'))
+    await tick(5000)
+    expect(screen.getByText(/boom/)).toBeInTheDocument()
+  })
+
+  it('clears status and error when disabled', async () => {
+    getSystemStatus.mockResolvedValueOnce(status({ queueDepth: 7 }))
+    const { rerender } = render(<SystemStatusProvider enabled><Probe /></SystemStatusProvider>)
+    await flush()
+    expect(screen.getByText(/queued 7/)).toBeInTheDocument()
+    rerender(<SystemStatusProvider enabled={false}><Probe /></SystemStatusProvider>)
+    expect(screen.getByText('none|ok|calm')).toBeInTheDocument()
+
+    getSystemStatus.mockRejectedValueOnce(new Error('boom'))
+    rerender(<SystemStatusProvider enabled><Probe /></SystemStatusProvider>)
+    await flush()
+    expect(screen.getByText(/boom/)).toBeInTheDocument()
+    rerender(<SystemStatusProvider enabled={false}><Probe /></SystemStatusProvider>)
+    expect(screen.getByText('none|ok|calm')).toBeInTheDocument()
+  })
+
+  it('skips ticks while a request is in flight so a slow server still updates', async () => {
+    let resolve!: (s: SystemStatusDto) => void
+    getSystemStatus.mockReset()
+    getSystemStatus.mockReturnValueOnce(new Promise<SystemStatusDto>((r) => { resolve = r }))
+    render(<SystemStatusProvider enabled><Probe /></SystemStatusProvider>)
+    await flush()
+    await tick(12_000)
+    expect(getSystemStatus).toHaveBeenCalledTimes(1)
+    await act(async () => { resolve(status({ queueDepth: 4 })) })
+    expect(screen.getByText(/queued 4/)).toBeInTheDocument()
+    getSystemStatus.mockResolvedValue(status({ queueDepth: 5 }))
+    await tick(5000)
+    expect(getSystemStatus).toHaveBeenCalledTimes(2)
+  })
+
+  it('times out a request that never settles after 30 s, aborts it, and fetches again on the next tick', async () => {
+    let signal: AbortSignal | undefined
+    getSystemStatus.mockReset()
+    getSystemStatus.mockImplementationOnce((s?: AbortSignal) => { signal = s; return new Promise(() => undefined) })
+    let resolve!: (v: SystemStatusDto) => void
+    getSystemStatus.mockImplementationOnce(() => new Promise<SystemStatusDto>((r) => { resolve = r }))
+    render(<SystemStatusProvider enabled><Probe /></SystemStatusProvider>)
+    await flush()
+    await tick(25_000)
+    expect(getSystemStatus).toHaveBeenCalledTimes(1)
+    expect(signal?.aborted).toBe(false)
+    await tick(5000)
+    expect(signal?.aborted).toBe(true)
+    expect(screen.getByText(/Status request timed out/)).toBeInTheDocument()
+    // the 30 s poll tick fires right after the timeout and issues a fresh request
+    expect(getSystemStatus).toHaveBeenCalledTimes(2)
+    await act(async () => { resolve(status({ queueDepth: 2 })) })
+    expect(screen.getByText('queued 2|ok|calm')).toBeInTheDocument()
+  })
+
+  it('aborts an in-flight request when disabled', async () => {
+    let signal: AbortSignal | undefined
+    getSystemStatus.mockReset()
+    getSystemStatus.mockImplementationOnce((s?: AbortSignal) => { signal = s; return new Promise(() => undefined) })
+    const { rerender } = render(<SystemStatusProvider enabled><Probe /></SystemStatusProvider>)
+    await flush()
+    rerender(<SystemStatusProvider enabled={false}><Probe /></SystemStatusProvider>)
+    expect(signal?.aborted).toBe(true)
+  })
+
+  it('flags attention for a disk under 10% free but not at exactly 10%', async () => {
+    getSystemStatus.mockResolvedValueOnce(status({ disks: [{ name: 'vm', path: '/v', freeBytes: 10, totalBytes: 100 }] }))
+    render(<SystemStatusProvider enabled><Probe /></SystemStatusProvider>)
+    await flush()
+    expect(screen.getByText(/calm/)).toBeInTheDocument()
+
+    getSystemStatus.mockResolvedValueOnce(status({ disks: [{ name: 'vm', path: '/v', freeBytes: 9, totalBytes: 100 }] }))
+    await tick(5000)
+    expect(screen.getByText(/attn/)).toBeInTheDocument()
+  })
+})

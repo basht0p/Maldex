@@ -27,7 +27,8 @@ const win = row({
   id: 'win', images: [
     { index: 6, name: 'Windows 11 Pro', build: '26300.1', supported: true },
     { index: 1, name: 'Windows 11 Home', build: '26300.1', supported: false, unsupportedReason: 'Home cannot be used' },
-  ], preferredImageIndex: 6, usedBy: ['Windows 11 Golden v1'],
+  ], preferredImageIndex: 6, usedBy: ['Windows 11 Golden v1', 'job j1'],
+  usedByRefs: [{ templateId: 'golden', templateName: 'Windows 11 Golden', versionNumber: 1, templateExists: true }],
 })
 const office = row({ id: 'off', kind: 'Application', fileName: 'office.img', application: 'Office', sha256: '1111222233334444' })
 const partial = row({ id: 'part', fileName: 'big.iso', size: 1000, receivedBytes: 400, status: 'Receiving', sha256: null })
@@ -57,8 +58,8 @@ describe('MediaLibrary', () => {
     expect(w).toHaveTextContent('abcdef012345')
     expect(w).not.toHaveTextContent('abcdef0123456')
     expect(w).toHaveTextContent('Ready')
-    expect(w).toHaveTextContent('6 · Windows 11 Pro (26300.1)')
-    expect(w).toHaveTextContent('1 · Windows 11 Home (26300.1)')
+    expect(w).toHaveTextContent('Windows 11 Pro')
+    expect(w).toHaveTextContent('Windows 11 Home')
     expect(w).toHaveTextContent('basht0p')
     expect(w.querySelector('time')).toHaveAttribute('datetime', '2026-10-25T09:30:00Z') // shown relative, exact time in the title
     expect(within(w).getByRole('button', { name: 'Copy SHA-256' })).toBeInTheDocument()
@@ -200,13 +201,85 @@ describe('MediaLibrary', () => {
     })
   })
 
+  it('lists editions with the default marked', async () => {
+    renderWithKit(<MediaLibrary />)
+    await screen.findByText('win11.iso')
+    const w = rowOf('win11.iso')
+    expect(within(w).getByText(/^Editions/)).toBeInTheDocument()
+    const t = within(w).getByRole('table', { name: 'Editions of win11.iso' })
+    const pro = within(t).getByRole('row', { name: /Windows 11 Pro/ })
+    expect(pro).toHaveTextContent('6')
+    expect(pro).toHaveTextContent('26300.1')
+    expect(pro).toHaveTextContent('Default')
+    const home = within(t).getByRole('row', { name: /Windows 11 Home/ })
+    expect(home).not.toHaveTextContent('Default')
+    expect(home).toHaveTextContent('Home cannot be used')
+    expect(within(rowOf('office.img')).queryByText(/^Editions/)).toBeNull()
+  })
+
+  it('links used-by entries and shows a deleted template as text', async () => {
+    const gone = row({
+      id: 'g', fileName: 'g.iso', usedBy: ['Old v2'],
+      usedByRefs: [{ templateId: 'old', templateName: 'Old', versionNumber: 2, templateExists: false }],
+    })
+    listMedia.mockResolvedValue([win, gone])
+    renderWithKit(<MediaLibrary />)
+    await screen.findByText('win11.iso')
+    const link = within(rowOf('win11.iso')).getByRole('link', { name: 'Windows 11 Golden v1' })
+    expect(link).toHaveAttribute('href', '/admin/templates/golden')
+    expect(rowOf('win11.iso')).toHaveTextContent('job j1')
+    expect(within(rowOf('g.iso')).queryByRole('link')).toBeNull()
+    expect(rowOf('g.iso')).toHaveTextContent('Old v2')
+  })
+
+  it('delete confirm lists the users', async () => {
+    renderWithKit(<MediaLibrary />)
+    await screen.findByText('win11.iso')
+    await userEvent.click(within(rowOf('win11.iso')).getByRole('button', { name: 'Delete' }))
+    const dlg = await screen.findByRole('dialog', { name: 'Delete win11.iso?' })
+    expect(dlg).toHaveTextContent('Windows 11 Golden v1, job j1')
+    expect(dlg).toHaveTextContent('refuse')
+    await userEvent.click(within(dlg).getByRole('button', { name: 'Cancel' }))
+  })
+
+  it('renders edition names, reasons and the delete-confirm users through safeText', async () => {
+    const evil = row({
+      id: 'ev', fileName: 'ev.iso', usedBy: ['job\u202Ex'],
+      images: [{ index: 1, name: 'Home\u200B', build: '1', supported: false, unsupportedReason: 'no\u202Ereason' }],
+    })
+    listMedia.mockResolvedValue([evil])
+    renderWithKit(<MediaLibrary />)
+    await screen.findByText('ev.iso')
+    const r = rowOf('ev.iso')
+    expect(r).toHaveTextContent('Home\\u200B')
+    expect(r).toHaveTextContent('no\\u202Ereason')
+    await userEvent.click(within(r).getByRole('button', { name: 'Delete' }))
+    expect(await screen.findByRole('dialog')).toHaveTextContent('job\\u202Ex')
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+  })
+
+  it('shows upload speed and ETA when the upload reports them', async () => {
+    uploadMedia.mockImplementation((_f: File, _k: string, onProgress: (r: number, s: number, rate: unknown) => void) => {
+      onProgress(1024 * 1024, 4 * 1024 * 1024, { bytesPerSec: 1024 * 1024, etaSec: 3 })
+      return new Promise<void>(() => undefined)
+    })
+    renderWithKit(<MediaLibrary />)
+    await screen.findByText('win11.iso')
+    const group = screen.getByRole('group', { name: 'Upload' })
+    await userEvent.upload(within(group).getByLabelText('File'), new File(['x'], 'new.iso'))
+    await userEvent.click(within(group).getByRole('button', { name: 'Upload' }))
+    const status = await screen.findByText(/Uploading new\.iso: 25%/)
+    expect(status).toHaveTextContent('1.0 MiB/s')
+    expect(status).toHaveTextContent('ETA 0:03')
+  })
+
   it('shows an unsupported edition once, with only the reason after the name', async () => {
     const home = row({ id: 'h', fileName: 'h.iso', images: [{ index: 1, name: 'Windows 11 Home', build: '26300.1', supported: false, unsupportedReason: 'Windows 11 Home is not supported: Home cannot be used' }] })
     listMedia.mockResolvedValue([home])
     renderWithKit(<MediaLibrary />)
     await screen.findByText('h.iso')
     const cell = rowOf('h.iso')
-    expect(cell).toHaveTextContent('1 · Windows 11 Home (26300.1): Home cannot be used')
+    expect(cell).toHaveTextContent('Home cannot be used')
     expect(cell.textContent?.match(/Windows 11 Home/g)).toHaveLength(1)
   })
 

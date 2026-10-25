@@ -1225,7 +1225,9 @@ public sealed class TemplateCoordinator(
             int? baseNumber = job.BaseVersionId is { } baseId ? numbers.FirstOrDefault(n => n.Id == baseId)?.Number ?? 0 : null;
             int? resultNumber = numbers.FirstOrDefault(n => n.Id == job.ResultVersionId)?.Number;
             var hasLog = job.Kind == TemplateJobKind.Build && File.Exists(buildOptions.Value.ProvisionLogPathOf(job.Id));
-            await publisher.PublishAsync(TemplateJobDto.From(job, baseNumber, resultNumber, options.Value.ConfigureIdleTimeout, hasLog), CancellationToken.None).ConfigureAwait(false);
+            var steps = await db.TemplateJobSteps.AsNoTracking().Where(s => s.JobId == job.Id).OrderBy(s => s.Id)
+                .ToListAsync(CancellationToken.None).ConfigureAwait(false);
+            await publisher.PublishAsync(TemplateJobDto.From(job, baseNumber, resultNumber, options.Value.ConfigureIdleTimeout, hasLog, steps), CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

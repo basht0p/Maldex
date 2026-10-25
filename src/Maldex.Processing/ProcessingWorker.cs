@@ -1,5 +1,6 @@
 using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
+using Maldex.Core.Health;
 using Maldex.Core.Live;
 using Maldex.Data;
 using Microsoft.EntityFrameworkCore;
@@ -21,7 +22,8 @@ public sealed class ProcessingWorker(
     IProcessingPipeline pipeline,
     TimeProvider time,
     IOptions<ProcessingOptions> options,
-    ILogger<ProcessingWorker> logger) : BackgroundService
+    ILogger<ProcessingWorker> logger,
+    WorkerHealth? health = null) : BackgroundService
 {
     public static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(2);
 
@@ -30,6 +32,9 @@ public sealed class ProcessingWorker(
 
     // In memory only: a restart gives every task a fresh set of attempts.
     private readonly Dictionary<Guid, (int Failures, DateTimeOffset RetryAt)> _failures = [];
+
+    // Registered at construction: a worker the start gate never lets run shows up as stalled.
+    private readonly WorkerHealth? _health = WorkerHealth.RegisterOn(health, "processing", PollInterval);
 
     private int MaxAttempts => options.Value.MaxAttempts > 0 ? options.Value.MaxAttempts : DefaultMaxAttempts;
 
@@ -47,6 +52,7 @@ public sealed class ProcessingWorker(
             using var timer = new PeriodicTimer(PollInterval, time);
             do
             {
+                _health?.Tick("processing");
                 try
                 {
                     await ProcessPendingAsync(stoppingToken).ConfigureAwait(false);
@@ -73,6 +79,7 @@ public sealed class ProcessingWorker(
         HashSet<Guid> tried = [.. _failures.Where(f => f.Value.RetryAt > now).Select(f => f.Key)]; // still backing off
         while (!ct.IsCancellationRequested)
         {
+            _health?.Tick("processing"); // a long backlog is progress, not a stall
             var next = await OldestProcessingAsync(tried, ct).ConfigureAwait(false);
             if (next is null) break;
             tried.Add(next.Value);

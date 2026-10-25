@@ -2,7 +2,7 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
-const css = readFileSync('src/pages/TemplatesAdminPage.module.css', 'utf8') // vitest runs from ui/
+const css = readFileSync('src/pages/templates/JobDialog.module.css', 'utf8') // vitest runs from ui/
 
 const rule = (selector: string) => css.match(new RegExp(`${selector.replaceAll('.', '\\.')}\\s*\\{([^}]*)\\}`))?.[1] ?? ''
 

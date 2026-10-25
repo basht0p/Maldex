@@ -34,6 +34,35 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers())
 
 describe('uploadMedia', () => {
+  it('shows speed and ETA from a 5 s moving average', async () => {
+    vi.setSystemTime(0)
+    const rates: { bytesPerSec: number; etaSec: number | null }[] = []
+    putMediaChunk.mockImplementation(async (_id: string, offset: number, chunk: Blob) => {
+      vi.advanceTimersByTime(1000)
+      return { receivedBytes: offset + chunk.size, status: 'Receiving' }
+    })
+    await uploadMedia(file(10), 'OsInstaller', (_r, _s, rate) => rates.push(rate), ctl())
+    // samples: t0 0, t1 4, t2 8, t3 10 bytes (1 s apart); window still covers all of them
+    expect(rates[0]).toEqual({ bytesPerSec: 0, etaSec: null })
+    expect(rates[1]).toEqual({ bytesPerSec: 4, etaSec: 2 })
+    expect(rates[2]).toEqual({ bytesPerSec: 4, etaSec: 1 })
+    expect(rates[3].bytesPerSec).toBeCloseTo(10 / 3)
+    expect(rates[3].etaSec).toBe(0)
+  })
+
+  it('forgets samples older than 5 s', async () => {
+    vi.setSystemTime(0)
+    const rates: { bytesPerSec: number }[] = []
+    const waits = [10_000, 1000, 1000]
+    putMediaChunk.mockImplementation(async (_id: string, offset: number, chunk: Blob) => {
+      vi.advanceTimersByTime(waits.shift() ?? 0)
+      return { receivedBytes: offset + chunk.size, status: 'Receiving' }
+    })
+    await uploadMedia(file(10), 'OsInstaller', (_r, _s, rate) => rates.push(rate), ctl())
+    // the slow first chunk (4 B in 10 s) has left the window by the last report: 6 B over the 2 s since
+    expect(rates[3].bytesPerSec).toBeCloseTo(3)
+  })
+
   it('creates the upload and sends chunkBytes slices at their offsets, reporting progress', async () => {
     const progress: number[][] = []
     const result = await uploadMedia(file(10), 'OsInstaller', (r, s) => progress.push([r, s]), ctl())

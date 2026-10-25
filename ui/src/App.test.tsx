@@ -24,7 +24,7 @@ it('shows the Admin menu to admins only', async () => {
   for (const name of ['Templates', 'Media', 'Organizations', 'Status']) {
     expect(screen.getByRole('link', { name })).toBeInTheDocument()
   }
-  expect(screen.getByRole('link', { name: 'Media' })).toHaveAttribute('href', '/admin/templates')
+  expect(screen.getByRole('link', { name: 'Media' })).toHaveAttribute('href', '/admin/media')
   unmount()
 
   server.use(me('Analyst'))
@@ -66,4 +66,45 @@ it('collapses the nav into a menu button under 768 px', async () => {
   expect(screen.queryByRole('link', { name: 'Submit' })).not.toBeInTheDocument()
   await userEvent.setup().click(screen.getByRole('button', { name: 'Menu' }))
   expect(screen.getByRole('link', { name: 'Submit' })).toBeInTheDocument()
+})
+
+const statusBody = (over: Record<string, unknown> = {}) => ({
+  vmSlot: { capacity: 1, busy: 0, holders: [] }, queueDepth: 0, runningTasks: 0, activeJobs: 0,
+  disks: [{ name: 'data', path: '/d', freeBytes: 50, totalBytes: 100 }],
+  workers: [{ name: 'orchestrator', lastTickAt: null, expectedIntervalSec: 5, stalled: false }],
+  recentFailures: [], generatedAt: '2026-10-25T10:00:00Z', ...over,
+})
+const stalledWorkers = [{ name: 'orchestrator', lastTickAt: null, expectedIntervalSec: 5, stalled: true }]
+const lowDisk = [{ name: 'vm', path: '/v', freeBytes: 5, totalBytes: 100 }]
+
+it.each([
+  ['a stalled worker', { workers: stalledWorkers }],
+  ['a low disk', { disks: lowDisk }],
+])('shows the attention dot on the Admin button and the Status link for %s', async (_n, over) => {
+  server.use(me('Admin'), http.get('/api/admin/status', () => HttpResponse.json(statusBody(over))))
+  window.history.pushState({}, '', '/admin/status')
+  render(<App />)
+  await screen.findByRole('heading', { name: 'System status' })
+  const button = await screen.findByRole('button', { name: /Admin/ })
+  expect(await within(button).findByRole('img', { name: 'needs attention' })).toBeInTheDocument()
+  await userEvent.setup().click(button)
+  expect(within(screen.getByRole('link', { name: /Status/ })).getByRole('img', { name: 'needs attention' })).toBeInTheDocument()
+})
+
+it('does not request status for analysts or for an admin outside /admin', async () => {
+  let calls = 0
+  const status = http.get('/api/admin/status', () => { calls++; return HttpResponse.json(statusBody()) })
+  const settle = () => new Promise((r) => setTimeout(r, 150))
+  server.use(me('Analyst'), status)
+  window.history.pushState({}, '', '/admin/status')
+  const { unmount } = render(<App />)
+  await screen.findByText('Pat (Analyst)')
+  await settle()
+  unmount()
+  server.use(me('Admin'), status)
+  window.history.pushState({}, '', '/')
+  render(<App />)
+  await screen.findByText('Pat (Admin)')
+  await settle()
+  expect(calls).toBe(0)
 })

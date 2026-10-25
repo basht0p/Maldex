@@ -69,10 +69,23 @@ public sealed class TemplateJobConfiguration : IEntityTypeConfiguration<Template
         b.HasOne<TemplateVersion>().WithMany().HasForeignKey(x => x.BaseVersionId).OnDelete(DeleteBehavior.Restrict);
         b.HasOne<TemplateVersion>().WithMany().HasForeignKey(x => x.ResultVersionId).OnDelete(DeleteBehavior.Restrict);
         b.HasOne<AppUser>().WithMany().HasForeignKey(x => x.RequestedByUserId).OnDelete(DeleteBehavior.Restrict);
+        b.HasMany(x => x.Steps).WithOne().HasForeignKey(s => s.JobId).OnDelete(DeleteBehavior.Cascade);
 
         // One active (non-terminal) job per template. SQL Server filtered indexes reject NOT IN, so this spells it as <> terms.
         b.HasIndex(x => x.TemplateId).IsUnique()
             .HasFilter("[State] <> 'Published' AND [State] <> 'Sealed' AND [State] <> 'Failed' AND [State] <> 'Cancelled'")
             .HasDatabaseName("IX_TemplateJobs_TemplateId_Active");
+    }
+}
+
+public sealed class TemplateJobStepConfiguration : IEntityTypeConfiguration<TemplateJobStep>
+{
+    public void Configure(EntityTypeBuilder<TemplateJobStep> b)
+    {
+        b.ToTable("TemplateJobSteps");
+        b.HasKey(x => x.Id);
+        // As TemplateJob.Message; the state is stored as its name (max 32) by the context's enum convention, as TemplateJob.State is.
+        b.Property(x => x.Message).HasMaxLength(500);
+        b.HasIndex(x => new { x.JobId, x.Id });
     }
 }

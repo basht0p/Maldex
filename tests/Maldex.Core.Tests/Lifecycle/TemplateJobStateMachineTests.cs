@@ -118,6 +118,32 @@ public class TemplateJobStateMachineTests
     }
 
     [Fact]
+    public void TransitionTo_appends_a_step_with_state_time_and_message()
+    {
+        var job = new TemplateJob { Id = Guid.NewGuid(), Kind = TemplateJobKind.Edit };
+        job.TransitionTo(Preparing, "copying", Now);
+        job.TransitionTo(Configuring, null, Now.AddMinutes(2));
+
+        Assert.Collection(job.Steps,
+            s =>
+            {
+                Assert.Equal((job.Id, Preparing, Now, "copying"), (s.JobId, s.State, s.At, s.Message));
+            },
+            s =>
+            {
+                Assert.Equal((job.Id, Configuring, Now.AddMinutes(2), (string?)null), (s.JobId, s.State, s.At, s.Message));
+            });
+    }
+
+    [Fact]
+    public void Illegal_transition_appends_nothing()
+    {
+        var job = new TemplateJob { Kind = TemplateJobKind.Edit };
+        Assert.Throws<InvalidOperationException>(() => job.TransitionTo(Verifying, "nope", Now));
+        Assert.Empty(job.Steps);
+    }
+
+    [Fact]
     public void TransitionTo_IllegalMove_Throws()
     {
         var job = new TemplateJob { Kind = TemplateJobKind.Edit };

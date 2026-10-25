@@ -1,6 +1,7 @@
 import { getAccessToken } from '../auth/auth'
 import type {
   AdminTemplateDto,
+  TemplateDetailDto,
   ArtifactDto,
   EventsQuery,
   LiveEventDto,
@@ -16,6 +17,7 @@ import type {
   TaskDto,
   TaskListDto,
   TaskListQuery,
+  SystemStatusDto,
   TaskReportDto,
   TemplateJobDto,
   TemplateJobNetwork,
@@ -132,6 +134,7 @@ export const getTunnelToken = (id: string) => get<{ token: string }>(`/api/tasks
 
 export const listTemplates = () => get<TemplateSummaryDto[]>('/api/templates')
 export const listAdminTemplates = () => get<AdminTemplateDto[]>('/api/admin/templates')
+export const getAdminTemplate = (id: string) => get<TemplateDetailDto>(`/api/admin/templates/${encodeURIComponent(id)}`)
 export const setDefaultTemplate = (id: string) => post<void>(`/api/admin/templates/${encodeURIComponent(id)}/default`)
 export const setTemplateEnabled = (id: string, enabled: boolean) => post<void>(`/api/admin/templates/${encodeURIComponent(id)}/enabled`, { enabled })
 /** Makes the kept previous version current again; returns the updated template. */
@@ -175,3 +178,5 @@ export const getTaskReport = (id: string) => get<TaskReportDto>(`/api/tasks/${en
 export const screenshotUrl = (artifactId: string) => `/api/artifacts/${encodeURIComponent(artifactId)}/image`
 export const httpBodyUrl = (taskId: string, txId: number) => `/api/tasks/${encodeURIComponent(taskId)}/http/${txId}/body`
 export const resubmitTask = (id: string, req: ResubmitRequest) => post<TaskDto>(`/api/tasks/${encodeURIComponent(id)}/resubmit`, req)
+
+export const getSystemStatus = (signal?: AbortSignal) => request<SystemStatusDto>('GET', '/api/admin/status', undefined, undefined, { signal })
