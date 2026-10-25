@@ -4,6 +4,10 @@
     <PackageReference Include="Microsoft.Playwright" />
   </ItemGroup>
   <ItemGroup>
+    <!-- Packaged-install defaults (loaded via MALDEX_EXTRA_CONFIG): next to the binaries, in the output and in publish. -->
+    <Content Update="appsettings.Package.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\Maldex.Data\Maldex.Data.csproj" />
     <ProjectReference Include="..\Maldex.Orchestrator\Maldex.Orchestrator.csproj" />
     <ProjectReference Include="..\Maldex.Processing\Maldex.Processing.csproj" />
