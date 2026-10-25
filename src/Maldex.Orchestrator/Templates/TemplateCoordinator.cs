@@ -455,6 +455,10 @@ public sealed class TemplateCoordinator(
             verdict = IsolationVerdict.Fail($"self-test error: {GuestText.Clean(ex.Message, 200)}");
         }
 
+        // Audited as an analysis' self-test is (RunCoordinator): the same actions and details, with the job named first.
+        var audit = Audit(job, null, verdict.Isolated ? "isolation.selftest.passed" : "isolation.selftest.failed",
+            $"job={job.Id}; mode={NetworkMode.Direct}; {(verdict.Isolated ? "guest-reported probes all blocked" : "not isolated: " + GuestText.Clean(verdict.Reason, 500))}");
+        await SaveJobAsync(db, job.Id, _ => true, [audit], ct).ConfigureAwait(false);
         if (!verdict.Isolated) throw new JobFailedException($"isolation self-test failed: {GuestText.Clean(verdict.Reason, 500)}");
     }
 

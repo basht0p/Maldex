@@ -433,9 +433,10 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         // One lease for the edit VM (Direct), cut off while still configuring, i.e. before any sealing step; then the verify VM's own None lease.
         Assert.Equal(["create Direct", "isolate Configuring", "release", "create None", "release"], rig.Egress.Calls);
         var audits = await rig.AuditsAsync();
-        Assert.Equal(["template.egress.start", "template.egress.stop", "template.seal", "template.publish"], audits.Select(a => a.Action));
-        Assert.All(audits.Take(2), a => Assert.Equal(rig.AdminId, a.UserId));
-        Assert.All(audits.Take(2), a => Assert.Contains($"job={id}", a.Details));
+        Assert.Equal(["template.egress.start", "isolation.selftest.passed", "template.egress.stop", "template.seal", "template.publish"], audits.Select(a => a.Action));
+        var egress = audits.Where(a => a.Action.StartsWith("template.egress")).ToList();
+        Assert.All(egress, a => Assert.Equal(rig.AdminId, a.UserId));
+        Assert.All(egress, a => Assert.Contains($"job={id}", a.Details));
     }
 
     [Fact]
@@ -451,6 +452,10 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         var selfTest = Assert.Single(selfTests);
         Assert.Equal(rig.H.Get<IOptions<Maldex.Infrastructure.Net.NetOptions>>().Value.DirectProbeUrl, selfTest.EchoUrl);
         Assert.Contains(selfTest.Targets, t => t.Name == "gateway");
+        // Audited as for analyses (same action and details shape; the system acted, the template is the target).
+        var passed = Assert.Single(await rig.AuditsAsync(), a => a.Action.StartsWith("isolation.selftest"));
+        Assert.Equal(("isolation.selftest.passed", (Guid?)null, "win10", $"job={id}; mode=Direct; guest-reported probes all blocked"),
+            (passed.Action, passed.UserId, passed.Target, passed.Details));
         await rig.RequestCancelAsync(id);
         await rig.PumpAsync(run);
     }
@@ -484,7 +489,10 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         Assert.Null(job.ConfiguringSince); // the admin never got the guest
         await rig.AssertDiscardedAsync(id);
         Assert.Equal(["create Direct", "release"], rig.Egress.Calls);
-        Assert.Equal(["template.egress.start", "template.egress.stop", "template.job.fail"], (await rig.AuditsAsync()).Select(a => a.Action));
+        var audits = await rig.AuditsAsync();
+        Assert.Equal(["template.egress.start", "isolation.selftest.failed", "template.egress.stop", "template.job.fail"], audits.Select(a => a.Action));
+        var selfTest = audits[1];
+        Assert.Equal(((Guid?)null, "win10", $"job={id}; mode=Direct; not isolated: gateway is reachable from the guest"), (selfTest.UserId, selfTest.Target, selfTest.Details));
     }
 
     [Fact]
@@ -680,7 +688,7 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         Assert.Empty(rig.Store.Sealed);
         var audits = await rig.AuditsAsync();
         // The cancel endpoint audits an admin's cancel (R17); the coordinator writes no second row for it.
-        Assert.Equal(["template.egress.start", "template.egress.stop"], audits.Select(a => a.Action));
+        Assert.Equal(["template.egress.start", "isolation.selftest.passed", "template.egress.stop"], audits.Select(a => a.Action));
     }
 
     /// <summary>
@@ -1036,6 +1044,62 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         Assert.Equal((TemplateJobState.Published, (Guid?)id), (job.State, job.ResultVersionId));
         Assert.Equal(id, await rig.CurrentVersionIdAsync());
         Assert.DoesNotContain(TemplateCoordinator.StemOf(id), rig.Store.Deleted); // the recorded version's disk stays
+        Assert.DoesNotContain(await rig.AuditsAsync(), a => a.Action == "template.job.fail");
+    }
+
+    /// <summary>Fails the first "does the version exist" lookup after <see cref="Arm"/> (the database is briefly unreachable).</summary>
+    private sealed class FailingVersionLookup : Microsoft.EntityFrameworkCore.Diagnostics.DbCommandInterceptor
+    {
+        private int _armed;
+        public int Failed;
+        public void Arm() => Interlocked.Exchange(ref _armed, 1);
+
+        public override ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<System.Data.Common.DbDataReader>> ReaderExecutingAsync(
+            System.Data.Common.DbCommand command, Microsoft.EntityFrameworkCore.Diagnostics.CommandEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<System.Data.Common.DbDataReader> result, CancellationToken cancellationToken = default)
+        {
+            if (command.CommandText.Contains("EXISTS") && command.CommandText.Contains("[TemplateVersions]") && Interlocked.Exchange(ref _armed, 0) == 1)
+            {
+                Interlocked.Increment(ref Failed);
+                throw new InvalidOperationException("the database is unreachable");
+            }
+            return ValueTask.FromResult(result);
+        }
+    }
+
+    /// <summary>As <see cref="LostCommitAnswer"/>, and arms <paramref name="lookup"/> when it throws.</summary>
+    private sealed class LostCommitThenLookup(FailingVersionLookup lookup) : Microsoft.EntityFrameworkCore.Diagnostics.DbTransactionInterceptor
+    {
+        public Guid VersionId { get; set; }
+        public int Thrown;
+
+        public override Task TransactionCommittedAsync(System.Data.Common.DbTransaction transaction, Microsoft.EntityFrameworkCore.Diagnostics.TransactionEndEventData eventData, CancellationToken cancellationToken = default)
+        {
+            if (eventData.Context?.ChangeTracker.Entries<TemplateVersion>().Any(e => e.Entity.Id == VersionId) == true && Interlocked.Increment(ref Thrown) == 1)
+            {
+                lookup.Arm();
+                throw new InvalidOperationException("the connection broke while the commit was answered");
+            }
+            return Task.CompletedTask;
+        }
+    }
+
+    [Fact]
+    public async Task ACommittedVersion_WhoseLookupAlsoFails_LeavesTheJobAsRecorded_NotFailed()
+    {
+        var lookup = new FailingVersionLookup();
+        var lost = new LostCommitThenLookup(lookup);
+        await using var rig = await TemplateJobRig.CreateAsync(sql, configure: s => s.ConfigureDbContext<MaldexDbContext>(o => o.AddInterceptors(lost, lookup)));
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
+        lost.VersionId = id;
+
+        await rig.PumpAsync(rig.Start(id));
+
+        Assert.Equal((1, 1), (lost.Thrown, lookup.Failed));
+        var job = await rig.JobAsync(id);
+        Assert.Equal((TemplateJobState.Published, (string?)null), (job.State, job.FailureReason)); // committed: never moved on to Failed
+        Assert.Equal(id, await rig.CurrentVersionIdAsync());
+        Assert.DoesNotContain(TemplateCoordinator.StemOf(id), rig.Store.Deleted);
         Assert.DoesNotContain(await rig.AuditsAsync(), a => a.Action == "template.job.fail");
     }
 

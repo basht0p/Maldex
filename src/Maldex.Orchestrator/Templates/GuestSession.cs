@@ -3,6 +3,9 @@ using Maldex.Core.Abstractions;
 using Maldex.Core.Agent;
 using Maldex.Core.Text;
 
+// GuestSession is internal to the job pipeline; its unit tests (GuestSessionTests) live in the integration test project.
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("Maldex.Integration.Tests")]
+
 namespace Maldex.Orchestrator.Templates;
 
 /// <summary>
