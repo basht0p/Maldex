@@ -93,16 +93,17 @@ export interface TemplateVersionDto {
   sizeBytes?: number | null
 }
 
-export type TemplateJobKind = 'Edit' | 'Refresh'
+export type TemplateJobKind = 'Edit' | 'Refresh' | 'Build'
 export type TemplateJobNetwork = 'None' | 'Direct'
-export type TemplateJobState = 'Queued' | 'Preparing' | 'Configuring' | 'Sealing' | 'Verifying' | 'Published' | 'Sealed' | 'Failed' | 'Cancelled'
+export type TemplateJobState = 'Queued' | 'Preparing' | 'Installing' | 'Provisioning' | 'Configuring' | 'Sealing' | 'Verifying' | 'Published' | 'Sealed' | 'Failed' | 'Cancelled'
 
-/** An Edit or Refresh job (GET /api/admin/template-jobs/{id}, the `templateJob` hub event). `idleDeadline` is null outside Configuring. */
+/** An Edit, Refresh or Build job (GET /api/admin/template-jobs/{id}, the `templateJob` hub event). `idleDeadline` is null outside Configuring. */
 export interface TemplateJobDto {
   id: string
   kind: TemplateJobKind
   templateId: string
-  baseVersionNumber: number
+  /** Null for a Build (it has no base version). */
+  baseVersionNumber: number | null
   resultVersionNumber?: number | null
   network: TemplateJobNetwork
   state: TemplateJobState
@@ -111,6 +112,58 @@ export interface TemplateJobDto {
   createdAt: string
   endedAt?: string | null
   idleDeadline?: string | null
+  /** The installed edition of a Build. */
+  edition?: string | null
+  hasProvisionLog?: boolean
+  /** A Seal was accepted and has not been acted on yet; false again after a refusal (Defender). */
+  sealRequested?: boolean
+}
+
+export type MediaKind = 'OsInstaller' | 'Application'
+export type MediaStatus = 'Receiving' | 'Ready' | 'Failed'
+
+export interface InstallerImageDto {
+  index: number
+  name: string
+  build?: string | null
+  architecture?: string | null
+  supported: boolean
+  unsupportedReason?: string | null
+}
+
+/** GET /api/admin/media (Admin only). */
+export interface MediaFileDto {
+  id: string
+  kind: MediaKind
+  fileName: string
+  size: number
+  receivedBytes: number
+  sha256?: string | null
+  source: 'Upload' | 'Url'
+  sourceUrl?: string | null
+  status: MediaStatus
+  failureReason?: string | null
+  images: InstallerImageDto[]
+  preferredImageIndex?: number | null
+  application?: string | null
+  addedBy: string
+  addedAt: string
+  usedBy: string[]
+}
+
+export interface StartUploadResponse {
+  media: MediaFileDto
+  chunkBytes: number
+}
+
+/** POST /api/admin/templates/build. `displayName` is needed only when `templateId` is new. */
+export interface StartBuildRequest {
+  templateId: string
+  displayName?: string
+  osMediaId: string
+  editionIndex?: number
+  applicationMediaIds: string[]
+  publishOnSuccess: boolean
 }
 
 /** GET /api/admin/templates (Admin only). */

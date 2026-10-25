@@ -291,4 +291,71 @@ describe('TemplateJobPage', () => {
     renderJob()
     expect(await screen.findByRole('alert')).toHaveTextContent('Not found')
   })
+
+  describe('Build', () => {
+    const build = (over: Partial<TemplateJobDto> = {}) => job({ kind: 'Build', baseVersionNumber: null, ...over })
+    const stepsOf = () => within(screen.getByRole('list', { name: 'Progress' })).getAllByRole('listitem').map((li) => li.textContent?.trim())
+
+    it('shows the Build steps, the Build heading and no "from v" without a base version', async () => {
+      getTemplateJob.mockResolvedValue(build({ state: 'Installing' }))
+      renderJob()
+      expect(await screen.findByRole('heading', { name: /New template \(build\)/ })).toBeInTheDocument()
+      expect(stepsOf()).toEqual(['Queued', 'Preparing', 'Installing', 'Provisioning', 'Configuring', 'Sealing', 'Verifying', 'Published'])
+      expect(current()).toHaveTextContent('Installing')
+      expect(screen.queryByText(/from v/)).toBeNull()
+      hub.push(build({ state: 'Provisioning' }))
+      expect(current()).toHaveTextContent('Provisioning')
+    })
+
+    it('an Edit still shows from v<n>, and Edit and Refresh steps are unchanged', async () => {
+      getTemplateJob.mockResolvedValue(job({ state: 'Preparing', baseVersionNumber: 3 }))
+      renderJob()
+      expect(await screen.findByText('from v3')).toBeInTheDocument()
+      expect(stepsOf()).toEqual(['Queued', 'Preparing', 'Configuring', 'Sealing', 'Verifying', 'Published'])
+    })
+
+    it('offers Cancel while installing or provisioning', async () => {
+      getTemplateJob.mockResolvedValue(build({ state: 'Installing' }))
+      renderJob()
+      await userEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
+      expect(cancelTemplateJob).toHaveBeenCalledWith('job-1')
+    })
+
+    it('links the provisioning log only when the job has one', async () => {
+      getTemplateJob.mockResolvedValue(build({ state: 'Provisioning', hasProvisionLog: false }))
+      renderJob()
+      await screen.findByRole('heading', { name: /New template/ })
+      expect(screen.queryByRole('link', { name: 'Provisioning log' })).toBeNull()
+      hub.push(build({ state: 'Configuring', hasProvisionLog: true }))
+      expect(screen.getByRole('link', { name: 'Provisioning log' })).toHaveAttribute('href', '/api/admin/template-jobs/job-1/provision-log')
+    })
+
+    it('Seal requested follows the server; a refusal turns it back, enables Seal, shows the message and remounts the console', async () => {
+      getTemplateJob.mockResolvedValue(build({ state: 'Configuring', sealRequested: false }))
+      sealTemplateJob.mockResolvedValue(undefined)
+      renderJob()
+      await userEvent.click(await screen.findByRole('button', { name: 'Seal' }))
+      hub.push(build({ state: 'Configuring', sealRequested: true }))
+      expect(screen.getByText('Seal requested')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Seal' })).toBeDisabled()
+      expect(getTemplateJobTunnelToken).toHaveBeenCalledTimes(1)
+
+      hub.push(build({ state: 'Configuring', sealRequested: false, message: 'Defender is still on: turn off Tamper Protection and Real-time protection, then seal again.' }))
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Seal' })).toBeEnabled())
+      expect(screen.queryByText('Seal requested')).toBeNull()
+      expect(screen.getByText(/Defender is still on/)).toBeInTheDocument()
+      await waitFor(() => expect(getTemplateJobTunnelToken).toHaveBeenCalledTimes(2)) // a fresh token for the remounted console
+      expect(guac.state.disconnects).toBe(1)
+      expect(screen.getByLabelText('Seal note (optional)')).toBeEnabled()
+    })
+
+    it('a push that keeps Seal not requested does not remount the console', async () => {
+      getTemplateJob.mockResolvedValue(build({ state: 'Configuring', sealRequested: false }))
+      renderJob()
+      await screen.findByRole('button', { name: 'Seal' })
+      hub.push(build({ state: 'Configuring', sealRequested: false, message: 'still here' }))
+      expect(getTemplateJobTunnelToken).toHaveBeenCalledTimes(1)
+      expect(guac.state.disconnects).toBe(0)
+    })
+  })
 })

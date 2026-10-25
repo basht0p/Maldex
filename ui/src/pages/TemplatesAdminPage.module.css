@@ -16,3 +16,8 @@
 .dialogActions { display: flex; gap: 0.75rem; }
 .rowActions { display: inline-flex; gap: 0.5rem; }
 .subhead { margin: 1rem 0 0.5rem; font-size: 0.95rem; }
+
+.tabs { display: flex; gap: 0.25rem; margin: 0 0 1rem; border-bottom: 1px solid var(--mx-border); }
+.tab { padding: 0.45rem 1rem; border: 1px solid transparent; border-bottom: 0; border-radius: var(--mx-radius-control) var(--mx-radius-control) 0 0; background: none; color: var(--mx-muted); font: inherit; font-weight: 600; }
+.tab[aria-selected='true'] { color: var(--mx-text); border-color: var(--mx-border); border-bottom: 2px solid var(--mx-accent); background: var(--mx-surface); }
+.toolbar { margin: 0 0 1rem; }

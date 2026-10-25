@@ -4,10 +4,14 @@ import type {
   ArtifactDto,
   EventsQuery,
   LiveEventDto,
+  MediaFileDto,
+  MediaKind,
   MeDto,
   OrgDto,
   OrgRequest,
   ProcessNodeDto,
+  StartBuildRequest,
+  StartUploadResponse,
   TaskDto,
   TaskListDto,
   TaskListQuery,
@@ -44,8 +48,8 @@ async function parseBody(res: Response): Promise<unknown> {
   }
 }
 
-async function request<T>(method: string, path: string, body?: BodyInit | null, json?: unknown): Promise<T> {
-  const headers: Record<string, string> = { Accept: 'application/json' }
+async function request<T>(method: string, path: string, body?: BodyInit | null, json?: unknown, extra?: { headers?: Record<string, string>; signal?: AbortSignal }): Promise<T> {
+  const headers: Record<string, string> = { Accept: 'application/json', ...extra?.headers }
   const token = await getAccessToken()
   if (token) headers.Authorization = `Bearer ${token}`
   let payload = body ?? undefined
@@ -54,7 +58,7 @@ async function request<T>(method: string, path: string, body?: BodyInit | null, 
     payload = JSON.stringify(json)
   }
   // FormData bodies must not get a Content-Type: the browser adds the multipart boundary itself.
-  const res = await fetch(path, { method, headers, body: payload })
+  const res = await fetch(path, { method, headers, body: payload, signal: extra?.signal })
   const parsed = await parseBody(res)
   if (!res.ok) throw new ApiError(res.status, parsed)
   return parsed as T
@@ -114,3 +118,20 @@ export const publishTemplateVersion = (id: string, versionId: string) =>
   post<AdminTemplateDto>(`/api/admin/templates/${encodeURIComponent(id)}/versions/${encodeURIComponent(versionId)}/publish`)
 export const discardTemplateVersion = (id: string, versionId: string) =>
   post<void>(`/api/admin/templates/${encodeURIComponent(id)}/versions/${encodeURIComponent(versionId)}/discard`)
+
+/** Starts a Build job (202); 400/409 carry the reason in the title. */
+export const startTemplateBuild = (req: StartBuildRequest) => post<TemplateJobDto>('/api/admin/templates/build', req)
+/** Only for a template with no versions; 409 carries the reason. */
+export const deleteTemplate = (id: string) => request<void>('DELETE', `/api/admin/templates/${encodeURIComponent(id)}`)
+export const provisionLogUrl = (jobId: string) => `${jobPath(jobId)}/provision-log`
+
+export const listMedia = () => get<MediaFileDto[]>('/api/admin/media')
+export const getMedia = (id: string) => get<MediaFileDto>(`/api/admin/media/${encodeURIComponent(id)}`)
+export const startMediaUpload = (fileName: string, size: number, kind: MediaKind) =>
+  post<StartUploadResponse>('/api/admin/media/uploads', { fileName, size, kind })
+/** One chunk at `offset`. A 409 carries the server's `receivedBytes` in its problem body. */
+export const putMediaChunk = (id: string, offset: number, chunk: Blob, signal?: AbortSignal) =>
+  request<{ receivedBytes: number; status: string }>('PUT', `/api/admin/media/uploads/${encodeURIComponent(id)}`, chunk, undefined, { headers: { 'Upload-Offset': String(offset) }, signal })
+export const fetchMedia = (url: string, kind: MediaKind, fileName?: string) =>
+  post<MediaFileDto>('/api/admin/media/fetch', { url, kind, fileName: fileName || null })
+export const deleteMedia = (id: string) => request<void>('DELETE', `/api/admin/media/${encodeURIComponent(id)}`)

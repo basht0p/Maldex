@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { cancelTemplateJob, getTemplateJobTunnelToken, sealTemplateJob } from '../api/client'
+import { cancelTemplateJob, getTemplateJobTunnelToken, provisionLogUrl, sealTemplateJob } from '../api/client'
 import type { MeDto, TemplateJobDto, TemplateJobState } from '../api/types'
 import LiveConsole from '../components/LiveConsole'
 import type { HubConnectionLike } from '../live/useTaskLive'
@@ -9,12 +9,18 @@ import { messageOf } from '../util/apiMessage'
 import styles from './forms.module.css'
 import page from './TemplateJobPage.module.css'
 
-const ACTIVE: TemplateJobState[] = ['Queued', 'Preparing', 'Configuring', 'Sealing', 'Verifying']
-/** The steps of a job in order; a Refresh has no Configuring step (nobody works in the guest). */
-const STEPS: TemplateJobState[] = ['Queued', 'Preparing', 'Configuring', 'Sealing', 'Verifying', 'Published']
+const ACTIVE: TemplateJobState[] = ['Queued', 'Preparing', 'Installing', 'Provisioning', 'Configuring', 'Sealing', 'Verifying']
+const EDIT_STEPS: TemplateJobState[] = ['Queued', 'Preparing', 'Configuring', 'Sealing', 'Verifying', 'Published']
+const BUILD_STEPS: TemplateJobState[] = ['Queued', 'Preparing', 'Installing', 'Provisioning', 'Configuring', 'Sealing', 'Verifying', 'Published']
 
+/** The steps of a job in order: a Build installs and provisions first; a Refresh has no Configuring step (nobody works in the guest). */
 function stepsFor(job: TemplateJobDto): TemplateJobState[] {
-  return job.kind === 'Refresh' ? STEPS.filter((s) => s !== 'Configuring') : STEPS
+  if (job.kind === 'Build') return BUILD_STEPS
+  return job.kind === 'Refresh' ? EDIT_STEPS.filter((s) => s !== 'Configuring') : EDIT_STEPS
+}
+
+function headingOf(job: TemplateJobDto): string {
+  return job.kind === 'Build' ? 'New template (build)' : job.kind === 'Edit' ? 'Edit' : 'Refresh components'
 }
 
 /** Index of the step the job is at; `Sealed` (held, never published) has passed Verifying and shows no current step. */
@@ -47,14 +53,23 @@ function JobView({ job }: { job: TemplateJobDto }) {
   const [errors, setErrors] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const [note, setNote] = useState('')
-  const [sealedIn, setSealedIn] = useState<TemplateJobState | null>(null) // the state a Seal was accepted in
+  const jobRef = useRef(job)
+  useEffect(() => { jobRef.current = job })
+  // The 202 only records a request: until the server pushes again (it may refuse, e.g. Defender is still on) the button stays off.
+  const [acceptedAt, setAcceptedAt] = useState<TemplateJobDto | null>(null)
+  const [consoleKey, setConsoleKey] = useState(0) // bumped when a refused seal turns back: the remounted console fetches a fresh token
+  const [wasRequested, setWasRequested] = useState(!!job.sealRequested)
   const steps = stepsFor(job)
   const at = progressOf(job, steps)
   const active = ACTIVE.includes(job.state)
   const configuring = job.state === 'Configuring'
   const failed = job.state === 'Failed' || job.state === 'Cancelled'
 
-  const sealRequested = sealedIn === job.state // the 202 is only a request: wait for the state to change
+  const sealRequested = !!job.sealRequested || acceptedAt === job
+  if (wasRequested !== !!job.sealRequested) {
+    setWasRequested(!!job.sealRequested)
+    if (wasRequested && configuring) setConsoleKey((k) => k + 1)
+  }
 
   async function run(action: () => Promise<unknown>): Promise<boolean> {
     setBusy(true)
@@ -71,8 +86,7 @@ function JobView({ job }: { job: TemplateJobDto }) {
   }
 
   async function seal() {
-    const state = job.state
-    if (await run(() => sealTemplateJob(job.id, note.trim()))) setSealedIn(state)
+    if (await run(() => sealTemplateJob(job.id, note.trim()))) setAcceptedAt(jobRef.current)
   }
 
   function discard() {
@@ -82,10 +96,14 @@ function JobView({ job }: { job: TemplateJobDto }) {
   return (
     <section aria-labelledby="job-heading">
       <div className={page.head}>
-        <h1 id="job-heading">{job.kind === 'Edit' ? 'Edit' : 'Refresh components'}: <span className={styles.mono}>{job.templateId}</span></h1>
-        <span className={page.meta}>{`from v${job.baseVersionNumber}${job.resultVersionNumber != null ? ` to v${job.resultVersionNumber}` : ''}`}</span>
+        <h1 id="job-heading">{headingOf(job)}: <span className={styles.mono}>{job.templateId}</span></h1>
+        {(job.baseVersionNumber != null || job.resultVersionNumber != null) && (
+          <span className={page.meta}>{[job.baseVersionNumber != null ? `from v${job.baseVersionNumber}` : '', job.resultVersionNumber != null ? `to v${job.resultVersionNumber}` : ''].filter(Boolean).join(' ')}</span>
+        )}
+        {job.edition && <span className={page.meta}>{job.edition}</span>}
         <Elapsed job={job} />
         <span className={styles.hint}>{`State: ${job.state}`}</span>
+        {job.hasProvisionLog && <a href={provisionLogUrl(job.id)}>Provisioning log</a>}
         <Link to="/admin/templates">Back to templates</Link>
         <span style={{ flex: 1 }} />
         {active && !configuring && (
@@ -116,7 +134,7 @@ function JobView({ job }: { job: TemplateJobDto }) {
             <span className={`${page.badge} ${job.network === 'Direct' ? page.direct : ''}`}>{job.network === 'Direct' ? 'Direct: internet on' : 'None'}</span>
             {job.idleDeadline && <span className={styles.hint}>{`Discarded automatically if idle until ${new Date(job.idleDeadline).toLocaleTimeString()}`}</span>}
           </div>
-          <LiveConsole getToken={() => getTemplateJobTunnelToken(job.id)} tunnelPath={`/api/admin/template-jobs/${encodeURIComponent(job.id)}/tunnel`} />
+          <LiveConsole key={consoleKey} getToken={() => getTemplateJobTunnelToken(job.id)} tunnelPath={`/api/admin/template-jobs/${encodeURIComponent(job.id)}/tunnel`} />
           <div className={page.actions}>
             <div className={`${styles.field} ${page.note}`}>
               <label htmlFor="seal-note">Seal note (optional)</label>
