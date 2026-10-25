@@ -24,7 +24,7 @@ it('shows the Admin menu to admins only', async () => {
   for (const name of ['Templates', 'Media', 'Organizations', 'Status']) {
     expect(screen.getByRole('link', { name })).toBeInTheDocument()
   }
-  expect(screen.getByRole('link', { name: 'Media' })).toHaveAttribute('href', '/admin/templates')
+  expect(screen.getByRole('link', { name: 'Media' })).toHaveAttribute('href', '/admin/media')
   unmount()
 
   server.use(me('Analyst'))

@@ -12,6 +12,7 @@ import { ThemeSwitch } from './kit/ThemeSwitch'
 import { ToastProvider } from './kit/Toaster'
 import { applyTheme, loadTheme } from './kit/theme'
 import { useShortcuts } from './kit/useShortcuts'
+import MediaPage from './pages/MediaPage'
 import OrgsAdminPage from './pages/OrgsAdminPage'
 import SubmitPage from './pages/SubmitPage'
 import TaskPage from './pages/TaskPage'
@@ -37,10 +38,9 @@ function useNarrow(): boolean {
   return narrow
 }
 
-// Media has no route of its own until Plan 4b; its tab on the templates page is local state.
 const ADMIN_LINKS = [
   { to: '/admin/templates', label: 'Templates' },
-  { to: '/admin/templates', label: 'Media' },
+  { to: '/admin/media', label: 'Media' },
   { to: '/admin/orgs', label: 'Organizations' },
   { to: '/admin/status', label: 'Status' },
 ]
@@ -139,6 +139,7 @@ function Shell() {
           <Route path="/tasks/:id" element={<TaskPage />} />
           <Route path="/admin/orgs" element={<OrgsAdminPage me={me} />} />
           <Route path="/admin/templates" element={<TemplatesAdminPage me={me} />} />
+          <Route path="/admin/media" element={<MediaPage />} />
           <Route path="/admin/template-jobs/:id" element={<TemplateJobPage me={me} />} />
           <Route path="/admin/status" element={<EmptyState title="System status" body="Coming in the next update." />} />
           <Route path="*" element={<p>Page not found.</p>} />

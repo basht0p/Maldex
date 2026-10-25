@@ -288,6 +288,36 @@ public sealed class MediaEndpointsTests(SqlServerFixture sql) : IDisposable
     }
 
     [Fact]
+    public async Task Media_dto_has_used_by_refs_with_template_existence()
+    {
+        var f = Factory();
+        using var admin = f.CreateClient(UserRole.Admin);
+        var id = await SeedMediaAsync(f, "w.iso");
+        using (var scope = f.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+            var now = DateTimeOffset.UtcNow;
+            db.Templates.Add(new Template { Id = "refd", DisplayName = "Referenced", CreatedAt = now });
+            await db.SaveChangesAsync(Ct);
+            db.TemplateVersions.Add(new TemplateVersion
+            {
+                Id = Guid.NewGuid(), TemplateId = "refd", Number = 2, Origin = TemplateVersionOrigin.Imported, FileStem = "refd-2", SealedAt = now,
+                SourceMediaIds = JsonSerializer.Serialize(new[] { id }),
+            });
+            await db.SaveChangesAsync(Ct);
+        }
+
+        var m = await admin.GetFromJsonAsync<JsonElement>($"/api/admin/media/{id}", Ct);
+
+        Assert.Equal(["Referenced v2"], m.GetProperty("usedBy").EnumerateArray().Select(u => u.GetString()));
+        var r = Assert.Single(m.GetProperty("usedByRefs").EnumerateArray());
+        Assert.Equal("refd", r.GetProperty("templateId").GetString());
+        Assert.Equal("Referenced", r.GetProperty("templateName").GetString());
+        Assert.Equal(2, r.GetProperty("versionNumber").GetInt32());
+        Assert.True(r.GetProperty("templateExists").GetBoolean());
+    }
+
+    [Fact]
     public async Task Delete_Unused_204_ThenGone_AndUnknown404()
     {
         var f = Factory();

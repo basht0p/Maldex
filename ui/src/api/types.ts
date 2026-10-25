@@ -154,6 +154,15 @@ export interface MediaFileDto {
   addedBy: string
   addedAt: string
   usedBy: string[]
+  /** Template versions that use this media; `usedBy` also names active jobs. */
+  usedByRefs?: MediaUsageDto[]
+}
+
+export interface MediaUsageDto {
+  templateId: string
+  templateName: string
+  versionNumber: number
+  templateExists: boolean
 }
 
 export interface StartUploadResponse {
