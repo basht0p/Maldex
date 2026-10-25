@@ -386,7 +386,7 @@ public static class GuacamoleTunnelEndpoint
         {
             var job = await db.TemplateJobs.AsNoTracking().SingleOrDefaultAsync(j => j.Id == target.Id, ct);
             if (job is null) return;
-            var dto = (await TemplateEndpoints.JobDtosAsync(db, [job], sp.GetRequiredService<IOptions<TemplateJobOptions>>().Value, ct)).Single();
+            var dto = (await TemplateEndpoints.JobDtosAsync(db, [job], sp.GetRequiredService<IOptions<TemplateJobOptions>>().Value, sp.GetRequiredService<IOptions<Maldex.Orchestrator.Templates.Build.BuildOptions>>().Value, ct)).Single();
             await publisher.PublishAsync(dto, ct);
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)

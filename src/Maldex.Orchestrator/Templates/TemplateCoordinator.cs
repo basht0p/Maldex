@@ -1216,9 +1216,10 @@ public sealed class TemplateCoordinator(
             var numbers = await db.TemplateVersions.AsNoTracking()
                 .Where(v => v.Id == job.BaseVersionId || (job.ResultVersionId != null && v.Id == job.ResultVersionId))
                 .Select(v => new { v.Id, v.Number }).ToListAsync(CancellationToken.None).ConfigureAwait(false);
-            var baseNumber = job.BaseVersionId is { } baseId ? numbers.FirstOrDefault(n => n.Id == baseId)?.Number ?? 0 : 0;
+            int? baseNumber = job.BaseVersionId is { } baseId ? numbers.FirstOrDefault(n => n.Id == baseId)?.Number ?? 0 : null;
             int? resultNumber = numbers.FirstOrDefault(n => n.Id == job.ResultVersionId)?.Number;
-            await publisher.PublishAsync(TemplateJobDto.From(job, baseNumber, resultNumber, options.Value.ConfigureIdleTimeout), CancellationToken.None).ConfigureAwait(false);
+            var hasLog = job.Kind == TemplateJobKind.Build && File.Exists(buildOptions.Value.ProvisionLogPathOf(job.Id));
+            await publisher.PublishAsync(TemplateJobDto.From(job, baseNumber, resultNumber, options.Value.ConfigureIdleTimeout, hasLog), CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

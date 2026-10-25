@@ -1,6 +1,8 @@
 using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
 using Maldex.Core.Lifecycle;
+using Maldex.Core.Media;
+using Maldex.Core.Text;
 using Maldex.Data;
 using Maldex.Data.Templates;
 using Maldex.Infrastructure.Guacamole;
@@ -11,6 +13,8 @@ using Maldex.Web.Auth;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace Maldex.Web.Endpoints;
 
@@ -31,6 +35,13 @@ public sealed record StartEditRequest(string? Network, bool? PublishOnSuccess);
 public sealed record StartRefreshRequest(bool? PublishOnSuccess);
 
 public sealed record SealRequest(string? Note);
+
+/// <summary>
+/// Builds a template from installer media. <c>TemplateId</c> names an existing template (the build adds a version) or a new one
+/// (then <c>DisplayName</c> is required). <c>PublishOnSuccess</c> defaults to true.
+/// </summary>
+public sealed record StartBuildRequest(string? TemplateId, string? DisplayName, string? Description, Guid OsMediaId, int? EditionIndex,
+    Guid[]? ApplicationMediaIds, bool? PublishOnSuccess);
 
 public static class TemplateEndpoints
 {
@@ -121,20 +132,53 @@ public static class TemplateEndpoints
             ITemplateStore store, IDiskSpaceProbe disk, IOptions<LibvirtOptions> libvirt, IOptions<TemplateJobOptions> jobs, IOptions<BuildOptions> build, TimeProvider time, CancellationToken ct) =>
             await StartJobAsync(id, TemplateJobKind.Refresh, NetworkMode.None, req?.PublishOnSuccess ?? true, db, catalog, user, store, disk, libvirt, jobs, build, time, ct));
 
-        admin.MapGet("{id}/jobs", async (string id, MaldexDbContext db, IOptions<TemplateJobOptions> jobs, CancellationToken ct) =>
+        admin.MapPost("build", async (StartBuildRequest? req, MaldexDbContext db, CurrentUser user, ITemplateStore store, IDiskSpaceProbe disk,
+            IOptions<LibvirtOptions> libvirt, IOptions<TemplateJobOptions> jobs, IOptions<BuildOptions> build, TimeProvider time, CancellationToken ct) =>
+            await StartBuildAsync(req, db, user, store, disk, libvirt, jobs, build, time, ct));
+
+        // Only a template that never produced a version (a Build that failed, say); the audit rows keep its history.
+        admin.MapDelete("{id}", async (string id, MaldexDbContext db, TemplateCatalog catalog, CurrentUser user, CancellationToken ct) =>
+        {
+            if (await CanonicalIdAsync(db, id, ct) is not { } templateId) return Results.NotFound();
+            return await ConflictOr(async () =>
+            {
+                await catalog.DeleteEmptyAsync(templateId, ct, new TemplateAudit(ActorOf(user), "template.delete"));
+                return Results.NoContent();
+            });
+        });
+
+        admin.MapGet("{id}/jobs", async (string id, MaldexDbContext db, IOptions<TemplateJobOptions> jobs, IOptions<BuildOptions> build, CancellationToken ct) =>
         {
             if (await CanonicalIdAsync(db, id, ct) is not { } templateId) return Results.NotFound();
             var rows = await db.TemplateJobs.AsNoTracking().Where(j => j.TemplateId == templateId)
                 .OrderByDescending(j => j.CreatedAt).ThenByDescending(j => j.Id).Take(RecentJobs).ToListAsync(ct);
-            return Results.Ok(await JobDtosAsync(db, rows, jobs.Value, ct));
+            return Results.Ok(await JobDtosAsync(db, rows, jobs.Value, build.Value, ct));
         });
 
         var jobGroup = app.MapGroup("/api/admin/template-jobs").RequireAuthorization(AuthSetup.AdminPolicy);
 
-        jobGroup.MapGet("{jobId:guid}", async (Guid jobId, MaldexDbContext db, IOptions<TemplateJobOptions> jobs, CancellationToken ct) =>
+        jobGroup.MapGet("{jobId:guid}", async (Guid jobId, MaldexDbContext db, IOptions<TemplateJobOptions> jobs, IOptions<BuildOptions> build, CancellationToken ct) =>
         {
             var job = await db.TemplateJobs.AsNoTracking().SingleOrDefaultAsync(j => j.Id == jobId, ct);
-            return job is null ? Results.NotFound() : Results.Ok((await JobDtosAsync(db, [job], jobs.Value, ct)).Single());
+            return job is null ? Results.NotFound() : Results.Ok((await JobDtosAsync(db, [job], jobs.Value, build.Value, ct)).Single());
+        });
+
+        // The log is guest output: always a download, never rendered.
+        jobGroup.MapGet("{jobId:guid}/provision-log", async (Guid jobId, MaldexDbContext db, IOptions<BuildOptions> build, HttpContext http, CancellationToken ct) =>
+        {
+            if (!await db.TemplateJobs.AsNoTracking().AnyAsync(j => j.Id == jobId, ct)) return Results.NotFound();
+            var path = build.Value.ProvisionLogPathOf(jobId);
+            FileStream stream;
+            try
+            {
+                stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            }
+            catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException)
+            {
+                return Results.NotFound();
+            }
+            http.Response.Headers["X-Content-Type-Options"] = "nosniff";
+            return Results.File(stream, "text/plain; charset=utf-8", $"provision-{jobId:N}.log");
         });
 
         // Both requests are single-column conditional updates (no row-version check): the coordinator writes the same row, and
@@ -262,6 +306,104 @@ public static class TemplateEndpoints
         return Results.Accepted($"/api/admin/template-jobs/{job.Id}", dto);
     }
 
+    private static readonly Regex Slug = new(@"^[a-z0-9][a-z0-9-]{0,63}\z", RegexOptions.CultureInvariant | RegexOptions.NonBacktracking);
+    private const int MaxDisplayName = 100, MaxDescription = 1000;
+
+    /// <summary>
+    /// Records a Build of a new or existing template from installer (and at most one Office) media, or refuses: 400 with the reason
+    /// when the request is wrong, 409 when a job is active for the template or the disk is short. The media rows (and the template
+    /// row, when it exists) are locked until the commit, so deleting media or the template cannot slip in between the checks and the
+    /// job. The coordinator re-checks all of it when it starts the job.
+    /// </summary>
+    private static async Task<IResult> StartBuildAsync(StartBuildRequest? req, MaldexDbContext db, CurrentUser user, ITemplateStore store, IDiskSpaceProbe disk,
+        IOptions<LibvirtOptions> libvirt, IOptions<TemplateJobOptions> jobs, IOptions<BuildOptions> build, TimeProvider time, CancellationToken ct)
+    {
+        static IResult Bad(string reason) => Results.Problem(title: reason, statusCode: StatusCodes.Status400BadRequest);
+        static IResult Refuse(string reason) => Results.Problem(title: reason, statusCode: StatusCodes.Status409Conflict);
+        if (req is null) return Bad("a request body is required");
+
+        var requestedId = req.TemplateId?.Trim() ?? "";
+        var displayName = req.DisplayName?.Trim();
+        var description = string.IsNullOrWhiteSpace(req.Description) ? null : req.Description.Trim();
+        if (description is { Length: > MaxDescription }) return Bad($"description may be at most {MaxDescription} characters");
+        var publish = req.PublishOnSuccess ?? true;
+        var applicationIds = (req.ApplicationMediaIds ?? []).Distinct().ToList();
+        var mediaIds = new List<Guid> { req.OsMediaId };
+        mediaIds.AddRange(applicationIds.Where(a => a != req.OsMediaId));
+
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        var media = await MediaLocks.LockAsync(db, mediaIds, ct);
+        var template = await db.Templates
+            .FromSqlInterpolated($"SELECT * FROM Templates WITH (UPDLOCK, HOLDLOCK) WHERE Id = {requestedId}")
+            .SingleOrDefaultAsync(ct);
+        if (template is null)
+        {
+            if (!Slug.IsMatch(requestedId)) return Bad("templateId must be 1 to 64 lowercase letters, digits or hyphens, starting with a letter or digit");
+            if (displayName is not { Length: > 0 and <= MaxDisplayName }) return Bad($"displayName is required for a new template (1 to {MaxDisplayName} characters)");
+        }
+
+        static string NameOf(MediaFile m) => GuestText.Clean(m.FileName, 255);
+        var os = media.SingleOrDefault(m => m.Id == req.OsMediaId);
+        if (os is null) return Bad("the installer media was not found");
+        if (os.Kind != MediaKind.OsInstaller) return Bad($"{NameOf(os)} is not installer media");
+        if (os.Status != MediaStatus.Ready) return Bad($"the installer media {NameOf(os)} is {os.Status}");
+        if (MediaContentsJson.Parse(os.Contents) is not { } contents) return Bad($"the installer media {NameOf(os)} has not been inspected");
+        EditionChoice edition;
+        try
+        {
+            edition = EditionSelector.Choose(contents.Images, req.EditionIndex);
+        }
+        catch (EditionNotSupportedException ex)
+        {
+            return Bad(ex.Message);
+        }
+
+        var applications = applicationIds.Select(id => media.SingleOrDefault(m => m.Id == id)).ToList();
+        if (applications.Count > 1 || applications.Any(a => a is null || a.Kind != MediaKind.Application || MediaContentsJson.Parse(a.Contents)?.Application != "Office"))
+            return Bad("only Office media can be installed by a build");
+        foreach (var a in applications)
+            if (a!.Status != MediaStatus.Ready) return Bad($"the application media {NameOf(a)} is {a.Status}");
+
+        var now = time.GetUtcNow();
+        var templateId = template?.Id ?? requestedId;
+        if (template is not null &&
+            await db.TemplateJobs.AsNoTracking().AnyAsync(j => j.TemplateId == template.Id && ActiveStates.Contains(j.State), ct))
+            return Refuse(TemplateCoordinator.AlreadyRunning);
+        if (await TemplateCoordinator.BuildDiskSpaceRefusalAsync(db, store, disk, libvirt.Value, jobs.Value.MinFreeGiB, build.Value.DiskGiB, Guid.Empty, ct) is { } lowSpace)
+            return Refuse(lowSpace);
+
+        if (template is null)
+        {
+            template = new Template { Id = templateId, DisplayName = displayName!, Description = description, CreatedAt = now };
+            db.Templates.Add(template);
+            db.AuditLogs.Add(new AuditLog { At = now, UserId = user.UserId, Action = "template.create", Target = templateId, Details = $"displayName={displayName}" });
+        }
+        var ordered = new List<Guid> { os.Id };
+        ordered.AddRange(applications.Select(a => a!.Id));
+        var job = new TemplateJob
+        {
+            Id = Guid.NewGuid(), Kind = TemplateJobKind.Build, TemplateId = templateId, BaseVersionId = null, Network = NetworkMode.None,
+            RequestedByUserId = user.UserId, CreatedAt = now, PublishOnSuccess = publish, MediaIds = JsonSerializer.Serialize(ordered),
+            EditionIndex = edition.Index, EditionName = edition.Name, ExpectedCurrentVersionId = template.CurrentVersionId,
+        };
+        db.TemplateJobs.Add(job);
+        db.AuditLogs.Add(new AuditLog
+        {
+            At = now, UserId = user.UserId, Action = "template.job.start", Target = templateId,
+            Details = $"job={job.Id}; kind=Build; network=None; base=none; publish={publish}; media={string.Join(",", ordered)}; edition={edition.Name}",
+        });
+        try
+        {
+            await db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
+        }
+        catch (DbUpdateException ex) when (ex.InnerException is SqlException { Number: SqlDuplicateKeyIndex or SqlDuplicateKeyConstraint })
+        {
+            return Refuse(TemplateCoordinator.AlreadyRunning); // a racing request got its job (or the new template) in first
+        }
+        return Results.Accepted($"/api/admin/template-jobs/{job.Id}", TemplateJobDto.From(job, null, null, jobs.Value.ConfigureIdleTimeout));
+    }
+
     /// <summary>The audit row of a job action: the template's id as target, the job in the details.</summary>
     private static async Task<AuditLog> JobAuditAsync(MaldexDbContext db, Guid jobId, Guid? userId, string action, string extra, TimeProvider time, CancellationToken ct) =>
         new()
@@ -270,12 +412,13 @@ public static class TemplateEndpoints
             Target = await db.TemplateJobs.AsNoTracking().Where(j => j.Id == jobId).Select(j => j.TemplateId).SingleAsync(ct),
         };
 
-    internal static async Task<List<TemplateJobDto>> JobDtosAsync(MaldexDbContext db, IReadOnlyList<TemplateJob> jobs, TemplateJobOptions options, CancellationToken ct)
+    internal static async Task<List<TemplateJobDto>> JobDtosAsync(MaldexDbContext db, IReadOnlyList<TemplateJob> jobs, TemplateJobOptions options, BuildOptions build, CancellationToken ct)
     {
         var versionIds = jobs.Where(j => j.BaseVersionId != null).Select(j => j.BaseVersionId!.Value).Concat(jobs.Where(j => j.ResultVersionId != null).Select(j => j.ResultVersionId!.Value)).Distinct().ToList();
         var numbers = await db.TemplateVersions.AsNoTracking().Where(v => versionIds.Contains(v.Id)).ToDictionaryAsync(v => v.Id, v => v.Number, ct);
-        return jobs.Select(j => TemplateJobDto.From(j, j.BaseVersionId is { } b ? numbers.GetValueOrDefault(b) : 0,
-            j.ResultVersionId is { } r ? numbers.GetValueOrDefault(r) : null, options.ConfigureIdleTimeout)).ToList();
+        return jobs.Select(j => TemplateJobDto.From(j, j.BaseVersionId is { } b ? numbers.GetValueOrDefault(b) : null,
+            j.ResultVersionId is { } r ? numbers.GetValueOrDefault(r) : null, options.ConfigureIdleTimeout,
+            j.Kind == TemplateJobKind.Build && File.Exists(build.ProvisionLogPathOf(j.Id)))).ToList();
     }
 
     private static Task<int?> VersionNumberAsync(MaldexDbContext db, string templateId, Guid versionId, CancellationToken ct) =>
