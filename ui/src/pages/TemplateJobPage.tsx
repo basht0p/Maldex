@@ -57,6 +57,15 @@ function Elapsed({ job }: { job: TemplateJobDto }) {
   return <span className={page.meta}>{`Elapsed ${formatElapsed((ended ?? now) - Date.parse(job.createdAt))}`}</span>
 }
 
+/**
+ * Messages of a refused Seal. Keep in step with TemplateCoordinator.DefenderStillOn and .DefenderUnconfirmed (C#);
+ * the normal Configuring guidance (DefenderGuidance) is not a refusal and shows as the plain message.
+ */
+const REFUSAL_PREFIXES = [
+  'Defender real-time protection is still on',
+  'Defender state could not be confirmed',
+]
+
 const TERMINAL: TemplateJobState[] = ['Published', 'Sealed', 'Failed', 'Cancelled']
 const MAX_LOG_BYTES = 1024 * 1024
 
@@ -76,10 +85,13 @@ function Timeline({ job }: { job: TemplateJobDto }) {
   const steps = job.steps ?? []
   const terminal = TERMINAL.includes(job.state)
   const now = useNow(!terminal && steps.length > 0)
+  const [seen, setSeen] = useState(() => ({ state: job.state, at: new Date().toISOString() }))
+  if (seen.state !== job.state) setSeen({ state: job.state, at: new Date(now).toISOString() }) // when this push arrived
   if (steps.length === 0) {
     return <p className={page.since}>{job.state} since <RelativeTime iso={job.createdAt} /></p>
   }
-  const rows = [{ state: 'Queued' as TemplateJobState, at: job.createdAt }, ...steps]
+  const rows: { state: TemplateJobState; at: string }[] = [{ state: 'Queued', at: job.createdAt }, ...steps]
+  if (rows[rows.length - 1].state !== job.state) rows.push({ state: job.state, at: seen.at }) // a push that lacked the newest step
   const ms = (iso: string) => Date.parse(iso)
   return (
     <ol className={page.timeline} aria-label="Timeline">
@@ -179,7 +191,7 @@ function JobView({ job }: { job: TemplateJobDto }) {
   const at = progressOf(job, steps)
   const active = ACTIVE.includes(job.state)
   const configuring = job.state === 'Configuring'
-  const refusal = configuring && job.message && /defender/i.test(job.message) ? job.message : null
+  const refusal = configuring && job.message && REFUSAL_PREFIXES.some((p) => job.message!.startsWith(p)) ? job.message : null
   const failed = job.state === 'Failed' || job.state === 'Cancelled'
 
   const sealRequested = !!job.sealRequested || acceptedAt === job
@@ -194,6 +206,10 @@ function JobView({ job }: { job: TemplateJobDto }) {
     if (next) void document.documentElement.requestFullscreen?.()?.catch?.(() => undefined)
     else if (document.fullscreenElement) void document.exitFullscreen?.()?.catch?.(() => undefined)
   }
+  if (!configuring && expanded) setExpanded(false) // the console is gone: a later one must not start expanded
+  useEffect(() => {
+    if (!configuring && document.fullscreenElement) void document.exitFullscreen?.()?.catch?.(() => undefined)
+  }, [configuring])
   useEffect(() => { // leaving fullscreen with Esc restores the layout too
     if (!expanded) { fullscreenEntered.current = false; return }
     const onChange = () => {

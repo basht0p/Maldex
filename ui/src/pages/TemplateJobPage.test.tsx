@@ -341,7 +341,7 @@ describe('TemplateJobPage', () => {
       await screen.findByText('Requested by Ada')
       hub.push(job({ state: 'Sealing', message: 'Sysprep', createdAt: t(0), requestedByName: null }))
       expect(current()).toHaveTextContent('Sealing')
-      expect(timeline()).toHaveLength(3)
+      expect(timeline()).toHaveLength(4) // held three plus the pushed state
       expect(screen.getByText('Requested by Ada')).toBeInTheDocument()
     })
 
@@ -388,14 +388,47 @@ describe('TemplateJobPage', () => {
     })
 
     it('shows the Defender checklist during Configuring and the refusal next to it', async () => {
-      getTemplateJob.mockResolvedValue(job({ state: 'Configuring', message: 'Defender is still on: turn off Tamper Protection.' }))
+      getTemplateJob.mockResolvedValue(job({ state: 'Configuring', message: 'Defender real-time protection is still on; turn it off in the console, then press Seal again.' }))
       renderJob()
       const items = await screen.findAllByRole('listitem')
       const texts = items.map((li) => li.textContent)
       const at = texts.indexOf('Open Windows Security')
       expect(at).toBeGreaterThanOrEqual(0)
       expect(texts.slice(at, at + 5)).toEqual(['Open Windows Security', 'Virus and threat protection → Manage settings', 'Turn off Tamper Protection', 'Turn off Real-time protection', 'Press Seal'])
-      expect(screen.getAllByText(/Defender is still on/)).toHaveLength(1)
+      expect(screen.getAllByText(/Defender real-time protection is still on/)).toHaveLength(1)
+    })
+
+    it('does not treat the normal guidance as a refusal, flags both refusals, and clears on a new message', async () => {
+      const guidance = 'Defender real-time protection is on. In the console open Windows Security, turn off Tamper Protection, then Real-time protection, then press Seal.'
+      getTemplateJob.mockResolvedValue(job({ state: 'Configuring', message: guidance }))
+      renderJob()
+      expect(await screen.findByText(guidance)).toBeInTheDocument()
+      expect(document.querySelector('[class*="refusal"]')).toBeNull()
+      const unconfirmed = 'Defender state could not be confirmed; wait a minute and press Seal again'
+      hub.push(job({ state: 'Configuring', message: unconfirmed }))
+      expect(screen.getByText(unconfirmed).className).toMatch(/refusal/)
+      hub.push(job({ state: 'Configuring', message: 'Defender real-time protection is still on; turn it off in the console, then press Seal again.' }))
+      expect(document.querySelector('[class*="refusal"]')).not.toBeNull()
+      hub.push(job({ state: 'Configuring', message: guidance }))
+      expect(document.querySelector('[class*="refusal"]')).toBeNull()
+    })
+
+    it('a console that reappears after leaving Configuring is not expanded', async () => {
+      getTemplateJob.mockResolvedValue(job({ state: 'Configuring' }))
+      renderJob()
+      await userEvent.click(await screen.findByRole('button', { name: 'Expand' }))
+      hub.push(job({ state: 'Sealing' }))
+      hub.push(job({ state: 'Configuring' }))
+      expect(await screen.findByRole('button', { name: 'Expand' })).toBeInTheDocument()
+    })
+
+    it('appends a row for the current state when the held steps end earlier', async () => {
+      getTemplateJob.mockResolvedValue(withSteps())
+      renderJob()
+      await screen.findByRole('list', { name: 'Timeline' })
+      hub.push(job({ state: 'Sealing', createdAt: t(0) }))
+      expect(timeline()).toHaveLength(4)
+      expect(timeline()[3].textContent).toMatch(/^Sealing/)
     })
 
     it('hides the checklist outside Configuring', async () => {
@@ -488,10 +521,10 @@ describe('TemplateJobPage', () => {
       expect(screen.getByRole('button', { name: 'Seal' })).toBeDisabled()
       expect(getTemplateJobTunnelToken).toHaveBeenCalledTimes(1)
 
-      hub.push(build({ state: 'Configuring', sealRequested: false, message: 'Defender is still on: turn off Tamper Protection and Real-time protection, then seal again.' }))
+      hub.push(build({ state: 'Configuring', sealRequested: false, message: 'Defender real-time protection is still on; turn it off in the console, then press Seal again.' }))
       await waitFor(() => expect(screen.getByRole('button', { name: 'Seal' })).toBeEnabled())
       expect(screen.queryByText('Seal requested')).toBeNull()
-      expect(screen.getByText(/Defender is still on/)).toBeInTheDocument()
+      expect(screen.getByText(/Defender real-time protection is still on/)).toBeInTheDocument()
       await waitFor(() => expect(getTemplateJobTunnelToken).toHaveBeenCalledTimes(2)) // a fresh token for the remounted console
       expect(guac.state.disconnects).toBe(1)
       expect(screen.getByLabelText('Seal note (optional)')).toBeEnabled()
