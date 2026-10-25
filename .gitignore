@@ -11,6 +11,8 @@ docs/superpowers/
 
 # .NET / Node / build output
 bin/
+# packaging/bin holds packaged commands (maldex-setup): source, not build output
+!packaging/bin/
 obj/
 TestResults/
 *.user
