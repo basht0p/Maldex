@@ -334,6 +334,115 @@ public class RealEgressTests
         return dns;
     }
 
+    /// <summary>
+    /// Direct egress (template edit sessions) on the real host: a stand-in guest (DHCP from the run's dnsmasq) reaches a public
+    /// address and resolves a public name through dnsmasq, and is refused the LAN gateway, the host, the control plane, the
+    /// gateway's own services and the uplink; IsolateAsync then cuts the public address off while the stand-in stays attached;
+    /// release leaves no mxu link, no maldex_direct table and no namespace. Contacts only the default probe URL host and a
+    /// public name lookup.
+    /// </summary>
+    [Fact]
+    public async Task Direct_StandInGuest_ReachesInternet_NotLanHostOrControlPlane_IsolateCutsIt_ReleaseLeavesNothing()
+    {
+        Assert.SkipUnless(Environment.GetEnvironmentVariable("MALDEX_REAL_NET") == "1" && OperatingSystem.IsLinux(),
+            "set MALDEX_REAL_NET=1 (needs passwordless sudo, nft, dnsmasq, busybox, curl, dig)");
+        var hostIp = (await Proc.RunAsync("sh", ["-c", "ip -4 -o addr show scope global | grep -v ' mx' | head -n1 | awk '{print $4}' | cut -d/ -f1"], CancellationToken.None)).Stdout.Trim();
+        var lanGw = (await Proc.RunAsync("sh", ["-c", "ip -4 -o route show default | awk '{print $3; exit}'"], CancellationToken.None)).Stdout.Trim();
+        Assert.False(string.IsNullOrEmpty(hostIp) || string.IsNullOrEmpty(lanGw), "no host LAN IPv4 / default gateway found");
+
+        var tmp = Path.Combine(Path.GetTempPath(), "mx-real-net-" + Guid.NewGuid().ToString("N"));
+        var opts = Options.Create(new NetOptions { RunDir = Path.Combine(tmp, "run"), DeployNetDir = RepoDeployNet(), ControlPlaneIps = [hostIp] });
+        var probeUrl = new NetOptions().DirectProbeUrl;
+        var router = new NetnsEgressRouter(opts, Proc);
+        var id = Guid.NewGuid();
+        var n = RunNetNames.For(id);
+        var h = id.ToString("N")[..12];
+        var scratchNs = "mxs" + h;
+        var scratchHost = "mxq" + h;
+        var scratchGuestLeg = "mxe" + h;
+        var subnet = RunSubnet.For(0);
+        NetworkLease? lease = null;
+        async Task<ProcessResult> Guest(params string[] a) => await Sudo(["ip", "netns", "exec", scratchNs, .. a]);
+        async Task<string> Http(string url, params string[] extra) =>
+            (await Guest(["curl", "-s", "-m", "6", "-o", "/dev/null", "-w", "%{http_code}", .. extra, url])).Stdout.Trim();
+        try
+        {
+            lease = await router.CreateAsync(id, NetworkMode.Direct, null, CancellationToken.None);
+            Assert.Equal(n.Tap, lease.NetworkId);
+
+            // topology: the uplink pair, the lease's own host table, no interception daemons
+            Assert.Contains(n.UplinkHost, (await Sudo("ip", "-o", "link", "show", n.UplinkHost)).Stdout);
+            var table = (await Sudo("nft", "list", "table", "inet", n.DirectTable)).Stdout;
+            var defIface = (await Proc.RunAsync("sh", ["-c", "ip -4 -o route show default | awk '{print $5; exit}'"], CancellationToken.None)).Stdout.Trim();
+            Assert.Contains($"iifname \"{n.UplinkHost}\" oifname \"{defIface}\" masquerade", string.Join(' ', table.Split([' ', '\t', '\n'], StringSplitOptions.RemoveEmptyEntries)));
+            var comms = new List<string>();
+            foreach (var pid in (await Sudo("ip", "netns", "pids", n.Namespace)).Stdout.Split([' ', '\n'], StringSplitOptions.RemoveEmptyEntries))
+                comms.Add((await Proc.RunAsync("ps", ["-o", "comm=", "-p", pid], CancellationToken.None)).Stdout.Trim());
+            Assert.Equal(["dnsmasq"], comms.Distinct());
+            await AssertDnsmasqUnprivilegedAsync(id, n.Namespace);
+
+            // stand-in guest on the run bridge, addressed by the run's dnsmasq (DHCP), like the guest NIC
+            Assert.Equal(0, (await Sudo("ip", "netns", "add", scratchNs)).ExitCode);
+            Assert.Equal(0, (await Sudo("ip", "link", "add", scratchHost, "type", "veth", "peer", "name", scratchGuestLeg, "netns", scratchNs)).ExitCode);
+            Assert.Equal(0, (await Guest("ip", "link", "set", scratchGuestLeg, "address", RunNetNames.GuestMac(id))).ExitCode);
+            Assert.Equal(0, (await Sudo("ip", "link", "set", scratchHost, "master", n.Bridge)).ExitCode);
+            Assert.Equal(0, (await Sudo("ip", "link", "set", scratchHost, "up")).ExitCode);
+            await Guest("sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=1");
+            Assert.Equal(0, (await Guest("ip", "link", "set", scratchGuestLeg, "up")).ExitCode);
+            Assert.Equal(0, (await Guest("ip", "link", "set", "lo", "up")).ExitCode);
+            var dhcp = await Guest("busybox", "udhcpc", "-i", scratchGuestLeg, "-q", "-n", "-t", "4", "-T", "2", "-s", "/bin/true");
+            Assert.Contains($"lease of {subnet.GuestIp} obtained", dhcp.Stderr + dhcp.Stdout);
+            Assert.Equal(0, (await Guest("ip", "addr", "add", subnet.GuestIp + "/30", "dev", scratchGuestLeg)).ExitCode);
+            Assert.Equal(0, (await Guest("ip", "route", "add", "default", "via", subnet.GatewayIp)).ExitCode);
+
+            // the stand-in resolves through the run's dnsmasq like the guest does (ip netns exec bind-mounts this resolv.conf)
+            Assert.Equal(0, (await Sudo("sh", "-c", $"mkdir -p /etc/netns/{scratchNs} && echo 'nameserver {subnet.GatewayIp}' > /etc/netns/{scratchNs}/resolv.conf")).ExitCode);
+            // the internet: a public address is reachable, and a public name resolves through the run's dnsmasq
+            Assert.Equal("204", await Http(probeUrl));
+            var dig = await Guest("dig", "+short", "+time=4", "+tries=1", $"@{subnet.GatewayIp}", "example.com", "A");
+            Assert.Matches(@"(?m)^\d+\.\d+\.\d+\.\d+$", dig.Stdout);
+
+            // ... and nothing internal: the LAN gateway, the host, the control plane, the gateway, the uplink, other private ranges
+            foreach (var (what, ip) in new[] { ("LAN gateway", lanGw), ("host LAN IP", hostIp), ("gateway", subnet.GatewayIp), ("uplink host end", "100.127.0.1"),
+                         ("docker bridge", "172.17.0.1"), ("rfc1918", "10.0.0.1"), ("link-local", "169.254.169.254") })
+                foreach (var port in new[] { 22, 80, 443 })
+                {
+                    var tcp = await Guest("curl", "-s", "-m", "3", "-o", "/dev/null", $"http://{ip}:{port}/");
+                    Assert.True(tcp.ExitCode != 0, $"{what}:{port} answered");
+                }
+            Assert.NotEqual(0, (await Guest("ping", "-c", "1", "-W", "2", hostIp)).ExitCode);
+            Assert.NotEqual(0, (await Guest("ping", "-c", "1", "-W", "2", lanGw)).ExitCode);
+            // IsolateAsync: the stand-in stays attached, the public address is gone
+            Assert.Contains(lease, await router.ListAsync(CancellationToken.None));
+            await router.IsolateAsync(lease, CancellationToken.None);
+            await router.IsolateAsync(lease, CancellationToken.None); // idempotent
+            Assert.NotEqual("204", await Http(probeUrl));
+            Assert.NotEqual(0, (await Guest("curl", "-s", "-m", "4", "-o", "/dev/null", "http://93.184.216.34/")).ExitCode);
+            Assert.NotEqual(0, (await Sudo("nft", "list", "table", "inet", n.DirectTable)).ExitCode);
+            Assert.DoesNotContain(n.UplinkHost, (await Proc.RunAsync("ip", ["-o", "link"], CancellationToken.None)).Stdout);
+            Assert.DoesNotContain("default", (await Sudo("ip", "netns", "exec", n.Namespace, "ip", "route", "show")).Stdout);
+            Assert.DoesNotContain("masquerade", (await Sudo("ip", "netns", "exec", n.Namespace, "nft", "list", "ruleset")).Stdout);
+            await Guest("ping", "-c", "1", "-W", "2", subnet.GatewayIp);
+            Assert.Contains("lladdr", (await Guest("ip", "neigh", "show", subnet.GatewayIp)).Stdout); // still attached to its gateway
+            Assert.Contains(n.Namespace, (await Sudo("ip", "netns", "list")).Stdout);
+        }
+        finally
+        {
+            if (lease is not null) await router.ReleaseAsync(lease, CancellationToken.None);
+            await router.ReleaseAsync(new NetworkLease(id, n.Tap), CancellationToken.None); // idempotent
+            await Sudo("ip", "link", "del", scratchHost);
+            await Sudo("ip", "netns", "del", scratchNs);
+            await Sudo("rm", "-rf", "--", "/etc/netns/" + scratchNs);
+            await Sudo("rm", "-rf", tmp);
+        }
+        var links = (await Proc.RunAsync("ip", ["-o", "link"], CancellationToken.None)).Stdout;
+        Assert.DoesNotContain(h, links);
+        Assert.DoesNotContain("mxu", links);
+        Assert.DoesNotContain("maldex_direct", (await Sudo("nft", "list", "tables")).Stdout);
+        Assert.DoesNotContain(h, (await Proc.RunAsync("ip", ["netns", "list"], CancellationToken.None)).Stdout);
+        Assert.False(Directory.Exists("/run/maldex/dns/mxn" + h));
+    }
+
     private static async Task<ProcessResult> Sudo(params string[] args) => await Proc.RunAsync("sudo", ["-n", .. args], CancellationToken.None, null, TimeSpan.FromSeconds(30));
 
     private static string RepoDeployNet()

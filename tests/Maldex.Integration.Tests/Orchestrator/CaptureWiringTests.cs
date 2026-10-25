@@ -207,6 +207,7 @@ public class CaptureWiringTests(SqlServerFixture sql)
     {
         public Task<NetworkLease> CreateAsync(Guid taskId, NetworkMode mode, string? exitCountry, CancellationToken ct) => inner.CreateAsync(taskId, mode, exitCountry, ct);
         public Task ReleaseAsync(NetworkLease lease, CancellationToken ct) => throw new IOException("ip netns del: device busy");
+        public Task IsolateAsync(NetworkLease lease, CancellationToken ct) => inner.IsolateAsync(lease, ct);
         public Task<IReadOnlyList<NetworkLease>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
     }
 
@@ -267,6 +268,7 @@ public class CaptureWiringTests(SqlServerFixture sql)
             MarkerAtRelease ??= File.Exists(Path.Combine(runDir, "net", Maldex.Infrastructure.Net.RunNetNames.For(lease.TaskId).Namespace, Maldex.Infrastructure.Net.NetnsEgressRouter.FlowsStoredMarker));
             return inner.ReleaseAsync(lease, ct);
         }
+        public Task IsolateAsync(NetworkLease lease, CancellationToken ct) => inner.IsolateAsync(lease, ct);
         public Task<IReadOnlyList<NetworkLease>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
     }
 

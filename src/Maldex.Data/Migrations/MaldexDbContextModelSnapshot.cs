@@ -612,6 +612,101 @@ namespace Maldex.Data.Migrations
                     b.ToTable("Templates", (string)null);
                 });
 
+            modelBuilder.Entity("Maldex.Core.Domain.TemplateJob", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<Guid>("BaseVersionId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<DateTimeOffset?>("CancelRequestedAt")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<DateTimeOffset?>("ConfiguringSince")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<DateTimeOffset?>("EndedAt")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<string>("FailureReason")
+                        .HasMaxLength(1000)
+                        .HasColumnType("nvarchar(1000)");
+
+                    b.Property<string>("Kind")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("nvarchar(32)");
+
+                    b.Property<DateTimeOffset?>("LastConsoleAt")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<string>("Message")
+                        .HasMaxLength(500)
+                        .HasColumnType("nvarchar(500)");
+
+                    b.Property<string>("Network")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("nvarchar(32)");
+
+                    b.Property<string>("Note")
+                        .HasMaxLength(1000)
+                        .HasColumnType("nvarchar(1000)");
+
+                    b.Property<bool>("PublishOnSuccess")
+                        .HasColumnType("bit");
+
+                    b.Property<Guid>("RequestedByUserId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<Guid?>("ResultVersionId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<byte[]>("RowVersion")
+                        .IsConcurrencyToken()
+                        .IsRequired()
+                        .ValueGeneratedOnAddOrUpdate()
+                        .HasColumnType("rowversion");
+
+                    b.Property<DateTimeOffset?>("SealRequestedAt")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<DateTimeOffset?>("SlotHeldAt")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<DateTimeOffset?>("StartedAt")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<string>("State")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("nvarchar(32)");
+
+                    b.Property<string>("TemplateId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("nvarchar(64)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("BaseVersionId");
+
+                    b.HasIndex("RequestedByUserId");
+
+                    b.HasIndex("ResultVersionId");
+
+                    b.HasIndex("TemplateId")
+                        .IsUnique()
+                        .HasDatabaseName("IX_TemplateJobs_TemplateId_Active")
+                        .HasFilter("[State] <> 'Published' AND [State] <> 'Sealed' AND [State] <> 'Failed' AND [State] <> 'Cancelled'");
+
+                    b.ToTable("TemplateJobs", (string)null);
+                });
+
             modelBuilder.Entity("Maldex.Core.Domain.TemplateVersion", b =>
                 {
                     b.Property<Guid>("Id")
@@ -620,6 +715,9 @@ namespace Maldex.Data.Migrations
                     b.Property<string>("AgentVersion")
                         .HasMaxLength(32)
                         .HasColumnType("nvarchar(32)");
+
+                    b.Property<DateTimeOffset?>("CurrentUntil")
+                        .HasColumnType("datetimeoffset");
 
                     b.Property<string>("FileStem")
                         .IsRequired()
@@ -821,6 +919,32 @@ namespace Maldex.Data.Migrations
                         .WithMany()
                         .HasForeignKey("CurrentVersionId")
                         .OnDelete(DeleteBehavior.Restrict);
+                });
+
+            modelBuilder.Entity("Maldex.Core.Domain.TemplateJob", b =>
+                {
+                    b.HasOne("Maldex.Core.Domain.TemplateVersion", null)
+                        .WithMany()
+                        .HasForeignKey("BaseVersionId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.HasOne("Maldex.Core.Domain.AppUser", null)
+                        .WithMany()
+                        .HasForeignKey("RequestedByUserId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.HasOne("Maldex.Core.Domain.TemplateVersion", null)
+                        .WithMany()
+                        .HasForeignKey("ResultVersionId")
+                        .OnDelete(DeleteBehavior.Restrict);
+
+                    b.HasOne("Maldex.Core.Domain.Template", null)
+                        .WithMany()
+                        .HasForeignKey("TemplateId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
                 });
 
             modelBuilder.Entity("Maldex.Core.Domain.TemplateVersion", b =>

@@ -1,6 +1,7 @@
 using System.Linq.Expressions;
 using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
+using Maldex.Core.Lifecycle;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
@@ -36,6 +37,8 @@ public sealed record RollBackResult(int? From, int To);
 public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IOptions<TemplateOptions> options, TimeProvider time, ILogger<TemplateCatalog>? log = null)
 {
     public const int MaxAttempts = 3;
+
+    private static readonly IReadOnlyList<TemplateJobState> ActiveJobStates = TemplateJobStateMachine.ActiveStates;
 
     /// <summary>Every available template, the default first, then by display name.</summary>
     public Task<List<Template>> AvailableAsync(CancellationToken ct) => AvailableWhereAsync(_ => true, ct);
@@ -147,10 +150,47 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
         }, ct);
 
     /// <summary>
-    /// Publishes the highest-numbered Ready version that is not current. Returns the version numbers it moved between, as
-    /// read in the attempt that was saved; <paramref name="audit"/> builds the audit row from them.
+    /// Publishes a held version (sealed by a job that was told not to publish, so Ready and never current): as
+    /// <see cref="PublishAsync"/>, but any other version is refused.
     /// </summary>
-    /// <exception cref="TemplateRuleException">There is no previous Ready version.</exception>
+    /// <exception cref="TemplateRuleException">The version is not Pending.</exception>
+    public Task PublishPendingAsync(string templateId, Guid versionId, CancellationToken ct, TemplateAudit? audit = null) =>
+        MutateAsync(async () =>
+        {
+            var template = await GetTemplateAsync(templateId, ct).ConfigureAwait(false);
+            await RequirePendingAsync(template, versionId, ct).ConfigureAwait(false);
+            await PublishCoreAsync(template, versionId, ct).ConfigureAwait(false);
+            AddAudit(audit, template.Id);
+        }, ct);
+
+    /// <summary>Retires a held version; the sweep then deletes its disk.</summary>
+    /// <exception cref="TemplateRuleException">The version is not Pending.</exception>
+    public Task DiscardPendingAsync(string templateId, Guid versionId, CancellationToken ct, TemplateAudit? audit = null) =>
+        MutateAsync(async () =>
+        {
+            var template = await GetTemplateAsync(templateId, ct).ConfigureAwait(false);
+            var version = await RequirePendingAsync(template, versionId, ct).ConfigureAwait(false);
+            version.Status = TemplateVersionStatus.Retired;
+            AddAudit(audit, template.Id);
+        }, ct);
+
+    /// <summary>The version, when it is Pending (<see cref="RolesOf"/>: Ready and never current).</summary>
+    private async Task<TemplateVersion> RequirePendingAsync(Template template, Guid versionId, CancellationToken ct)
+    {
+        var versions = await db.TemplateVersions.Where(v => v.TemplateId == template.Id).ToListAsync(ct).ConfigureAwait(false);
+        var version = versions.SingleOrDefault(v => v.Id == versionId)
+            ?? throw new TemplateRuleException($"version {versionId} does not belong to template '{template.Id}'");
+        var role = RolesOf(versions, template.CurrentVersionId)[version.Id];
+        if (role != "Pending") throw new TemplateRuleException($"version v{version.Number} is {role}, not Pending");
+        return version;
+    }
+
+    /// <summary>
+    /// Publishes the Ready version that was current most recently (the latest <see cref="TemplateVersion.CurrentUntil"/>),
+    /// and retires the version being rolled back from, so a rollback never keeps the bad version. Returns the version
+    /// numbers it moved between, as read in the attempt that was saved; <paramref name="audit"/> builds the audit row from them.
+    /// </summary>
+    /// <exception cref="TemplateRuleException">No Ready version was ever current before the current one.</exception>
     public async Task<RollBackResult> RollBackAsync(string templateId, CancellationToken ct, Func<RollBackResult, TemplateAudit>? audit = null)
     {
         RollBackResult? result = null;
@@ -158,11 +198,12 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
         {
             var template = await GetTemplateAsync(templateId, ct).ConfigureAwait(false);
             var versions = await db.TemplateVersions.Where(v => v.TemplateId == template.Id).ToListAsync(ct).ConfigureAwait(false);
-            var previous = versions
-                .Where(v => v.Status == TemplateVersionStatus.Ready && v.Id != template.CurrentVersionId)
-                .MaxBy(v => v.Number)
+            var previous = PreviousVersions(versions, template.CurrentVersionId).FirstOrDefault()
                 ?? throw new TemplateRuleException($"template '{template.Id}' has no previous version to roll back to");
-            result = new RollBackResult(versions.SingleOrDefault(v => v.Id == template.CurrentVersionId)?.Number, previous.Number);
+            var from = versions.SingleOrDefault(v => v.Id == template.CurrentVersionId);
+            result = new RollBackResult(from?.Number, previous.Number);
+            // The version rolled back from is never kept: retire it now, before retention counts the others.
+            if (from is { Status: TemplateVersionStatus.Ready }) from.Status = TemplateVersionStatus.Retired;
             await PublishCoreAsync(template, previous.Id, ct).ConfigureAwait(false);
             if (audit is not null) AddAudit(audit(result), template.Id);
         }, ct).ConfigureAwait(false);
@@ -204,7 +245,8 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
         }, ct);
 
     /// <summary>
-    /// Deletes the disk of every Retired version that no Preparing, Running or Collecting task uses, and marks it Deleted.
+    /// Deletes the disk of every Retired version that no Preparing, Running or Collecting task uses and that is not the base
+    /// of a non-terminal template job, and marks it Deleted.
     /// Each version is recorded on its own (delete, then mark it and add its system audit row in one save); a failing
     /// version is logged, stays Retired, and the others carry on. Never touches Ready versions. Returns the versions deleted.
     /// </summary>
@@ -226,6 +268,9 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
                     var inUse = await db.Tasks.AnyAsync(t => t.TemplateVersionId == version.Id
                         && (t.Status == RunStatus.Preparing || t.Status == RunStatus.Running || t.Status == RunStatus.Collecting), ct).ConfigureAwait(false);
                     if (inUse) return;
+                    // A job still working from it may not have copied it yet (a rollback can retire a running job's base).
+                    var jobBase = await db.TemplateJobs.AnyAsync(j => j.BaseVersionId == version.Id && ActiveJobStates.Contains(j.State), ct).ConfigureAwait(false);
+                    if (jobBase) return;
                     await store.DeleteAsync(version.FileStem, ct).ConfigureAwait(false); // idempotent, so safe to repeat on retry
                     version.Status = TemplateVersionStatus.Deleted;
                     AddAudit(new TemplateAudit(null, "template.version.delete", $"template={version.TemplateId}; v={version.Number}"), version.Id.ToString());
@@ -256,17 +301,43 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
         if (target.Status != TemplateVersionStatus.Ready)
             throw new TemplateRuleException($"version {versionId} is {target.Status}, not Ready");
 
+        if (versions.SingleOrDefault(v => v.Id == template.CurrentVersionId) is { } old && old.Id != target.Id)
+            old.CurrentUntil = time.GetUtcNow();
         template.CurrentVersionId = target.Id;
+        target.CurrentUntil = null;
 
-        // Keep Ready = current + the KeepPrevious highest-numbered other Ready versions; retire the rest.
-        var keep = versions
-            .Where(v => v.Status == TemplateVersionStatus.Ready && v.Id != target.Id)
-            .OrderByDescending(v => v.Number)
-            .Take(Math.Max(0, options.Value.KeepPrevious))
-            .Select(v => v.Id)
-            .ToHashSet();
-        foreach (var v in versions.Where(v => v.Status == TemplateVersionStatus.Ready && v.Id != target.Id && !keep.Contains(v.Id)))
+        // Keep Ready = current + the KeepPrevious versions that were current most recently; a sealed version that was
+        // never current (CurrentUntil null) is pending an admin's decision and is never retired here.
+        var previous = PreviousVersions(versions, target.Id);
+        foreach (var v in previous.Skip(Math.Max(0, options.Value.KeepPrevious)))
             v.Status = TemplateVersionStatus.Retired;
+    }
+
+    /// <summary>
+    /// The Ready versions that were current before (not the current one), most recently current first. The first is the
+    /// rollback target. Ties (same instant) go to the higher number.
+    /// </summary>
+    private static List<TemplateVersion> PreviousVersions(IEnumerable<TemplateVersion> versions, Guid? currentId) =>
+        versions
+            .Where(v => v.Status == TemplateVersionStatus.Ready && v.Id != currentId && v.CurrentUntil != null)
+            .OrderByDescending(v => v.CurrentUntil).ThenByDescending(v => v.Number)
+            .ToList();
+
+    /// <summary>
+    /// What each version of a template is for the admin: <c>Current</c>; <c>RollbackTarget</c> (what <see cref="RollBackAsync"/>
+    /// would publish); <c>Previous</c> (the other versions that were current before); <c>Pending</c> (Ready, never current);
+    /// <c>Retired</c>; <c>Deleted</c>.
+    /// </summary>
+    public static Dictionary<Guid, string> RolesOf(IReadOnlyCollection<TemplateVersion> versions, Guid? currentId)
+    {
+        var previous = PreviousVersions(versions, currentId);
+        return versions.ToDictionary(v => v.Id, v =>
+            v.Id == currentId ? "Current"
+            : v.Status == TemplateVersionStatus.Retired ? "Retired"
+            : v.Status == TemplateVersionStatus.Deleted ? "Deleted"
+            : previous.Count > 0 && previous[0].Id == v.Id ? "RollbackTarget"
+            : v.CurrentUntil != null ? "Previous"
+            : "Pending");
     }
 
     /// <summary>Adds the change's audit row to the pending save, so it commits (or fails) together with the change.</summary>

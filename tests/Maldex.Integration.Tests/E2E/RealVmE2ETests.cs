@@ -29,10 +29,10 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
 
     // ---- gating -------------------------------------------------------------------------------------------------
 
-    private static string Root => RealPaths.FindRoot(AppContext.BaseDirectory);
+    internal static string Root => RealPaths.FindRoot(AppContext.BaseDirectory);
     private static string SamplesDir => Path.Combine(Root, "deploy", "guest", "samples");
 
-    private static void RequireRealStack()
+    internal static void RequireRealStack()
     {
         var baseDir = Path.Combine(Root, ".data", "vm", "base");
         var missing = new[] { "win11-26h2.qcow2", "win11-26h2.vars.fd" }.Where(f => !File.Exists(Path.Combine(baseDir, f))).ToList();
@@ -87,17 +87,18 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
     /// <summary>
     /// Submits a file or URL in Simulated mode, waits for a terminal status and hands the finished task to <paramref name="assert"/>.
     /// Whatever happens (assertion failure, timeout, exception) the run is stopped, the host is shut down, and the leak check runs;
-    /// a leak is reported in addition to the original failure.
+    /// a leak is reported in addition to the original failure. On <paramref name="host"/> (a caller's factory) the run uses that
+    /// host and leaves it running; otherwise it boots its own. Returns the task's id.
     /// </summary>
-    private async Task RunAsync(string? fileName, byte[]? file, string? url, Func<AnalysisTask, MaldexDbContext, Task> assert)
+    private async Task<Guid> RunAsync(string? fileName, byte[]? file, string? url, Func<AnalysisTask, MaldexDbContext, Task> assert, MaldexAppFactory? host = null)
     {
-        var f = NewFactory();
+        var f = host ?? NewFactory();
         Guid taskId = default;
         Exception? failure = null;
         try
         {
             using var admin = f.CreateClient(UserRole.Admin, "admin");
-            var orgResp = await admin.PostAsJsonAsync("/api/orgs", new { name = "e2e", retentionDays = 30 }, Ct);
+            var orgResp = await admin.PostAsJsonAsync("/api/orgs", new { name = "e2e-" + Guid.NewGuid().ToString("N")[..8], retentionDays = 30 }, Ct);
             orgResp.EnsureSuccessStatusCode();
             var orgId = (await orgResp.Content.ReadFromJsonAsync<JsonElement>(Ct)).GetProperty("id").GetGuid();
 
@@ -156,7 +157,7 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
         // ---- cleanup: always runs; every phase has its own bound (see E2ECleanup) and none uses the test's token ----
         var leak = await new E2ECleanup(
             stop: ct => taskId == default ? Task.CompletedTask : StopAndWaitAsync(f, taskId, ct),
-            dispose: () => { f.Dispose(); _factories.Remove(f); },
+            dispose: () => { if (host is null) { f.Dispose(); _factories.Remove(f); } },
             find: ct => taskId == default ? Task.FromResult(LeftOver.None) : FindAsync(taskId, ct),
             forceRemove: ForceRemoveAsync,
             stopBound: TimeSpan.FromSeconds(90), checkBound: TimeSpan.FromMinutes(2), removeBound: TimeSpan.FromMinutes(1),
@@ -165,6 +166,7 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
         if (failure is not null && leak is not null) throw new AggregateException($"E2E failed AND cleanup reported problems: {leak}", failure, new InvalidOperationException(leak));
         if (leak is not null) throw new InvalidOperationException(leak);
         if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+        return taskId;
     }
 
     /// <summary>Asks a still-active task to stop (cancel when queued, stop when preparing/running) and waits, bounded, for a terminal status.</summary>
@@ -211,7 +213,7 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
 
     // ---- leak check, scoped to this run --------------------------------------------------------------------------
 
-    private static async Task<string> RunToolAsync(CancellationToken ct, string file, params string[] args)
+    internal static async Task<string> RunToolAsync(CancellationToken ct, string file, params string[] args)
     {
         var psi = new ProcessStartInfo(file) { RedirectStandardOutput = true, RedirectStandardError = true };
         foreach (var a in args) psi.ArgumentList.Add(a);
@@ -238,10 +240,10 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
         }
     }
 
-    private static string[] Lines(string s) => s.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    internal static string[] Lines(string s) => s.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
     /// <summary>Resources of this run only: domain maldex-{id:N} and links/namespaces carrying h = id:N[..12] (mxb/mxt/mxv/mxg/mxn/mxw + h).</summary>
-    private static async Task<LeftOver> FindAsync(Guid taskId, CancellationToken ct)
+    internal static async Task<LeftOver> FindAsync(Guid taskId, CancellationToken ct)
     {
         var n = taskId.ToString("N");
         var h = n[..12];
@@ -259,7 +261,7 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
     internal static bool IsKillablePid(string s) =>
         int.TryParse(s, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var pid) && pid > 1;
 
-    private static async Task ForceRemoveAsync(LeftOver found, CancellationToken ct)
+    internal static async Task ForceRemoveAsync(LeftOver found, CancellationToken ct)
     {
         foreach (var d in found.Domains) await RunToolAsync(ct, "virsh", "-c", "qemu:///session", "destroy", d);
         foreach (var ns in found.Namespaces)
@@ -278,36 +280,54 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
     public async Task Eicar_IsMalicious()
     {
         RequireRealStack();
+        await EicarAsync();
+    }
+
+    /// <summary>The EICAR scenario on <paramref name="host"/> (or a host of its own); returns the task's id. RealTemplateJobTests runs it too.</summary>
+    internal async Task<Guid> EicarAsync(MaldexAppFactory? host = null)
+    {
         var b64 = await File.ReadAllTextAsync(Path.Combine(SamplesDir, "eicar.txt.b64"), Ct);
-        await RunAsync("eicar.txt", Convert.FromBase64String(b64.Trim()), url: null, async (task, db) =>
+        return await RunAsync("eicar.txt", Convert.FromBase64String(b64.Trim()), url: null, async (task, db) =>
         {
             Assert.Equal(Verdict.Malicious, task.Verdict);
             Assert.Contains(await db.Detections.AsNoTracking().Where(d => d.TaskId == task.Id).ToListAsync(Ct),
                 d => d.Source == DetectionSource.Yara && d.Rule.Contains("EICAR", StringComparison.OrdinalIgnoreCase));
-        });
+        }, host);
     }
 
     [Fact]
     public async Task RegWriteScript_PersistenceHeuristic()
     {
         RequireRealStack();
+        await RegWriteAsync();
+    }
+
+    /// <summary>The registry-write scenario on <paramref name="host"/> (or a host of its own); returns the task's id.</summary>
+    internal async Task<Guid> RegWriteAsync(MaldexAppFactory? host = null)
+    {
         var script = await File.ReadAllBytesAsync(Path.Combine(SamplesDir, "regwrite.ps1"), Ct);
-        await RunAsync("regwrite.ps1", script, url: null, async (task, db) =>
+        return await RunAsync("regwrite.ps1", script, url: null, async (task, db) =>
         {
             Assert.True(task.Verdict >= Verdict.Suspicious, $"verdict {task.Verdict}");
             Assert.Contains(await db.Detections.AsNoTracking().Where(d => d.TaskId == task.Id).ToListAsync(Ct),
                 d => d.Source == DetectionSource.Heuristic && d.Rule == "persistence_run_key");
             Assert.Contains(await db.BehaviorEvents.AsNoTracking().Where(e => e.TaskId == task.Id && e.Type == EventType.Registry).ToListAsync(Ct),
                 e => e.Data.Contains("MaldexTest", StringComparison.OrdinalIgnoreCase));
-        });
+        }, host);
     }
 
     [Fact]
     public async Task ControlledUrl_CapturesDnsFlowAndHttp()
     {
         RequireRealStack();
+        await ControlledUrlAsync();
+    }
+
+    /// <summary>The controlled-URL scenario on <paramref name="host"/> (or a host of its own); returns the task's id.</summary>
+    internal async Task<Guid> ControlledUrlAsync(MaldexAppFactory? host = null)
+    {
         var url = (await File.ReadAllTextAsync(Path.Combine(SamplesDir, "url.txt"), Ct)).Trim();
-        await RunAsync(null, null, url, async (task, db) =>
+        return await RunAsync(null, null, url, async (task, db) =>
         {
             var artifacts = await db.Artifacts.AsNoTracking().Where(a => a.TaskId == task.Id).Select(a => a.Kind).ToListAsync(Ct);
             Assert.Contains(ArtifactKind.Pcap, artifacts);
@@ -320,7 +340,7 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
                 h => h.Host.Contains("maldex-test.invalid", StringComparison.OrdinalIgnoreCase));
             Assert.Contains(await db.Detections.AsNoTracking().Where(d => d.TaskId == task.Id && d.Source == DetectionSource.Suricata).ToListAsync(Ct),
                 d => d.Details != null && d.Details.Contains("sid 9000001", StringComparison.Ordinal));
-        });
+        }, host);
     }
 
     /// <summary>

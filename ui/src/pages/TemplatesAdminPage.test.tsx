@@ -1,18 +1,29 @@
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AdminTemplateDto, MeDto, TemplateVersionDto } from '../api/types'
+import type { AdminTemplateDto, MeDto, TemplateJobDto, TemplateVersionDto } from '../api/types'
 
 const listAdminTemplates = vi.fn()
 const setDefaultTemplate = vi.fn()
 const setTemplateEnabled = vi.fn()
 const rollBackTemplate = vi.fn()
+const listTemplateJobs = vi.fn()
+const startTemplateEdit = vi.fn()
+const startTemplateRefresh = vi.fn()
+const publishTemplateVersion = vi.fn()
+const discardTemplateVersion = vi.fn()
 vi.mock('../api/client', async (orig) => ({
   ...(await orig<typeof import('../api/client')>()),
   listAdminTemplates: (...a: unknown[]) => listAdminTemplates(...a),
   setDefaultTemplate: (...a: unknown[]) => setDefaultTemplate(...a),
   setTemplateEnabled: (...a: unknown[]) => setTemplateEnabled(...a),
   rollBackTemplate: (...a: unknown[]) => rollBackTemplate(...a),
+  listTemplateJobs: (...a: unknown[]) => listTemplateJobs(...a),
+  startTemplateEdit: (...a: unknown[]) => startTemplateEdit(...a),
+  startTemplateRefresh: (...a: unknown[]) => startTemplateRefresh(...a),
+  publishTemplateVersion: (...a: unknown[]) => publishTemplateVersion(...a),
+  discardTemplateVersion: (...a: unknown[]) => discardTemplateVersion(...a),
 }))
 
 import { ApiError } from '../api/client'
@@ -21,32 +32,49 @@ import TemplatesAdminPage from './TemplatesAdminPage'
 const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin' }
 
 const version = (over: Partial<TemplateVersionDto>): TemplateVersionDto => ({
-  id: 'v-id', number: 1, origin: 'Imported', status: 'Ready', isCurrent: false, diskPresent: true,
+  id: 'v-id', number: 1, origin: 'Imported', status: 'Ready', role: 'Pending', isCurrent: false, diskPresent: true,
   windowsEdition: null, windowsBuild: null, officePresent: null, agentVersion: null, sealedBy: null,
   sealedAt: '2026-10-24T10:00:00Z', note: null, sizeBytes: null, ...over,
 })
 
 const v3 = version({
-  id: 'g3', number: 3, origin: 'Edit', isCurrent: true, windowsEdition: 'Windows 11 Pro', windowsBuild: '26300', agentVersion: '1.0.0', sealedBy: 'basht0p',
+  id: 'g3', number: 3, origin: 'Edit', isCurrent: true, role: 'Current', windowsEdition: 'Windows 11 Pro', windowsBuild: '26300', agentVersion: '1.0.0', sealedBy: 'basht0p',
 })
-const v2 = version({ id: 'g2', number: 2, origin: 'Refresh', status: 'Ready' })
-const v1 = version({ id: 'g1', number: 1, origin: 'IsoBuild', status: 'Deleted', diskPresent: false })
+const v2 = version({ id: 'g2', number: 2, origin: 'Refresh', status: 'Ready', role: 'RollbackTarget' })
+const v1 = version({ id: 'g1', number: 1, origin: 'IsoBuild', status: 'Deleted', role: 'Deleted', diskPresent: false })
 
 const golden = (over: Partial<AdminTemplateDto> = {}): AdminTemplateDto => ({
   id: 'win11-golden', displayName: 'Windows 11 Golden', description: null, isDefault: false, enabled: true,
   current: v3, versions: [v3, v2, v1], ...over,
 })
 const base = (over: Partial<AdminTemplateDto> = {}): AdminTemplateDto => {
-  const cur = version({ id: 'b1', number: 1, isCurrent: true })
+  const cur = version({ id: 'b1', number: 1, isCurrent: true, role: 'Current' })
   return { id: 'win11-26h2', displayName: 'Windows 11 26H2', description: null, isDefault: true, enabled: true, current: cur, versions: [cur], ...over }
 }
 
-const renderPage = (me: MeDto | null = admin) => render(<TemplatesAdminPage me={me} />)
+const job = (over: Partial<TemplateJobDto> = {}): TemplateJobDto => ({
+  id: 'job-1', kind: 'Edit', templateId: 'win11-golden', baseVersionNumber: 3, resultVersionNumber: null, network: 'None', state: 'Configuring',
+  message: null, failureReason: null, createdAt: '2026-10-24T10:00:00Z', endedAt: null, idleDeadline: null, ...over,
+})
+
+function Where() {
+  return <p data-testid="where">{useLocation().pathname}</p>
+}
+const renderPage = (me: MeDto | null = admin) =>
+  render(
+    <MemoryRouter initialEntries={['/admin/templates']}>
+      <Routes>
+        <Route path="/admin/templates" element={<TemplatesAdminPage me={me} />} />
+        <Route path="*" element={<Where />} />
+      </Routes>
+    </MemoryRouter>,
+  )
 const region = (name: string) => screen.findByRole('region', { name })
 
 beforeEach(() => {
   vi.clearAllMocks()
   listAdminTemplates.mockResolvedValue([base(), golden()])
+  listTemplateJobs.mockResolvedValue([])
 })
 afterEach(() => vi.restoreAllMocks())
 
@@ -84,8 +112,8 @@ describe('TemplatesAdminPage', () => {
     expect(within(g).getAllByText('Disk missing')).toHaveLength(1)
   })
 
-  it('keeps only a Ready non-current version: Retired history means no previous version and Roll back is disabled', async () => {
-    const retired = version({ id: 'r2', number: 2, status: 'Retired' })
+  it('Retired history means no previous version and Roll back is disabled', async () => {
+    const retired = version({ id: 'r2', number: 2, status: 'Retired', role: 'Retired' })
     listAdminTemplates.mockResolvedValue([golden({ versions: [v3, retired, v1] })])
     renderPage()
     const g = await region('Windows 11 Golden')
@@ -93,11 +121,21 @@ describe('TemplatesAdminPage', () => {
     expect(within(g).getByRole('button', { name: 'Roll back' })).toBeDisabled()
   })
 
+  it('a Pending version (sealed, never current) is not a rollback target: it is listed apart and Roll back stays disabled', async () => {
+    const pending = version({ id: 'p4', number: 4, origin: 'Edit', role: 'Pending' })
+    listAdminTemplates.mockResolvedValue([golden({ versions: [pending, v3] })])
+    renderPage()
+    const g = await region('Windows 11 Golden')
+    expect(within(g).getByText('No previous version kept')).toBeInTheDocument()
+    expect(within(g).getByText('Not yet published: v4')).toBeInTheDocument()
+    expect(within(g).getByRole('button', { name: 'Roll back' })).toBeDisabled()
+  })
+
   it('names exactly the Ready previous version in the confirmation', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     const v4 = version({ id: 'g4', number: 4, isCurrent: true, origin: 'Edit' })
-    const v3r = version({ id: 'r3', number: 3, status: 'Retired' })
-    const v2r = version({ id: 'g2', number: 2, status: 'Ready' })
+    const v3r = version({ id: 'r3', number: 3, status: 'Retired', role: 'Retired' })
+    const v2r = version({ id: 'g2', number: 2, status: 'Ready', role: 'RollbackTarget' })
     listAdminTemplates.mockResolvedValue([golden({ current: v4, versions: [v4, v3r, v2r] })])
     renderPage()
     const g = await region('Windows 11 Golden')
@@ -109,30 +147,30 @@ describe('TemplatesAdminPage', () => {
     expect(text).not.toContain('v3')
   })
 
-  it('says the replaced version stays available as the previous version', async () => {
+  it('says the version rolled back from is retired, never kept', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     renderPage()
     const g = await region('Windows 11 Golden')
     await userEvent.click(within(g).getByRole('button', { name: 'Roll back' }))
     const text = String(confirm.mock.calls[0][0])
     expect(text).toContain('New tasks will use v2.')
-    expect(text).toContain('v3 stays available as the previous version.')
-    expect(text).not.toMatch(/retired/i)
+    expect(text).toContain('v3 will be retired')
+    expect(text).not.toContain('stays available')
   })
 
-  it('does not promise to keep the replaced version when a newer previous version is kept before it', async () => {
+  it('takes the rollback target from the server role, not from the highest number, and lists the other kept versions', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
-    const c2 = version({ id: 'c2', number: 2, isCurrent: true })
-    const r3 = version({ id: 'r3', number: 3 })
-    const r4 = version({ id: 'r4', number: 4 })
-    listAdminTemplates.mockResolvedValue([golden({ current: c2, versions: [r4, r3, c2] })])
+    const c5 = version({ id: 'c5', number: 5, isCurrent: true, role: 'Current' })
+    const t2 = version({ id: 't2', number: 2, role: 'RollbackTarget' })
+    const p4 = version({ id: 'p4', number: 4, role: 'Previous' })
+    listAdminTemplates.mockResolvedValue([golden({ current: c5, versions: [c5, p4, t2] })])
     renderPage()
     const g = await region('Windows 11 Golden')
+    expect(within(g).getByText('Previous kept: v2, v4')).toBeInTheDocument()
     await userEvent.click(within(g).getByRole('button', { name: 'Roll back' }))
     const text = String(confirm.mock.calls[0][0])
-    expect(text).toContain('New tasks will use v4.')
-    expect(text).not.toContain('stays available')
-    expect(text).toContain('v2 becomes a previous version')
+    expect(text).toContain('New tasks will use v2.')
+    expect(text).toContain('v5 will be retired')
   })
 
   it('shows a Ready previous version whose disk is missing as kept, with a warning, and disables Roll back', async () => {
@@ -223,5 +261,164 @@ describe('TemplatesAdminPage', () => {
     listAdminTemplates.mockRejectedValue(new ApiError(500, { title: 'Boom' }))
     renderPage()
     expect(await screen.findByRole('alert')).toHaveTextContent('Boom')
+  })
+
+  describe('Edit, Refresh and jobs', () => {
+    it('Edit sends the chosen network and publish flag, then opens the job', async () => {
+      startTemplateEdit.mockResolvedValue(job({ id: 'job-9' }))
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await userEvent.click(within(g).getByRole('button', { name: 'Edit' }))
+      const dlg = within(g).getByRole('dialog')
+      expect(within(dlg).getByLabelText('None')).toBeChecked()
+      expect(within(dlg).getByLabelText('Publish when done')).toBeChecked()
+      await userEvent.click(within(dlg).getByLabelText('Direct: internet on'))
+      await userEvent.click(within(dlg).getByLabelText('Publish when done'))
+      await userEvent.click(within(dlg).getByRole('button', { name: 'Start edit' }))
+      expect(startTemplateEdit).toHaveBeenCalledWith('win11-golden', 'Direct', false)
+      expect(await screen.findByTestId('where')).toHaveTextContent('/admin/template-jobs/job-9')
+    })
+
+    it('moves focus into the dialog, traps Tab, closes on Escape and returns focus to the trigger', async () => {
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      const trigger = within(g).getByRole('button', { name: 'Edit' })
+      await userEvent.click(trigger)
+      const dlg = within(g).getByRole('dialog')
+      await waitFor(() => expect(dlg).toContainElement(document.activeElement as HTMLElement))
+      for (let i = 0; i < 12; i++) {
+        await userEvent.tab()
+        expect(dlg).toContainElement(document.activeElement as HTMLElement)
+      }
+      for (let i = 0; i < 12; i++) {
+        await userEvent.tab({ shift: true })
+        expect(dlg).toContainElement(document.activeElement as HTMLElement)
+      }
+      await userEvent.keyboard('{Escape}')
+      expect(within(g).queryByRole('dialog')).toBeNull()
+      expect(trigger).toHaveFocus()
+    })
+
+    it('Cancel also returns focus to the trigger', async () => {
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      const trigger = within(g).getByRole('button', { name: 'Refresh components' })
+      await userEvent.click(trigger)
+      await userEvent.click(within(g).getByRole('button', { name: 'Cancel' }))
+      expect(trigger).toHaveFocus()
+    })
+
+    it('when the active job ends, the poll refreshes the versions and re-enables Edit and Refresh', async () => {
+      const pending = version({ id: 'p4', number: 4, origin: 'Edit', role: 'Pending' })
+      listTemplateJobs.mockResolvedValue([job({ state: 'Sealing' })])
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await waitFor(() => expect(within(g).getByRole('button', { name: 'Edit' })).toBeDisabled())
+      const loads = listAdminTemplates.mock.calls.length
+      listTemplateJobs.mockResolvedValue([job({ state: 'Sealed', resultVersionNumber: 4 })])
+      listAdminTemplates.mockResolvedValue([base(), golden({ versions: [pending, v3, v2, v1] })])
+      await waitFor(() => expect(within(g).getByRole('button', { name: 'Edit' })).toBeEnabled(), { timeout: 8000 })
+      expect(listAdminTemplates.mock.calls.length).toBeGreaterThan(loads)
+      expect(within(g).getByRole('button', { name: 'Publish v4' })).toBeInTheDocument()
+      expect(within(g).getByRole('button', { name: 'Refresh components' })).toBeEnabled()
+    }, 15000)
+
+    it('Edit defaults to network None and publishing', async () => {
+      startTemplateEdit.mockResolvedValue(job())
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await userEvent.click(within(g).getByRole('button', { name: 'Edit' }))
+      await userEvent.click(within(g).getByRole('button', { name: 'Start edit' }))
+      expect(startTemplateEdit).toHaveBeenCalledWith('win11-golden', 'None', true)
+    })
+
+    it('Refresh components asks for confirmation and sends only the publish flag', async () => {
+      startTemplateRefresh.mockResolvedValue(job({ kind: 'Refresh', id: 'job-r' }))
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await userEvent.click(within(g).getByRole('button', { name: 'Refresh components' }))
+      const dlg = within(g).getByRole('dialog')
+      expect(within(dlg).queryByLabelText('None')).toBeNull()
+      expect(startTemplateRefresh).not.toHaveBeenCalled()
+      await userEvent.click(within(dlg).getByRole('button', { name: 'Start refresh' }))
+      expect(startTemplateRefresh).toHaveBeenCalledWith('win11-golden', true)
+      expect(await screen.findByTestId('where')).toHaveTextContent('/admin/template-jobs/job-r')
+    })
+
+    it('shows the server 409 reason inside the dialog and stays on the page', async () => {
+      startTemplateEdit.mockRejectedValue(new ApiError(409, { title: 'The base disk for v3 is missing.', status: 409 }))
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await userEvent.click(within(g).getByRole('button', { name: 'Edit' }))
+      await userEvent.click(within(g).getByRole('button', { name: 'Start edit' }))
+      expect(await within(g).findByRole('alert')).toHaveTextContent('The base disk for v3 is missing.')
+      expect(screen.queryByTestId('where')).toBeNull()
+    })
+
+    it('disables Edit and Refresh with the reason while a job is active, and links to it', async () => {
+      listTemplateJobs.mockImplementation(async (id: string) => (id === 'win11-golden' ? [job({ state: 'Preparing' })] : []))
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await waitFor(() => expect(within(g).getByRole('button', { name: 'Edit' })).toBeDisabled())
+      expect(within(g).getByRole('button', { name: 'Edit' })).toHaveAttribute('title', expect.stringMatching(/already preparing/i))
+      expect(within(g).getByRole('button', { name: 'Refresh components' })).toBeDisabled()
+      expect(within(g).getByRole('link', { name: 'Open the job' })).toHaveAttribute('href', '/admin/template-jobs/job-1')
+      const other = await region('Windows 11 26H2')
+      expect(within(other).getByRole('button', { name: 'Edit' })).toBeEnabled()
+    })
+
+    it('a finished job does not block Edit and Refresh; the Jobs list links each job', async () => {
+      listTemplateJobs.mockResolvedValue([job({ id: 'j2', state: 'Failed', failureReason: 'Verify failed.' }), job({ id: 'j1', state: 'Published', resultVersionNumber: 4 })])
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      const jobs = await within(g).findByRole('table', { name: 'Jobs' })
+      expect(within(jobs).getByText('Failed: Verify failed.')).toBeInTheDocument()
+      const links = within(jobs).getAllByRole('link')
+      expect(links[0]).toHaveAttribute('href', '/admin/template-jobs/j2')
+      expect(within(g).getByRole('button', { name: 'Edit' })).toBeEnabled()
+    })
+
+    it('a Pending version shows Publish and Discard; Publish calls the route and reloads', async () => {
+      const pending = version({ id: 'p4', number: 4, origin: 'Edit', role: 'Pending' })
+      listAdminTemplates.mockResolvedValue([golden({ versions: [pending, v3] })])
+      publishTemplateVersion.mockResolvedValue(golden())
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await userEvent.click(within(g).getByRole('button', { name: 'Publish v4' }))
+      expect(publishTemplateVersion).toHaveBeenCalledWith('win11-golden', 'p4')
+      await waitFor(() => expect(listAdminTemplates).toHaveBeenCalledTimes(2))
+      expect(within(g).queryByRole('button', { name: 'Publish v3' })).toBeNull()
+    })
+
+    it('Discard asks first and only then calls the route', async () => {
+      const pending = version({ id: 'p4', number: 4, role: 'Pending' })
+      listAdminTemplates.mockResolvedValue([golden({ versions: [pending, v3] })])
+      discardTemplateVersion.mockResolvedValue(undefined)
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true)
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await userEvent.click(within(g).getByRole('button', { name: 'Discard v4' }))
+      expect(discardTemplateVersion).not.toHaveBeenCalled()
+      await userEvent.click(within(g).getByRole('button', { name: 'Discard v4' }))
+      expect(confirm).toHaveBeenCalledTimes(2)
+      expect(discardTemplateVersion).toHaveBeenCalledWith('win11-golden', 'p4')
+    })
+
+    it('shows a 409 from Publish inline', async () => {
+      const pending = version({ id: 'p4', number: 4, role: 'Pending' })
+      listAdminTemplates.mockResolvedValue([golden({ versions: [pending, v3] })])
+      publishTemplateVersion.mockRejectedValue(new ApiError(409, { title: 'Only a held version can be published.', status: 409 }))
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await userEvent.click(within(g).getByRole('button', { name: 'Publish v4' }))
+      expect(await within(g).findByRole('alert')).toHaveTextContent('Only a held version can be published.')
+    })
+
+    it('shows no Publish or Discard on versions that are not Pending', async () => {
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      expect(within(g).queryByRole('button', { name: /^Publish v/ })).toBeNull()
+      expect(within(g).queryByRole('button', { name: /^Discard v/ })).toBeNull()
+    })
   })
 })

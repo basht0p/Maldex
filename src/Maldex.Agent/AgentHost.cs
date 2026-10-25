@@ -14,10 +14,35 @@ public sealed class AgentHost(Stream channel, IEventSource source, CommandDispat
 {
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
-    public static string Version { get; } =
-        typeof(AgentHost).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0]
-        ?? typeof(AgentHost).Assembly.GetName().Version?.ToString()
-        ?? "0.0.0";
+    public static string Version { get; } = AgentIdentity.VersionOf(
+        typeof(AgentHost).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+        ?? typeof(AgentHost).Assembly.GetName().Version?.ToString());
+
+    /// <summary>
+    /// <c>Version+</c> the first 12 lowercase hex characters of the SHA-256 of the running agent exe (e.g. <c>1.0.0+3fa9c1d2e4b5</c>),
+    /// computed once at startup. Identifies the exact build, which the version alone cannot.
+    /// </summary>
+    public static string BuildId { get; } = ComputeBuildId(Version, Environment.ProcessPath);
+
+    public static string ComputeBuildId(string version, string? exePath)
+    {
+        try
+        {
+            if (exePath is null) return Fallback(version, "no process path");
+            using var stream = File.OpenRead(exePath);
+            return AgentIdentity.BuildId(version, stream);
+        }
+        catch (Exception ex)
+        {
+            return Fallback(version, ex.Message);
+        }
+    }
+
+    private static string Fallback(string version, string reason)
+    {
+        try { AgentLog.Write("Build hash unavailable, using zeros: " + reason); } catch { }
+        return AgentIdentity.UnknownBuildId(version);
+    }
 
     public async Task RunAsync(CancellationToken ct)
     {

@@ -6,6 +6,10 @@ delete table inet maldex_guard
 table inet maldex_guard {
 	chain forward {
 		type filter hook forward priority -10; policy accept;
+		# Direct egress (template edit sessions): the per-lease table inet maldex_direct_<id> decides what mxu* uplinks may
+		# forward (only to the default-route interface); everything else on mx* stays dropped.
+		iifname "mxu*" oifname != "mx*" accept
+		oifname "mxu*" iifname != "mx*" ct state established,related accept
 		iifname "mx*" drop
 		oifname "mx*" drop
 	}

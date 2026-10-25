@@ -50,6 +50,8 @@ export interface TaskDto {
 
 export type TemplateVersionOrigin = 'IsoBuild' | 'Edit' | 'Refresh' | 'Imported'
 export type TemplateVersionStatus = 'Ready' | 'Retired' | 'Deleted'
+/** What a version is for the admin; the server derives it (retention by "was current before"). */
+export type TemplateVersionRole = 'Current' | 'Previous' | 'RollbackTarget' | 'Pending' | 'Retired' | 'Deleted'
 
 /** GET /api/templates: the enabled templates an analyst may pick. */
 export interface TemplateSummaryDto {
@@ -78,6 +80,7 @@ export interface TemplateVersionDto {
   number: number
   origin: TemplateVersionOrigin
   status: TemplateVersionStatus
+  role: TemplateVersionRole
   isCurrent: boolean
   diskPresent: boolean
   windowsEdition?: string | null
@@ -88,6 +91,26 @@ export interface TemplateVersionDto {
   sealedAt: string
   note?: string | null
   sizeBytes?: number | null
+}
+
+export type TemplateJobKind = 'Edit' | 'Refresh'
+export type TemplateJobNetwork = 'None' | 'Direct'
+export type TemplateJobState = 'Queued' | 'Preparing' | 'Configuring' | 'Sealing' | 'Verifying' | 'Published' | 'Sealed' | 'Failed' | 'Cancelled'
+
+/** An Edit or Refresh job (GET /api/admin/template-jobs/{id}, the `templateJob` hub event). `idleDeadline` is null outside Configuring. */
+export interface TemplateJobDto {
+  id: string
+  kind: TemplateJobKind
+  templateId: string
+  baseVersionNumber: number
+  resultVersionNumber?: number | null
+  network: TemplateJobNetwork
+  state: TemplateJobState
+  message?: string | null
+  failureReason?: string | null
+  createdAt: string
+  endedAt?: string | null
+  idleDeadline?: string | null
 }
 
 /** GET /api/admin/templates (Admin only). */

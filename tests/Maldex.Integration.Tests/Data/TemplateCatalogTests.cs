@@ -4,6 +4,7 @@ using Maldex.Data;
 using Maldex.Data.Templates;
 using Maldex.Integration.Tests.Fixtures;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.Options;
 using Xunit;
 using OrgEntity = Maldex.Core.Domain.Org;
@@ -53,8 +54,11 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         return (db, cs);
     }
 
-    private static TemplateCatalog Catalog(MaldexDbContext db, int keepPrevious = 1, ITemplateStore? store = null) =>
-        new(db, store ?? new RecordingStore(), Options.Create(new TemplateOptions { KeepPrevious = keepPrevious }), new FixedTime(Now));
+    private static TemplateCatalog Catalog(MaldexDbContext db, int keepPrevious = 1, ITemplateStore? store = null, DateTimeOffset? now = null) =>
+        new(db, store ?? new RecordingStore(), Options.Create(new TemplateOptions { KeepPrevious = keepPrevious }), new FixedTime(now ?? Now));
+
+    /// <summary>A moment before <see cref="Now"/>, <paramref name="hoursAgo"/> hours back: larger values are earlier.</summary>
+    private static DateTimeOffset Ago(int hoursAgo) => Now.AddHours(-hoursAgo);
 
     private sealed class FixedTime(DateTimeOffset now) : TimeProvider
     {
@@ -70,12 +74,13 @@ public class TemplateCatalogTests(SqlServerFixture sql)
     }
 
     private static async Task<TemplateVersion> AddVersionAsync(
-        MaldexDbContext db, string templateId, int number, TemplateVersionStatus status = TemplateVersionStatus.Ready, bool current = false)
+        MaldexDbContext db, string templateId, int number, TemplateVersionStatus status = TemplateVersionStatus.Ready, bool current = false,
+        DateTimeOffset? currentUntil = null)
     {
         var v = new TemplateVersion
         {
             Id = Guid.NewGuid(), TemplateId = templateId, Number = number, Origin = TemplateVersionOrigin.IsoBuild,
-            FileStem = Guid.NewGuid().ToString("N"), SealedAt = Now, Status = status,
+            FileStem = Guid.NewGuid().ToString("N"), SealedAt = Now, Status = status, CurrentUntil = currentUntil,
         };
         db.TemplateVersions.Add(v);
         await db.SaveChangesAsync(Ct);
@@ -284,9 +289,9 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         await using (db)
         {
             await AddTemplateAsync(db, "a");
-            await AddVersionAsync(db, "a", 1);
-            await AddVersionAsync(db, "a", 2);
-            await AddVersionAsync(db, "a", 3);
+            await AddVersionAsync(db, "a", 1, currentUntil: Ago(3));
+            await AddVersionAsync(db, "a", 2, currentUntil: Ago(2));
+            await AddVersionAsync(db, "a", 3, currentUntil: Ago(1));
             var v4 = await AddVersionAsync(db, "a", 4);
 
             await Catalog(db).PublishAsync("a", v4.Id, Ct);
@@ -307,8 +312,8 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         await using (db)
         {
             await AddTemplateAsync(db, "a");
-            await AddVersionAsync(db, "a", 1);
-            await AddVersionAsync(db, "a", 2);
+            await AddVersionAsync(db, "a", 1, currentUntil: Ago(2));
+            await AddVersionAsync(db, "a", 2, currentUntil: Ago(1));
             var v3 = await AddVersionAsync(db, "a", 3);
 
             await Catalog(db, keepPrevious: 0).PublishAsync("a", v3.Id, Ct);
@@ -345,7 +350,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         {
             await AddTemplateAsync(db, "a");
             await AddVersionAsync(db, "a", 1, TemplateVersionStatus.Retired);
-            var v2 = await AddVersionAsync(db, "a", 2);
+            var v2 = await AddVersionAsync(db, "a", 2, currentUntil: Ago(1));
             await AddVersionAsync(db, "a", 3, current: true);
 
             await Catalog(db).RollBackAsync("a", Ct);
@@ -353,7 +358,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
             Assert.Equal(v2.Id, await CurrentAsync(db, "a"));
             var s = await StatusesAsync(db, "a");
             Assert.Equal(TemplateVersionStatus.Ready, s[2]);
-            Assert.Equal(TemplateVersionStatus.Ready, s[3]);
+            Assert.Equal(TemplateVersionStatus.Retired, s[3]); // the version rolled back from is never kept
             Assert.Equal(TemplateVersionStatus.Retired, s[1]);
         }
     }
@@ -370,6 +375,186 @@ public class TemplateCatalogTests(SqlServerFixture sql)
             await Assert.ThrowsAsync<TemplateRuleException>(() => Catalog(db).RollBackAsync("a", Ct));
             Assert.Equal(v2.Id, await CurrentAsync(db, "a"));
         }
+    }
+
+
+    private static async Task<Dictionary<int, DateTimeOffset?>> CurrentUntilAsync(MaldexDbContext db, string templateId)
+    {
+        await using var fresh = new MaldexDbContext(new DbContextOptionsBuilder<MaldexDbContext>().UseSqlServer(db.Database.GetConnectionString()).Options);
+        return await fresh.TemplateVersions.Where(v => v.TemplateId == templateId).ToDictionaryAsync(v => v.Number, v => v.CurrentUntil, Ct);
+    }
+
+    // --- retention by "was current before" (basht0p, 2026-10-24) ---
+
+    [Fact]
+    public async Task Publish_OldCurrentBecomesPrevious()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            await AddVersionAsync(db, "a", 1, current: true);
+            var v2 = await AddVersionAsync(db, "a", 2);
+
+            await Catalog(db).PublishAsync("a", v2.Id, Ct);
+
+            Assert.Equal(v2.Id, await CurrentAsync(db, "a"));
+            var until = await CurrentUntilAsync(db, "a");
+            Assert.Equal(Now, until[1]);
+            Assert.Null(until[2]);
+            Assert.Equal(TemplateVersionStatus.Ready, (await StatusesAsync(db, "a"))[1]);
+        }
+    }
+
+    [Fact]
+    public async Task RollBack_RetiresTheVersionRolledBackFrom()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            var v1 = await AddVersionAsync(db, "a", 1, currentUntil: Ago(1));
+            await AddVersionAsync(db, "a", 2, current: true);
+
+            var result = await Catalog(db).RollBackAsync("a", Ct);
+
+            Assert.Equal(new RollBackResult(2, 1), result);
+            Assert.Equal(v1.Id, await CurrentAsync(db, "a"));
+            Assert.Equal(TemplateVersionStatus.Retired, (await StatusesAsync(db, "a"))[2]);
+            Assert.Equal(Now, (await CurrentUntilAsync(db, "a"))[2]);
+        }
+    }
+
+    [Fact]
+    public async Task RollBack_TargetIsTheMostRecentlyCurrent_NotTheHighestNumber()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            await AddVersionAsync(db, "a", 1, current: true);
+            var v2 = await AddVersionAsync(db, "a", 2);
+            var v3 = await AddVersionAsync(db, "a", 3);
+            var v4 = await AddVersionAsync(db, "a", 4);
+            await Catalog(db, now: Ago(30)).PublishAsync("a", v2.Id, Ct);
+            await Catalog(db, now: Ago(20)).PublishAsync("a", v3.Id, Ct); // history v1 -> v2 -> v3 (KeepPrevious 1 retired v1)
+
+            await Catalog(db, now: Ago(10)).RollBackAsync("a", Ct); // from v3: the target is v2, not a higher number
+
+            Assert.Equal(v2.Id, await CurrentAsync(db, "a"));
+            var s = await StatusesAsync(db, "a");
+            Assert.Equal(TemplateVersionStatus.Retired, s[3]);
+            Assert.Equal(TemplateVersionStatus.Ready, s[4]); // never current: pending, untouched
+
+            await Catalog(db, now: Ago(5)).PublishAsync("a", v4.Id, Ct);
+
+            s = await StatusesAsync(db, "a");
+            Assert.Equal(TemplateVersionStatus.Ready, s[2]); // v2 was current before v4: it is the previous version
+            Assert.Equal(TemplateVersionStatus.Retired, s[3]);
+        }
+    }
+
+    [Fact]
+    public async Task Publish_PendingVersionsAreNotRetired()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            await AddVersionAsync(db, "a", 1, current: true);
+            var v2 = await AddVersionAsync(db, "a", 2);
+            await AddVersionAsync(db, "a", 3); // sealed, never published
+            await AddVersionAsync(db, "a", 4); // sealed, never published
+
+            await Catalog(db, keepPrevious: 0).PublishAsync("a", v2.Id, Ct);
+
+            var s = await StatusesAsync(db, "a");
+            Assert.Equal(TemplateVersionStatus.Retired, s[1]); // KeepPrevious 0: the old current goes
+            Assert.Equal(TemplateVersionStatus.Ready, s[3]);
+            Assert.Equal(TemplateVersionStatus.Ready, s[4]);
+        }
+    }
+
+    [Fact]
+    public async Task Publish_PendingVersionsDoNotCountTowardKeepPrevious()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            await AddVersionAsync(db, "a", 1, current: true);
+            var v2 = await AddVersionAsync(db, "a", 2);
+            await AddVersionAsync(db, "a", 3);
+
+            await Catalog(db).PublishAsync("a", v2.Id, Ct);
+
+            var s = await StatusesAsync(db, "a");
+            Assert.Equal(TemplateVersionStatus.Ready, s[1]);
+            Assert.Equal(TemplateVersionStatus.Ready, s[3]);
+        }
+    }
+
+    [Fact]
+    public async Task RollBack_PendingVersionIsNotATarget()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            var v1 = await AddVersionAsync(db, "a", 1, current: true);
+            await AddVersionAsync(db, "a", 2); // never current
+
+            await Assert.ThrowsAsync<TemplateRuleException>(() => Catalog(db).RollBackAsync("a", Ct));
+            Assert.Equal(v1.Id, await CurrentAsync(db, "a"));
+        }
+    }
+
+    [Fact]
+    public async Task RollBack_Twice_NeverReturnsToTheBadVersion()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            await AddVersionAsync(db, "a", 1, current: true);
+            var v2 = await AddVersionAsync(db, "a", 2);
+            await Catalog(db, keepPrevious: 2, now: Ago(20)).PublishAsync("a", v2.Id, Ct); // v1 previous, v2 current
+            var v3 = await AddVersionAsync(db, "a", 3);
+            await Catalog(db, keepPrevious: 2, now: Ago(10)).PublishAsync("a", v3.Id, Ct); // v3 current, v2 then v1 previous
+
+            await Catalog(db, keepPrevious: 2, now: Ago(5)).RollBackAsync("a", Ct); // v3 is bad: back to v2
+            Assert.Equal(v2.Id, await CurrentAsync(db, "a"));
+            await Catalog(db, keepPrevious: 2, now: Ago(4)).RollBackAsync("a", Ct); // v2 is bad too: back to v1, never to v3
+
+            var s = await StatusesAsync(db, "a");
+            Assert.Equal(TemplateVersionStatus.Ready, s[1]);
+            Assert.Equal(TemplateVersionStatus.Retired, s[2]);
+            Assert.Equal(TemplateVersionStatus.Retired, s[3]);
+            await Assert.ThrowsAsync<TemplateRuleException>(() => Catalog(db, keepPrevious: 2).RollBackAsync("a", Ct));
+        }
+    }
+
+    [Fact]
+    public async Task Migration_BackfillsCurrentUntilOfNonCurrentReadyVersions()
+    {
+        var cs = sql.CreateDatabaseConnectionString();
+        await using var db = sql.CreateContext(cs);
+        var migrator = db.GetService<Microsoft.EntityFrameworkCore.Migrations.IMigrator>();
+        await migrator.MigrateAsync("20261024060433_TemplateVersionFileStemUnique", cancellationToken: Ct);
+        var sealedAt = Now.AddDays(-3);
+        await db.Database.ExecuteSqlRawAsync("INSERT INTO Templates (Id, DisplayName, IsDefault, Enabled, CreatedAt) VALUES ('a', 'A', 0, 1, {0})", [Now], Ct);
+        foreach (var (n, status) in new[] { (1, "Ready"), (2, "Retired"), (3, "Ready") })
+            await db.Database.ExecuteSqlRawAsync(
+                "INSERT INTO TemplateVersions (Id, TemplateId, Number, Origin, FileStem, SourceMediaIds, SealedAt, Status) VALUES ({0}, 'a', {1}, 'IsoBuild', {2}, '[]', {3}, {4})",
+                [Guid.NewGuid(), n, "stem" + n, sealedAt, status], Ct);
+        await db.Database.ExecuteSqlRawAsync("UPDATE Templates SET CurrentVersionId = (SELECT Id FROM TemplateVersions WHERE Number = 3) WHERE Id = 'a'", [], Ct);
+
+        await db.Database.MigrateAsync(Ct);
+
+        var until = await CurrentUntilAsync(db, "a");
+        Assert.Equal(sealedAt, until[1]); // non-current Ready: was current before
+        Assert.Null(until[2]);            // Retired: untouched
+        Assert.Null(until[3]);            // current
     }
 
     // --- default / enabled ---
@@ -578,6 +763,60 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         }
     }
 
+    private static async Task SeedJobAsync(MaldexDbContext db, string templateId, Guid baseVersionId, TemplateJobState state)
+    {
+        db.TemplateJobs.Add(new TemplateJob
+        {
+            Id = Guid.NewGuid(), Kind = TemplateJobKind.Refresh, TemplateId = templateId, BaseVersionId = baseVersionId, State = state,
+            RequestedByUserId = await AddUserAsync(db), CreatedAt = Now,
+        });
+        await db.SaveChangesAsync(Ct);
+    }
+
+    [Theory]
+    [InlineData(TemplateJobState.Queued)]
+    [InlineData(TemplateJobState.Preparing)]
+    [InlineData(TemplateJobState.Configuring)]
+    [InlineData(TemplateJobState.Sealing)]
+    [InlineData(TemplateJobState.Verifying)]
+    public async Task Sweep_KeepsRetiredVersion_ThatIsTheBaseOfAnActiveJob(TemplateJobState state)
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            var retired = await AddVersionAsync(db, "a", 1, TemplateVersionStatus.Retired);
+            await SeedJobAsync(db, "a", retired.Id, state);
+            var store = new RecordingStore();
+
+            Assert.Empty(await Catalog(db, store: store).SweepAsync(Ct));
+
+            Assert.Empty(store.Deleted);
+            Assert.Equal(TemplateVersionStatus.Retired, (await StatusesAsync(db, "a"))[1]);
+        }
+    }
+
+    [Theory]
+    [InlineData(TemplateJobState.Published)]
+    [InlineData(TemplateJobState.Sealed)]
+    [InlineData(TemplateJobState.Failed)]
+    [InlineData(TemplateJobState.Cancelled)]
+    public async Task Sweep_EndedJob_DoesNotKeepItsRetiredBaseVersion(TemplateJobState state)
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            var retired = await AddVersionAsync(db, "a", 1, TemplateVersionStatus.Retired);
+            await SeedJobAsync(db, "a", retired.Id, state);
+            var store = new RecordingStore();
+
+            Assert.Single(await Catalog(db, store: store).SweepAsync(Ct));
+
+            Assert.Equal([retired.FileStem], store.Deleted);
+        }
+    }
+
     // --- audit ---
 
     /// <summary>Fails any save that carries an audit row, as a failing audit write would.</summary>
@@ -611,7 +850,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
     private static async Task<TemplateVersion> SeedAuditCaseAsync(MaldexDbContext db)
     {
         await AddTemplateAsync(db, "a", isDefault: true);
-        var a1 = await AddVersionAsync(db, "a", 1);
+        var a1 = await AddVersionAsync(db, "a", 1, currentUntil: Ago(1));
         await AddVersionAsync(db, "a", 2, current: true);
         await AddTemplateAsync(db, "b");
         await AddVersionAsync(db, "b", 1, current: true);

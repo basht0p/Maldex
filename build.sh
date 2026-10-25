@@ -173,6 +173,9 @@ VM_DIR=".data/vm"
 GUARD_SRC="deploy/host/maldex-host-guard.nft"
 GUARD_DST="/etc/maldex/maldex-host-guard.nft"
 GUARD_UNIT="/etc/systemd/system/maldex-host-guard.service"
+DOCKER_USER_SRC="deploy/host/maldex-docker-user.sh"
+DOCKER_USER_DST="/etc/maldex/maldex-docker-user.sh"
+DOCKER_USER_UNIT="/etc/systemd/system/maldex-docker-user.service"
 
 # Verify file $1 against SHA-256 $2; on mismatch delete it and fail loudly.
 verify_sha256() {
@@ -221,6 +224,50 @@ UNIT
   sudo systemctl restart maldex-host-guard.service
 }
 
+# True when Docker's systemd unit exists on this host.
+docker_installed() { systemctl cat docker.service >/dev/null 2>&1; }
+
+# Direct egress (template edit sessions) needs a narrow exception in Docker's DOCKER-USER chain (Docker's FORWARD policy is DROP):
+# exactly two rules for the default-route interface, tagged maldex-direct (see deploy/host/maldex-docker-user.sh). Re-applied at
+# every docker.service start; nothing else in Docker's chains, tables or settings is touched. (Approved by basht0p, 2026-10-24.)
+install_direct_docker_exception() {
+  if ! docker_installed; then
+    echo "skip Direct egress DOCKER-USER exception: Docker is not installed (the FORWARD drop it works around only exists with Docker)"
+    return 0
+  fi
+  sudo install -d -m 0755 /etc/maldex
+  sudo install -m 0755 "$DOCKER_USER_SRC" "$DOCKER_USER_DST"
+  sudo tee "$DOCKER_USER_UNIT" >/dev/null <<UNIT
+[Unit]
+Description=Maldex Direct egress exception in Docker's DOCKER-USER chain
+Documentation=file://$DOCKER_USER_DST
+Wants=network-online.target
+After=docker.service network-online.target
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$DOCKER_USER_DST
+ExecStop=$DOCKER_USER_DST stop
+
+[Install]
+WantedBy=docker.service multi-user.target
+UNIT
+  sudo systemctl daemon-reload
+  sudo systemctl enable maldex-docker-user.service
+  sudo systemctl restart maldex-docker-user.service
+}
+
+# True when both maldex-direct rules exist in DOCKER-USER for the current default-route interface.
+direct_docker_exception_present() {
+  local i
+  i=$(ip -4 -o route show default | awk '{for (k = 1; k < NF; k++) if ($k == "dev") { print $(k + 1); exit }}')
+  [ -n "$i" ] || return 1
+  sudo -n iptables -C DOCKER-USER -i 'mxu+' -o "$i" -m comment --comment maldex-direct -j ACCEPT \
+    && sudo -n iptables -C DOCKER-USER -i "$i" -o 'mxu+' -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment maldex-direct -j ACCEPT
+}
+
 # Dedicated, powerless account for the per-run mitmproxy: own group, no supplementary groups, no home, no shell, no sudoers.
 ensure_mitm_user() {
   if ! id maldex-mitm >/dev/null 2>&1; then
@@ -259,6 +306,28 @@ ensure_mitm_ca() {
   [ -f "$MITM_CA_DIR/mitmproxy-ca.pem" ] && [ -f "$MITM_CA_DIR/mitmproxy-ca-cert.pem" ]
 }
 
+# libguestfs's fixed appliance (LIBGUESTFS_PATH): the guest disk editor writes the current agent into a template working copy with
+# guestfish as the app's own user. Ubuntu's 0600 /boot/vmlinuz-* stops supermin from building an appliance for a non-root user, so
+# one is built once as root into a world-readable directory. The stamp records the libguestfs version it was built from.
+GUESTFS_APPLIANCE_DIR="/var/lib/maldex/guestfs-appliance"
+guestfs_version() { dpkg-query -W -f='${Version}' libguestfs-tools; }
+ensure_guestfs_appliance() {
+  local want; want="$(guestfs_version)"
+  if [ -f "$GUESTFS_APPLIANCE_DIR/maldex-libguestfs-version" ] && [ "$(cat "$GUESTFS_APPLIANCE_DIR/maldex-libguestfs-version")" = "$want" ] \
+     && [ -f "$GUESTFS_APPLIANCE_DIR/kernel" ] && [ -f "$GUESTFS_APPLIANCE_DIR/initrd" ] && [ -f "$GUESTFS_APPLIANCE_DIR/root" ]; then
+    return 0
+  fi
+  local fresh="$GUESTFS_APPLIANCE_DIR.new"
+  sudo rm -rf "$fresh"
+  sudo mkdir -p "$(dirname "$GUESTFS_APPLIANCE_DIR")"
+  sudo libguestfs-make-fixed-appliance "$fresh"
+  echo "$want" | sudo tee "$fresh/maldex-libguestfs-version" >/dev/null
+  sudo chown -R root:root "$fresh"
+  sudo chmod -R a+rX,go-w "$fresh"
+  sudo rm -rf "$GUESTFS_APPLIANCE_DIR"
+  sudo mv "$fresh" "$GUESTFS_APPLIANCE_DIR"
+}
+
 # INetSim's template data is only ever read (as root) and copied per run, so it must be root-owned, not writable by others
 # and free of symlinks; the guest-facing INetSim user gets only fresh per-run leaf directories.
 harden_inetsim_template() {
@@ -288,7 +357,8 @@ cmd_real_setup() {
   local me="${SUDO_USER:-$(id -un)}"
   sudo apt-get update -qq
   sudo apt-get install -y qemu-system-x86 qemu-utils libvirt-daemon libvirt-clients virtinst ovmf swtpm swtpm-tools \
-    dnsmasq-base nftables tcpdump suricata inetsim wireguard-tools xorriso libxml2-utils socat genisoimage wimtools
+    dnsmasq-base nftables tcpdump suricata inetsim wireguard-tools xorriso libxml2-utils socat genisoimage wimtools \
+    libguestfs-tools
 
   if ! command -v pwsh >/dev/null 2>&1; then
     sudo snap install powershell --classic   # script parse checks only
@@ -326,11 +396,13 @@ cmd_real_setup() {
   disable_system_unit suricata
 
   install_host_guard
+  install_direct_docker_exception
   ensure_mitm_user
   ensure_dns_user
   ensure_inetsim_userns_ids
   ensure_mitm_ca
   harden_inetsim_template
+  ensure_guestfs_appliance
 
   real_verify
 }
@@ -378,6 +450,14 @@ real_verify() {
   real_check "mitmproxy CA present (.data/mitm/ca)" "./build.sh real-setup" \
     bash -c "[ -f $MITM_CA_DIR/mitmproxy-ca.pem ] && [ -f $MITM_CA_DIR/mitmproxy-ca-cert.pem ]"
   real_check "/var/lib/inetsim is root-owned, not group/world-writable, symlink-free" "./build.sh real-setup" inetsim_template_clean
+  if docker_installed; then
+    real_check "Direct egress exception in DOCKER-USER (both maldex-direct rules, current default interface)" "./build.sh real-setup" direct_docker_exception_present
+    real_check "Direct egress exception enabled at boot (maldex-docker-user)" "./build.sh real-setup" systemctl is-enabled maldex-docker-user
+  else
+    echo "skip Direct egress DOCKER-USER exception checks (Docker is not installed; no FORWARD drop to work around)"
+  fi
+  real_check "guest disk editor (libguestfs appliance)" "./build.sh real-setup" \
+    env LIBGUESTFS_BACKEND=direct "LIBGUESTFS_PATH=$GUESTFS_APPLIANCE_DIR" libguestfs-test-tool
   real_check "host guard enabled at boot" "./build.sh real-setup" systemctl is-enabled maldex-host-guard
   return "$REAL_FAILED"
 }
@@ -436,6 +516,18 @@ cmd_real_smoke() {
 SYSMON_URL="https://download.sysinternals.com/files/Sysmon.zip"
 SYSMON_SHA256="00ecf1b46aec99299d3ae0bca79dc621458bd014b20b509d7c5c8e8c8611aa54"
 
+# Publishes the guest agent (self-contained single-file win-x64) to .data/agent/Maldex.Agent.exe. Used by build-guest and by template sealing.
+cmd_agent() {
+  dotnet publish src/Maldex.Agent -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o "$PWD/.data/agent" --nologo -v q
+  [ -f .data/agent/Maldex.Agent.exe ] || { echo "Agent publish did not produce Maldex.Agent.exe" >&2; return 1; }
+  # The agent reports "<version>+<12 hex of its exe>"; the hash half the host computes from the exe, the version half is
+  # recorded here from the same project properties the exe was just compiled with (a Windows exe's file version is the .NET host's).
+  local version
+  version="$(dotnet msbuild src/Maldex.Agent -getProperty:Version -p:Configuration=Release -p:RuntimeIdentifier=win-x64 --nologo | head -n 1 | cut -d+ -f1 | tr -d '[:space:]')"
+  [ -n "$version" ] || { echo "Could not read the agent version" >&2; return 1; }
+  printf '%s\n' "$version" > .data/agent/Maldex.Agent.version
+}
+
 cmd_build_guest() {
   if [ -z "${MALDEX_WIN_ISO:-}" ] || [ ! -f "${MALDEX_WIN_ISO:-}" ]; then
     echo "MALDEX_WIN_ISO must point to a Windows 11 x64 Enterprise (evaluation) ISO (got: '${MALDEX_WIN_ISO:-}')." >&2
@@ -447,30 +539,153 @@ cmd_build_guest() {
     deploy/guest/build-guest.sh
 }
 
-# Harmless real-VM end-to-end suite (needs the built guest image; see deploy/guest/README.md "Running the E2E suite").
-cmd_e2e() {
+# The code a real template E2E (./build.sh e2e-templates) exercises. When any of it changed since the commit recorded in
+# $TEMPLATE_E2E_STAMP, ./build.sh e2e points at e2e-templates. The one list for both the notice and the stamp.
+TEMPLATE_E2E_PATHS=(
+  src/Maldex.Orchestrator/Templates/
+  src/Maldex.Orchestrator/VmSlotGate.cs
+  src/Maldex.Orchestrator/Reconciler.cs
+  src/Maldex.Agent/
+  src/Maldex.Core/Agent/
+  'src/Maldex.Core/Domain/TemplateJob*'
+  'src/Maldex.Core/Lifecycle/TemplateJob*'
+  src/Maldex.Data/Templates/
+  src/Maldex.Data/VmSlots.cs
+  src/Maldex.Infrastructure/Libvirt/
+  src/Maldex.Infrastructure/Agent/
+  src/Maldex.Infrastructure/Net/
+  src/Maldex.Infrastructure/Isolation/
+  src/Maldex.Web/Endpoints/TemplateEndpoints.cs
+  src/Maldex.Web/Endpoints/GuacamoleTunnelEndpoint.cs
+  deploy/guest/provision/sysmon-config.xml
+  deploy/host/
+  src/Maldex.Orchestrator/SelfTestGate.cs
+  src/Maldex.Orchestrator/TransferInbox.cs
+  src/Maldex.Orchestrator/DependencyInjection.cs
+  src/Maldex.Core/Abstractions/
+  src/Maldex.Infrastructure/Execution/
+  src/Maldex.Infrastructure/Real/
+  src/Maldex.Infrastructure/DependencyInjection.cs
+  src/Maldex.Web/Templates/TemplateProvenance.cs
+  tests/Maldex.Integration.Tests/E2E/RealTemplateJobTests.cs
+  tests/Maldex.Integration.Tests/E2E/RealGuestDiskEditorTests.cs
+  tests/Maldex.Integration.Tests/E2E/RealVmE2ETests.cs
+  tests/Maldex.Integration.Tests/E2E/ProvenanceRoundTrips.cs
+)
+TEMPLATE_E2E_STAMP=".data/e2e-templates.validated"
+
+# Exit 0 when a real template E2E is due (the reason and the changed files go to stdout), 1 when the stamp covers HEAD: the stamp
+# names a commit that is an ancestor of HEAD, nothing under TEMPLATE_E2E_PATHS changed since it, and nothing there is uncommitted.
+template_e2e_check() {
+  local sha="" changed
+  [ -f "$TEMPLATE_E2E_STAMP" ] || { echo "no validated template E2E run is recorded ($TEMPLATE_E2E_STAMP)"; return 0; }
+  sha="$(tr -d '[:space:]' < "$TEMPLATE_E2E_STAMP")"
+  if [ -z "$sha" ] || ! git cat-file -e "$sha^{commit}" 2>/dev/null || ! git merge-base --is-ancestor "$sha" HEAD 2>/dev/null; then
+    echo "the commit recorded in $TEMPLATE_E2E_STAMP ('${sha:-empty}') is not an ancestor of HEAD"
+    return 0
+  fi
+  local due=1
+  changed="$(git diff --name-only "$sha" HEAD -- "${TEMPLATE_E2E_PATHS[@]}")"
+  if [ -n "$changed" ]; then
+    echo "changed since the last validated template E2E ($sha):"
+    printf '%s\n' "$changed" | sed 's/^/  /'
+    due=0
+  fi
+  # Uncommitted or untracked files under the watched paths (porcelain: "XY path").
+  changed="$(git status --porcelain --untracked-files=all -- "${TEMPLATE_E2E_PATHS[@]}" | cut -c4-)"
+  if [ -n "$changed" ]; then
+    echo "uncommitted changes in template-affecting paths:"
+    printf '%s\n' "$changed" | sed 's/^/  /'
+    due=0
+  fi
+  return "$due"
+}
+
+# The end of ./build.sh e2e: say when the real template E2E is due; ask only on a terminal (default No).
+template_e2e_gate_notice() {
+  local out answer
+  out="$(template_e2e_check)" || return 0
+  echo
+  echo "NOTE: the real template E2E (RealTemplateJobTests, RealGuestDiskEditorTests) is due; plain e2e does not run it."
+  printf '%s\n' "$out"
+  echo "Run it with: ./build.sh e2e-templates"
+  if [ -t 0 ] && [ -t 1 ]; then
+    read -r -p "run ./build.sh e2e-templates now? [y/N] " answer || answer=""
+    case "$answer" in y|Y|yes|YES) cmd_e2e_templates ;; esac
+  fi
+  return 0
+}
+
+require_base_image() {
   local base="$VM_DIR/base"
   if [ ! -f "$base/win11-26h2.qcow2" ] || [ ! -f "$base/win11-26h2.vars.fd" ]; then
     echo "The Windows 11 26H2 base image is missing ($base/win11-26h2.qcow2 and .vars.fd)." >&2
     echo "Build it first:  MALDEX_WIN_ISO=/path/to/Win11_26H2.iso ./build.sh build-guest" >&2
     return 2
   fi
-  MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 dotnet test --project tests/Maldex.Integration.Tests --filter-class "*RealVmE2ETests"
 }
 
-case "${1:-}" in
-  setup)  cmd_setup ;;
-  dev-db) cmd_dev_db ;;
-  test)   cmd_test ;;
-  run)    cmd_run ;;
-  smoke)  cmd_smoke ;;
-  build)  cmd_build ;;
-  real-setup) cmd_real_setup ;;
-  real-smoke) cmd_real_smoke ;;
-  build-guest) cmd_build_guest ;;
-  prepare-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" deploy/guest/prepare-guest.sh prepare ;;
-  finalize-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" deploy/guest/prepare-guest.sh finalize ;;
-  discard-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" deploy/guest/prepare-guest.sh discard ;;
-  e2e)    cmd_e2e ;;
-  *) echo "usage: $0 setup|dev-db|run|test|smoke|build|real-setup|real-smoke|build-guest|prepare-guest|finalize-guest|discard-guest|e2e" >&2; exit 64 ;;
-esac
+# Harmless real-VM end-to-end suite (needs the built guest image; see deploy/guest/README.md "Running the E2E suite").
+cmd_e2e() {
+  require_base_image || return $?
+  local rc=0
+  MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 dotnet test --project tests/Maldex.Integration.Tests --filter-class "*RealVmE2ETests" || rc=$?
+  template_e2e_gate_notice
+  return "$rc"
+}
+
+# The real template-job E2E (Refresh, Edit with Direct network, Roll back, guest disk editor): up to about two hours, so it runs
+# only when affecting code changed. A full green run records HEAD in $TEMPLATE_E2E_STAMP. Optional $1: one test (method-name part).
+cmd_e2e_templates() {
+  local filter="${1:-}" log rc=0 head dirty
+  require_base_image || return $?
+  case "$filter" in *[!A-Za-z0-9_.*]*) echo "e2e-templates: the filter may contain only letters, digits, _ . and *" >&2; return 64 ;; esac
+  if [ ! -f .data/agent/Maldex.Agent.exe ] || [ ! -f .data/agent/Maldex.Agent.version ]; then
+    echo "The guest agent build is missing; running ./build.sh agent first."
+    cmd_agent
+  fi
+  local args=(--project tests/Maldex.Integration.Tests --filter-class "*RealTemplateJobTests" --filter-class "*RealGuestDiskEditorTests")
+  [ -z "$filter" ] || args+=(--filter-method "*$filter*")
+  log="$(mktemp)"
+  MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 MALDEX_REAL_TEMPLATES=1 dotnet test "${args[@]}" 2>&1 | tee "$log" || rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$log"; return "$rc"; fi
+  if [ -n "$filter" ]; then
+    rm -f "$log"; echo "Filtered run passed; $TEMPLATE_E2E_STAMP not updated (only a full run validates)."; return 0
+  fi
+  if ! grep -Eq '^[[:space:]]*skipped: 0[[:space:]]*$' "$log" || grep -Eq '^[[:space:]]*total: 0[[:space:]]*$' "$log"; then
+    rm -f "$log"; echo "Some template E2E tests were skipped or none ran; $TEMPLATE_E2E_STAMP not updated." >&2; return 1
+  fi
+  rm -f "$log"
+  dirty="$(git status --porcelain --untracked-files=all -- "${TEMPLATE_E2E_PATHS[@]}")"
+  if [ -n "$dirty" ]; then
+    echo "Green, but $TEMPLATE_E2E_STAMP not updated: uncommitted changes in template-affecting paths (commit them and run again):" >&2
+    printf '%s\n' "$dirty" >&2
+    return 0
+  fi
+  head="$(git rev-parse HEAD)"
+  mkdir -p "$(dirname "$TEMPLATE_E2E_STAMP")"
+  printf '%s\n' "$head" > "$TEMPLATE_E2E_STAMP"
+  echo "Template E2E validated at $head ($TEMPLATE_E2E_STAMP)."
+}
+
+# Sourced by the gate tests (tests/Maldex.Core.Tests/Build); only dispatch when executed.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-}" in
+    setup)  cmd_setup ;;
+    dev-db) cmd_dev_db ;;
+    test)   cmd_test ;;
+    run)    cmd_run ;;
+    smoke)  cmd_smoke ;;
+    build)  cmd_build ;;
+    real-setup) cmd_real_setup ;;
+    real-smoke) cmd_real_smoke ;;
+    agent) cmd_agent ;;
+    build-guest) cmd_build_guest ;;
+    prepare-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" deploy/guest/prepare-guest.sh prepare ;;
+    finalize-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" deploy/guest/prepare-guest.sh finalize ;;
+    discard-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" deploy/guest/prepare-guest.sh discard ;;
+    e2e)    cmd_e2e ;;
+    e2e-templates) cmd_e2e_templates "${2:-}" ;;
+    *) echo "usage: $0 setup|dev-db|run|test|smoke|build|agent|real-setup|real-smoke|build-guest|prepare-guest|finalize-guest|discard-guest|e2e|e2e-templates [test-filter]" >&2; exit 64 ;;
+  esac
+fi

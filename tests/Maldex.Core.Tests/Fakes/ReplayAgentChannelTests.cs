@@ -235,6 +235,117 @@ public sealed class ReplayAgentChannelTests : IDisposable
     }
 
     [Fact]
+    public async Task Provenance_IsAnsweredFromFakeGuest()
+    {
+        var guest = new FakeGuest { ProvenanceEdition = "Windows 10 Enterprise", ProvenanceBuild = "19045.5", ProvenanceOfficePresent = true, ProvenanceRealTimeProtection = true };
+        await using var ch = new ReplayAgentChannel([], 1.0, holdOpen: true, _time, guest, Vm.TaskId);
+        await ch.SendAsync(new ProvenanceCommand("p1"), TestContext.Current.CancellationToken);
+        var got = new List<AgentMessage>();
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cts.CancelAfter(Timeout);
+        await foreach (var m in ch.ReadAsync(cts.Token))
+        {
+            got.Add(m);
+            if (m is CommandResultMessage) break;
+        }
+        Assert.Equal(new ProvenanceMessage("p1", "Windows 10 Enterprise", "19045.5", "0.1.0-fake+000000000000", true, true), got[0]);
+        Assert.Equal(new CommandResultMessage("p1", true), got[1]);
+    }
+
+    private async Task<List<AgentMessage>> ReadUntilEndAsync(IAgentChannel ch)
+    {
+        var got = new List<AgentMessage>();
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cts.CancelAfter(Timeout);
+        await foreach (var m in ch.ReadAsync(cts.Token)) got.Add(m);
+        return got;
+    }
+
+    [Fact]
+    public async Task ApplyComponents_IsRecordedAndAcknowledged()
+    {
+        var guest = new FakeGuest();
+        await using var ch = new ReplayAgentChannel([], 1.0, holdOpen: true, _time, guest, Vm.TaskId);
+        await ch.SendAsync(new ApplyComponentsCommand("a1", "components/agent/h1", "components/sysmon/h2", "components/ca/h3"), TestContext.Current.CancellationToken);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cts.CancelAfter(Timeout);
+        await foreach (var m in ch.ReadAsync(cts.Token))
+        {
+            Assert.Equal(new CommandResultMessage("a1", true), m);
+            break;
+        }
+        Assert.Equal(["components/agent/h1", "components/sysmon/h2", "components/ca/h3"], guest.AppliedComponentIds);
+    }
+
+    [Fact]
+    public async Task ApplyComponents_CanBeRefusedByTheFakeGuest()
+    {
+        var guest = new FakeGuest { RejectApplyComponents = true };
+        await using var ch = new ReplayAgentChannel([], 1.0, holdOpen: true, _time, guest, Vm.TaskId);
+        await ch.SendAsync(new ApplyComponentsCommand("a1", "components/a", "components/b", "components/c"), TestContext.Current.CancellationToken);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cts.CancelAfter(Timeout);
+        await foreach (var m in ch.ReadAsync(cts.Token))
+        {
+            var r = Assert.IsType<CommandResultMessage>(m);
+            Assert.False(r.Success);
+            break;
+        }
+        Assert.Empty(guest.AppliedComponentIds);
+    }
+
+    [Fact]
+    public async Task PowerOff_AcksThenClosesTheChannel_AndTellsTheGuestHook()
+    {
+        var guest = new FakeGuest();
+        var poweredOff = new List<Guid>();
+        guest.PoweredOff += poweredOff.Add;
+        await using var ch = new ReplayAgentChannel([], 1.0, holdOpen: true, _time, guest, Vm.TaskId);
+        await ch.SendAsync(new PowerOffCommand("p1"), TestContext.Current.CancellationToken);
+
+        var got = await ReadUntilEndAsync(ch); // the stream ends by itself even though the replay holds it open
+
+        Assert.Equal(new CommandResultMessage("p1", true), Assert.Single(got));
+        Assert.Equal([Vm.TaskId], poweredOff);
+    }
+
+    [Fact]
+    public async Task PowerOff_WithoutAFakeGuest_IsIgnored()
+    {
+        await using var ch = new ReplayAgentChannel([], 1.0, holdOpen: true, _time);
+        await ch.SendAsync(new PowerOffCommand("p1"), TestContext.Current.CancellationToken);
+        Assert.Single(ch.SentCommands);
+    }
+
+    [Fact]
+    public async Task FakeHypervisor_ReportsTheVmStopped_AfterTheGuestPowersOff()
+    {
+        var guest = new FakeGuest();
+        var hv = new FakeHypervisor(Options.Create(new FakeHypervisorOptions()), guest);
+        var other = await hv.StartAsync(new VmSpec(Guid.NewGuid(), "t", 1024, 1, "net"), TestContext.Current.CancellationToken);
+        var vm = await hv.StartAsync(new VmSpec(Guid.NewGuid(), "t", 1024, 1, "net"), TestContext.Current.CancellationToken);
+        await using var ch = new ReplayAgentChannel([], 1.0, holdOpen: true, _time, guest, vm.TaskId);
+        Assert.Equal(2, (await hv.ListAsync(TestContext.Current.CancellationToken)).Count);
+
+        await ch.SendAsync(new PowerOffCommand("p1"), TestContext.Current.CancellationToken);
+
+        // Like libvirt: not running any more, but still listed until it is destroyed.
+        Assert.False(await hv.IsRunningAsync(vm, TestContext.Current.CancellationToken));
+        Assert.True(await hv.IsRunningAsync(other, TestContext.Current.CancellationToken));
+        Assert.Equal(2, (await hv.ListAsync(TestContext.Current.CancellationToken)).Count);
+        await hv.DestroyAsync(vm, TestContext.Current.CancellationToken);
+        Assert.Equal([other], await hv.ListAsync(TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public void FakeGuest_ProvenanceDefaults()
+    {
+        var g = new FakeGuest();
+        Assert.Equal(("Windows 11 Pro", "26300.1", "0.1.0-fake+000000000000", false, false),
+            (g.ProvenanceEdition, g.ProvenanceBuild, g.ProvenanceAgentVersion, g.ProvenanceOfficePresent, g.ProvenanceRealTimeProtection));
+    }
+
+    [Fact]
     public void ShippedScreenshots_AreDecodableBaselineJpegs()
     {
         var shipped = Path.Combine(AppContext.BaseDirectory, "Fakes", "Replays");

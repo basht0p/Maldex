@@ -5,6 +5,7 @@ using Maldex.Data.Templates;
 using Maldex.Infrastructure;
 using Maldex.Infrastructure.Real;
 using Maldex.Orchestrator;
+using Maldex.Orchestrator.Templates;
 using Maldex.Processing;
 using Maldex.Web;
 using Maldex.Web.Auth;
@@ -46,6 +47,7 @@ builder.Services.AddSingleton<PdfRenderer>();
 // Real-time surface: the hub carries live status/process/event pushes; enums go over the wire as strings, like the REST DTOs.
 builder.Services.AddSignalR().AddJsonProtocol(o => o.PayloadSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddSingleton<ITaskEventPublisher, SignalRTaskEventPublisher>();
+builder.Services.AddSingleton<ITemplateJobPublisher, SignalRTemplateJobPublisher>();
 builder.Services.AddMaldexOrchestrator(builder.Configuration);
 builder.Services.AddMaldexProcessing(builder.Configuration);
 // The orchestrator and processing workers run inside the web host only when Maldex:Workers:Enabled (default true).
@@ -53,6 +55,8 @@ if ((builder.Configuration.GetSection(WorkersOptions.SectionName).Get<WorkersOpt
 {
     // Real mode: the orchestrator only starts when the host guards pass (fail closed; the web app stays up either way).
     builder.Services.AddGatedHostedService<OrchestratorWorker>();
+    // Template jobs run VMs too: same gate, and they start only after the orchestrator's startup reconcile.
+    builder.Services.AddGatedHostedService<TemplateJobWorker>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<ProcessingWorker>());
     builder.Services.AddHostedService(sp => sp.GetRequiredService<RetentionWorker>());
 }

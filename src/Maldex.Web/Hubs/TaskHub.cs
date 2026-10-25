@@ -26,6 +26,11 @@ namespace Maldex.Web.Hubs;
 /// backlog overlap (an event saved between the join and the fetch is in both), so the skip is what removes the
 /// duplicates; the join-before-fetch order is what removes the gaps. Processes are upserted by id.</description></item>
 /// </list>
+///
+/// <para><b>Template jobs (Admin only).</b> <c>JoinTemplateJob(jobId)</c> joins the group <c>templateJob:{id}</c>, which receives
+/// <c>"templateJob"(TemplateJobDto)</c> on every state or message change of the job, pushed by
+/// <see cref="SignalRTemplateJobPublisher"/>. As for tasks: join first, then fetch <c>GET /api/admin/template-jobs/{id}</c>,
+/// and keep whichever is newer.</para>
 /// </summary>
 [Authorize(Policy = AuthSetup.AnalystPolicy)]
 public sealed class TaskHub(MaldexDbContext db, CurrentUser user, AuditWriter audit) : Hub
@@ -43,6 +48,22 @@ public sealed class TaskHub(MaldexDbContext db, CurrentUser user, AuditWriter au
         await Groups.AddToGroupAsync(Context.ConnectionId, GroupName(taskId), ct);
         await audit.WriteAsync("session.join", taskId.ToString(), null, ct);
     }
+
+    public static string TemplateJobGroupName(Guid jobId) => $"templateJob:{jobId}";
+
+    [Authorize(Policy = AuthSetup.AdminPolicy)]
+    public async Task JoinTemplateJob(Guid jobId)
+    {
+        var ct = Context.ConnectionAborted;
+        await user.ResolveAsync(Context.User!, ct);
+        if (!await db.TemplateJobs.AsNoTracking().AnyAsync(j => j.Id == jobId, ct))
+            throw new HubException("Template job not found.");
+        await Groups.AddToGroupAsync(Context.ConnectionId, TemplateJobGroupName(jobId), ct);
+    }
+
+    [Authorize(Policy = AuthSetup.AdminPolicy)]
+    public Task LeaveTemplateJob(Guid jobId) =>
+        Groups.RemoveFromGroupAsync(Context.ConnectionId, TemplateJobGroupName(jobId), Context.ConnectionAborted);
 
     public Task LeaveTask(Guid taskId) =>
         Groups.RemoveFromGroupAsync(Context.ConnectionId, GroupName(taskId), Context.ConnectionAborted);

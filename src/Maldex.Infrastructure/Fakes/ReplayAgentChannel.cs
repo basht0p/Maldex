@@ -185,6 +185,39 @@ public sealed class ReplayAgentChannel : IAgentChannel
                 Enqueue(new CommandResultMessage(c.CommandId, true));
                 _opened.TrySetResult();
                 break;
+            case ProvenanceCommand c:
+                if (_guest!.SilentProvenance) break;
+                if (_guest.RejectProvenance)
+                {
+                    Enqueue(new CommandResultMessage(c.CommandId, false, "unknown command"));
+                    break;
+                }
+                Enqueue(new ProvenanceMessage(c.CommandId, _guest!.ProvenanceEdition, _guest.ProvenanceBuild, _guest.ProvenanceAgentVersion,
+                    _guest.ProvenanceOfficePresent, _guest.ProvenanceRealTimeProtection));
+                Enqueue(new CommandResultMessage(c.CommandId, true));
+                break;
+            case ApplyComponentsCommand c:
+                // Same check, same order and same text as the real agent: a sample can never be installed as a component.
+                foreach (var transferId in new[] { c.CaCertTransferId, c.SysmonConfigTransferId, c.AgentTransferId })
+                {
+                    if (AgentLimits.IsComponentTransfer(transferId)) continue;
+                    Enqueue(new CommandResultMessage(c.CommandId, false, AgentLimits.NotComponentTransferMessage(transferId)));
+                    return;
+                }
+                if (_guest!.RejectApplyComponents)
+                {
+                    Enqueue(new CommandResultMessage(c.CommandId, false, "import_ca failed: refused by the fake guest"));
+                    break;
+                }
+                _guest.RecordApplied(c);
+                Enqueue(new CommandResultMessage(c.CommandId, true));
+                break;
+            case PowerOffCommand c:
+                // The guest acknowledges, then the OS goes away: the stream ends and the VM is no longer running.
+                Enqueue(new CommandResultMessage(c.CommandId, true));
+                _outbox.Writer.TryComplete();
+                if (_taskId is { } id) _guest!.NotifyPoweredOff(id);
+                break;
             case OpenUrlCommand:
                 _opened.TrySetResult();
                 break;

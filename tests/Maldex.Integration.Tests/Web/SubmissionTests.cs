@@ -270,6 +270,20 @@ public sealed class SubmissionTests(SqlServerFixture sql) : IDisposable
         await AssertBadRequest(await client.PostAsync("/api/tasks", Form(org, [1], fields: new() { ["networkMode"] = "3" }), Ct), "networkMode");
     }
 
+    [Theory]
+    [InlineData("Direct")]
+    [InlineData("direct")]
+    public async Task Direct_400_OnlyForTemplateEditSessions(string value)
+    {
+        using var f = Factory();
+        using var client = f.CreateClient(UserRole.Analyst, "analyst");
+        var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
+        var resp = await client.PostAsync("/api/tasks", Form(org, [1], fields: new() { ["networkMode"] = value }), Ct);
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        Assert.Contains("Direct is only available to template edit sessions.", await resp.Content.ReadAsStringAsync(Ct));
+        await AssertBadRequest(await client.PostAsync("/api/tasks", Form(org, [1], fields: new() { ["networkMode"] = "4" }), Ct), "networkMode");
+    }
+
     [Fact]
     public async Task LiveVpnWithoutConfiguredCountry_400()
     {

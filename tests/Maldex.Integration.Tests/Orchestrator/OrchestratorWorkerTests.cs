@@ -89,6 +89,50 @@ public class OrchestratorWorkerTests(SqlServerFixture sql)
         }
     }
 
+    [Theory]
+    [InlineData(TemplateJobState.Preparing, false, false)] // still copying the disk, no slot taken yet
+    [InlineData(TemplateJobState.Preparing, true, true)]   // slot taken, about to boot
+    [InlineData(TemplateJobState.Configuring, true, true)]
+    [InlineData(TemplateJobState.Sealing, true, true)]
+    [InlineData(TemplateJobState.Verifying, true, true)]
+    [InlineData(TemplateJobState.Failed, true, false)]     // terminal: the slot is free again
+    public async Task Worker_CountsJobVmsAgainstMaxConcurrentVms(TemplateJobState jobState, bool slotHeld, bool blocks)
+    {
+        await using var h = await OrchestratorHarness.CreateAsync(sql, Settings());
+        var worker = h.Get<OrchestratorWorker>();
+        var id = await h.SeedTaskAsync(RunStatus.Queued);
+        await using (var db = h.NewContext())
+        {
+            var template = await db.Templates.SingleAsync(t => t.Id == "win10", Ct);
+            var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "J", Role = UserRole.Admin };
+            db.Users.Add(user);
+            db.TemplateJobs.Add(new TemplateJob
+            {
+                Id = Guid.NewGuid(), Kind = TemplateJobKind.Edit, TemplateId = template.Id, BaseVersionId = template.CurrentVersionId!.Value,
+                Network = NetworkMode.Simulated, State = jobState, RequestedByUserId = user.Id, CreatedAt = h.Time.GetUtcNow(),
+                SlotHeldAt = slotHeld ? h.Time.GetUtcNow() : null,
+            });
+            await db.SaveChangesAsync(Ct);
+        }
+        try
+        {
+            var claimed = await worker.ClaimAndStartAsync(Ct);
+            if (blocks)
+            {
+                Assert.Empty(claimed);
+                Assert.Equal(RunStatus.Queued, await h.StatusOfAsync(id));
+            }
+            else
+            {
+                Assert.Equal([id], claimed);
+            }
+        }
+        finally
+        {
+            await worker.StopRunsAsync();
+        }
+    }
+
     [Fact]
     public async Task Worker_LowDisk_ClaimsNothing()
     {
@@ -173,6 +217,7 @@ public class OrchestratorWorkerTests(SqlServerFixture sql)
         public int ListCalls;
         public Task<Maldex.Core.Abstractions.VmHandle> StartAsync(Maldex.Core.Abstractions.VmSpec spec, CancellationToken ct) => inner.StartAsync(spec, ct);
         public Task DestroyAsync(Maldex.Core.Abstractions.VmHandle vm, CancellationToken ct) => inner.DestroyAsync(vm, ct);
+        public Task<bool> IsRunningAsync(Maldex.Core.Abstractions.VmHandle vm, CancellationToken ct) => inner.IsRunningAsync(vm, ct);
         public Task<IReadOnlyList<Maldex.Core.Abstractions.VmHandle>> ListAsync(CancellationToken ct) =>
             Interlocked.Increment(ref ListCalls) <= failures ? throw new IOException("virsh: failed to connect to the hypervisor") : inner.ListAsync(ct);
     }

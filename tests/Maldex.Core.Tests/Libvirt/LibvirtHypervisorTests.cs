@@ -71,6 +71,52 @@ public sealed class LibvirtHypervisorTests : IDisposable
 
     [Fact]
     [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public async Task Start_Writable_BootsTheDiskDirectly_NoOverlay()
+    {
+        SeedBase();
+        var h = await Hv().StartAsync(Spec() with { Writable = true }, CancellationToken.None);
+        var dir = RunDirOf(h);
+        var call = Assert.Single(_runner.Calls);
+        Assert.Equal("virsh", call.File);
+        var xml = File.ReadAllText(Path.Combine(dir, "domain.xml"));
+        Assert.Contains(Path.Combine(_opts.BaseImageDir, "win11-26h2.qcow2"), xml);
+        Assert.Contains(Path.Combine(_opts.BaseImageDir, "win11-26h2.vars.fd"), xml);
+        Assert.DoesNotContain("overlay.qcow2", xml);
+        Assert.False(File.Exists(Path.Combine(dir, "overlay.qcow2")));
+        Assert.False(File.Exists(Path.Combine(dir, "nvram.fd")));
+        Assert.True(File.Exists(Path.Combine(dir, "vnc.pass")));
+        Assert.True(File.Exists(Path.Combine(dir, "domain.xml")));
+    }
+
+    [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public async Task Start_Writable_RefusesADiskThatIsNotOwnerWritable_ASealedVersion()
+    {
+        SeedBase();
+        // A sealed template version is 0444: QEMU running as root would otherwise write straight through the mode.
+        var disk = Path.Combine(_opts.BaseImageDir, "win11-26h2.qcow2");
+        File.SetUnixFileMode(disk, UnixFileMode.UserRead | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
+
+        var ex = await Assert.ThrowsAsync<VmStartException>(() => Hv().StartAsync(Spec() with { Writable = true }, CancellationToken.None));
+
+        Assert.Contains("win11-26h2", ex.Message);
+        Assert.Contains("sealed", ex.Message);
+        Assert.Empty(_runner.Calls);
+        Assert.False(Directory.Exists(RunDirOf(VmHandle.For(Id))));
+    }
+
+    [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public async Task Start_NotWritable_StillBootsASealedDisk_ThroughAnOverlay()
+    {
+        SeedBase();
+        File.SetUnixFileMode(Path.Combine(_opts.BaseImageDir, "win11-26h2.qcow2"), UnixFileMode.UserRead | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
+        await Hv().StartAsync(Spec(), CancellationToken.None);
+        Assert.Equal("qemu-img", _runner.Calls[0].File);
+    }
+
+    [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
     public async Task Start_NvramIsWritable_EvenThoughTheVarsTemplateIsReadOnly()
     {
         SeedBase();
@@ -168,6 +214,40 @@ public sealed class LibvirtHypervisorTests : IDisposable
         Assert.Equal(2, list.Count);
         Assert.Contains(VmHandle.For(running), list);
         Assert.Contains(VmHandle.For(orphan), list);
+    }
+
+    [Theory]
+    [InlineData("running", true)]
+    [InlineData("paused", true)]
+    [InlineData("in shutdown", true)]
+    [InlineData("blocked", true)]
+    [InlineData("shut off", false)]
+    [InlineData("crashed", false)]
+    [InlineData("pmsuspended", false)]
+    public async Task IsRunning_MapsDomstate(string state, bool expected)
+    {
+        _runner.Handler = (_, _) => new(0, state + "\n\n", "");
+        var vm = VmHandle.For(Id);
+        Directory.CreateDirectory(RunDirOf(vm)); // the run dir lingers after shutdown; it must not count
+
+        Assert.Equal(expected, await Hv().IsRunningAsync(vm, CancellationToken.None));
+        Assert.Equal(["-c", "qemu:///session", "domstate", vm.Name], _runner.Calls[0].Args);
+    }
+
+    [Fact]
+    public async Task IsRunning_UnknownDomain_IsFalse()
+    {
+        _runner.Handler = (_, _) => new(1, "", "error: failed to get domain 'maldex-x'\nerror: Domain not found: no domain with matching name\n");
+
+        Assert.False(await Hv().IsRunningAsync(VmHandle.For(Id), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task IsRunning_OtherVirshFailure_Throws()
+    {
+        _runner.Handler = (_, _) => new(1, "", "error: failed to connect to the hypervisor");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Hv().IsRunningAsync(VmHandle.For(Id), CancellationToken.None));
     }
 
     [Fact]

@@ -19,9 +19,15 @@ public sealed class NetnsEgressRouterTests : IDisposable
         public string Handshakes = "pubkey\t1700000000\n";
         public string Pids = "";
         public bool GuardPresent = true;
+        /// <summary>Which of Docker's DOCKER-USER exception rules (<c>iptables -C</c>) exist: out = [0], replies back = [1].</summary>
+        public bool[] DockerRules = [true, true];
+        /// <summary>When set, the DOCKER-USER rules exist only for this interface.</summary>
+        public string? DockerRulesIface;
         public string TemplateOffender = "";
         public bool HonorCancellation;
         public string? MissingUser;
+        public string DefaultRoute = "default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.5 metric 100\n";
+        public string NftTables = "";
 
         public Task<ProcessResult> RunAsync(string file, IReadOnlyList<string> args, CancellationToken ct, string? stdin = null, TimeSpan? timeout = null)
         {
@@ -35,6 +41,10 @@ public sealed class NetnsEgressRouterTests : IDisposable
             if (line == "sudo -n ip netns list") { lock (Namespaces) return Ok(out_: string.Join('\n', Namespaces.Select(n => n + " (id: 0)"))); }
             if (line.StartsWith("sudo -n ip netns pids ")) return Ok(out_: Pids);
             if (line.Contains(" ss -ltn")) return Ok(out_: string.Join('\n', Enumerable.Range(0, 20).Select(i => $"LISTEN 0 128 10.213.{i / 64}.{i % 64 * 4 + 1}:8080 0.0.0.0:*")));
+            if (line == "ip -4 -o route show default") return Ok(out_: DefaultRoute);
+            if (line.StartsWith("sudo -n iptables -C DOCKER-USER -i mxu+ -o ")) return Ok(DockerRules[0] && (DockerRulesIface is null || line.Contains($" -o {DockerRulesIface} ")) ? 0 : 1);
+            if (line.StartsWith("sudo -n iptables -C DOCKER-USER -i ") && line.Contains(" -o mxu+ ")) return Ok(DockerRules[1] && (DockerRulesIface is null || line.Contains($" -i {DockerRulesIface} ")) ? 0 : 1);
+            if (line == "sudo -n nft list tables") return Ok(out_: NftTables);
             if (line == "id -u" || line == "id -g") return Ok(out_: "1000\n");
             if (line == "id -u maldex-mitm") return Ok(out_: "995\n");
             if (MissingUser is not null && line.EndsWith(" " + MissingUser)) return Ok(1);
@@ -62,13 +72,19 @@ public sealed class NetnsEgressRouterTests : IDisposable
     public NetnsEgressRouterTests()
     {
         Directory.CreateDirectory(Path.Combine(_tmp, "ca"));
+        File.WriteAllText(ResolvConf, "# upstream\nnameserver 192.168.3.10\nnameserver 8.8.8.8\nnameserver 2001:4860:4860::8888\nsearch example.test\n");
+        File.WriteAllText(IpForward, "1\n");
         foreach (var f in new[] { "mitmproxy-ca.pem", "mitmproxy-ca-cert.pem", "mitmproxy-dhparam.pem" })
             File.WriteAllText(Path.Combine(_tmp, "ca", f), "x");
     }
     public void Dispose() { try { Directory.Delete(_tmp, true); } catch (IOException) { } }
 
-    private NetnsEgressRouter Router(Action<string>? warn = null, IProcessRunner? runner = null) => new(Options.Create(new NetOptions
+    private string ResolvConf => Path.Combine(_tmp, "resolv.conf");
+    private string IpForward => Path.Combine(_tmp, "ip_forward");
+
+    private NetnsEgressRouter Router(Action<string>? warn = null, IProcessRunner? runner = null, string[]? dns = null) => new(Options.Create(new NetOptions
     {
+        DirectDnsServers = dns ?? [],
         RunDir = Path.Combine(_tmp, "run"),
         WireGuardConfigDir = Path.Combine(_tmp, "wg"),
         MitmConfDir = Path.Combine(_tmp, "ca"),
@@ -79,6 +95,8 @@ public sealed class NetnsEgressRouterTests : IDisposable
         PollInterval = TimeSpan.FromMilliseconds(5), MitmWait = TimeSpan.FromMilliseconds(100), InetSimWait = TimeSpan.FromMilliseconds(100),
         HandshakeWait = TimeSpan.FromMilliseconds(100), KillGrace = TimeSpan.FromMilliseconds(50),
         BrNetfilterPath = Path.Combine(_tmp, "no-br-netfilter"),
+        ResolvConfPath = ResolvConf,
+        IpForwardPath = IpForward,
     });
 
     private void WriteWg(string country, string body)
@@ -782,6 +800,351 @@ public sealed class NetnsEgressRouterTests : IDisposable
             if (string.Join(' ', args) == "-n ip -o link show") return Task.FromResult(new ProcessResult(0, linkOutput, ""));
             return inner.RunAsync(file, args, ct, stdin, timeout);
         }
+    }
+
+    // ---- Direct egress (template edit sessions) ----
+
+    private async Task<(NetnsEgressRouter Router, NetworkLease Lease, RunNetNames N)> CreateDirect(string[]? dns = null)
+    {
+        var router = Router(dns: dns);
+        var lease = await router.CreateAsync(Guid.NewGuid(), NetworkMode.Direct, null, CancellationToken.None);
+        return (router, lease, RunNetNames.For(lease.TaskId));
+    }
+
+    private string HostTableScript(RunNetNames n) =>
+        _r.Stdins.Single(s => s is not null && s.Contains($"table inet {n.DirectTable} {{") && s.Contains("chain postrouting"))!;
+
+    [Fact]
+    public async Task Direct_BuildsUplink_HostTableFirst_AndNoInterception()
+    {
+        var (_, lease, n) = await CreateDirect();
+        Assert.Equal(n.Tap, lease.NetworkId);
+
+        // the host table (with the default-route interface) and the namespace ruleset are loaded before any link exists
+        var hostTable = _r.Stdins.FindIndex(s => s is not null && s.Contains($"table inet {n.DirectTable} {{"));
+        Assert.True(hostTable >= 0, "host table not loaded");
+        Assert.Equal("sudo -n nft -f -", _r.Calls[hostTable]);
+        Assert.Contains($"iifname \"{n.UplinkHost}\" oifname \"eth0\" masquerade", _r.Stdins[hostTable]!);
+        Assert.True(hostTable < _r.IndexOf(c => c.Contains("ip link add")));
+        Assert.True(hostTable < _r.IndexOf(c => c.Contains($"link set {n.UplinkHost} up")));
+        var nsRules = _r.Calls.FindIndex(c => c == $"sudo -n ip netns exec {n.Namespace} nft -f -");
+        Assert.True(nsRules >= 0 && nsRules < _r.IndexOf(c => c.Contains("ip link add")));
+        Assert.Contains("masquerade", _r.Stdins[nsRules]!);
+        Assert.DoesNotContain("redirect", _r.Stdins[nsRules]!);
+
+        // the uplink pair, addressed from the pool by slot (0 here), default route out of it
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip link add {n.UplinkHost} type veth peer name {n.UplinkNs} netns {n.Namespace}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n sysctl -w net.ipv6.conf.{n.UplinkHost}.disable_ipv6=1");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip addr add 100.127.0.1/30 dev {n.UplinkHost}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip link set {n.UplinkHost} up");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip netns exec {n.Namespace} ip addr add 100.127.0.2/30 dev {n.UplinkNs}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip netns exec {n.Namespace} ip link set {n.UplinkNs} up");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip netns exec {n.Namespace} sysctl -w net.ipv4.ip_forward=1");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip netns exec {n.Namespace} ip route add default via 100.127.0.1 dev {n.UplinkNs}");
+        // the host bridge stays address-less
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("ip addr add") && c.Contains(n.Bridge));
+
+        // no interception, capture or simulated internet
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("mitmdump") || c.Contains("inetsim") || c.Contains("tcpdump") || c.Contains("route add local"));
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("maldex-mitm"));
+        Assert.Contains("\"Mode\":\"Direct\"", File.ReadAllText(Path.Combine(_tmp, "run", "net", n.Namespace, "lease.json")));
+    }
+
+    [Fact]
+    public async Task Direct_DnsmasqStaysUnprivileged_AndForwardsToTheHostsUpstreamResolvers()
+    {
+        var (_, _, n) = await CreateDirect();
+        var dnsmasq = Assert.Single(_r.Calls, c => c.Contains(" dnsmasq "));
+        Assert.Contains("setpriv --reuid=maldex-dns --regid=maldex-dns --clear-groups --no-new-privs --inh-caps=-all --bounding-set=-all -- dnsmasq", dnsmasq);
+        Assert.Contains("--no-resolv", dnsmasq);
+        Assert.Contains("--server=192.168.3.10 --server=8.8.8.8", dnsmasq); // the IPv6 and 'search' lines of resolv.conf are ignored
+        Assert.DoesNotContain("2001:", dnsmasq);
+        Assert.DoesNotContain("--address=", dnsmasq);
+        Assert.Contains($"--interface={n.VethNs}", dnsmasq);
+    }
+
+    [Fact]
+    public async Task Direct_ConfiguredDnsServers_ReplaceTheHostResolvers()
+    {
+        var (_, _, n) = await CreateDirect(["9.9.9.9"]);
+        var dnsmasq = Assert.Single(_r.Calls, c => c.Contains(" dnsmasq "));
+        Assert.Contains("--server=9.9.9.9", dnsmasq);
+        Assert.DoesNotContain("8.8.8.8", dnsmasq);
+        var ns = _r.Stdins[_r.Calls.FindIndex(c => c == $"sudo -n ip netns exec {n.Namespace} nft -f -")]!;
+        Assert.Contains("ip daddr { 9.9.9.9 } udp dport 53 accept", ns);
+    }
+
+    [Fact]
+    public async Task Direct_ReadsTheDefaultRouteInterface_PerLease()
+    {
+        _r.DefaultRoute = "default via 10.0.0.1 dev enp3s0 proto static metric 20\ndefault via 192.168.1.1 dev wlan0 metric 600\n";
+        var (_, _, n) = await CreateDirect();
+        var table = HostTableScript(n);
+        Assert.Contains("oifname \"enp3s0\" masquerade", table);
+        Assert.DoesNotContain("wlan0", table);
+        // the next lease re-reads it (the host may have changed networks)
+        _r.DefaultRoute = "default via 192.168.1.1 dev wlan0 metric 600\n";
+        var second = await Router().CreateAsync(Guid.NewGuid(), NetworkMode.Direct, null, CancellationToken.None);
+        Assert.Contains("oifname \"wlan0\" masquerade", HostTableScript(RunNetNames.For(second.TaskId)));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("\n")]
+    [InlineData("192.168.1.0/24 dev eth0 scope link\n")]
+    [InlineData("default via 10.9.9.9 dev mxu0123456789ab\n")]
+    [InlineData("default via 10.9.9.9 dev lo\n")]
+    [InlineData("default via 10.9.9.9 dev e\"th0\n")]
+    public async Task Direct_NoUsableDefaultRoute_IsEgressUnavailable_AndNothingIsTouched(string route)
+    {
+        _r.DefaultRoute = route;
+        var ex = await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(Guid.NewGuid(), NetworkMode.Direct, null, CancellationToken.None));
+        Assert.Contains("default route", ex.Message);
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("netns add") || c.Contains("link add") || c.Contains("nft -f"));
+        Assert.Empty(_r.Namespaces);
+    }
+
+    [Fact]
+    public async Task Direct_NoResolvers_IsEgressUnavailable()
+    {
+        File.WriteAllText(ResolvConf, "# nothing\nnameserver ::1\nnameserver 127.0.0.53\n");
+        var ex = await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(Guid.NewGuid(), NetworkMode.Direct, null, CancellationToken.None));
+        Assert.Contains("DNS", ex.Message);
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("netns add"));
+        File.Delete(ResolvConf);
+        await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(Guid.NewGuid(), NetworkMode.Direct, null, CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData("192.168.50.7")] // a control-plane address
+    [InlineData("127.0.0.1")]
+    [InlineData("not-an-ip")]
+    public async Task Direct_UnsafeConfiguredResolver_IsEgressUnavailable(string dns)
+    {
+        await Assert.ThrowsAsync<EgressUnavailableException>(() => Router(dns: [dns]).CreateAsync(Guid.NewGuid(), NetworkMode.Direct, null, CancellationToken.None));
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("netns add"));
+    }
+
+    [Theory]
+    [InlineData("0\n")]
+    [InlineData("garbage")]
+    public async Task Direct_HostNotForwarding_IsEgressUnavailable(string value)
+    {
+        File.WriteAllText(IpForward, value);
+        var ex = await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(Guid.NewGuid(), NetworkMode.Direct, null, CancellationToken.None));
+        Assert.Contains("forward", ex.Message);
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("netns add"));
+    }
+
+    [Fact]
+    public async Task Direct_BadPool_IsEgressUnavailable()
+    {
+        var router = new NetnsEgressRouter(Options.Create(new NetOptions { RunDir = Path.Combine(_tmp, "run"), DirectUplinkPool = "nonsense", ControlPlaneIps = ["192.168.50.7"] }), _r, null,
+            new NetnsRouterTuning { BrNetfilterPath = Path.Combine(_tmp, "none"), ResolvConfPath = ResolvConf, IpForwardPath = IpForward });
+        await Assert.ThrowsAsync<EgressUnavailableException>(() => router.CreateAsync(Guid.NewGuid(), NetworkMode.Direct, null, CancellationToken.None));
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("netns add"));
+    }
+
+    [Fact]
+    public async Task Direct_EachLeaseGetsItsOwnUplinkSubnetAndTable()
+    {
+        var router = Router();
+        var a = await router.CreateAsync(Guid.NewGuid(), NetworkMode.Direct, null, CancellationToken.None);
+        var b = await router.CreateAsync(Guid.NewGuid(), NetworkMode.Direct, null, CancellationToken.None);
+        var nb = RunNetNames.For(b.TaskId);
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip addr add 100.127.0.5/30 dev {nb.UplinkHost}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip netns exec {nb.Namespace} ip route add default via 100.127.0.5 dev {nb.UplinkNs}");
+        Assert.NotEqual(RunNetNames.For(a.TaskId).DirectTable, nb.DirectTable);
+        await router.ReleaseAsync(a, CancellationToken.None);
+        Assert.DoesNotContain(_r.Calls, c => c == $"sudo -n nft delete table inet {nb.DirectTable}"); // releasing one never touches the other's table
+    }
+
+    [Theory]
+    [InlineData("ip route add default via")]
+    [InlineData("dnsmasq")]
+    [InlineData("ip link add mxu")]
+    public async Task Direct_SetupFailure_TearsDownUplinkAndTable(string failing)
+    {
+        var id = Guid.NewGuid();
+        var n = RunNetNames.For(id);
+        _r.Fail = c => c.Contains(failing) && !c.Contains("ip link del") && !c.Contains("netns del");
+        var ex = await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(id, NetworkMode.Direct, null, CancellationToken.None));
+        Assert.Contains("scripted failure", ex.Message);
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip link del {n.UplinkHost}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n nft delete table inet {n.DirectTable}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip netns del {n.Namespace}");
+        Assert.Empty(_r.Namespaces);
+    }
+
+    [Fact]
+    public async Task Direct_Release_RemovesUplinkAndHostTable_Idempotently()
+    {
+        var (router, lease, n) = await CreateDirect();
+        _r.Calls.Clear();
+        await router.ReleaseAsync(lease, CancellationToken.None);
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip link del {n.UplinkHost}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n nft delete table inet {n.DirectTable}");
+        _r.Fail = c => c.Contains("ip link del") || c.Contains("nft delete") || c.Contains("netns");
+        await router.ReleaseAsync(lease, CancellationToken.None); // "does not exist" is tolerated
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    public async Task Direct_WithoutTheDockerUserException_IsEgressUnavailable_AndNothingIsTouched(bool outRule, bool backRule)
+    {
+        _r.DockerRules = [outRule, backRule];
+        var ex = await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(Guid.NewGuid(), NetworkMode.Direct, null, CancellationToken.None));
+        Assert.Equal("Direct egress needs the Maldex exception in Docker's DOCKER-USER chain; run ./build.sh real-setup", ex.Message);
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("netns add") || c.Contains("link add") || c.Contains("nft -f"));
+    }
+
+    [Fact]
+    public async Task Direct_DockerUserException_IsCheckedForTheCurrentDefaultInterface_ReadOnly()
+    {
+        _r.DockerRulesIface = "eth0";
+        await CreateDirect();
+        var checks = _r.Calls.Where(c => c.Contains("iptables")).ToList();
+        Assert.Equal(
+        [
+            "sudo -n iptables -C DOCKER-USER -i mxu+ -o eth0 -m comment --comment maldex-direct -j ACCEPT",
+            "sudo -n iptables -C DOCKER-USER -i eth0 -o mxu+ -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment maldex-direct -j ACCEPT",
+        ], checks); // only -C: the router never edits Docker's chains
+
+        // the host moved to another interface and the exception was not re-installed for it: fail closed
+        _r.DefaultRoute = "default via 192.168.1.1 dev wlan0 metric 600\n";
+        await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(Guid.NewGuid(), NetworkMode.Direct, null, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task OtherModes_NeverCheckDocker()
+    {
+        await Router().CreateAsync(Guid.NewGuid(), NetworkMode.None, null, CancellationToken.None);
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("iptables"));
+    }
+
+    [Fact]
+    public async Task Direct_HostChecks_StillApply()
+    {
+        _r.GuardPresent = false;
+        await Assert.ThrowsAsync<EgressUnavailableException>(() => Router().CreateAsync(Guid.NewGuid(), NetworkMode.Direct, null, CancellationToken.None));
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("netns add"));
+    }
+
+    [Fact]
+    public async Task OtherModes_NeverTouchTheUplinkOrHostTable_OnCreate()
+    {
+        var router = Router();
+        await router.CreateAsync(Guid.NewGuid(), NetworkMode.Simulated, null, CancellationToken.None);
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("mxu") || c.Contains("maldex_direct") || c == "ip -4 -o route show default");
+        Assert.DoesNotContain(_r.Stdins, s => s is not null && s.Contains("maldex_direct"));
+    }
+
+    // ---- IsolateAsync (controller ruling R2): cut a running lease off from all egress ----
+
+    [Fact]
+    public async Task Isolate_Direct_SwitchesToNoEgress_RemovesRouteAndHostTable_KeepsTheVmsLinks()
+    {
+        var (router, lease, n) = await CreateDirect();
+        _r.Calls.Clear();
+        _r.Stdins.Clear();
+        await router.IsolateAsync(lease, CancellationToken.None);
+
+        var apply = _r.Calls.FindIndex(c => c == $"sudo -n ip netns exec {n.Namespace} nft -f -");
+        Assert.True(apply >= 0, "no ruleset applied");
+        var rules = _r.Stdins[apply]!;
+        Assert.DoesNotContain("masquerade", rules);
+        Assert.DoesNotContain(n.UplinkNs, rules);
+        Assert.Contains("table inet maldex {", rules);
+        Assert.Contains("policy drop;", rules);
+        var delRoute = _r.Calls.FindIndex(c => c == $"sudo -n ip netns exec {n.Namespace} ip route del default");
+        var delTable = _r.Calls.FindIndex(c => c == $"sudo -n nft delete table inet {n.DirectTable}");
+        var delLink = _r.Calls.FindIndex(c => c == $"sudo -n ip link del {n.UplinkHost}");
+        Assert.True(apply < delRoute && delTable >= 0 && delLink >= 0, string.Join('\n', _r.Calls));
+        Assert.True(delRoute < delLink && delLink < delTable, "teardown order must match release (uplink link, then host table):\n" + string.Join('\n', _r.Calls));
+        // the VM's own attachment (tap, bridge, guest veth), dnsmasq and the namespace are untouched
+        Assert.DoesNotContain(_r.Calls, c => c.Contains($"link del {n.Tap}") || c.Contains($"link del {n.Bridge}") || c.Contains($"link del {n.VethHost}") || c.Contains("netns del") || c.Contains("kill"));
+    }
+
+    [Fact]
+    public async Task Isolate_IsIdempotent_AndReleaseStillTearsEverythingDown()
+    {
+        var (router, lease, n) = await CreateDirect();
+        await router.IsolateAsync(lease, CancellationToken.None);
+        _r.Fail = c => c.Contains("route del") || c.Contains("nft delete") || c.Contains("ip link del"); // already gone
+        await router.IsolateAsync(lease, CancellationToken.None);
+        _r.Fail = _ => false;
+        _r.Calls.Clear();
+        await router.ReleaseAsync(lease, CancellationToken.None);
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip netns del {n.Namespace}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip link del {n.Bridge}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n nft delete table inet {n.DirectTable}");
+    }
+
+    [Fact]
+    public async Task Isolate_RulesetFailure_StillCutsTheHostSide_ThenThrows()
+    {
+        var (router, lease, n) = await CreateDirect();
+        _r.Calls.Clear();
+        _r.Fail = c => c == $"sudo -n ip netns exec {n.Namespace} nft -f -";
+        await Assert.ThrowsAsync<EgressUnavailableException>(() => router.IsolateAsync(lease, CancellationToken.None));
+        Assert.Contains(_r.Calls, c => c == $"sudo -n nft delete table inet {n.DirectTable}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip link del {n.UplinkHost}");
+        Assert.Contains(_r.Calls, c => c == $"sudo -n ip netns exec {n.Namespace} ip route del default");
+    }
+
+    [Fact]
+    public async Task Isolate_NonDirectLease_OnlyReplacesTheRuleset()
+    {
+        var router = Router();
+        var lease = await router.CreateAsync(Guid.NewGuid(), NetworkMode.Simulated, null, CancellationToken.None);
+        var n = RunNetNames.For(lease.TaskId);
+        _r.Calls.Clear();
+        _r.Stdins.Clear();
+        await router.IsolateAsync(lease, CancellationToken.None);
+        var apply = _r.Calls.FindIndex(c => c == $"sudo -n ip netns exec {n.Namespace} nft -f -");
+        Assert.True(apply >= 0);
+        Assert.DoesNotContain("ct status & dnat == 0 meta l4proto", _r.Stdins[apply]!); // Simulated's any-IP accept is gone
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("route del") || c.Contains("nft delete") || c.Contains("ip link del"));
+    }
+
+    [Fact]
+    public async Task Isolate_UnknownOrReleasedLease_IsANoOp_ButCleansHostRemnants()
+    {
+        var router = Router();
+        var ghost = new NetworkLease(Guid.NewGuid(), "mxt000000000000");
+        await router.IsolateAsync(ghost, CancellationToken.None);
+        Assert.DoesNotContain(_r.Calls, c => c.Contains("nft -f -"));
+        Assert.Contains(_r.Calls, c => c == $"sudo -n nft delete table inet {RunNetNames.For(ghost.TaskId).DirectTable}");
+    }
+
+    [Fact]
+    public async Task Isolate_LiveNamespaceWithUnreadableLease_FailsClosedLoudly()
+    {
+        var (router, lease, n) = await CreateDirect();
+        File.Delete(Path.Combine(_tmp, "run", "net", n.Namespace, "lease.json"));
+        await Assert.ThrowsAsync<EgressUnavailableException>(() => router.IsolateAsync(lease, CancellationToken.None));
+        Assert.Contains(_r.Calls, c => c == $"sudo -n nft delete table inet {n.DirectTable}"); // the host side is cut regardless
+    }
+
+    // ---- orphans ----
+
+    [Fact]
+    public async Task ReleaseOrphans_RemovesStrayDirectTablesAndUplinks_ButNotLiveOnes()
+    {
+        var (_, _, n) = await CreateDirect();
+        _r.NftTables = $"table ip nat\ntable inet maldex_guard\ntable inet {n.DirectTable}\ntable inet maldex_direct_deadbeef0001\ntable inet maldex_direct_notahex\n";
+        var runner = new LinkListingRunner(_r, $"""
+            2: eth0: <BROADCAST> mtu 1500
+            3: mxudeadbeef0001@if4: <NO-CARRIER> mtu 1500
+            4: {n.UplinkHost}@if5: <UP> mtu 1500
+            """);
+        var r2 = new NetnsEgressRouter(Options.Create(new NetOptions { RunDir = Path.Combine(_tmp, "run") }), runner, null, new NetnsRouterTuning());
+        _r.Calls.Clear();
+        await r2.ReleaseOrphansAsync(CancellationToken.None);
+        Assert.Equal(["sudo -n nft delete table inet maldex_direct_deadbeef0001"], _r.Calls.Where(c => c.Contains("nft delete")).ToList());
+        Assert.Equal(["sudo -n ip link del mxudeadbeef0001"], _r.Calls.Where(c => c.StartsWith("sudo -n ip link del ")).ToList());
     }
 
     [Fact]

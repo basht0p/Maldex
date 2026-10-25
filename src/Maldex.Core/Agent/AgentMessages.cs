@@ -38,6 +38,7 @@ public static class AgentJson
 [JsonDerivedType(typeof(CommandResultMessage), "command_result")]
 [JsonDerivedType(typeof(FileChunkMessage), "file_chunk")]
 [JsonDerivedType(typeof(SelfTestResultMessage), "self_test_result")]
+[JsonDerivedType(typeof(ProvenanceMessage), "provenance")]
 public abstract record AgentMessage;
 
 /// <param name="Pid">The agent's own process id (additive; null from older agents). Processes it launches (the opened sample)
@@ -82,6 +83,9 @@ public sealed record FileChunkMessage(
 [JsonDerivedType(typeof(PutFileChunkCommand), "put_file_chunk")]
 [JsonDerivedType(typeof(CollectFileCommand), "collect_file")]
 [JsonDerivedType(typeof(SelfTestCommand), "self_test")]
+[JsonDerivedType(typeof(ProvenanceCommand), "provenance")]
+[JsonDerivedType(typeof(ApplyComponentsCommand), "apply_components")]
+[JsonDerivedType(typeof(PowerOffCommand), "power_off")]
 public abstract record AgentCommand(string CommandId);
 
 public sealed record OpenSampleCommand(string CommandId, string FileName, string BlobKey) : AgentCommand(CommandId);
@@ -120,6 +124,27 @@ public sealed record ProbeResult(string Name, bool Reachable);
 public sealed record SelfTestResultMessage(DateTimeOffset At, string CommandId, IReadOnlyList<ProbeResult> Probes, string? EchoBody,
     IReadOnlyList<string>? GuestAddresses = null) : AgentMessage;
 
+/// <summary>Asks the guest for a read-only provenance report; it answers with a <see cref="ProvenanceMessage"/> then a command result.</summary>
+public sealed record ProvenanceCommand(string CommandId) : AgentCommand(CommandId);
+
+/// <summary>
+/// Installs the current Maldex components into a template, in order: the CA certificate (DER) into the machine Root store, the
+/// Sysmon configuration, then the new agent exe (swapped in; effective at the next start), then clears event logs and temp files.
+/// Each id names a file already delivered with <see cref="PutFileChunkCommand"/> and must start with
+/// <see cref="AgentLimits.ComponentTransferPrefix"/>. Only the template sealing service sends this; analyses never do.
+/// </summary>
+public sealed record ApplyComponentsCommand(string CommandId, string AgentTransferId, string SysmonConfigTransferId, string CaCertTransferId) : AgentCommand(CommandId);
+
+/// <summary>Acknowledges, then shuts the guest OS down once the result has been written. Only the template sealing service sends this.</summary>
+public sealed record PowerOffCommand(string CommandId) : AgentCommand(CommandId);
+
+/// <summary>
+/// The guest's answer to a <see cref="ProvenanceCommand"/> (<c>CommandId</c> is the command's). UNTRUSTED. <c>AgentVersion</c> is the
+/// agent's build identity (<c>version+sha256-prefix</c> of its exe). <c>OfficePresent</c> and <c>RealTimeProtectionEnabled</c> are null when unknown.
+/// </summary>
+public sealed record ProvenanceMessage(string CommandId, string WindowsEdition, string WindowsBuild, string AgentVersion,
+    bool? OfficePresent, bool? RealTimeProtectionEnabled) : AgentMessage;
+
 /// <summary>Limits shared by both ends of a bulk transfer.</summary>
 public static class AgentLimits
 {
@@ -134,6 +159,22 @@ public static class AgentLimits
 
     /// <summary>Largest sample the guest buffers.</summary>
     public const long MaxInboundBytes = 32L * 1024 * 1024;
+
+    /// <summary>Transfer ids of Maldex component files (agent exe, Sysmon config, CA) start with this; samples never do.</summary>
+    public const string ComponentTransferPrefix = "components/";
+
+    /// <summary>Largest component file the guest buffers (the published agent exe is about 77 MB).</summary>
+    public const long MaxComponentBytes = 160L * 1024 * 1024;
+
+    /// <summary>Most chunks in one component transfer: <see cref="MaxComponentBytes"/> in full chunks.</summary>
+    public const int MaxComponentChunks = (int)(MaxComponentBytes / ChunkBytes);
+
+    /// <summary>The refusal text for an <c>apply_components</c> transfer id that is not a component transfer (shared by the agent and the fake guest).</summary>
+    public static string NotComponentTransferMessage(string? transferId) =>
+        $"transfer id '{transferId}' is not a component transfer (it must start with {ComponentTransferPrefix})";
+
+    public static bool IsComponentTransfer(string? transferId) =>
+        transferId is not null && transferId.StartsWith(ComponentTransferPrefix, StringComparison.Ordinal);
 }
 
 /// <summary>

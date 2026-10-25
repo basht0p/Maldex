@@ -48,22 +48,36 @@ public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcess
             throw new VmStartException($"invalid disk stem '{spec.DiskStem}'");
         if (!File.Exists(basePath)) throw new VmStartException($"base image {basePath} not found");
         if (!File.Exists(varsPath)) throw new VmStartException($"UEFI vars template {varsPath} not found");
+        // A sealed version disk is 0444 and is never booted writable, even if QEMU runs as root and would ignore the mode.
+        // The same owner-write check the guestfish editor makes.
+        if (spec.Writable && !OperatingSystem.IsWindows() && (File.GetUnixFileMode(basePath) & UnixFileMode.UserWrite) == 0)
+            throw new VmStartException($"template disk '{spec.DiskStem}' is a sealed version, not a working copy: refusing to boot it writable");
 
         try
         {
             if (OperatingSystem.IsWindows()) Directory.CreateDirectory(runDir);
             else Directory.CreateDirectory(runDir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-            var overlay = Path.Combine(runDir, "overlay.qcow2");
-            var nvram = Path.Combine(runDir, "nvram.fd");
-            await new QemuImageCli(runner, _o.QemuImgBinary).CreateOverlayAsync(basePath, overlay, ct);
-            // Not File.Copy: it keeps the template's mode, and the template is finalised read-only (0444) while QEMU must write
-            // the run's UEFI variable store. 0600 from creation; chmod as well in case a retry finds the file already there.
-            var nvramOptions = new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.Write };
-            if (!OperatingSystem.IsWindows()) nvramOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
-            await using (var src = File.OpenRead(varsPath))
-            await using (var dst = new FileStream(nvram, nvramOptions))
-                await src.CopyToAsync(dst, ct);
-            if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(nvram, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            string diskPath, nvram;
+            if (spec.Writable)
+            {
+                // A template working copy: QEMU writes the disk and its UEFI variable store in place; nothing to create here.
+                diskPath = basePath;
+                nvram = varsPath;
+            }
+            else
+            {
+                diskPath = Path.Combine(runDir, "overlay.qcow2");
+                nvram = Path.Combine(runDir, "nvram.fd");
+                await new QemuImageCli(runner, _o.QemuImgBinary).CreateOverlayAsync(basePath, diskPath, ct);
+                // Not File.Copy: it keeps the template's mode, and the template is finalised read-only (0444) while QEMU must write
+                // the run's UEFI variable store. 0600 from creation; chmod as well in case a retry finds the file already there.
+                var nvramOptions = new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.Write };
+                if (!OperatingSystem.IsWindows()) nvramOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+                await using (var src = File.OpenRead(varsPath))
+                await using (var dst = new FileStream(nvram, nvramOptions))
+                    await src.CopyToAsync(dst, ct);
+                if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(nvram, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
 
             var password = RandomNumberGenerator.GetString(VncAlphabet, 8);
             var passFile = Path.Combine(runDir, "vnc.pass");
@@ -82,7 +96,7 @@ public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcess
             try
             {
                 var port = FindFreeVncPort();
-                var paths = new DomainPaths(overlay, nvram, sockPath, port, password);
+                var paths = new DomainPaths(diskPath, nvram, sockPath, port, password);
                 var xmlOptions = new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.Write };
                 if (!OperatingSystem.IsWindows()) xmlOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
                 await using (var xfs = new FileStream(xmlPath, xmlOptions))
@@ -122,6 +136,21 @@ public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcess
             // Always remove the run dir (vnc.pass, overlay, NVRAM); the domain error, if any, still propagates.
             try { if (Directory.Exists(runDir)) Directory.Delete(runDir, recursive: true); } catch { /* best effort */ }
         }
+    }
+
+    public async Task<bool> IsRunningAsync(VmHandle vm, CancellationToken ct)
+    {
+        var r = await runner.RunAsync(_o.VirshBinary, ["-c", _o.Uri, "domstate", vm.Name], ct);
+        if (r.ExitCode != 0)
+        {
+            // A transient domain disappears when it shuts off.
+            if (r.Stderr.Contains("failed to get domain", StringComparison.OrdinalIgnoreCase)
+                || r.Stderr.Contains("domain not found", StringComparison.OrdinalIgnoreCase)) return false;
+            throw new InvalidOperationException($"virsh domstate {vm.Name} failed ({r.ExitCode}): {r.Stderr.Trim()}");
+        }
+
+        // Anything not known to be off counts as running: sealing must never start while the guest might still write.
+        return r.Stdout.Trim().ToLowerInvariant() is not ("shut off" or "crashed" or "pmsuspended");
     }
 
     public async Task<IReadOnlyList<VmHandle>> ListAsync(CancellationToken ct)

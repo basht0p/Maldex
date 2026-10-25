@@ -39,10 +39,27 @@ media, fully unattended and offline.
 - The event logs are cleared by `Provision.ps1`, but the verification boot afterwards writes new entries, so the finished image does NOT have pristine logs. This is deliberate and harmless; the per-run overlay is what matters.
 - The build has not been run against real media yet (it needs `MALDEX_WIN_ISO`); only static validation was possible.
 
-## Manual preparation (prepare-guest / finalize-guest)
+## Changing an existing template: Edit and Refresh in the app
 
-Some changes cannot be made unattended, notably turning off Tamper Protection and Defender on Pro media. They are made by
-hand on a copy of the base image:
+Once an image is a template (the first start imports it as v1), change it in the app, not with the scripts below: under
+**Admin → Sandbox Templates**, **Edit** boots a writable copy of the current version with a browser console (network
+`None`, or `Direct` for internet-only updates) and **Seal** turns it into a new version; **Refresh components** re-applies
+the current agent, Sysmon configuration and interception CA without a console. Both verify the sealed copy (agent build,
+Defender real-time protection off) before publishing it as a new version, and **Roll back** returns to the previous one.
+No disk is ever replaced in place: every version is a new file `base/<version id>.qcow2`, so the hand-prepared base stays
+as it is.
+
+Before the first boot, each Edit and Refresh job writes the current agent into its own working copy offline with
+libguestfs (guestfish), so even an image with an older agent can be updated. This needs `libguestfs-tools` and the fixed
+appliance at `/var/lib/maldex/guestfs-appliance`, which root builds; `./build.sh real-setup` installs and builds both. The
+agent comes from `.data/agent/Maldex.Agent.exe` and its `Maldex.Agent.version`: run `./build.sh agent` first.
+
+`prepare-guest` / `finalize-guest` remain only for making the first image, until Build from ISO exists in the app (Plan 3).
+
+## Manual preparation of the first image (prepare-guest / finalize-guest)
+
+Some changes cannot be made unattended, notably turning off Tamper Protection and Defender on Pro media. Until the app can
+build an image, they are made by hand on a copy of the base image, before it is first imported:
 
 1. `./build.sh prepare-guest` copies the base to `.data/vm/prepare/` and boots it as `maldex-prepare` with **no network**.
    VNC listens on this host's LAN address (`MALDEX_VNC_LISTEN` overrides it) with a random 8-character password; the
@@ -60,7 +77,7 @@ Images built by `build-guest.sh` are imported as templates (v1) on the next star
 
 Both `build-guest` and `finalize-guest` replace the base in place, so both refuse (exit 2) while any analysis run exists (a `maldex-<32 hex>` domain or run directory): every run's overlay reads the base as its backing file. They check before starting and again right before the swap.
 
-Once an image has been imported as template v1, running `build-guest` or `finalize-guest` again replaces that template's disk in place: v1 keeps its id and number, but its recorded provenance (Windows build, size, sealed date) no longer matches the disk. Until Build and Edit in the app exist (later plans), do this only while no analysis is running, and accept that v1 is redefined by it.
+Once an image has been imported as template v1, running `build-guest` or `finalize-guest` again replaces that template's disk in place: v1 keeps its id and number, but its recorded provenance (Windows build, size, sealed date) no longer matches the disk. Use Edit or Refresh in the app instead; if you must, do this only while no analysis or template job is running, and accept that v1 is redefined by it.
 
 ## Running the E2E suite
 
@@ -70,5 +87,31 @@ Once an image has been imported as template v1, running `build-guest` or `finali
 2. Run `./build.sh e2e`. It sets `MALDEX_REAL_VM=1` and `MALDEX_REAL_NET=1` and runs only `RealVmE2ETests` (needs Docker for the SQL container, and the passwordless sudo that real mode uses). Without those variables and the image the tests skip with a message.
 3. The test output records the time from `Preparing` to agent Ready for every run (measured, not asserted), and each run is followed by a check that no `maldex-*` libvirt domain and no `mx*` link or namespace survived.
 4. Calc-macro test: needs Office in the image (`MALDEX_OFFICE_ISO` at build time) and a macro-enabled document whose AutoOpen starts `calc.exe`, which is not stored in the repository. Opt in with `MALDEX_E2E_OFFICE=1 MALDEX_E2E_OFFICE_SAMPLE=/path/to/calc-macro.doc`; otherwise the test skips with a message.
+
+5. Template jobs (`RealTemplateJobTests`, and `RealGuestDiskEditorTests` for the libguestfs disk editor): a Refresh of
+   `win11-26h2` that must publish v2 and then pass the three scenarios above on v2; an Edit with `Direct` network whose guest
+   self-test must reach a public address and not the LAN gateway, the host or the control plane, then a discard; and a Refresh
+   followed by a Roll back (v1 current, v2 retired). Each test deletes the disks its jobs created and checks that
+   `.data/vm/base` holds exactly the files it held before; nothing touches `win11-26h2.*`. They take up to about two hours in
+   all, so they are **not** part of `./build.sh e2e`: they also require `MALDEX_REAL_TEMPLATES=1` and skip with a pointer to
+   `./build.sh e2e-templates` without it. They also need the base image and the real-setup toolchain (the libguestfs appliance).
+
+### The template E2E gate
+
+`./build.sh e2e-templates [test-filter]` runs those two classes (`MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 MALDEX_REAL_TEMPLATES=1`).
+It checks the base image (exit 2 if missing) and runs `./build.sh agent` when `.data/agent/Maldex.Agent.exe` is missing. An
+optional argument runs only the tests whose method name contains it (for example `./build.sh e2e-templates Edit`); a filtered
+run never updates the stamp.
+
+A full run that is green, with no skipped test, writes `git rev-parse HEAD` to **`.data/e2e-templates.validated`** (the stamp;
+`.data/` is untracked), but only if the template-affecting paths have no uncommitted changes (otherwise it says why and leaves
+the stamp alone). The paths are the one `TEMPLATE_E2E_PATHS` list in `build.sh`: the template orchestrator code, agent,
+domain/lifecycle/data/infrastructure for templates, Libvirt/Agent/Net/Isolation, the template and tunnel endpoints,
+`deploy/guest/provision/sysmon-config.xml`, `deploy/host/` and the two E2E test files.
+
+At the end of `./build.sh e2e`, build.sh tells you when the template E2E is due: the stamp is missing, its commit is not an
+ancestor of HEAD, a watched path changed since it (`git diff --name-only <stamp> HEAD -- <paths>`), or a watched path has
+uncommitted changes. It prints the changed files and, on a terminal, asks `run ./build.sh e2e-templates now? [y/N]` (default
+No); with no terminal it only prints. Plain `e2e` still runs only `RealVmE2ETests`.
 
 The registry-write sample is a `.ps1`; the agent opens samples with ShellExecute, so `Provision.ps1` re-points the `.ps1` Open verb at PowerShell (Windows 11 otherwise opens it in Notepad).
