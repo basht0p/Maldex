@@ -74,29 +74,15 @@ public sealed class DroppedFileCollector(IArtifactStore artifacts, TimeProvider 
 
     private async Task<Outcome> CollectOneAsync(IAgentChannel ch, ChannelReader<AgentMessage> replies, string path, string? excludeSha256, long receivedSoFar, CancellationToken ct)
     {
-        var id = Guid.NewGuid().ToString("N");
         var shown = GuestText.Clean(path, 256);
-        var transfer = new Transfer();
+        var transfer = new FileTransfer(path, AgentLimits.MaxDroppedFileBytes);
 
         using var timeout = new CancellationTokenSource(PerFileTimeout, time);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
-        CommandResultMessage? result = null;
+        CommandResultMessage result;
         try
         {
-            await ch.SendAsync(new CollectFileCommand(id, path), linked.Token).ConfigureAwait(false);
-            while (result is null)
-            {
-                var message = await replies.ReadAsync(linked.Token).ConfigureAwait(false);
-                switch (message)
-                {
-                    case FileChunkMessage chunk when chunk.TransferId == id:
-                        transfer.Add(chunk);
-                        break;
-                    case CommandResultMessage r when r.CommandId == id:
-                        result = r;
-                        break;
-                }
-            }
+            result = await transfer.ReceiveAsync(ch, replies, linked.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (timeout.IsCancellationRequested && !ct.IsCancellationRequested)
         {
@@ -142,79 +128,108 @@ public sealed class DroppedFileCollector(IArtifactStore artifacts, TimeProvider 
             return new Outcome(null, transfer.BytesReceived);
         }
     }
+}
 
-    /// <summary>Reassembles one file from untrusted chunks. Anything wrong marks it rejected; it still counts the bytes it was sent.</summary>
-    private sealed class Transfer
+/// <summary>
+/// One <c>collect_file</c> exchange: sends the command, then reassembles the file from untrusted chunks until the agent's result
+/// arrives. Anything wrong (a declared size over the limit, chunks out of range or disagreeing, a hash mismatch) marks it
+/// rejected; it still counts the bytes it was sent. Shared by dropped-file collection and template builds.
+/// </summary>
+/// <param name="maxBytes">The largest file accepted (a declared size above it is rejected before anything is buffered).</param>
+internal sealed class FileTransfer(string path, long maxBytes)
+{
+    public string Id { get; } = Guid.NewGuid().ToString("N");
+
+    private byte[]?[]? _chunks;
+    private int _count = -1;
+    private long _total;
+    private long _held;
+    private string? _problem;
+
+    public long BytesReceived { get; private set; }
+    public string? Sha256 { get; private set; }
+
+    /// <summary>
+    /// Sends <c>collect_file</c> and reads <paramref name="replies"/> (an open inbox lease) until the result for it arrives: its own
+    /// chunks are kept, every other frame is skipped. The result says whether the agent served the file; <see cref="Verify"/> says
+    /// whether what arrived is whole.
+    /// </summary>
+    public async Task<CommandResultMessage> ReceiveAsync(IAgentChannel ch, ChannelReader<AgentMessage> replies, CancellationToken ct)
     {
-        private byte[]?[]? _chunks;
-        private int _count = -1;
-        private long _total;
-        private long _held;
-        private string? _problem;
-
-        public long BytesReceived { get; private set; }
-        public string? Sha256 { get; private set; }
-
-        public void Add(FileChunkMessage c)
+        await ch.SendAsync(new CollectFileCommand(Id, path), ct).ConfigureAwait(false);
+        while (true)
         {
-            byte[] data;
-            try { data = Convert.FromBase64String(c.DataBase64); }
-            catch (FormatException) { Reject("chunk is not valid base64"); return; }
-            BytesReceived += data.Length;
-            if (_problem is not null) return;
-
-            if (c.TotalBytes is < 0 or > AgentLimits.MaxDroppedFileBytes) { Reject($"declared size {c.TotalBytes} exceeds the {AgentLimits.MaxDroppedFileBytes}-byte limit"); return; }
-            if (c.Count is < 1 or > AgentLimits.MaxChunks) { Reject($"chunk count {c.Count} out of range"); return; }
-            if (c.Index < 0 || c.Index >= c.Count) { Reject($"chunk index {c.Index} out of range"); return; }
-            if (data.Length > AgentLimits.ChunkBytes) { Reject("chunk is larger than the chunk limit"); return; }
-
-            if (_chunks is null)
+            var message = await replies.ReadAsync(ct).ConfigureAwait(false);
+            switch (message)
             {
-                _chunks = new byte[]?[c.Count];
-                _count = c.Count;
-                _total = c.TotalBytes;
-                Sha256 = c.Sha256;
+                case FileChunkMessage chunk when chunk.TransferId == Id:
+                    Add(chunk);
+                    break;
+                case CommandResultMessage r when r.CommandId == Id:
+                    return r;
             }
-            else if (c.Count != _count || c.TotalBytes != _total || !string.Equals(c.Sha256, Sha256, StringComparison.Ordinal))
-            {
-                Reject("chunks disagree about the file's size, count or hash");
-                return;
-            }
+        }
+    }
 
-            if (_chunks[c.Index] is not null) { Reject($"chunk {c.Index} arrived twice"); return; }
-            _held += data.Length;
-            if (_held > _total) { Reject("the data is larger than the declared size"); return; }
-            _chunks[c.Index] = data;
+    private void Add(FileChunkMessage c)
+    {
+        byte[] data;
+        try { data = Convert.FromBase64String(c.DataBase64); }
+        catch (FormatException) { Reject("chunk is not valid base64"); return; }
+        BytesReceived += data.Length;
+        if (_problem is not null) return;
+
+        if (c.TotalBytes < 0 || c.TotalBytes > maxBytes) { Reject($"declared size {c.TotalBytes} exceeds the {maxBytes}-byte limit"); return; }
+        if (c.Count is < 1 or > AgentLimits.MaxChunks) { Reject($"chunk count {c.Count} out of range"); return; }
+        if (c.Index < 0 || c.Index >= c.Count) { Reject($"chunk index {c.Index} out of range"); return; }
+        if (data.Length > AgentLimits.ChunkBytes) { Reject("chunk is larger than the chunk limit"); return; }
+
+        if (_chunks is null)
+        {
+            _chunks = new byte[]?[c.Count];
+            _count = c.Count;
+            _total = c.TotalBytes;
+            Sha256 = c.Sha256;
+        }
+        else if (c.Count != _count || c.TotalBytes != _total || !string.Equals(c.Sha256, Sha256, StringComparison.Ordinal))
+        {
+            Reject("chunks disagree about the file's size, count or hash");
+            return;
         }
 
-        private void Reject(string why)
-        {
-            _problem ??= why;
-            _chunks = null; // free what was buffered
-            _held = 0;
-        }
+        if (_chunks[c.Index] is not null) { Reject($"chunk {c.Index} arrived twice"); return; }
+        _held += data.Length;
+        if (_held > _total) { Reject("the data is larger than the declared size"); return; }
+        _chunks[c.Index] = data;
+    }
 
-        /// <summary>Null when the file is complete and its hash matches; otherwise why not.</summary>
-        public string? Verify(out byte[]? content)
-        {
-            content = null;
-            if (_problem is not null) return _problem;
-            if (_chunks is null) return "no data arrived";
-            for (var i = 0; i < _chunks.Length; i++)
-                if (_chunks[i] is null) return $"chunk {i} of {_count} is missing";
-            if (_held != _total) return $"received {_held} bytes but {_total} were declared";
+    private void Reject(string why)
+    {
+        _problem ??= why;
+        _chunks = null; // free what was buffered
+        _held = 0;
+    }
 
-            var assembled = new byte[_total];
-            var offset = 0;
-            foreach (var part in _chunks)
-            {
-                part!.CopyTo(assembled, offset);
-                offset += part.Length;
-            }
-            var actual = Convert.ToHexString(SHA256.HashData(assembled)).ToLowerInvariant();
-            if (!string.Equals(actual, Sha256, StringComparison.Ordinal)) return "SHA-256 does not match the declared hash";
-            content = assembled;
-            return null;
+    /// <summary>Null when the file is complete and its hash matches; otherwise why not.</summary>
+    public string? Verify(out byte[]? content)
+    {
+        content = null;
+        if (_problem is not null) return _problem;
+        if (_chunks is null) return "no data arrived";
+        for (var i = 0; i < _chunks.Length; i++)
+            if (_chunks[i] is null) return $"chunk {i} of {_count} is missing";
+        if (_held != _total) return $"received {_held} bytes but {_total} were declared";
+
+        var assembled = new byte[_total];
+        var offset = 0;
+        foreach (var part in _chunks)
+        {
+            part!.CopyTo(assembled, offset);
+            offset += part.Length;
         }
+        var actual = Convert.ToHexString(SHA256.HashData(assembled)).ToLowerInvariant();
+        if (!string.Equals(actual, Sha256, StringComparison.Ordinal)) return "SHA-256 does not match the declared hash";
+        content = assembled;
+        return null;
     }
 }

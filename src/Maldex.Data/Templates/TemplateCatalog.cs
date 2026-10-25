@@ -213,7 +213,8 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
     /// <summary>
     /// Makes the template the default and clears the old default in one transaction. The old default is saved cleared
     /// first because the unique index is checked per statement, not per transaction. Already the default: nothing changes
-    /// and nothing is audited.
+    /// and nothing is audited. Inside a transaction the caller opened (<c>db.Database.CurrentTransaction</c>), it joins that
+    /// transaction and commits (or rolls back) with it.
     /// </summary>
     /// <exception cref="TemplateRuleException">The template is disabled.</exception>
     public Task SetDefaultAsync(string templateId, CancellationToken ct, TemplateAudit? audit = null) =>
@@ -222,14 +223,14 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
             var template = await GetTemplateAsync(templateId, ct).ConfigureAwait(false);
             if (!template.Enabled) throw new TemplateRuleException($"template '{template.Id}' is disabled");
             if (template.IsDefault) return;
-            await using var tx = await db.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
+            await using var tx = db.Database.CurrentTransaction is null ? await db.Database.BeginTransactionAsync(ct).ConfigureAwait(false) : null;
             foreach (var old in await db.Templates.Where(t => t.IsDefault && t.Id != template.Id).ToListAsync(ct).ConfigureAwait(false))
                 old.IsDefault = false;
             await db.SaveChangesAsync(ct).ConfigureAwait(false);
             template.IsDefault = true;
             AddAudit(audit, template.Id);
             await db.SaveChangesAsync(ct).ConfigureAwait(false);
-            await tx.CommitAsync(ct).ConfigureAwait(false);
+            if (tx is not null) await tx.CommitAsync(ct).ConfigureAwait(false);
         }, ct);
 
     /// <summary>Enables or disables the template. Already in that state: nothing changes and nothing is audited.</summary>
@@ -242,6 +243,36 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
             if (template.Enabled == enabled) return;
             template.Enabled = enabled;
             AddAudit(audit, template.Id);
+        }, ct);
+
+    /// <summary>
+    /// Deletes a template that never produced a version, together with its (terminal) job rows. One transaction with the template
+    /// row locked (<c>UPDLOCK, HOLDLOCK</c>), so a Build queued meanwhile either finds the template gone or makes this refuse.
+    /// The audit rows that name the template stay: they are the history.
+    /// </summary>
+    /// <exception cref="TemplateRuleException">The template has a version (any status), an active job, or is the default.</exception>
+    public Task DeleteEmptyAsync(string templateId, CancellationToken ct, TemplateAudit? audit = null) =>
+        RetryAsync(async () =>
+        {
+            await using var tx = await db.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
+            var template = await db.Templates
+                .FromSqlInterpolated($"SELECT * FROM Templates WITH (UPDLOCK, HOLDLOCK) WHERE Id = {templateId}")
+                .SingleOrDefaultAsync(ct).ConfigureAwait(false)
+                ?? throw new InvalidOperationException($"template '{templateId}' does not exist");
+            if (await db.TemplateVersions.AnyAsync(v => v.TemplateId == template.Id, ct).ConfigureAwait(false))
+                throw new TemplateRuleException("the template has versions; it cannot be deleted");
+            if (await db.TemplateJobs.AnyAsync(j => j.TemplateId == template.Id && ActiveJobStates.Contains(j.State), ct).ConfigureAwait(false))
+                throw new TemplateRuleException("a job is already running for this template");
+            if (template.IsDefault) throw new TemplateRuleException("choose another default first");
+
+            await db.TemplateJobs.Where(j => j.TemplateId == template.Id).ExecuteDeleteAsync(ct).ConfigureAwait(false);
+            // Gone from the database: stop tracking them, or removing the template would try to delete them once more.
+            foreach (var entry in db.ChangeTracker.Entries<TemplateJob>().Where(en => en.Entity.TemplateId == template.Id).ToList())
+                entry.State = EntityState.Detached;
+            db.Templates.Remove(template);
+            AddAudit(audit, template.Id);
+            await db.SaveChangesAsync(ct).ConfigureAwait(false);
+            await tx.CommitAsync(ct).ConfigureAwait(false);
         }, ct);
 
     /// <summary>

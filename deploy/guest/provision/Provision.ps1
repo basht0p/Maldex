@@ -1,17 +1,23 @@
 #requires -Version 5.1
 <#
   One-shot provisioning of the Maldex analysis guest. Runs as the local administrator `analyst` from the
-  provisioning CD (label MALDEXPROV) via Autounattend FirstLogonCommands, then powers the VM off.
+  provisioning CD (label MALDEXPROV) via Autounattend FirstLogonCommands, in the same boot as Setup.
 
-  Critical steps record a failure and provisioning still powers off (the host-side boot check then fails because
-  no agent "ready" frame arrives). Best-effort steps (Defender, power plan, Office) warn and continue.
-  Everything is logged to C:\ProgramData\Maldex\provision.log.
+  Critical steps record a failure and provisioning carries on. Best-effort steps (Defender, SmartScreen, Windows Update,
+  .ps1 association, Edge, power plan) warn and continue. Office is critical when office-config.xml is on the CD.
+  The Maldex agent is installed and started right after the virtio tools, so the host can read the result even when a
+  later step fails. Everything is logged to C:\ProgramData\Maldex\provision.log, and the outcome is written last to
+  C:\ProgramData\Maldex\provision-result.json as {"ok":true|false,"failedSteps":[...]}.
+
+  This script never shuts the guest down and never clears event logs: the host powers the VM off after it has read the
+  result, and sealing clears the logs.
 #>
 $ErrorActionPreference = 'Stop'
 
 $LogDir = 'C:\ProgramData\Maldex'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $LogFile = Join-Path $LogDir 'provision.log'
+$ResultFile = 'C:\ProgramData\Maldex\provision-result.json'
 Start-Transcript -Path $LogFile -Append | Out-Null
 
 $ProvRoot = $PSScriptRoot
@@ -45,6 +51,25 @@ try {
         if ($p.ExitCode -notin 0, 3010) { throw "virtio-win-guest-tools exit code $($p.ExitCode)" }
     }
 
+    Step 'Maldex agent (scheduled task at logon of analyst, interactive session; started now)' {
+        New-Item -ItemType Directory -Force -Path $AgentDir | Out-Null
+        $exe = Join-Path $AgentDir 'Maldex.Agent.exe'
+        Copy-Item -Force (Join-Path $ProvRoot 'Maldex.Agent.exe') $exe
+
+        $user = "$env:COMPUTERNAME\$AnalystUser"
+        $action = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $AgentDir
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
+            -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
+            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+        Register-ScheduledTask -TaskName 'MaldexAgent' -Action $action -Trigger $trigger -Principal $principal `
+            -Settings $settings -Force | Out-Null
+        if (-not (Get-ScheduledTask -TaskName 'MaldexAgent')) { throw 'MaldexAgent task was not registered' }
+        # Start it now (analyst is logged on): the host sees the agent come up and reads the result marker through it.
+        Start-ScheduledTask -TaskName 'MaldexAgent'
+    }
+
     Step 'Sysmon' {
         $p = Start-Process -FilePath (Join-Path $ProvRoot 'Sysmon64.exe') `
             -ArgumentList '-accepteula', '-i', (Join-Path $ProvRoot 'sysmon-config.xml') -Wait -PassThru
@@ -68,26 +93,9 @@ try {
         if (-not (Get-ChildItem Cert:\LocalMachine\Root | Where-Object Thumbprint -eq $cert.Thumbprint)) { throw 'CA not in Root store' }
     }
 
-    Step 'Maldex agent (scheduled task at logon of analyst, interactive session)' {
-        if ($script:failed) { throw "not registering the agent because earlier critical steps failed: $($script:failedSteps -join '; ')" }
-        New-Item -ItemType Directory -Force -Path $AgentDir | Out-Null
-        $exe = Join-Path $AgentDir 'Maldex.Agent.exe'
-        Copy-Item -Force (Join-Path $ProvRoot 'Maldex.Agent.exe') $exe
-
-        $user = "$env:COMPUTERNAME\$AnalystUser"
-        $action = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $AgentDir
-        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-        $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
-            -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
-            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
-        Register-ScheduledTask -TaskName 'MaldexAgent' -Action $action -Trigger $trigger -Principal $principal `
-            -Settings $settings -Force | Out-Null
-        if (-not (Get-ScheduledTask -TaskName 'MaldexAgent')) { throw 'MaldexAgent task was not registered' }
-    }
-
     Step 'Defender real-time, SmartScreen and Windows Update off' -BestEffort {
-        # Policy keys are also set by Autounattend. Tamper Protection can block runtime changes; report the outcome.
+        # Policy keys are also set by Autounattend. Tamper Protection can block runtime changes; report the outcome
+        # (Defender is never forced off here: the admin does it in the Configuring console).
         $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
         New-Item -Path "$pol\Real-Time Protection" -Force | Out-Null
         Set-ItemProperty -Path $pol -Name DisableAntiSpyware -Value 1 -Type DWord
@@ -97,7 +105,7 @@ try {
         try {
             $rt = (Get-MpComputerStatus).RealTimeProtectionEnabled
             Write-Host "Defender RealTimeProtectionEnabled = $rt"
-            if ($rt) { Write-Warning 'Defender real-time protection is STILL ON (Tamper Protection?). Disable it in the image by hand.' }
+            if ($rt) { Write-Warning 'Defender real-time protection is STILL ON (Tamper Protection?). Disable it in the Configuring console.' }
         } catch { Write-Warning "Get-MpComputerStatus: $_" }
 
         Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' -Name SmartScreenEnabled -Value 'Off' -Type String
@@ -117,7 +125,7 @@ try {
         Set-ItemProperty -Path "$key\Open\Command" -Name '(default)' -Value '"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%1"'
     }
 
-    Step 'Edge: no Startup Boost, no background mode' -BestEffort {
+    Step 'Edge: no Startup Boost, no background mode, no first-run page' -BestEffort {
         # The agent launches msedge.exe for URL runs; with Startup Boost or background mode (Windows 11 defaults) an Edge
         # already running outside the sample's process tree takes the URL over, and its downloads would not be collected.
         # BackgroundModeEnabled=0 also covers "Continue running background extensions and apps when Microsoft Edge is closed".
@@ -125,6 +133,8 @@ try {
         New-Item -Path $edge -Force | Out-Null
         Set-ItemProperty -Path $edge -Name StartupBoostEnabled -Value 0 -Type DWord
         Set-ItemProperty -Path $edge -Name BackgroundModeEnabled -Value 0 -Type DWord
+        # No welcome page: it would cover the URL a run opens.
+        Set-ItemProperty -Path $edge -Name HideFirstRunExperience -Value 1 -Type DWord
         # Resolve through Windows (no built-in DNS client, no DNS over HTTPS): Sysmon only sees DnsQuery lookups, and the
         # run's dnsmasq/INetSim must answer every name.
         Set-ItemProperty -Path $edge -Name BuiltInDnsClientEnabled -Value 0 -Type DWord
@@ -140,14 +150,15 @@ try {
         powercfg /hibernate off
     }
 
-    Step 'Office (optional)' -BestEffort {
+    # Critical when the host put office-config.xml on the CD: the admin asked for Office.
+    Step 'Office' {
         $config = Join-Path $ProvRoot 'office-config.xml'
         if (-not (Test-Path $config)) { Write-Host 'No office-config.xml on the provisioning CD; skipping Office.'; return }
         # The Office media is the other CD that has setup.exe and an Office\ folder.
         $src = Get-PSDrive -PSProvider FileSystem |
             Where-Object { $_.Root -ne $ProvDrive -and (Test-Path (Join-Path $_.Root 'setup.exe')) -and (Test-Path (Join-Path $_.Root 'Office')) } |
             Select-Object -First 1 -ExpandProperty Root
-        if (-not $src) { Write-Host 'Office media not mounted; skipping Office.'; return }
+        if (-not $src) { throw 'Office media not mounted' }
         $cfg = Join-Path $env:TEMP 'office-config.xml'
         (Get-Content -Raw $config).Replace('@OFFICE_SOURCE@', $src.TrimEnd('\')) | Set-Content -Path $cfg -Encoding UTF8
         $p = Start-Process -FilePath (Join-Path $src 'setup.exe') -ArgumentList '/configure', $cfg -Wait -PassThru
@@ -168,15 +179,16 @@ try {
 }
 catch { Write-Host "FATAL: $_"; $script:failed = $true; $script:failedSteps += 'unexpected error' }
 finally {
-    if ($script:failed) { Write-Host "PROVISIONING FAILED: $($script:failedSteps -join '; '). Powering off; the host boot check will fail." }
-    else { Write-Host 'Provisioning complete. Powering off.' }
+    if ($script:failed) { Write-Host "PROVISIONING FAILED: $($script:failedSteps -join '; ')." }
+    else { Write-Host 'Provisioning complete.' }
+    # The host reads this marker through the agent. UTF-8 without BOM, written to .tmp and renamed so a reader never sees a partial file.
+    # Written before the transcript stops, so a failure to write it is still in provision.log.
+    try {
+        $json = (@{ ok = (-not $script:failed); failedSteps = @($script:failedSteps) } | ConvertTo-Json -Compress)
+        $tmp = "$ResultFile.tmp"
+        [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -Force -Path $tmp -Destination $ResultFile
+    } catch { Write-Host "Could not write ${ResultFile}: $_" }
     try { Stop-Transcript | Out-Null } catch { }
-
-    # Clear every event log last, so the first analysis run starts clean (provision.log stays on disk).
-    # Native stderr under 'Stop' would be a terminating error, so relax it here and never let this block shutdown.
-    $ErrorActionPreference = 'Continue'
-    try { foreach ($log in (wevtutil el)) { wevtutil cl "$log" 2>$null | Out-Null } } catch { }
-
-    shutdown.exe /s /t 0
 }
 exit ([int]$script:failed)

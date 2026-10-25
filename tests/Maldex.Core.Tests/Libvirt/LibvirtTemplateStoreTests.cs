@@ -1,4 +1,5 @@
 using System.Runtime.Versioning;
+using Maldex.Infrastructure.Execution;
 using Maldex.Infrastructure.Libvirt;
 using Microsoft.Extensions.Options;
 using Xunit;
@@ -18,7 +19,27 @@ public sealed class LibvirtTemplateStoreTests : IDisposable
         try { Directory.Delete(_dir, true); } catch { }
     }
 
-    private LibvirtTemplateStore Store() => new(Options.Create(new LibvirtOptions { BaseImageDir = _dir }));
+    private readonly BlankRunner _runner = new();
+
+    /// <summary>Stands in for qemu-img: records the argv and (like the real tool) writes the output file unless told to fail.</summary>
+    private sealed class BlankRunner : IProcessRunner
+    {
+        public readonly List<(string File, string[] Args)> Calls = [];
+        public bool Fail { get; set; }
+        public Task<ProcessResult> RunAsync(string file, IReadOnlyList<string> args, CancellationToken ct, string? stdin = null, TimeSpan? timeout = null)
+        {
+            Calls.Add((file, args.ToArray()));
+            if (Fail)
+            {
+                File.WriteAllBytes(args[3], [0]); // a half-written output, as a failing qemu-img may leave
+                return Task.FromResult(new ProcessResult(1, "", "boom"));
+            }
+            File.WriteAllBytes(args[3], [7, 7]);
+            return Task.FromResult(new ProcessResult(0, "", ""));
+        }
+    }
+
+    private LibvirtTemplateStore Store() => new(Options.Create(new LibvirtOptions { BaseImageDir = _dir }), _runner);
     private string Qcow => Path.Combine(_dir, Stem + ".qcow2");
     private string Vars => Path.Combine(_dir, Stem + ".vars.fd");
 
@@ -159,5 +180,70 @@ public sealed class LibvirtTemplateStoreTests : IDisposable
         await Assert.ThrowsAsync<ArgumentException>(() => s.CreateWorkingCopyAsync("../x", Copy, CancellationToken.None));
         await Assert.ThrowsAsync<ArgumentException>(() => s.CreateWorkingCopyAsync(Stem, "A/b", CancellationToken.None));
         await Assert.ThrowsAsync<ArgumentException>(() => s.SealAsync("../x", CancellationToken.None));
+    }
+
+    private string VarsTemplate()
+    {
+        var p = Path.Combine(_dir, "template.vars.fd");
+        if (File.Exists(p)) return p;
+        File.WriteAllBytes(p, [4, 5, 6]);
+        if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(p, ReadOnly);
+        return p;
+    }
+
+    [Fact]
+    [SupportedOSPlatform("linux")]
+    public async Task CreateBlank_RunsQemuImgCreateQcow2WithTheByteSize_AndPublishesBothFiles0600()
+    {
+        var s = Store();
+        await s.CreateBlankAsync(Copy, 64L * 1024 * 1024 * 1024, VarsTemplate(), CancellationToken.None);
+
+        var call = Assert.Single(_runner.Calls);
+        Assert.Equal("qemu-img", call.File);
+        Assert.Equal(["create", "-f", "qcow2", CopyQcow + ".tmp", "68719476736"], call.Args);
+        var rw = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        Assert.Equal(rw, File.GetUnixFileMode(CopyQcow));
+        Assert.Equal(rw, File.GetUnixFileMode(CopyVars));
+        Assert.Equal([4, 5, 6], File.ReadAllBytes(CopyVars));
+        Assert.True(s.Exists(Copy));
+        Assert.Empty(Directory.GetFiles(_dir, "*.tmp"));
+    }
+
+    [Fact]
+    public async Task CreateBlank_ExistingStem_Refused_AndTouchesNothing()
+    {
+        var s = Store();
+        File.WriteAllBytes(CopyVars, [7]);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => s.CreateBlankAsync(Copy, 1024, VarsTemplate(), CancellationToken.None));
+        Assert.Equal([7], File.ReadAllBytes(CopyVars));
+        Assert.False(File.Exists(CopyQcow));
+        Assert.Empty(_runner.Calls);
+    }
+
+    [Fact]
+    public async Task CreateBlank_FailedQemuImg_LeavesNoFileBehind()
+    {
+        var s = Store();
+        var template = VarsTemplate();
+        _runner.Fail = true;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => s.CreateBlankAsync(Copy, 1024, template, CancellationToken.None));
+        Assert.Equal([Path.GetFileName(template)], Directory.GetFiles(_dir).Select(Path.GetFileName).ToArray());
+    }
+
+    [Fact]
+    public async Task CreateBlank_MissingVarsTemplate_LeavesNoFileBehind()
+    {
+        var s = Store();
+        await Assert.ThrowsAsync<FileNotFoundException>(() => s.CreateBlankAsync(Copy, 1024, Path.Combine(_dir, "none.fd"), CancellationToken.None));
+        Assert.Empty(Directory.GetFiles(_dir));
+    }
+
+    [Fact]
+    public async Task CreateBlank_InvalidStemOrSize_Throws()
+    {
+        var s = Store();
+        var template = VarsTemplate();
+        await Assert.ThrowsAsync<ArgumentException>(() => s.CreateBlankAsync("../x", 1024, template, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => s.CreateBlankAsync(Copy, 0, template, CancellationToken.None));
     }
 }

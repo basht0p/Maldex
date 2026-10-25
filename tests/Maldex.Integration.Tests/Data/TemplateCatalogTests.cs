@@ -20,6 +20,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
 
     private sealed class RecordingStore : ITemplateStore
     {
+        public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
         public List<string> Deleted { get; } = [];
         public HashSet<string> Missing { get; } = [];
         public bool Exists(string fileStem) => !Missing.Contains(fileStem);
@@ -158,6 +159,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
     /// <summary>Like <c>LibvirtTemplateStore</c>: a stem that is not a valid slug throws instead of answering.</summary>
     private sealed class InvalidStemStore(string invalid) : ITemplateStore
     {
+        public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
         public bool Exists(string fileStem) => fileStem == invalid ? throw new ArgumentException("Invalid template file stem.", nameof(fileStem)) : true;
         public long? SizeOf(string fileStem) => fileStem == invalid ? throw new ArgumentException("Invalid template file stem.", nameof(fileStem)) : null;
         public Task DeleteAsync(string fileStem, CancellationToken ct) => Task.CompletedTask;
@@ -571,6 +573,47 @@ public class TemplateCatalogTests(SqlServerFixture sql)
 
             await using var fresh = sql.CreateContext(db.Database.GetConnectionString()!);
             Assert.Equal(["b"], await fresh.Templates.Where(t => t.IsDefault).Select(t => t.Id).ToListAsync(Ct));
+        }
+    }
+
+    [Fact]
+    public async Task SetDefault_InsideAnOpenTransaction_JoinsIt_AndCommitsWithIt()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a", isDefault: true);
+            await AddTemplateAsync(db, "b");
+            await using (var tx = await db.Database.BeginTransactionAsync(Ct))
+            {
+                await Catalog(db).SetDefaultAsync("b", Ct, new TemplateAudit(null, "template.default", "first template"));
+                await tx.CommitAsync(Ct);
+            }
+
+            await using var fresh = sql.CreateContext(db.Database.GetConnectionString()!);
+            Assert.Equal(["b"], await fresh.Templates.Where(t => t.IsDefault).Select(t => t.Id).ToListAsync(Ct));
+            var audit = await fresh.AuditLogs.SingleAsync(Ct);
+            Assert.Equal(("template.default", (Guid?)null, "b", "first template"), (audit.Action, audit.UserId, audit.Target, audit.Details));
+        }
+    }
+
+    [Fact]
+    public async Task SetDefault_InsideAnOpenTransaction_RollsBackWithIt()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a", isDefault: true);
+            await AddTemplateAsync(db, "b");
+            await using (var tx = await db.Database.BeginTransactionAsync(Ct))
+            {
+                await Catalog(db).SetDefaultAsync("b", Ct, new TemplateAudit(null, "template.default"));
+                await tx.RollbackAsync(Ct);
+            }
+
+            await using var fresh = sql.CreateContext(db.Database.GetConnectionString()!);
+            Assert.Equal(["a"], await fresh.Templates.Where(t => t.IsDefault).Select(t => t.Id).ToListAsync(Ct));
+            Assert.Empty(await fresh.AuditLogs.ToListAsync(Ct));
         }
     }
 
@@ -1046,6 +1089,100 @@ public class TemplateCatalogTests(SqlServerFixture sql)
 
             Assert.Equal(2, interceptor.Calls);
             Assert.Null(await Catalog(db).FindAvailableAsync("a", Ct));
+        }
+    }
+
+    // --- delete an empty template ---
+
+    private static async Task SeedBuildJobAsync(MaldexDbContext db, string templateId, TemplateJobState state)
+    {
+        db.TemplateJobs.Add(new TemplateJob
+        {
+            Id = Guid.NewGuid(), Kind = TemplateJobKind.Build, TemplateId = templateId, State = state,
+            RequestedByUserId = await AddUserAsync(db), CreatedAt = Now,
+        });
+        await db.SaveChangesAsync(Ct);
+    }
+
+    [Fact]
+    public async Task DeleteEmpty_RemovesTheTemplateAndItsTerminalJobs_AndAuditsWithIt()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a", isDefault: true);
+            await AddTemplateAsync(db, "empty");
+            await SeedBuildJobAsync(db, "empty", TemplateJobState.Failed);
+            await SeedBuildJobAsync(db, "empty", TemplateJobState.Cancelled);
+            await SeedBuildJobAsync(db, "a", TemplateJobState.Failed);
+
+            await Catalog(db).DeleteEmptyAsync("empty", Ct, new TemplateAudit(null, "template.delete"));
+
+            await using var fresh = sql.CreateContext(db.Database.GetConnectionString()!);
+            Assert.Equal(["a"], await fresh.Templates.Select(t => t.Id).ToListAsync(Ct));
+            Assert.Equal(["a"], await fresh.TemplateJobs.Select(j => j.TemplateId).ToListAsync(Ct));
+            var audit = Assert.Single(await fresh.AuditLogs.Where(l => l.Action == "template.delete").ToListAsync(Ct));
+            Assert.Equal("empty", audit.Target);
+        }
+    }
+
+    [Theory]
+    [InlineData(TemplateJobState.Queued)]
+    [InlineData(TemplateJobState.Installing)]
+    [InlineData(TemplateJobState.Provisioning)]
+    [InlineData(TemplateJobState.Configuring)]
+    public async Task DeleteEmpty_RefusesAnActiveJob_AndChangesNothing(TemplateJobState state)
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a", isDefault: true);
+            await AddTemplateAsync(db, "empty");
+            await SeedBuildJobAsync(db, "empty", TemplateJobState.Failed);
+            await SeedBuildJobAsync(db, "empty", state);
+
+            var ex = await Assert.ThrowsAsync<TemplateRuleException>(() => Catalog(db).DeleteEmptyAsync("empty", Ct, new TemplateAudit(null, "template.delete")));
+
+            Assert.Equal("a job is already running for this template", ex.Message);
+            await using var fresh = sql.CreateContext(db.Database.GetConnectionString()!);
+            Assert.Equal(2, await fresh.TemplateJobs.CountAsync(j => j.TemplateId == "empty", Ct));
+            Assert.Empty(await fresh.AuditLogs.Where(l => l.Action == "template.delete").ToListAsync(Ct));
+        }
+    }
+
+    [Theory]
+    [InlineData(TemplateVersionStatus.Ready)]
+    [InlineData(TemplateVersionStatus.Retired)]
+    [InlineData(TemplateVersionStatus.Deleted)]
+    public async Task DeleteEmpty_RefusesATemplateWithAVersionOfAnyStatus(TemplateVersionStatus status)
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a", isDefault: true);
+            var held = await AddTemplateAsync(db, "held");
+            db.TemplateVersions.Add(new TemplateVersion { Id = Guid.NewGuid(), TemplateId = "held", Number = 1, Origin = TemplateVersionOrigin.Edit, FileStem = "held", SealedAt = Now, Status = status });
+            await db.SaveChangesAsync(Ct);
+
+            var ex = await Assert.ThrowsAsync<TemplateRuleException>(() => Catalog(db).DeleteEmptyAsync("held", Ct));
+
+            Assert.Equal("the template has versions; it cannot be deleted", ex.Message);
+            await using var fresh = sql.CreateContext(db.Database.GetConnectionString()!);
+            Assert.True(await fresh.Templates.AnyAsync(t => t.Id == "held", Ct));
+        }
+    }
+
+    [Fact]
+    public async Task DeleteEmpty_RefusesTheDefault()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "only", isDefault: true);
+
+            var ex = await Assert.ThrowsAsync<TemplateRuleException>(() => Catalog(db).DeleteEmptyAsync("only", Ct));
+
+            Assert.Equal("choose another default first", ex.Message);
         }
     }
 }

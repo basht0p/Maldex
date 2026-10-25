@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import {
+  deleteTemplate,
   discardTemplateVersion,
   listAdminTemplates,
   listTemplateJobs,
@@ -13,7 +14,10 @@ import {
 } from '../api/client'
 import type { AdminTemplateDto, MeDto, TemplateJobDto, TemplateJobNetwork, TemplateVersionDto } from '../api/types'
 import { messageOf } from '../util/apiMessage'
+import { useDialogFocus } from './dialogFocus'
 import styles from './forms.module.css'
+import MediaLibrary from './MediaLibrary'
+import NewTemplateDialog from './NewTemplateDialog'
 import page from './TemplatesAdminPage.module.css'
 
 /** e.g. `v3 (Windows 11 Pro 26300, agent 1.0.0, sealed 2026-10-24 by basht0p)`; mirrors the server's task provenance line. */
@@ -36,14 +40,11 @@ function officeLabel(present: boolean | null | undefined): string {
   return present == null ? 'Office unknown' : present ? 'Office ✓' : 'Office ✗'
 }
 
-const ACTIVE_JOB_STATES = ['Queued', 'Preparing', 'Configuring', 'Sealing', 'Verifying']
+/** Why Edit and Refresh are off for a template that has no current version. */
+const NO_VERSION = 'no version yet'
+const ACTIVE_JOB_STATES = ['Queued', 'Preparing', 'Installing', 'Provisioning', 'Configuring', 'Sealing', 'Verifying']
 /** While a job of the template is active, its job list is polled at this interval to notice the terminal state. */
 const JOB_POLL_MS = 5000
-
-function focusables(root: HTMLElement | null): HTMLElement[] {
-  if (!root) return []
-  return Array.from(root.querySelectorAll<HTMLElement>('input, button, select, textarea, a[href], [tabindex]:not([tabindex="-1"])')).filter((el) => !el.hasAttribute('disabled'))
-}
 
 /** Start dialog for an Edit (with the network choice) or a Refresh (confirm only). Errors, such as a 409 reason, show inside it. */
 function JobDialog({ kind, template, onClose, onStarted }: {
@@ -59,25 +60,7 @@ function JobDialog({ kind, template, onClose, onStarted }: {
   const titleId = `job-dialog-${template.id}`
   const dialogRef = useRef<HTMLDivElement>(null)
 
-  useEffect(() => {
-    focusables(dialogRef.current)[0]?.focus() // focus moves into the dialog on open
-  }, [])
-
-  function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
-    if (e.key === 'Escape') {
-      e.stopPropagation()
-      if (!busy) onClose()
-      return
-    }
-    if (e.key !== 'Tab') return
-    const items = focusables(dialogRef.current)
-    if (items.length === 0) return
-    const first = items[0]
-    const last = items[items.length - 1]
-    const inside = dialogRef.current?.contains(document.activeElement) ?? false
-    if (e.shiftKey && (document.activeElement === first || !inside)) { e.preventDefault(); last.focus() }
-    else if (!e.shiftKey && (document.activeElement === last || !inside)) { e.preventDefault(); first.focus() }
-  }
+  const onKeyDown = useDialogFocus(dialogRef, busy, onClose)
 
   async function start() {
     setBusy(true)
@@ -121,7 +104,7 @@ function JobsList({ jobs }: { jobs: TemplateJobDto[] }) {
         {jobs.map((j) => (
           <tr key={j.id}>
             <td><Link to={`/admin/template-jobs/${j.id}`}>{j.kind}</Link></td>
-            <td className={styles.mono}>{`v${j.baseVersionNumber}`}</td>
+            <td className={styles.mono}>{j.baseVersionNumber != null ? `v${j.baseVersionNumber}` : 'new'}</td>
             <td className={styles.mono}>{j.resultVersionNumber != null ? `v${j.resultVersionNumber}` : ''}</td>
             <td>{j.state}{j.state === 'Failed' && j.failureReason ? `: ${j.failureReason}` : ''}</td>
             <td>{j.createdAt.slice(0, 16).replace('T', ' ')}</td>
@@ -142,14 +125,18 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
   const headingId = `template-${t.id}`
   const navigate = useNavigate()
   const [jobs, setJobs] = useState<TemplateJobDto[]>([])
+  const [jobsLoaded, setJobsLoaded] = useState(false) // Delete waits for it: an active Build must not look absent
   const [dialog, setDialog] = useState<'Edit' | 'Refresh' | null>(null)
   const opener = useRef<HTMLElement | null>(null)
   const activeJob = jobs.find((j) => ACTIVE_JOB_STATES.includes(j.state))
+  const canDelete = jobsLoaded && t.versions.length === 0 && !activeJob && !t.isDefault
+  const noVersion = !t.current
+  const noVersionId = `${headingId}-no-version`
   const jobBlock = activeJob ? `A ${activeJob.kind} job is already ${activeJob.state.toLowerCase()} for this template.` : undefined
 
   useEffect(() => {
     let cancelled = false
-    listTemplateJobs(t.id).then((list) => { if (!cancelled) setJobs(list) }, () => undefined) // best effort: the 409 on start is the guard
+    listTemplateJobs(t.id).then((list) => { if (!cancelled) { setJobs(list); setJobsLoaded(true) } }, () => undefined) // best effort: the 409 on start is the guard
     return () => { cancelled = true }
   }, [t])
 
@@ -199,6 +186,10 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
     if (window.confirm(`Discard v${v.number} of ${t.displayName}? It is never published and its disk is deleted.`)) void run(() => discardTemplateVersion(t.id, v.id))
   }
 
+  function remove() {
+    if (window.confirm(`Delete ${t.displayName}? It has no versions; the template entry is removed.`)) void run(() => deleteTemplate(t.id))
+  }
+
   function rollBack() {
     if (!previous) return
     const ok = window.confirm(
@@ -219,9 +210,11 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
           Enabled
         </label>
         <button type="button" className={styles.secondary} disabled={busy || t.isDefault} onClick={() => void run(() => setDefaultTemplate(t.id))}>Set as default</button>
-        <button type="button" className={styles.secondary} disabled={busy || !!activeJob} title={jobBlock} onClick={(e) => openDialog('Edit', e.currentTarget)}>Edit</button>
-        <button type="button" className={styles.secondary} disabled={busy || !!activeJob} title={jobBlock} onClick={(e) => openDialog('Refresh', e.currentTarget)}>Refresh components</button>
+        <button type="button" className={styles.secondary} disabled={busy || !!activeJob || noVersion} title={noVersion ? NO_VERSION : jobBlock} aria-describedby={noVersion ? noVersionId : undefined} onClick={(e) => openDialog('Edit', e.currentTarget)}>Edit</button>
+        <button type="button" className={styles.secondary} disabled={busy || !!activeJob || noVersion} title={noVersion ? NO_VERSION : jobBlock} aria-describedby={noVersion ? noVersionId : undefined} onClick={(e) => openDialog('Refresh', e.currentTarget)}>Refresh components</button>
+        {noVersion && <span id={noVersionId} hidden>{NO_VERSION}</span>}
         <button type="button" className={styles.secondary} disabled={busy || !previous || previousDiskMissing} title={previousDiskMissing ? `Cannot roll back: the disk is missing for v${previous.number}.` : undefined} onClick={rollBack}>Roll back</button>
+        {canDelete && <button type="button" className={styles.secondary} disabled={busy} onClick={remove}>Delete</button>}
       </div>
       {t.description && <p className={styles.hint}>{t.description}</p>}
       {errors.map((m, i) => <p key={i} className={styles.error} role="alert">{m}</p>)}
@@ -231,7 +224,7 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
         {t.current ? <>
             <span className={styles.mono}>{`Current: ${versionSummary(t.current)}`}</span>{' '}
             <span className={styles.hint}>{officeLabel(t.current.officePresent)}</span>
-          </> : <span className={styles.hint}>No current version</span>}
+          </> : <span className={styles.hint}>{t.versions.length === 0 ? 'No version yet' : 'No current version'}</span>}
       </p>
       <p className={page.summary}>
         {kept.length > 0 ? <span className={styles.mono}>{`Previous kept: ${kept.map((v) => `v${v.number}`).join(', ')}`}</span> : <span className={styles.hint}>No previous version kept</span>}
@@ -268,10 +261,17 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
   )
 }
 
+type Tab = 'templates' | 'media'
+
 /** Admin-only. Non-admins see a notice; the API enforces the same rule server-side. */
 export default function TemplatesAdminPage({ me }: { me: MeDto | null }) {
   const [templates, setTemplates] = useState<AdminTemplateDto[]>([])
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [tab, setTab] = useState<Tab>('templates')
+  const [mediaOpened, setMediaOpened] = useState(false) // the library stays mounted once opened, so an upload survives a tab switch
+  const [building, setBuilding] = useState(false)
+  const opener = useRef<HTMLElement | null>(null)
+  const navigate = useNavigate()
   const isAdmin = me?.role === 'Admin'
 
   const refresh = useCallback(async () => {
@@ -279,7 +279,7 @@ export default function TemplatesAdminPage({ me }: { me: MeDto | null }) {
       setTemplates(await listAdminTemplates())
       setLoadError(null)
     } catch (e) {
-      setLoadError(messageOf(e)[0])
+      setLoadError(messageOf(e)[0]) // the last loaded templates stay on screen
     }
   }, [])
 
@@ -291,11 +291,41 @@ export default function TemplatesAdminPage({ me }: { me: MeDto | null }) {
   if (!me) return <p>Loading…</p>
   if (!isAdmin) return <p role="alert">Administrator access is required to manage sandbox templates.</p>
 
+  function choose(next: Tab) {
+    setTab(next)
+    if (next === 'media') setMediaOpened(true)
+  }
+
+  function closeBuild() {
+    setBuilding(false)
+    opener.current?.focus() // focus returns to the trigger
+  }
+
   return (
     <section>
       <h1>Sandbox Templates</h1>
-      {loadError && <p className={styles.error} role="alert">{loadError}</p>}
-      {templates.map((t) => <TemplateCard key={t.id} template={t} onChanged={refresh} />)}
+      <div role="tablist" aria-label="Sandbox templates" className={page.tabs}>
+        <button type="button" role="tab" id="tab-templates" aria-selected={tab === 'templates'} aria-controls="panel-templates" className={page.tab} onClick={() => choose('templates')}>Templates</button>
+        <button type="button" role="tab" id="tab-media" aria-selected={tab === 'media'} aria-controls="panel-media" className={page.tab} onClick={() => choose('media')}>Media</button>
+      </div>
+      <div role="tabpanel" id="panel-templates" aria-labelledby="tab-templates" hidden={tab !== 'templates'}>
+        <div className={page.toolbar}>
+          <button type="button" className={styles.primary} onClick={(e) => { opener.current = e.currentTarget; setBuilding(true) }}>New template</button>
+        </div>
+        {building && <NewTemplateDialog templates={templates} onClose={closeBuild} onStarted={(job) => navigate(`/admin/template-jobs/${job.id}`)} />}
+        {loadError && (
+          <p className={styles.error} role="alert">
+            {templates.length > 0 ? `Could not refresh the templates (${loadError}). Showing the last loaded versions. ` : `${loadError} `}
+            <button type="button" className={styles.secondary} onClick={() => void refresh()}>Retry</button>
+          </p>
+        )}
+        {templates.map((t) => <TemplateCard key={t.id} template={t} onChanged={refresh} />)}
+      </div>
+      {mediaOpened && (
+        <div role="tabpanel" id="panel-media" aria-labelledby="tab-media" hidden={tab !== 'media'}>
+          <MediaLibrary />
+        </div>
+      )}
     </section>
   )
 }

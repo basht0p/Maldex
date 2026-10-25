@@ -2,6 +2,7 @@ using System.Threading.Channels;
 using Maldex.Core.Abstractions;
 using Maldex.Core.Agent;
 using Maldex.Core.Text;
+using Maldex.Orchestrator.Templates.Build;
 using Microsoft.Extensions.Options;
 
 namespace Maldex.Orchestrator.Templates;
@@ -55,11 +56,8 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
             o.ApplyComponentsTimeout, m => new TemplateSealException("installing the components failed: " + m), ct).ConfigureAwait(false);
 
         // One deadline covers the power_off acknowledgement and the wait for the guest to stop running.
-        using var deadline = new CancellationTokenSource(o.PowerOffTimeout, time);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, deadline.Token);
-        await AwaitPowerOffAckAsync(ch, session, linked.Token).ConfigureAwait(false);
-        var stopped = await WaitUntilStoppedAsync(vm, o, linked.Token, ct).ConfigureAwait(false);
-        ct.ThrowIfCancellationRequested();
+        var stopped = await GuestPowerOff.PowerOffAsync(session, ch, hypervisor, vm, o, time, (m, inner) => new TemplateSealException(m, inner), ct)
+            .ConfigureAwait(false);
         if (!stopped) throw new TemplateSealException(DidNotPowerOff);
 
         // Clears whatever remains of a shut-off domain (idempotent); then the disk can no longer change.
@@ -72,71 +70,6 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
             throw new TemplateSealException($"cleaning up the powered-off guest failed: {GuestText.Clean(ex.Message, 200)}", ex);
         }
         await store.SealAsync(stem, ct).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Sends power_off and waits for its result. A refusal fails. A disconnect (the OS went away before or while answering) counts
-    /// as acknowledged, and so does running out of time: whether the guest really stopped is the hypervisor's word, checked next.
-    /// </summary>
-    private static async Task AwaitPowerOffAckAsync(IAgentChannel ch, GuestSession session, CancellationToken ct)
-    {
-        var command = new PowerOffCommand(NewId());
-        using var lease = session.Inbox.Open();
-        try
-        {
-            await ch.SendAsync(command, ct).ConfigureAwait(false);
-            while (true)
-            {
-                var message = await lease.Reader.ReadAsync(ct).ConfigureAwait(false);
-                if (message is not CommandResultMessage result || result.CommandId != command.CommandId) continue;
-                if (!result.Success) throw new TemplateSealException($"powering off failed: the agent refused it ({GuestText.Clean(result.Error, 200)})");
-                return;
-            }
-        }
-        catch (Exception ex) when (ex is ChannelClosedException or OperationCanceledException or IOException or ObjectDisposedException || ct.IsCancellationRequested)
-        {
-            // Disconnected, or out of time: the running-wait decides.
-        }
-    }
-
-    /// <summary>
-    /// True once the hypervisor says the guest is not running; false when the deadline passes first. <paramref name="ct"/> is the
-    /// deadline linked to the caller's token; <paramref name="callerCt"/> is the caller's alone (the last look honours it too).
-    /// </summary>
-    private async Task<bool> WaitUntilStoppedAsync(VmHandle vm, TemplateJobOptions o, CancellationToken ct, CancellationToken callerCt)
-    {
-        while (!ct.IsCancellationRequested)
-        {
-            try
-            {
-                if (!await hypervisor.IsRunningAsync(vm, ct).ConfigureAwait(false)) return true;
-                await Task.Delay(o.PollInterval, time, ct).ConfigureAwait(false);
-            }
-            catch (Exception) when (ct.IsCancellationRequested)
-            {
-                break; // whatever the error, the deadline or the caller ended the wait
-            }
-            catch (Exception ex)
-            {
-                throw new TemplateSealException($"could not check whether the guest stopped: {GuestText.Clean(ex.Message, 200)}", ex);
-            }
-        }
-
-        // Out of time: one short last look, so a guest that stopped just now is not reported as dirty.
-        using var lastTimeout = new CancellationTokenSource(o.PollInterval * 5, time);
-        using var last = CancellationTokenSource.CreateLinkedTokenSource(callerCt, lastTimeout.Token);
-        try
-        {
-            return !await hypervisor.IsRunningAsync(vm, last.Token).ConfigureAwait(false);
-        }
-        catch (Exception) when (!callerCt.IsCancellationRequested && lastTimeout.IsCancellationRequested)
-        {
-            return false; // the last look itself ran out of time: it did not power off
-        }
-        catch (Exception ex) when (!callerCt.IsCancellationRequested)
-        {
-            throw new TemplateSealException($"could not check whether the guest stopped: {GuestText.Clean(ex.Message, 200)}", ex);
-        }
     }
 
     private static string NewId() => Guid.NewGuid().ToString("N");

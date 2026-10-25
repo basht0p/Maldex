@@ -8,6 +8,7 @@ using Maldex.Infrastructure.Fakes;
 using Maldex.Orchestrator;
 using Maldex.Orchestrator.Templates;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Time.Testing;
 using Xunit;
 
 namespace Maldex.Integration.Tests.Orchestrator;
@@ -26,6 +27,7 @@ internal sealed class TemplateJobKit : IAsyncDisposable
         ApplyComponentsTimeout = TimeSpan.FromSeconds(10),
         ChunkTimeout = TimeSpan.FromSeconds(10),
         PollInterval = TimeSpan.FromMilliseconds(10),
+        DefenderSettleWindow = TimeSpan.Zero, // one Defender reading; the settle tests set the window they are about
     };
     public ComponentBundle Bundle { get; } = MakeBundle();
     public List<ReplayAgentChannel> Channels { get; } = [];
@@ -36,20 +38,61 @@ internal sealed class TemplateJobKit : IAsyncDisposable
         Store = new SpyTemplateStore(Hypervisor);
     }
 
-    public TemplateSealer Sealer => new(Hypervisor, Store, Microsoft.Extensions.Options.Options.Create(Options), TimeProvider.System);
+    /// <summary>The clock the jobs (and the replay guests) run on: the system clock unless <see cref="UseFakeClock"/> was called.</summary>
+    public TimeProvider Time { get; private set; } = TimeProvider.System;
+
+    /// <summary>
+    /// Runs the jobs on a fake clock. The waits a test does not exercise get an hour, so a test that pumps the clock
+    /// (<see cref="PumpAsync"/>) never trips them on a loaded machine; the test then shortens the one it is about.
+    /// </summary>
+    public FakeTimeProvider UseFakeClock()
+    {
+        var fake = new FakeTimeProvider();
+        Time = fake;
+        foreach (var set in new Action<TimeSpan>[]
+                 {
+                     t => Options.AgentReadyTimeout = t, t => Options.PowerOffTimeout = t, t => Options.VerifyTimeout = t,
+                     t => Options.ApplyComponentsTimeout = t, t => Options.ChunkTimeout = t, t => Options.ProvenanceTimeout = t,
+                 })
+            set(TimeSpan.FromHours(1));
+        return fake;
+    }
+
+    /// <summary>Advances the fake clock by <paramref name="step"/> (default 100 ms) per real millisecond until <paramref name="run"/> ends.</summary>
+    public async Task PumpAsync(Task run, TimeSpan? step = null)
+    {
+        var fake = (FakeTimeProvider)Time;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!run.IsCompleted)
+        {
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(60), "The job did not finish within 60 s of real time.");
+            fake.Advance(step ?? TimeSpan.FromMilliseconds(100));
+            await Task.Delay(1, TestContext.Current.CancellationToken);
+        }
+        await run;
+    }
+
+    public async Task<T> PumpAsync<T>(Task<T> run, TimeSpan? step = null)
+    {
+        await PumpAsync((Task)run, step);
+        return await run;
+    }
+
+    public TemplateSealer Sealer => new(Hypervisor, Store, Microsoft.Extensions.Options.Options.Create(Options), Time);
 
     public TemplateVerifier Verifier => new(Hypervisor, new Factory(this), new NoopEgressRouter(Microsoft.Extensions.Options.Options.Create(new FakeEgressOptions()), Guest),
         Microsoft.Extensions.Options.Options.Create(new OrchestratorOptions()), Microsoft.Extensions.Options.Options.Create(Options),
-        Microsoft.Extensions.Options.Options.Create(new Maldex.Infrastructure.Net.NetOptions { RunDir = RunDir }), TimeProvider.System);
+        Microsoft.Extensions.Options.Options.Create(new Maldex.Infrastructure.Net.NetOptions { RunDir = RunDir }), Time);
 
     /// <summary>The run directory the verifier cleans its lease leftovers from (a private temp dir).</summary>
     public string RunDir { get; } = Path.Combine(Path.GetTempPath(), "maldex-kit-run-" + Guid.NewGuid().ToString("N"));
 
-    /// <summary>A channel to a guest that is ready at once, or never (<paramref name="ready"/> false).</summary>
+    /// <summary>A channel to a guest that is ready after <see cref="ReadyDelay"/> (default at once), or never (<paramref name="ready"/> false).</summary>
     public ReplayAgentChannel NewChannel(Guid taskId, bool ready = true)
     {
-        string[] lines = ready ? ["""{"delayMs":0,"message":{"type":"ready","agentVersion":"0.1.0-fake+000000000000","hostname":"h"}}"""] : [];
-        var ch = new ReplayAgentChannel(lines, 1, holdOpen: true, TimeProvider.System, Guest, taskId);
+        var delayMs = (int)ReadyDelay.TotalMilliseconds;
+        string[] lines = ready ? [$$$"""{"delayMs":{{{delayMs}}},"message":{"type":"ready","agentVersion":"0.1.0-fake+000000000000","hostname":"h"}}"""] : [];
+        var ch = new ReplayAgentChannel(lines, 1, holdOpen: true, Time, Guest, taskId);
         lock (Channels) Channels.Add(ch);
         return ch;
     }
@@ -102,12 +145,15 @@ internal sealed class TemplateJobKit : IAsyncDisposable
     public int DropProvenanceRequests { get; set; }
 
     public bool VerifyAgentReady { get; set; } = true;
+    /// <summary>How long (on <see cref="Time"/>) a new channel's guest takes to say ready.</summary>
+    public TimeSpan ReadyDelay { get; set; } = TimeSpan.Zero;
     public bool ConnectFails { get; set; }
 }
 
 /// <summary>Records the seal calls and whether the guest was already gone when each happened.</summary>
 internal sealed class SpyTemplateStore(IHypervisor hypervisor) : ITemplateStore
 {
+    public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
     public List<(string Stem, int VmsListed)> Seals { get; } = [];
     public bool Exists(string fileStem) => true;
     public long? SizeOf(string fileStem) => null;
@@ -171,10 +217,11 @@ public class TemplateSealerTests
     {
         await using var kit = new TemplateJobKit();
         kit.Guest.SilentProvenance = true;
+        kit.UseFakeClock();
         kit.Options.ProvenanceTimeout = TimeSpan.FromMilliseconds(300);
         var (ch, vm) = await kit.StartTemplateVmAsync();
 
-        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.PumpAsync(kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct)));
 
         Assert.StartsWith("the guest agent did not answer", ex.Message);
         Assert.Empty(kit.Store.Seals);
@@ -210,10 +257,11 @@ public class TemplateSealerTests
     {
         await using var kit = new TemplateJobKit();
         kit.Guest.SilentProvenance = true;
+        var time = kit.UseFakeClock();
         var (ch, vm) = await kit.StartTemplateVmAsync();
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200), time);
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, cts.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => kit.PumpAsync(kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, cts.Token)));
         Assert.Empty(kit.Store.Seals);
     }
 
@@ -221,10 +269,11 @@ public class TemplateSealerTests
     public async Task Seal_NoPowerOff_FailsAndDoesNotSeal()
     {
         await using var kit = new TemplateJobKit(hypervisorSeesPowerOff: false); // the VM stays running after power_off
+        kit.UseFakeClock();
         kit.Options.PowerOffTimeout = TimeSpan.FromMilliseconds(300);
         var (ch, vm) = await kit.StartTemplateVmAsync();
 
-        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.PumpAsync(kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct)));
 
         Assert.Equal("the guest did not power off; not sealing a possibly dirty disk", ex.Message);
         Assert.Empty(kit.Store.Seals);
@@ -264,11 +313,12 @@ public class TemplateSealerTests
     public async Task Seal_DisconnectButStillRunning_FailsWithoutSealing()
     {
         await using var kit = new TemplateJobKit(hypervisorSeesPowerOff: false);
+        kit.UseFakeClock();
         kit.Options.PowerOffTimeout = TimeSpan.FromMilliseconds(300);
         var (inner, vm) = await kit.StartTemplateVmAsync();
         var ch = new DropsPowerOffAck(inner, swallow: false);
 
-        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.PumpAsync(kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct)));
 
         Assert.Contains("did not power off", ex.Message);
         Assert.Empty(kit.Store.Seals);
@@ -278,20 +328,26 @@ public class TemplateSealerTests
     public async Task Seal_PowerOffNeverAnswered_OneDeadlineCoversAckAndWait()
     {
         await using var kit = new TemplateJobKit(hypervisorSeesPowerOff: false);
+        var time = kit.UseFakeClock();
         kit.Options.PowerOffTimeout = TimeSpan.FromMilliseconds(500);
         var (inner, vm) = await kit.StartTemplateVmAsync();
         var ch = new DropsPowerOffAck(inner, swallow: true); // channel stays open, nobody answers
-        var sw = System.Diagnostics.Stopwatch.StartNew();
 
-        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
+        var run = kit.Sealer.SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct);
+        await ch.PowerOffSent.WaitAsync(TimeSpan.FromSeconds(30), Ct);
+        // One timeout's worth of time, once: it ends the job only if the ack wait and the running wait share that deadline.
+        time.Advance(kit.Options.PowerOffTimeout);
+        var finished = await Task.WhenAny(run, Task.Delay(TimeSpan.FromSeconds(10), Ct)) == run;
 
+        Assert.True(finished, "still waiting after one PowerOffTimeout: the ack wait and the running wait each used a full timeout");
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => run);
         Assert.Contains("did not power off", ex.Message);
-        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(900), $"took {sw.Elapsed}: the ack wait and the running wait each used a full timeout");
         Assert.Empty(kit.Store.Seals);
     }
 
     private sealed class HypervisorWithIsRunning(IHypervisor inner, Func<VmHandle, CancellationToken, Task<bool>> isRunning, Func<VmHandle, Task>? destroy = null) : IHypervisor
     {
+        public Task SendKeyAsync(VmHandle vm, string key, CancellationToken ct) => throw new NotSupportedException();
         public Task<VmHandle> StartAsync(VmSpec spec, CancellationToken ct) => inner.StartAsync(spec, ct);
         public Task DestroyAsync(VmHandle vm, CancellationToken ct) => destroy is null ? inner.DestroyAsync(vm, ct) : destroy(vm);
         public Task<bool> IsRunningAsync(VmHandle vm, CancellationToken ct) => isRunning(vm, ct);
@@ -299,18 +355,19 @@ public class TemplateSealerTests
     }
 
     private static TemplateSealer SealerOver(TemplateJobKit kit, IHypervisor hv) =>
-        new(hv, kit.Store, Microsoft.Extensions.Options.Options.Create(kit.Options), TimeProvider.System);
+        new(hv, kit.Store, Microsoft.Extensions.Options.Options.Create(kit.Options), kit.Time);
 
     [Fact]
     public async Task Seal_DeadlineFiresDuringIsRunning_IsADidNotPowerOffFailure()
     {
         await using var kit = new TemplateJobKit();
+        kit.UseFakeClock();
         kit.Options.PowerOffTimeout = TimeSpan.FromMilliseconds(300);
         var (ch, vm) = await kit.StartTemplateVmAsync();
         // Honours the token and blocks until it is cancelled, like a virsh call that is killed at the deadline.
         var hv = new HypervisorWithIsRunning(kit.Hypervisor, async (_, token) => { await Task.Delay(Timeout.Infinite, token); return true; });
 
-        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => SealerOver(kit, hv).SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.PumpAsync(SealerOver(kit, hv).SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct)));
 
         Assert.Equal("the guest did not power off; not sealing a possibly dirty disk", ex.Message);
         Assert.Empty(kit.Store.Seals);
@@ -338,22 +395,28 @@ public class TemplateSealerTests
     public async Task Seal_CallerCancelsDuringTheLastLook_PropagatesPromptly_NotDidNotPowerOff()
     {
         await using var kit = new TemplateJobKit();
+        var time = kit.UseFakeClock();
         kit.Options.PowerOffTimeout = TimeSpan.FromMilliseconds(300);
         kit.Options.PollInterval = TimeSpan.FromSeconds(4); // the last look would otherwise wait up to 20 s
         var (ch, vm) = await kit.StartTemplateVmAsync();
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
         var calls = 0;
+        var firstLook = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var hv = new HypervisorWithIsRunning(kit.Hypervisor, async (_, token) =>
         {
             if (Interlocked.Increment(ref calls) > 1) await cts.CancelAsync(); // second call = the last look
+            else firstLook.TrySetResult();
             await Task.Delay(Timeout.Infinite, token);
             return true;
         });
 
-        var started = System.Diagnostics.Stopwatch.StartNew();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => SealerOver(kit, hv).SealAsync(ch, vm, "win11-edit", kit.Bundle, cts.Token));
+        var run = SealerOver(kit, hv).SealAsync(ch, vm, "win11-edit", kit.Bundle, cts.Token);
+        await firstLook.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct);
+        time.Advance(kit.Options.PowerOffTimeout); // the deadline ends the first look; the clock then stands still
+        var finished = await Task.WhenAny(run, Task.Delay(TimeSpan.FromSeconds(10), Ct)) == run;
 
-        Assert.True(started.Elapsed < TimeSpan.FromSeconds(10), $"took {started.Elapsed}");
+        Assert.True(finished, "the last look waited for its own timeout instead of honouring the caller's cancellation");
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
         Assert.Empty(kit.Store.Seals);
     }
 
@@ -361,6 +424,7 @@ public class TemplateSealerTests
     public async Task Seal_IsRunningThrowsDuringTheLastLook_IsNotReportedAsDidNotPowerOff()
     {
         await using var kit = new TemplateJobKit();
+        kit.UseFakeClock();
         kit.Options.PowerOffTimeout = TimeSpan.FromMilliseconds(300);
         var (ch, vm) = await kit.StartTemplateVmAsync();
         var calls = 0;
@@ -371,7 +435,7 @@ public class TemplateSealerTests
             return true;
         });
 
-        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => SealerOver(kit, hv).SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct));
+        var ex = await Assert.ThrowsAsync<TemplateSealException>(() => kit.PumpAsync(SealerOver(kit, hv).SealAsync(ch, vm, "win11-edit", kit.Bundle, Ct)));
 
         Assert.Contains("could not check whether the guest stopped", ex.Message);
         Assert.IsType<InvalidOperationException>(ex.InnerException);
@@ -471,7 +535,10 @@ public class TemplateSealerTests
 internal sealed class DropsPowerOffAck(ReplayAgentChannel inner, bool swallow) : IAgentChannel
 {
     private string? _powerOffId;
+    private readonly TaskCompletionSource _powerOffSent = new(TaskCreationOptions.RunContinuationsAsynchronously);
     public int Violations => inner.Violations;
+    /// <summary>Completes once power_off has been sent.</summary>
+    public Task PowerOffSent => _powerOffSent.Task;
     public IReadOnlyList<AgentCommand> SentCommands => inner.SentCommands;
 
     public Task SendAsync(AgentCommand command, CancellationToken ct)
@@ -479,6 +546,7 @@ internal sealed class DropsPowerOffAck(ReplayAgentChannel inner, bool swallow) :
         if (command is PowerOffCommand p)
         {
             _powerOffId = p.CommandId;
+            _powerOffSent.TrySetResult();
             if (swallow) return Task.CompletedTask;
         }
         return inner.SendAsync(command, ct);

@@ -1,11 +1,12 @@
 using System.Text.RegularExpressions;
 using Maldex.Core.Abstractions;
+using Maldex.Infrastructure.Execution;
 using Microsoft.Extensions.Options;
 
 namespace Maldex.Infrastructure.Libvirt;
 
 /// <summary>Template version disks in <c>BaseImageDir</c>: <c>{stem}.qcow2</c> and <c>{stem}.vars.fd</c>.</summary>
-public sealed partial class LibvirtTemplateStore(IOptions<LibvirtOptions> options) : ITemplateStore
+public sealed partial class LibvirtTemplateStore(IOptions<LibvirtOptions> options, IProcessRunner runner) : ITemplateStore
 {
     [GeneratedRegex(@"^[a-z0-9][a-z0-9-]{0,63}\z")] // \z, not $: $ also matches before a trailing newline
     private static partial Regex StemPattern();
@@ -59,6 +60,56 @@ public sealed partial class LibvirtTemplateStore(IOptions<LibvirtOptions> option
             throw;
         }
     }
+
+    public async Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct)
+    {
+        var (disk, vars) = Paths(stem);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(diskBytes);
+        var tmpDisk = disk + ".tmp";
+        var tmpVars = vars + ".tmp";
+        if (new[] { disk, vars, tmpDisk, tmpVars }.Any(File.Exists))
+            throw new InvalidOperationException($"Template file stem '{stem}' already exists.");
+        if (!File.Exists(varsTemplatePath))
+            throw new FileNotFoundException($"UEFI vars template '{varsTemplatePath}' not found.");
+
+        // Delete only what this call created: a file that was already there is somebody else's, and a rename that threw did not publish ours.
+        var createdTmpDisk = false;
+        var createdTmpVars = false;
+        var publishedDisk = false;
+        var publishedVars = false;
+        try
+        {
+            var rw = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+            var varsOptions = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
+            if (!OperatingSystem.IsWindows()) varsOptions.UnixCreateMode = rw;
+            await using (var src = File.OpenRead(varsTemplatePath))
+            await using (var dst = new FileStream(tmpVars, varsOptions))
+            {
+                createdTmpVars = true;
+                await src.CopyToAsync(dst, ct);
+                dst.Flush(true); // on disk before it can be renamed into place
+            }
+
+            createdTmpDisk = true; // qemu-img may leave a partial file when it fails
+            await new QemuImageCli(runner, _o.QemuImgBinary).CreateBlankAsync(tmpDisk, diskBytes, ct);
+            if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(tmpDisk, rw); // qemu-img honours the umask; the I4 guard wants owner-writable
+
+            File.Move(tmpDisk, disk);
+            publishedDisk = true;
+            File.Move(tmpVars, vars);
+            publishedVars = true;
+        }
+        catch
+        {
+            if (createdTmpDisk) TryDelete(tmpDisk);
+            if (createdTmpVars) TryDelete(tmpVars);
+            if (publishedDisk) TryDelete(disk);
+            if (publishedVars) TryDelete(vars);
+            throw;
+        }
+    }
+
+    private static void TryDelete(string path) { try { File.Delete(path); } catch { /* best effort */ } }
 
     public Task SealAsync(string fileStem, CancellationToken ct)
     {

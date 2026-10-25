@@ -19,6 +19,22 @@ public static class AgentIdentity
 
     public static string BuildId(string version, Stream exe) => version + "+" + Prefix(SHA256.HashData(exe));
 
+    /// <summary>
+    /// The build identity of the agent that <c>./build.sh agent</c> left on disk: the version from its version record (build metadata
+    /// dropped) plus the hash of the exe.
+    /// </summary>
+    public static string BuildIdOfFiles(string exePath, string versionPath)
+    {
+        var version = VersionOfRecord(File.ReadAllBytes(versionPath));
+        using var exe = File.OpenRead(exePath); // hashed as a stream: the exe is large
+        return BuildId(version, exe);
+    }
+
+    /// <summary>The same identity from the files' bytes (a caller that already holds them, so the id is of exactly these bytes).</summary>
+    public static string BuildIdOf(byte[] versionRecord, byte[] exe) => BuildId(VersionOfRecord(versionRecord), exe);
+
+    private static string VersionOfRecord(byte[] versionRecord) => VersionOf(System.Text.Encoding.UTF8.GetString(versionRecord));
+
     /// <summary>What the agent reports when it cannot read its own exe.</summary>
     public static string UnknownBuildId(string version) => version + "+" + new string('0', 12);
 

@@ -96,10 +96,29 @@ Once an image has been imported as template v1, running `build-guest` or `finali
    all, so they are **not** part of `./build.sh e2e`: they also require `MALDEX_REAL_TEMPLATES=1` and skip with a pointer to
    `./build.sh e2e-templates` without it. They also need the base image and the real-setup toolchain (the libguestfs appliance).
 
+6. Build from ISO (`RealTemplateBuildTests`, part of `./build.sh e2e-templates`, which needs `MALDEX_WIN_ISO` and refuses
+   without it): the ISO is fetched into a media library of the test's own from a loopback server (the real fetcher, with
+   private destinations allowed for that host only, and the real read-only loop-mount inspection, which must find the Pro
+   image and pick its index), then a Build with publish off installs and provisions Windows unattended (about 15-25 min here;
+   the test logs the time per phase). At Configuring the post-reboot agent check has passed (the bundle's agent), the
+   provisioning log has no failed step, and a Seal with Defender real-time protection on is refused (the job stays
+   Configuring, `sealRequested` false). The cancel must leave no version, VM, link, blank disk, work directory or held slot;
+   the test deletes the fetched copy, the provisioning log and the empty template, and checks the base image and the ISO
+   unchanged. It never modifies `MALDEX_WIN_ISO`.
+
+7. Interactive Build acceptance (`RealTemplateBuildAcceptanceTests`, `MALDEX_WIN_ISO=/path/to/win11.iso ./build.sh
+   e2e-build-acceptance`; also gated by `MALDEX_E2E_INTERACTIVE=1`, never part of `e2e-templates`): it builds the SPA, starts
+   guacd and serves the app on `localhost:5080` only (DevAuth), builds a new version of `win11-26h2` with publish on and
+   prints the job page (`http://localhost:5080/admin/template-jobs/<id>`) and the forward to open it with
+   (`ssh -L 5080:localhost:5080 maldex_admin@<host>`). In the job's console turn off Tamper Protection, then Real-time
+   protection, then press Seal, within the configure idle timeout (2 h). The version must publish as an ISO build with the
+   bundle's agent and pass the three harmless scenarios; its disks are deleted afterwards.
+
 ### The template E2E gate
 
-`./build.sh e2e-templates [test-filter]` runs those two classes (`MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 MALDEX_REAL_TEMPLATES=1`).
-It checks the base image (exit 2 if missing) and runs `./build.sh agent` when `.data/agent/Maldex.Agent.exe` is missing. An
+`MALDEX_WIN_ISO=/path/to/win11.iso ./build.sh e2e-templates [test-filter]` runs those three classes (`MALDEX_REAL_VM=1
+MALDEX_REAL_NET=1 MALDEX_REAL_TEMPLATES=1`; about two to three hours). It refuses without `MALDEX_WIN_ISO` (exit 2: the Build test
+would only skip, and a skipped run never validates), checks the base image (exit 2 if missing) and runs `./build.sh agent` when `.data/agent/Maldex.Agent.exe` is missing. An
 optional argument runs only the tests whose method name contains it (for example `./build.sh e2e-templates Edit`); a filtered
 run never updates the stamp.
 
@@ -107,7 +126,8 @@ A full run that is green, with no skipped test, writes `git rev-parse HEAD` to *
 `.data/` is untracked), but only if the template-affecting paths have no uncommitted changes (otherwise it says why and leaves
 the stamp alone). The paths are the one `TEMPLATE_E2E_PATHS` list in `build.sh`: the template orchestrator code, agent,
 domain/lifecycle/data/infrastructure for templates, Libvirt/Agent/Net/Isolation, the template and tunnel endpoints,
-`deploy/guest/provision/sysmon-config.xml`, `deploy/host/` and the two E2E test files.
+the media library (`Core`, `Infrastructure` and `Orchestrator` `Media/`, the media endpoints), `deploy/guest/provision/`,
+`deploy/guest/autounattend/`, `deploy/host/` and the E2E test files.
 
 At the end of `./build.sh e2e`, build.sh tells you when the template E2E is due: the stamp is missing, its commit is not an
 ancestor of HEAD, a watched path changed since it (`git diff --name-only <stamp> HEAD -- <paths>`), or a watched path has

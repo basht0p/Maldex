@@ -21,6 +21,7 @@ public class TemplateBindingTests(SqlServerFixture sql)
     /// <summary>Wraps the fake hypervisor and records every spec it is asked to start.</summary>
     private sealed class SpyHypervisor(IHypervisor inner) : IHypervisor
     {
+        public Task SendKeyAsync(VmHandle vm, string key, CancellationToken ct) => inner.SendKeyAsync(vm, key, ct);
         public List<VmSpec> Specs { get; } = [];
         public Task<VmHandle> StartAsync(VmSpec spec, CancellationToken ct)
         {
@@ -139,6 +140,7 @@ public class TemplateBindingTests(SqlServerFixture sql)
     /// <summary>Real mode on a database a fake-mode run imported into: the version's row is there, its disk is not.</summary>
     private sealed class MissingStemsStore : ITemplateStore
     {
+        public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
         public HashSet<string> Missing { get; } = [];
         public bool Exists(string fileStem) => !Missing.Contains(fileStem);
         public long? SizeOf(string fileStem) => null;
@@ -183,6 +185,7 @@ public class TemplateBindingTests(SqlServerFixture sql)
     /// <summary>Like <c>LibvirtTemplateStore</c>: a stem that is not a valid slug throws instead of answering.</summary>
     private sealed class InvalidStemStore : ITemplateStore
     {
+        public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
         public HashSet<string> Invalid { get; } = [];
         public bool Exists(string fileStem) => Invalid.Contains(fileStem) ? throw new ArgumentException("Invalid template file stem.", nameof(fileStem)) : true;
         public long? SizeOf(string fileStem) => null;

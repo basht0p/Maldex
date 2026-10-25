@@ -1,7 +1,10 @@
 namespace Maldex.Core.Abstractions;
 
-public sealed record VmSpec(Guid TaskId, string DiskStem, int MemoryMiB, int VCpus, string NetworkId, bool Writable = false);
+public sealed record VmSpec(Guid TaskId, string DiskStem, int MemoryMiB, int VCpus, string NetworkId, bool Writable = false,
+    IReadOnlyList<string>? CdRoms = null, bool BootFromCdRom = false);
 // Writable: boot base/<DiskStem>.qcow2 and its .vars.fd directly (a template working copy) instead of a throwaway overlay.
+// CdRoms (at most 4, absolute paths of existing .iso files, Writable boots only) are attached read-only on SATA in list order;
+// BootFromCdRom makes the first one the first boot device (an installer boot).
 
 public sealed record VmHandle(Guid TaskId, string Name)
 {
@@ -28,4 +31,7 @@ public interface IHypervisor
     Task<bool> IsRunningAsync(VmHandle vm, CancellationToken ct);
 
     Task<IReadOnlyList<VmHandle>> ListAsync(CancellationToken ct);
+
+    /// <summary>Presses one key in the guest console. <paramref name="key"/> is a libvirt key name matching <c>^KEY_[A-Z0-9_]{1,20}\z</c> (e.g. KEY_ENTER).</summary>
+    Task SendKeyAsync(VmHandle vm, string key, CancellationToken ct);
 }

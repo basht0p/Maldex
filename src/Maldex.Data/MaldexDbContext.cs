@@ -20,6 +20,7 @@ public class MaldexDbContext(DbContextOptions<MaldexDbContext> options) : DbCont
     public DbSet<Template> Templates => Set<Template>();
     public DbSet<TemplateVersion> TemplateVersions => Set<TemplateVersion>();
     public DbSet<TemplateJob> TemplateJobs => Set<TemplateJob>();
+    public DbSet<MediaFile> MediaFiles => Set<MediaFile>();
 
     protected override void ConfigureConventions(ModelConfigurationBuilder configurationBuilder)
     {
@@ -35,6 +36,9 @@ public class MaldexDbContext(DbContextOptions<MaldexDbContext> options) : DbCont
         configurationBuilder.Properties<TemplateVersionStatus>().HaveConversion<string>().HaveMaxLength(32);
         configurationBuilder.Properties<TemplateJobKind>().HaveConversion<string>().HaveMaxLength(32);
         configurationBuilder.Properties<TemplateJobState>().HaveConversion<string>().HaveMaxLength(32);
+        configurationBuilder.Properties<MediaKind>().HaveConversion<string>().HaveMaxLength(32);
+        configurationBuilder.Properties<MediaSource>().HaveConversion<string>().HaveMaxLength(32);
+        configurationBuilder.Properties<MediaStatus>().HaveConversion<string>().HaveMaxLength(32);
     }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder) =>

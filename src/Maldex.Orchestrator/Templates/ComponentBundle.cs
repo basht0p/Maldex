@@ -22,7 +22,6 @@ public sealed class ComponentBundle
     {
         var agent = await ReadAsync(options.AgentExePath, "the guest agent", "run ./build.sh agent", ct).ConfigureAwait(false);
         var versionText = await ReadAsync(options.AgentVersionPath, "the guest agent's version record", "run ./build.sh agent", ct).ConfigureAwait(false);
-        var version = AgentIdentity.VersionOf(System.Text.Encoding.UTF8.GetString(versionText));
         var sysmon = await ReadAsync(options.SysmonConfigPath, "the Sysmon configuration", "run from the Maldex repository root", ct).ConfigureAwait(false);
         var pem = await ReadAsync(options.MitmCaPemPath, "the mitmproxy CA certificate", "run ./build.sh real-setup", ct).ConfigureAwait(false);
 
@@ -40,7 +39,8 @@ public sealed class ComponentBundle
         return new ComponentBundle
         {
             AgentExe = agent,
-            AgentBuildId = AgentIdentity.BuildId(version, agent),
+            // The same derivation the fake guest uses for the agent on disk (AgentIdentity.BuildIdOfFiles), of exactly the bytes sealing installs.
+            AgentBuildId = AgentIdentity.BuildIdOf(versionText, agent),
             SysmonConfig = sysmon,
             SysmonConfigSha256 = Hex(sysmon),
             CaDer = der,

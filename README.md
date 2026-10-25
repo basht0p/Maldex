@@ -144,6 +144,14 @@ cd Maldex && ./build.sh setup
 
 This starts SQL Server in Docker (capped at 2 GB), the backend on `http://localhost:5080` and the Vite dev server. Sign-in uses `DevAuth`, and runs are played back by `FakeHypervisor` + `ReplayAgent`, so you get a live process tree, events, verdicts and reports with no Windows guest.
 
+Template jobs (Build, Edit, Refresh) also run in fake mode, but they load the same components as real mode: the guest agent (`./build.sh agent`) and the mitmproxy CA (`.data/mitm/ca/mitmproxy-ca-cert.pem`), and a Build also needs the virtio driver ISO (`.data/vm/iso/virtio-win.iso`). Run `./build.sh real-setup` once, or place stubs: any PEM certificate as the CA and an empty file as the virtio ISO (fake mode never reads it):
+
+```bash
+mkdir -p .data/mitm/ca .data/vm/iso
+openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=maldex-dev-ca -keyout /dev/null -out .data/mitm/ca/mitmproxy-ca-cert.pem
+touch .data/vm/iso/virtio-win.iso
+```
+
 ### Real mode (one Windows 11 VM)
 
 ```bash
@@ -174,6 +182,8 @@ MALDEX_MODE=Real ./build.sh run
 | `build-guest` | Build the Windows 11 26H2 base image |
 | `prepare-guest` / `finalize-guest` / `discard-guest` | Make manual changes to the base image, then keep or drop them |
 | `e2e` | Harmless real-VM end-to-end suite |
+| `e2e-templates` | Real template-job E2E (Refresh, Edit, Roll back, Build from `MALDEX_WIN_ISO`); a green full run writes the validation stamp |
+| `e2e-build-acceptance` | Interactive Build from `MALDEX_WIN_ISO`: you turn off Defender in the job's console (localhost:5080 over an SSH forward) and press Seal |
 
 ## Development progress
 

@@ -3,13 +3,20 @@ using Maldex.Core.Lifecycle;
 
 namespace Maldex.Core.Domain;
 
-/// <summary>An edit or refresh of a <see cref="Template"/>: runs a VM from the base version and seals the result as a new version.</summary>
+/// <summary>An edit, refresh or build of a <see cref="Template"/>: runs a VM from the base version and seals the result as a new version.</summary>
 public class TemplateJob
 {
     public Guid Id { get; set; }
     public TemplateJobKind Kind { get; set; }
     public string TemplateId { get; set; } = "";
-    public Guid BaseVersionId { get; set; }
+    /// <summary>The version an Edit or Refresh starts from; null for a Build (it starts from installation media).</summary>
+    public Guid? BaseVersionId { get; set; }
+    /// <summary>A Build's source media ids as a JSON list, the <see cref="MediaKind.OsInstaller"/> first.</summary>
+    public string MediaIds { get; set; } = "[]";
+    public int? EditionIndex { get; set; }
+    public string? EditionName { get; set; }
+    /// <summary>For a Build: the template's <c>CurrentVersionId</c> when the job was queued (null for a new or empty template); the publish guard compares against it. Not a foreign key.</summary>
+    public Guid? ExpectedCurrentVersionId { get; set; }
     public Guid? ResultVersionId { get; set; }
     public NetworkMode Network { get; set; }
     public TemplateJobState State { get; set; } = TemplateJobState.Queued;

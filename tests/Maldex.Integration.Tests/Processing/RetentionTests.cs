@@ -251,6 +251,7 @@ public class RetentionTests(SqlServerFixture sql)
 
     private sealed class RecordingTemplateStore : ITemplateStore
     {
+        public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
         public List<string> Deleted { get; } = [];
         public bool Exists(string fileStem) => true;
         public long? SizeOf(string fileStem) => null;

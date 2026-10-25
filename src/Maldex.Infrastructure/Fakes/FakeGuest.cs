@@ -9,11 +9,34 @@ public sealed record FakeGuestFile(byte[] Data, string? ClaimedSha256 = null, lo
 
 /// <summary>
 /// What the replayed "guest" has on disk and how it behaves during bulk transfers, shared by every fake channel.
-/// Empty by default: sample chunks are accepted and every <c>collect_file</c> is answered "file not found".
+/// By default sample chunks are accepted and the only files on disk are a finished provisioning's result marker and log (so a
+/// fake Build completes); every other <c>collect_file</c> is answered "file not found".
 /// </summary>
 public sealed class FakeGuest
 {
+    /// <summary>Where Provision.ps1 writes its result marker and its log (the Build's guest paths).</summary>
+    public const string ProvisionResultPath = @"C:\ProgramData\Maldex\provision-result.json";
+    public const string ProvisionLogPath = @"C:\ProgramData\Maldex\provision.log";
+
+    /// <summary>The marker of a provisioning run in which every step succeeded, as Provision.ps1 writes it (UTF-8, no BOM).</summary>
+    public const string ProvisionSucceeded = """{"ok":true,"failedSteps":[]}""";
+
     private readonly ConcurrentDictionary<string, FakeGuestFile> _files = new(StringComparer.OrdinalIgnoreCase);
+
+    public FakeGuest()
+    {
+        SetProvisionResult(ProvisionSucceeded);
+        AddFile(ProvisionLogPath, "**********************\nWindows PowerShell transcript start\n[fake] provisioning finished\n"u8.ToArray());
+    }
+
+    /// <summary>Sets the provisioning result marker the guest holds (UTF-8, no BOM); null removes it (provisioning has not finished).</summary>
+    public void SetProvisionResult(string? json)
+    {
+        if (json is null) _files.TryRemove(ProvisionResultPath, out _);
+        else AddFile(ProvisionResultPath, System.Text.Encoding.UTF8.GetBytes(json));
+    }
+
+    public void RemoveFile(string path) => _files.TryRemove(path, out _);
 
     /// <summary>When set, the chunk with this index is answered with a failure (the agent "refusing" the delivery).</summary>
     public int? RejectSampleChunkIndex { get; set; }
@@ -51,7 +74,20 @@ public sealed class FakeGuest
     /// <summary>What the fake guest answers to <c>provenance</c>.</summary>
     public string ProvenanceEdition { get; set; } = "Windows 11 Pro";
     public string ProvenanceBuild { get; set; } = "26300.1";
-    public string ProvenanceAgentVersion { get; set; } = "0.1.0-fake+000000000000";
+    /// <summary>When set, the agent version <c>provenance</c> reports, whatever is installed (a test's stale or current agent).</summary>
+    public string? ProvenanceAgentVersion { get; set; }
+
+    /// <summary>
+    /// The build id of the agent the fake guest "runs": in the app it is the one <c>./build.sh agent</c> left on disk, as sealing
+    /// installs it into a real guest. Null (or a null answer) when there is none.
+    /// </summary>
+    public Func<string?>? InstalledAgentBuildId { get; set; }
+
+    /// <summary>What <c>provenance</c> reports when neither an override nor an installed agent is known.</summary>
+    public const string FakeAgentVersion = "0.1.0-fake+000000000000";
+
+    /// <summary>The agent version <c>provenance</c> answers: the override, else the installed agent, else <see cref="FakeAgentVersion"/>.</summary>
+    public string ReportedAgentVersion => ProvenanceAgentVersion ?? InstalledAgentBuildId?.Invoke() ?? FakeAgentVersion;
     public bool? ProvenanceOfficePresent { get; set; } = false;
     public bool? ProvenanceRealTimeProtection { get; set; } = false;
 

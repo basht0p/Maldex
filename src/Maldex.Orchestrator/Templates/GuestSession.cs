@@ -1,10 +1,9 @@
 using System.Collections.Concurrent;
+using System.Runtime.ExceptionServices;
+using System.Threading.Channels;
 using Maldex.Core.Abstractions;
 using Maldex.Core.Agent;
 using Maldex.Core.Text;
-
-// GuestSession is internal to the job pipeline; its unit tests (GuestSessionTests) live in the integration test project.
-[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("Maldex.Integration.Tests")]
 
 namespace Maldex.Orchestrator.Templates;
 
@@ -16,6 +15,7 @@ namespace Maldex.Orchestrator.Templates;
 internal sealed class GuestSession : IAsyncDisposable
 {
     private readonly IAgentChannel _channel;
+    private readonly TimeProvider _time;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _pump;
     private readonly TaskCompletionSource<ReadyMessage> _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -26,9 +26,11 @@ internal sealed class GuestSession : IAsyncDisposable
     /// <summary>Set once the pump has ended: a request registered after it can never be answered and fails at once.</summary>
     private volatile bool _ended;
 
-    public GuestSession(IAgentChannel channel)
+    /// <param name="time">Measures <see cref="CollectFileAsync"/>'s timeout (default: the system clock).</param>
+    public GuestSession(IAgentChannel channel, TimeProvider? time = null)
     {
         _channel = channel;
+        _time = time ?? TimeProvider.System;
         _pump = Task.Run(PumpAsync);
     }
 
@@ -102,6 +104,110 @@ internal sealed class GuestSession : IAsyncDisposable
     }
 
     /// <summary>
+    /// Reads Defender's real-time protection until it has settled (right after a boot it briefly reads off before it turns on):
+    /// a provenance reading (<see cref="AskProvenanceWithRetryAsync"/>, each bounded by <paramref name="timeout"/>) every
+    /// <see cref="TemplateJobOptions.DefenderSettleInterval"/> over <see cref="TemplateJobOptions.DefenderSettleWindow"/>, measured (by
+    /// timestamps) from the first successful reading's start, on a fixed cadence: reading k is due k intervals in, and one that
+    /// overruns its slot is followed at once. A failed reading is skipped. The state (R19) is on as soon as any reading says on; off only with at
+    /// least <see cref="TemplateJobOptions.DefenderSettleMinReadings"/> off readings, the last of them at or after window - interval past
+    /// the first; unreadable when no reading could read the state (R7); otherwise not settled. A zero window takes one reading, which decides.
+    /// </summary>
+    /// <returns>The first successful reading (for the other checks) and the settled state.</returns>
+    /// <exception cref="TimeoutException">No reading succeeded within the window, the last one timed out.</exception>
+    /// <exception cref="InvalidOperationException">No reading succeeded within the window, the last one was refused or the agent went away.</exception>
+    public async Task<SettledProvenance> AskSettledProvenanceAsync(TemplateJobOptions o, TimeSpan timeout, TimeProvider time, CancellationToken ct)
+    {
+        // Timestamps, not the wall clock: a clock step must not shorten the observation.
+        var anchor = time.GetTimestamp(); // the first successful reading's start (until then: the first request's)
+        long slot = 0; // the slot of the reading just taken; reading k is due k intervals after the anchor
+        ProvenanceMessage? first = null;
+        var lastOffAt = TimeSpan.Zero; // since the anchor, at the reading's start
+        var offReadings = 0;
+        Exception? lastFailure = null;
+        while (true)
+        {
+            var readingStart = time.GetTimestamp();
+            try
+            {
+                var p = await AskProvenanceWithRetryAsync(o.ProvenanceRetryInterval, timeout, time, ct).ConfigureAwait(false);
+                if (first is null)
+                {
+                    first = p;
+                    anchor = readingStart;
+                    slot = 0;
+                }
+                if (p.RealTimeProtectionEnabled == true) return new SettledProvenance(first, DefenderSettlement.On); // no later reading can change it
+                if (p.RealTimeProtectionEnabled == false)
+                {
+                    offReadings++;
+                    lastOffAt = time.GetElapsedTime(anchor, readingStart);
+                }
+            }
+            catch (Exception) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                lastFailure = ex; // skipped: the rules below decide whether the others are enough
+            }
+
+            if (o.DefenderSettleWindow <= TimeSpan.Zero) break; // one reading
+            // A fixed cadence: a slow reading does not push the later ones back. One that overran its slot is followed at once.
+            var elapsed = time.GetElapsedTime(anchor);
+            var due = (slot + 1) * o.DefenderSettleInterval;
+            TimeSpan nextStart;
+            if (elapsed >= due)
+            {
+                slot = (long)(elapsed / o.DefenderSettleInterval);
+                nextStart = elapsed;
+            }
+            else
+            {
+                slot++;
+                nextStart = due;
+            }
+            if (nextStart > o.DefenderSettleWindow) break;
+            if (nextStart > elapsed) await Task.Delay(nextStart - elapsed, time, ct).ConfigureAwait(false);
+        }
+
+        if (first is null) ExceptionDispatchInfo.Throw(lastFailure!);
+        if (offReadings == 0) return new SettledProvenance(first, DefenderSettlement.Unreadable);
+        if (o.DefenderSettleWindow <= TimeSpan.Zero) return new SettledProvenance(first, DefenderSettlement.Off); // one reading decides
+        var settled = offReadings >= o.DefenderSettleMinReadings && lastOffAt >= o.DefenderSettleWindow - o.DefenderSettleInterval;
+        return new SettledProvenance(first, settled ? DefenderSettlement.Off : DefenderSettlement.NotSettled);
+    }
+
+    /// <summary>
+    /// Fetches one file from the guest with <c>collect_file</c> through the <see cref="Inbox"/> (which must not be open elsewhere),
+    /// reassembled and hash-checked as dropped files are.
+    /// </summary>
+    /// <returns>The file's bytes, or null when the agent answers that it could not serve it (the file is missing).</returns>
+    /// <exception cref="InvalidOperationException">The file is larger than <paramref name="maxBytes"/>, or its chunks do not reassemble.</exception>
+    /// <exception cref="TimeoutException">No complete answer within <paramref name="timeout"/>.</exception>
+    /// <exception cref="ChannelClosedException">The agent disconnected.</exception>
+    public async Task<byte[]?> CollectFileAsync(string guestPath, long maxBytes, TimeSpan timeout, CancellationToken ct)
+    {
+        var transfer = new FileTransfer(guestPath, maxBytes);
+        using var deadline = new CancellationTokenSource(timeout, _time);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, deadline.Token);
+        using var lease = Inbox.Open();
+        CommandResultMessage result;
+        try
+        {
+            result = await transfer.ReceiveAsync(_channel, lease.Reader, linked.Token).ConfigureAwait(false);
+        }
+        catch (Exception) when (deadline.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            throw new TimeoutException($"no answer to collect_file within {timeout.TotalSeconds:0} s");
+        }
+        if (!result.Success) return null;
+        var problem = transfer.Verify(out var content);
+        if (problem is not null) throw new InvalidOperationException($"the file {GuestText.Clean(guestPath, 256)} was rejected: {problem}");
+        return content;
+    }
+
+    /// <summary>
     /// Routes answers for <paramref name="commandId"/> to <paramref name="answer"/>. The pump fails every registered request when it
     /// ends; one registered after that is failed here (checked after registering, so one of the two always sees the other).
     /// </summary>
@@ -160,3 +266,17 @@ internal sealed class GuestSession : IAsyncDisposable
         _cts.Dispose();
     }
 }
+
+/// <summary>Defender real-time protection as <see cref="GuestSession.AskSettledProvenanceAsync"/> settled it.</summary>
+internal enum DefenderSettlement
+{
+    Off,
+    On,
+    /// <summary>The agent could not read the state (R7: does not block).</summary>
+    Unreadable,
+    /// <summary>Read off, but not often or not late enough in the window to be sure (R19: blocks).</summary>
+    NotSettled,
+}
+
+/// <summary>What <see cref="GuestSession.AskSettledProvenanceAsync"/> read: its first successful reading and the settled real-time protection state.</summary>
+internal sealed record SettledProvenance(ProvenanceMessage First, DefenderSettlement Defender);
