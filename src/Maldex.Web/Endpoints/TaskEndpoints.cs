@@ -142,6 +142,10 @@ public static class TaskEndpoints
         return app;
     }
 
+    private static IResult TooLarge(SubmissionOptions opts, string title) =>
+        Results.Problem(title: title, statusCode: StatusCodes.Status413PayloadTooLarge,
+            detail: $"Samples may be at most {opts.MaxUploadBytes} bytes" + (opts.IsReal ? " (the most a real-mode guest can receive)." : "."));
+
     private static IResult NotCancellable() =>
         Results.Problem(title: "Only queued tasks can be cancelled.", statusCode: StatusCodes.Status409Conflict);
 
@@ -209,13 +213,11 @@ public static class TaskEndpoints
         }
         catch (BlobTooLargeException)
         {
-            return Results.Problem(title: "The uploaded file is too large.", statusCode: StatusCodes.Status413PayloadTooLarge,
-                detail: $"Samples may be at most {opts.MaxUploadBytes} bytes" + (opts.IsReal ? " (the most a real-mode guest can receive)." : "."));
+            return TooLarge(opts, "The uploaded file is too large.");
         }
         catch (BadHttpRequestException ex) when (ex.StatusCode == StatusCodes.Status413PayloadTooLarge)
         {
-            return Results.Problem(title: "The request body is too large.", statusCode: StatusCodes.Status413PayloadTooLarge,
-                detail: $"Samples may be at most {opts.MaxUploadBytes} bytes" + (opts.IsReal ? " (the most a real-mode guest can receive)." : "."));
+            return TooLarge(opts, "The request body is too large.");
         }
         catch (Exception ex) when (ex is InvalidDataException or ArgumentException or FormatException)
         {
@@ -313,8 +315,9 @@ public static class TaskEndpoints
 
     private static async Task<IResult> ResubmitAsync(
         Guid id, ResubmitRequest body, MaldexDbContext db, IArtifactStore store, AuditWriter audit, CurrentUser user, TimeProvider time,
-        IOptions<EgressOptions> egressOptions, TemplateCatalog templates, CancellationToken ct)
+        IOptions<SubmissionOptions> submissionOptions, IOptions<EgressOptions> egressOptions, TemplateCatalog templates, CancellationToken ct)
     {
+        var opts = submissionOptions.Value;
         var source = await db.Tasks.AsNoTracking().FirstOrDefaultAsync(t => t.Id == id, ct);
         if (source is null) return Results.NotFound();
 
@@ -325,6 +328,8 @@ public static class TaskEndpoints
             if (sample is null || !store.Exists(sample.BlobKey))
                 return Results.Problem(title: "The sample has been deleted under the retention policy.", statusCode: StatusCodes.Status409Conflict,
                     type: "sample-unavailable");
+            // The cap may have been lowered (or the mode changed to Real) since the sample was uploaded: enforce it as submit does.
+            if (sample.Size > opts.MaxUploadBytes) return TooLarge(opts, "The sample is too large.");
             blob = new StoredBlob(sample.BlobKey, sample.Sha256, sample.Sha1, sample.Md5, sample.Size);
         }
 

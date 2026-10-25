@@ -28,7 +28,7 @@ test('submit a URL, watch live telemetry, stop, and read the report', async ({ p
   // The fake replay may or may not produce screenshots: accept an image or the empty state.
   await expect(page.locator('img[alt^="Screenshot at"]').first().or(page.getByText('No screenshots').first())).toBeVisible()
   await page.getByRole('tab', { name: /Events/ }).click()
-  await expect(page.getByRole('link', { name: 'Export CSV' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Export CSV' })).toBeVisible()
 
   // Reports menu -> HTML report popup.
   await page.getByRole('button', { name: 'Reports' }).click()

@@ -48,6 +48,7 @@ describe('TasksPage', () => {
     expect(screen.getByText(/#2 in queue/)).toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: 'Cancel' })).toHaveLength(1)
     expect(within(screen.getByRole('table')).getByText('Malicious')).toBeInTheDocument()
+    expect(screen.getByRole('table').parentElement?.className).toMatch(/tableScroll/) // wide tables scroll in their panel
   })
 
   it('asks before cancelling, then toasts "Task cancelled"', async () => {

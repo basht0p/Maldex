@@ -114,29 +114,39 @@ public static class LiveControlEndpoints
                 .AsAsyncEnumerable();
 
             var count = 0;
-            await using (var writer = new StreamWriter(ctx.Response.Body, new UTF8Encoding(false), 16 * 1024, leaveOpen: true))
+            var complete = false;
+            try
             {
-                await writer.WriteAsync(json ? "[" : EventCsv.Header + "\r\n");
-                await foreach (var e in rows.WithCancellation(ct))
+                await using (var writer = new StreamWriter(ctx.Response.Body, new UTF8Encoding(false), 16 * 1024, leaveOpen: true))
                 {
-                    if (json)
+                    await writer.WriteAsync(json ? "[" : EventCsv.Header + "\r\n");
+                    await foreach (var e in rows.WithCancellation(ct))
                     {
-                        if (count > 0) await writer.WriteAsync(",");
-                        await writer.WriteAsync(JsonSerializer.Serialize(e, options));
+                        if (json)
+                        {
+                            if (count > 0) await writer.WriteAsync(",");
+                            await writer.WriteAsync(JsonSerializer.Serialize(e, options));
+                        }
+                        else
+                        {
+                            await writer.WriteAsync(string.Join(',',
+                                e.Id.ToString(CultureInfo.InvariantCulture), EventCsv.Cell(e.Type.ToString()), e.At.ToString("O", CultureInfo.InvariantCulture),
+                                e.Pid.ToString(CultureInfo.InvariantCulture), e.ProcessId?.ToString(CultureInfo.InvariantCulture) ?? "",
+                                EventCsv.Cell(e.Summary), EventCsv.Cell(e.DataJson)) + "\r\n");
+                        }
+                        count++;
                     }
-                    else
-                    {
-                        await writer.WriteAsync(string.Join(',',
-                            e.Id.ToString(CultureInfo.InvariantCulture), EventCsv.Cell(e.Type.ToString()), e.At.ToString("O", CultureInfo.InvariantCulture),
-                            e.Pid.ToString(CultureInfo.InvariantCulture), e.ProcessId?.ToString(CultureInfo.InvariantCulture) ?? "",
-                            EventCsv.Cell(e.Summary), EventCsv.Cell(e.DataJson)) + "\r\n");
-                    }
-                    count++;
+                    if (json) await writer.WriteAsync("]");
+                    await writer.FlushAsync(ct);
                 }
-                if (json) await writer.WriteAsync("]");
-                await writer.FlushAsync(ct);
+                complete = true;
             }
-            await audit.WriteAsync("task.events.export", id.ToString(), $"format={fmt}; rows={count}", ct);
+            finally
+            {
+                // Audited even when the client aborts the download (the request token is cancelled by then).
+                await audit.WriteAsync("task.events.export", id.ToString(),
+                    $"format={fmt}; rows={count}" + (complete ? "" : "; complete=false"), CancellationToken.None);
+            }
             return Results.Empty;
         });
 

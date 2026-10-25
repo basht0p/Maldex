@@ -58,7 +58,7 @@ class MockHub implements HubConnectionLike {
   push(dto: TemplateJobDto) { act(() => { (this.handlers.get('templateJob') as (p: unknown) => void)(dto) }) }
 }
 
-const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin' }
+const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin', maxUploadBytes: 268_435_456 }
 const job = (over: Partial<TemplateJobDto> = {}): TemplateJobDto => ({
   id: 'job-1', kind: 'Edit', templateId: 'win11-golden', baseVersionNumber: 3, resultVersionNumber: null, network: 'None', state: 'Queued',
   message: null, failureReason: null, createdAt: '2026-10-24T10:00:00Z', endedAt: null, idleDeadline: null, ...over,

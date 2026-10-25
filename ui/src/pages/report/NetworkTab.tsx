@@ -1,4 +1,5 @@
 import type { DnsRowDto, NetworkFlowDto, TaskReportDto } from '../../api/types'
+import { CopyButton } from '../../kit/CopyButton'
 import { EmptyState } from '../../kit/EmptyState'
 import { FileSize } from '../../kit/RelativeTime'
 import { SortHeader } from '../../kit/SortHeader'
@@ -43,8 +44,8 @@ function Flows({ rows, truncated }: { rows: NetworkFlowDto[]; truncated: boolean
                 <tr key={i}>
                   <td><time dateTime={f.startedAt}>{formatTime(f.startedAt)}</time></td>
                   <td>{safeText(f.proto)}</td>
-                  <td className={styles.mono}>{safeText(f.src)}</td>
-                  <td className={styles.mono}>{safeText(f.dst)}</td>
+                  <td className={styles.mono}><span className={styles.cell}>{safeText(f.src)}<CopyButton value={f.src} label="Copy source" /></span></td>
+                  <td className={styles.mono}><span className={styles.cell}>{safeText(f.dst)}<CopyButton value={f.dst} label="Copy destination" /></span></td>
                   <td className={styles.mono}>{f.dstPort}</td>
                   <td><FileSize bytes={f.bytes} /></td>
                 </tr>
@@ -77,8 +78,12 @@ function Dns({ rows, truncated }: { rows: DnsRowDto[]; truncated: boolean }) {
                 <tr key={i}>
                   <td><time dateTime={d.at}>{formatTime(d.at)}</time></td>
                   <td className={styles.mono}>{d.pid}</td>
-                  <td className={styles.mono}>{safeText(d.query)}</td>
-                  <td className={styles.mono}>{d.answers.map(safeText).join(', ')}</td>
+                  <td className={styles.mono}><span className={styles.cell}>{safeText(d.query)}<CopyButton value={d.query} label="Copy query" /></span></td>
+                  <td className={styles.mono}>
+                    {d.answers.length > 0 && (
+                      <span className={styles.cell}>{d.answers.map(safeText).join(', ')}<CopyButton value={d.answers.join('\n')} label="Copy answers" /></span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>

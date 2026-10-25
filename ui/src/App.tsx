@@ -135,7 +135,7 @@ function Shell() {
         {error && <p className={styles.error} role="alert">{error}</p>}
         <Routes>
           <Route path="/" element={<TasksPage />} />
-          <Route path="/submit" element={<SubmitPage />} />
+          <Route path="/submit" element={<SubmitPage maxUploadBytes={me?.maxUploadBytes} />} />
           <Route path="/tasks/:id" element={<TaskPage />} />
           <Route path="/admin/orgs" element={<OrgsAdminPage me={me} />} />
           <Route path="/admin/templates" element={<TemplatesAdminPage me={me} />} />

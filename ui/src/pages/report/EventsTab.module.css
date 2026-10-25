@@ -7,3 +7,5 @@
 .chipOn, .chipOn:hover { background: var(--mx-accent); border-color: var(--mx-accent); color: var(--mx-accent-ink); }
 .eventExport { display: flex; gap: 1rem; margin-bottom: 0.5rem; font-size: 0.85rem; }
 .loadMore { margin-top: 0.5rem; padding: 0.3rem 1rem; border: 1px solid var(--mx-control); border-radius: var(--mx-radius-control); background: var(--mx-surface); font: inherit; }
+.exportButton { background: none; border: 0; padding: 0; color: var(--mx-accent); font: inherit; cursor: pointer; text-decoration: underline; }
+.exportButton:hover { color: var(--mx-accent-hover); }

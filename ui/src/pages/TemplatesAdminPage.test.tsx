@@ -36,7 +36,7 @@ import { ApiError } from '../api/client'
 import { renderWithKit } from '../test/renderWithKit'
 import TemplatesAdminPage from './TemplatesAdminPage'
 
-const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin' }
+const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin', maxUploadBytes: 268_435_456 }
 
 const version = (over: Partial<TemplateVersionDto>): TemplateVersionDto => ({
   id: 'v-id', number: 1, origin: 'Imported', status: 'Ready', role: 'Pending', isCurrent: false, diskPresent: true,
@@ -117,6 +117,7 @@ describe('TemplatesAdminPage', () => {
     listAdminTemplates.mockResolvedValue([golden({ versions: [v3, version({ ...v2, diskPresent: false }), v1] })])
     renderPage()
     const g = await region('Windows 11 Golden')
+    expect(within(g).getByRole('table').parentElement?.className).toMatch(/tableScroll/)
     const rows = within(g).getAllByRole('row').slice(1)
     expect(rows).toHaveLength(3)
     expect(rows[0]).toHaveTextContent(/v3.*Edit.*Ready/)

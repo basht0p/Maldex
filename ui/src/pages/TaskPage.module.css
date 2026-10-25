@@ -11,6 +11,8 @@
 }
 .menuList a { display: block; padding: 0.35rem 0.8rem; white-space: nowrap; }
 .menuList a:hover { background: var(--mx-raised); }
+.menuButton { display: block; width: 100%; padding: 0.35rem 0.8rem; border: 0; background: none; color: var(--mx-accent); font: inherit; text-align: left; white-space: nowrap; cursor: pointer; }
+.menuButton:hover { background: var(--mx-raised); }
 .sep { color: var(--mx-muted); }
 .error { color: var(--mx-critical); margin: 0.5rem 0; }
 .grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; margin-bottom: 1rem; }

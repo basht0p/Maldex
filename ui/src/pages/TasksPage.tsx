@@ -3,14 +3,14 @@ import { Link } from 'react-router-dom'
 import { ApiError, cancelTask, listOrgs, listTasks } from '../api/client'
 import { RUN_STATUSES, type OrgDto, type RunStatus, type TaskDto, type TaskListQuery, type Verdict } from '../api/types'
 import { StatusBadge, VerdictBadge } from '../components/StatusBadge'
-import { useConfirm } from '../kit/Confirm'
+import { useConfirm } from '../kit/useConfirm'
 import { CopyButton } from '../kit/CopyButton'
 import { EmptyState } from '../kit/EmptyState'
 import { ErrorBanner } from '../kit/ErrorBanner'
 import { Duration, RelativeTime } from '../kit/RelativeTime'
 import { Skeleton } from '../kit/Skeleton'
 import { SortHeader } from '../kit/SortHeader'
-import { useToast } from '../kit/Toaster'
+import { useToast } from '../kit/useToast'
 import { useUrlState, type UrlField } from '../kit/useUrlState'
 import { messageOf } from '../util/apiMessage'
 import { safeText } from '../util/safeText'
@@ -191,7 +191,7 @@ export default function TasksPage() {
           <EmptyState title="Submit your first sample" body="Tasks you submit appear here with their status and verdict." action={<Link to="/submit">Submit a sample</Link>} />
         )
       )}
-      {items.length > 0 && <table className={styles.table}>
+      {items.length > 0 && <div className={styles.tableScroll}><table className={styles.table}>
         <thead>
           <tr>
             <th>Sample</th><th>Organization</th><th>Submitted by</th><th>Status</th>
@@ -227,7 +227,7 @@ export default function TasksPage() {
             </tr>
           ))}
         </tbody>
-      </table>}
+      </table></div>}
 
       <div className={styles.pager}>
         <button type="button" className={styles.secondary} disabled={f.page === 0} onClick={() => setF({ page: Math.max(0, f.page - 1) })}>Previous</button>

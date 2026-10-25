@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import type { EventType, LiveEventDto } from '../../api/types'
 import { renderWithKit } from '../../test/renderWithKit'
 import { reportFixture } from '../../test/reportFixture'
@@ -78,11 +78,32 @@ describe('EventsTab', () => {
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Load more' })).toBeNull())
   })
 
-  it('builds export links from the current filters', async () => {
+  it('exports with the current filters', async () => {
+    const exported: string[] = []
+    server.use(http.get('/api/tasks/t1/events/export', ({ request }) => {
+      const u = new URL(request.url)
+      exported.push(u.pathname + u.search)
+      return new HttpResponse('[]')
+    }))
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
     renderTab('/tasks/t1?etype=Network&eq=evil')
     await waitFor(() => expect(requests.length).toBeGreaterThan(0))
-    expect(screen.getByRole('link', { name: 'Export CSV' })).toHaveAttribute('href', '/api/tasks/t1/events/export?format=csv&type=Network&q=evil')
-    expect(screen.getByRole('link', { name: 'Export JSON' })).toHaveAttribute('href', '/api/tasks/t1/events/export?format=json&type=Network&q=evil')
+    await userEvent.click(screen.getByRole('button', { name: 'Export CSV' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Export JSON' }))
+    await waitFor(() => expect(exported).toEqual([
+      '/api/tasks/t1/events/export?format=csv&type=Network&q=evil',
+      '/api/tasks/t1/events/export?format=json&type=Network&q=evil',
+    ]))
+    vi.restoreAllMocks()
+  })
+
+  it('matches the live text filter against the event data too, like the server', async () => {
+    const events = [
+      { ...ev(1, 'Registry', 'set value'), dataJson: '{"key":"HKCU\\\\Run\\\\EvilStartup"}' },
+      { ...ev(2, 'Registry', 'set value'), dataJson: '{"key":"HKCU\\\\Run\\\\Benign"}' },
+    ]
+    renderTab('/tasks/t1?eq=evilstartup', { live: true, liveEvents: events })
+    expect(await screen.findAllByText('set value')).toHaveLength(1) // only the event whose data matches
   })
 
   it('filters live events client-side by the same rules', async () => {

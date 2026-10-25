@@ -3,8 +3,9 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { ApiError, getTask, listOrgs, listTasks, listTemplates, resubmitTask, submitTask } from '../api/client'
 import type { NetworkMode, OrgDto, ProblemDetails, TaskDto, TemplateSummaryDto } from '../api/types'
 import { VerdictBadge } from '../components/StatusBadge'
+import { formatFileSize } from '../kit/format'
 import { RelativeTime } from '../kit/RelativeTime'
-import { useToast } from '../kit/Toaster'
+import { useToast } from '../kit/useToast'
 import { messageOf } from '../util/apiMessage'
 import { safeText } from '../util/safeText'
 import { DropZone, type DropItem } from './submit/DropZone'
@@ -39,6 +40,8 @@ type Entry = {
   state: RowState
   taskId?: string
   error?: string
+  /** Over the server's upload limit: shown as a row error and never uploaded. */
+  tooLarge?: boolean
   dup?: { total: number; latest: TaskDto }
 }
 
@@ -53,13 +56,16 @@ function Errors({ id, messages }: { id: string; messages?: string[] }) {
   )
 }
 
-export default function SubmitPage() {
+/** `maxUploadBytes` is the server's effective cap (from /api/me); files over it are refused before upload. */
+export default function SubmitPage({ maxUploadBytes }: { maxUploadBytes?: number } = {}) {
   const navigate = useNavigate()
   const toast = useToast()
   const [searchParams, setSearchParams] = useSearchParams()
   const from = searchParams.get('from')
   const [last] = useState(loadLastOptions)
   const nextId = useRef(1)
+  // Duplicate checks hash one file at a time: each hash reads the whole file (up to 512 MiB) into memory.
+  const hashQueue = useRef<Promise<void>>(Promise.resolve())
   const [orgs, setOrgs] = useState<OrgDto[] | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [templates, setTemplates] = useState<TemplateSummaryDto[]>([])
@@ -134,6 +140,10 @@ export default function SubmitPage() {
 
   // A single enabled template is the only choice, so the picker (and the image field) stay out of the way.
   const pickTemplate = templates.length > 1
+  // Whatever set `image` (a remembered option, a resubmit source, the analyst) and in whichever order the template
+  // list and the source task arrived, a template that is not listed (hidden or disabled) falls back to the default.
+  const defaultImage = (templates.find((x) => x.isDefault) ?? templates[0])?.id ?? ''
+  const chosenImage = templates.some((x) => x.id === image) ? image : defaultImage
 
   function validate(): FieldErrors {
     const e: FieldErrors = {}
@@ -143,6 +153,7 @@ export default function SubmitPage() {
       const hasFile = files.length > 0
       if (!hasFile && !trimmed) e.source = ['Provide a file or a url.']
       else if (hasFile && trimmed) e.source = ['Provide either a file or a url, not both.']
+      else if (hasFile && files.every((f) => f.tooLarge)) e.file = ['Every chosen file is over the size limit. Choose a smaller file.']
       else if (trimmed) {
         const u = urlError(trimmed)
         if (u) e.url = [u]
@@ -155,7 +166,7 @@ export default function SubmitPage() {
   }
 
   function persist() {
-    saveLastOptions({ orgId, image, networkMode, exitCountry, durationSec, interactive })
+    saveLastOptions({ orgId, image: chosenImage, networkMode, exitCountry, durationSec, interactive })
   }
 
   function buildForm(file: File | null): FormData {
@@ -166,7 +177,7 @@ export default function SubmitPage() {
     form.set('networkMode', networkMode)
     form.set('durationSec', String(Number(durationSec)))
     form.set('interactive', String(interactive))
-    if (pickTemplate && image) form.set('image', image)
+    if (pickTemplate && chosenImage) form.set('image', chosenImage)
     if (networkMode === 'LiveVpn') form.set('exitCountry', exitCountry.trim())
     return form
   }
@@ -190,7 +201,8 @@ export default function SubmitPage() {
     try {
       const task = await resubmitTask(id, {
         orgId,
-        image: image || undefined,
+        // As in buildForm: without a picker the server chooses its default template.
+        image: pickTemplate && chosenImage ? chosenImage : undefined,
         networkMode,
         exitCountry: networkMode === 'LiveVpn' ? exitCountry.trim() : undefined,
         durationSec: Number(durationSec),
@@ -212,7 +224,7 @@ export default function SubmitPage() {
 
   async function runBatch() {
     // One file or one URL behaves as it always did: errors land on the form and success opens the task.
-    if (url.trim() || files.length === 1) {
+    if (url.trim() || (files.length === 1 && !files[0].tooLarge)) {
       const entry = files[0]
       if (entry) patch(entry.id, { state: 'uploading' })
       try {
@@ -226,8 +238,8 @@ export default function SubmitPage() {
       return
     }
 
-    const todo = files.filter((f) => f.state !== 'created')
-    setFiles((fs) => fs.map((f) => (f.state === 'created' ? f : { ...f, state: 'queued', error: undefined })))
+    const todo = files.filter((f) => f.state !== 'created' && !f.tooLarge)
+    setFiles((fs) => fs.map((f) => (f.state === 'created' || f.tooLarge ? f : { ...f, state: 'queued', error: undefined })))
     let created = 0
     for (const entry of todo) {
       patch(entry.id, { state: 'uploading' })
@@ -269,9 +281,15 @@ export default function SubmitPage() {
 
   function addFiles(picked: File[]) {
     if (picked.length === 0) return
-    const entries: Entry[] = picked.map((file) => ({ id: nextId.current++, file, state: 'idle' }))
+    const entries: Entry[] = picked.map((file) =>
+      maxUploadBytes !== undefined && file.size > maxUploadBytes
+        ? { id: nextId.current++, file, state: 'failed', tooLarge: true, error: `${safeText(file.name)} is larger than the ${formatFileSize(maxUploadBytes)} limit.` }
+        : { id: nextId.current++, file, state: 'idle' })
     setFiles((fs) => [...fs, ...entries])
-    for (const entry of entries) void checkDuplicate(entry)
+    for (const entry of entries) {
+      if (entry.tooLarge) continue
+      hashQueue.current = hashQueue.current.then(() => checkDuplicate(entry))
+    }
   }
 
   function rowStatus(f: Entry) {
@@ -287,6 +305,7 @@ export default function SubmitPage() {
           </>
         )
       case 'failed':
+        if (f.tooLarge) return <span className={dropStyles.failed}>{f.error}</span>
         return <span className={dropStyles.failed}>{`Failed: ${f.error ?? 'Submission failed.'}`}</span>
       default:
         return undefined
@@ -331,7 +350,7 @@ export default function SubmitPage() {
         {pickTemplate && (
           <div className={styles.field}>
             <label htmlFor="image">Template</label>
-            <select id="image" value={image} onChange={(e) => setImage(e.target.value)} aria-describedby="image-error">
+            <select id="image" value={chosenImage} onChange={(e) => setImage(e.target.value)} aria-describedby="image-error">
               {templates.map((t) => (
                 <option key={t.id} value={t.id}>{t.displayName}</option>
               ))}
@@ -403,6 +422,8 @@ export default function SubmitPage() {
         </div>
 
         {formError && <p className={styles.error} role="alert">{formError}</p>}
+        {/* Without the picker there is no Template field to put a server image error under. */}
+        {!pickTemplate && <Errors id="image-error" messages={errors.image} />}
         {otherErrors.map((m, i) => (
           <p key={i} className={styles.error} role="alert">{m}</p>
         ))}

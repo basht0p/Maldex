@@ -13,11 +13,11 @@ import {
   startTemplateRefresh,
 } from '../api/client'
 import type { AdminTemplateDto, MeDto, TemplateJobDto, TemplateJobNetwork, TemplateVersionDto } from '../api/types'
-import { useConfirm } from '../kit/Confirm'
+import { useConfirm } from '../kit/useConfirm'
 import { ErrorBanner } from '../kit/ErrorBanner'
 import { RelativeTime } from '../kit/RelativeTime'
 import { Skeleton } from '../kit/Skeleton'
-import { useToast } from '../kit/Toaster'
+import { useToast } from '../kit/useToast'
 import { messageOf } from '../util/apiMessage'
 import { useDialogFocus } from './dialogFocus'
 import styles from './forms.module.css'
@@ -103,6 +103,7 @@ function JobDialog({ kind, template, onClose, onStarted }: {
 function JobsList({ jobs }: { jobs: TemplateJobDto[] }) {
   if (jobs.length === 0) return <p className={styles.hint}>No jobs yet</p>
   return (
+    <div className={styles.tableScroll}>
     <table className={styles.table} aria-label="Jobs">
       <thead><tr><th>Job</th><th>Base</th><th>Result</th><th>State</th><th>Started</th></tr></thead>
       <tbody>
@@ -117,6 +118,7 @@ function JobsList({ jobs }: { jobs: TemplateJobDto[] }) {
         ))}
       </tbody>
     </table>
+    </div>
   )
 }
 
@@ -254,6 +256,7 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
           <span className={styles.hint}>{`Not yet published: ${pending.map((v) => `v${v.number}`).join(', ')}`}</span>
         </p>
       )}
+      <div className={styles.tableScroll}>
       <table className={styles.table}>
         <thead><tr><th>Version</th><th>Origin</th><th>Status</th><th>Disk</th><th>Actions</th></tr></thead>
         <tbody>
@@ -275,6 +278,7 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
           ))}
         </tbody>
       </table>
+      </div>
       <h3 className={page.subhead}>Jobs</h3>
       <JobsList jobs={jobs} />
     </section>

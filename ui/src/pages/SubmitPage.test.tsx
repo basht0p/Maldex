@@ -46,10 +46,10 @@ function countSubmits(response: () => Response) {
   )
 }
 
-async function renderPage(route = '/submit') {
+async function renderPage(route = '/submit', maxUploadBytes?: number) {
   renderWithKit(
     <Routes>
-      <Route path="/submit" element={<SubmitPage />} />
+      <Route path="/submit" element={<SubmitPage maxUploadBytes={maxUploadBytes} />} />
       <Route path="/tasks/:id" element={<div>task page placeholder</div>} />
     </Routes>,
     { route },
@@ -384,6 +384,60 @@ describe('SubmitPage', () => {
       expect(calls).toBe(0)
       expect(screen.queryByText(/Analysed/)).toBeNull()
     })
+
+    it('hashes dropped files one at a time', async () => {
+      let release: () => void = () => {}
+      const digest = vi.fn()
+        .mockImplementationOnce(() => new Promise<ArrayBuffer>((r) => { release = () => r(new Uint8Array(32).buffer) }))
+        .mockResolvedValue(new Uint8Array(32).buffer)
+      vi.stubGlobal('crypto', { subtle: { digest } })
+      const first = withBuffer('one.exe')
+      const second = withBuffer('two.exe')
+      const read = vi.spyOn(second, 'arrayBuffer')
+      await renderPage()
+      await userEvent.upload(screen.getByLabelText('File'), [first, second])
+      await waitFor(() => expect(digest).toHaveBeenCalledTimes(1))
+      await new Promise((r) => setTimeout(r, 50))
+      expect(read).not.toHaveBeenCalled() // the second file is not read while the first is hashing
+      release()
+      await waitFor(() => expect(digest).toHaveBeenCalledTimes(2))
+      expect(read).toHaveBeenCalledOnce()
+    })
+  })
+
+  describe('upload limit', () => {
+    it('marks a file over the limit as a row error and uploads the rest of the batch', async () => {
+      const names: string[] = []
+      server.use(
+        http.post('/api/tasks', async ({ request }) => {
+          names.push(await ((await request.formData()).get('file') as File).text())
+          return HttpResponse.json({ id: `t${names.length}` }, { status: 201 })
+        }),
+      )
+      await renderPage('/submit', 1024)
+      const big = new File(['x'], 'huge.iso')
+      Object.defineProperty(big, 'size', { value: 4096 })
+      await userEvent.upload(screen.getByLabelText('File'), [new File(['a'], 'a.bin'), big, new File(['b'], 'b.bin')])
+      expect(await screen.findByText('huge.iso is larger than the 1.0 KiB limit.')).toBeInTheDocument()
+      await userEvent.selectOptions(screen.getByLabelText(/organization/i), ORG.id)
+      await submit()
+
+      expect(await screen.findByText('Created 2 tasks')).toBeInTheDocument()
+      expect(names).toEqual(['a', 'b'])
+      expect(screen.getByText('huge.iso is larger than the 1.0 KiB limit.')).toBeInTheDocument()
+    })
+
+    it('does not upload a single file over the limit', async () => {
+      countSubmits(() => HttpResponse.json({ id: 't1' }, { status: 201 }))
+      await renderPage('/submit', 1024)
+      const big = new File(['x'], 'huge.iso')
+      Object.defineProperty(big, 'size', { value: 4096 })
+      await userEvent.upload(screen.getByLabelText('File'), big)
+      await userEvent.selectOptions(screen.getByLabelText(/organization/i), ORG.id)
+      await submit()
+      expect(await screen.findByText('Every chosen file is over the size limit. Choose a smaller file.')).toBeInTheDocument()
+      expect(submitCalls).toBe(0)
+    })
   })
 
   describe('resubmit', () => {
@@ -433,6 +487,55 @@ describe('SubmitPage', () => {
       source({ originalFileName: null, url: 'https://evil.test/payload' })
       await renderPage('/submit?from=t1')
       expect(await screen.findByText('https://evil.test/payload')).toBeInTheDocument()
+    })
+
+    for (const first of ['templates', 'source'] as const) {
+      it(`falls back to the default template when the source template is not listed (${first} load first)`, async () => {
+        const bodies: { image?: string }[] = []
+        server.use(http.post('/api/tasks/t1/resubmit', async ({ request }) => {
+          bodies.push((await request.json()) as { image?: string })
+          return HttpResponse.json({ id: 't2' }, { status: 201 })
+        }))
+        let release: () => void = () => {}
+        const gate = new Promise<void>((r) => { release = r })
+        server.use(
+          http.get('/api/templates', async () => {
+            if (first === 'source') await gate
+            return HttpResponse.json([WIN11, GOLDEN])
+          }),
+          http.get('/api/tasks/t1', async () => {
+            if (first === 'templates') await gate
+            return HttpResponse.json({ ...SOURCE, image: 'win10-hidden' })
+          }),
+        )
+        await renderPage('/submit?from=t1')
+        if (first === 'templates') await screen.findByLabelText('Template')
+        else await screen.findByText('invoice.exe')
+        release()
+        await screen.findByText('invoice.exe')
+        await waitFor(() => expect(screen.getByLabelText(/organization/i)).toHaveValue(ORG.id))
+        expect(await screen.findByLabelText('Template')).toHaveValue(WIN11.id)
+        await submit()
+        await waitFor(() => expect(bodies).toHaveLength(1))
+        expect(bodies[0].image).toBe(WIN11.id)
+      })
+    }
+
+    it('sends no image when the picker is hidden and shows a server image error on the form', async () => {
+      const bodies: Record<string, unknown>[] = []
+      server.use(http.post('/api/tasks/t1/resubmit', async ({ request }) => {
+        bodies.push((await request.json()) as Record<string, unknown>)
+        return HttpResponse.json({ title: 'One or more validation errors occurred.', status: 400, errors: { image: ['Unknown or disabled template.'] } }, { status: 400 })
+      }))
+      source({ image: 'win10-hidden' })
+      await renderPage('/submit?from=t1')
+      await screen.findByText('invoice.exe')
+      await waitFor(() => expect(templatesAnswered).toBe(true))
+      await waitFor(() => expect(screen.getByLabelText(/organization/i)).toHaveValue(ORG.id))
+      expect(screen.queryByLabelText('Template')).toBeNull()
+      await submit()
+      expect(await screen.findByText('Unknown or disabled template.')).toBeInTheDocument()
+      expect(bodies[0]).not.toHaveProperty('image')
     })
 
     it('leaves resubmit mode through Change sample', async () => {

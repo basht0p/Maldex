@@ -1,13 +1,11 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useDialogFocus } from '../pages/dialogFocus'
 import styles from './Confirm.module.css'
 
-export type ConfirmOptions = { title: string; body?: string; confirmLabel: string; danger?: boolean }
-type Confirm = (o: ConfirmOptions) => Promise<boolean>
-type Pending = ConfirmOptions & { resolve: (ok: boolean) => void }
+import { ConfirmContext as Ctx, type Confirm, type ConfirmOptions } from './useConfirm'
 
-const Ctx = createContext<Confirm | null>(null)
+type Pending = ConfirmOptions & { resolve: (ok: boolean) => void }
 
 function ConfirmDialog({ pending, onDone }: { pending: Pending; onDone: (ok: boolean) => void }) {
   const ref = useRef<HTMLDivElement>(null)
@@ -58,10 +56,4 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
       {pending && <ConfirmDialog key={pending.title + pending.confirmLabel} pending={pending} onDone={done} />}
     </Ctx.Provider>
   )
-}
-
-export function useConfirm(): Confirm {
-  const c = useContext(Ctx)
-  if (!c) throw new Error('useConfirm must be used inside ConfirmProvider')
-  return c
 }

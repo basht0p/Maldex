@@ -161,6 +161,53 @@ public sealed class EventQueryTests(SqlServerFixture sql) : IDisposable
         Assert.Equal(seeded.TaskId.ToString(), row.Target);
         Assert.Contains("format=json", row.Details);
         Assert.Contains("rows=4", row.Details);
+        Assert.DoesNotContain("complete=false", row.Details);
+    }
+
+    [Fact]
+    public async Task Export_cut_short_is_still_audited_as_incomplete()
+    {
+        var f = Factory();
+        var seeded = await CompletedTaskSeed.SeedAsync(f, extraEvents: 20_000);
+        using var client = f.CreateClient(UserRole.Analyst);
+
+        using (var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct))
+        {
+            var resp = await client.GetAsync($"/api/tasks/{seeded.TaskId}/events/export?format=csv", HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            await using var body = await resp.Content.ReadAsStreamAsync(cts.Token);
+            await body.ReadExactlyAsync(new byte[1024], cts.Token);
+            cts.Cancel(); // the client goes away mid-download
+            resp.Dispose();
+        }
+
+        AuditLog? row = null;
+        for (var i = 0; i < 100 && row is null; i++)
+        {
+            using var scope = f.Services.CreateScope();
+            row = await scope.ServiceProvider.GetRequiredService<MaldexDbContext>().AuditLogs.AsNoTracking()
+                .SingleOrDefaultAsync(a => a.Action == "task.events.export", Ct);
+            if (row is null) await Task.Delay(100, Ct);
+        }
+        Assert.NotNull(row);
+        Assert.Contains("complete=false", row.Details);
+    }
+
+    [Fact]
+    public async Task Export_requires_analyst_auth()
+    {
+        var f = Factory();
+        var seeded = await CompletedTaskSeed.SeedAsync(f);
+        // A second host on the same database, in Entra mode: dev auth would admit an unauthenticated client.
+        var entra = new MaldexAppFactory(sql, authMode: "Entra", connectionString: f.ConnectionString, settings: new Dictionary<string, string?>
+        {
+            ["AzureAd:Instance"] = "https://login.microsoftonline.com/",
+            ["AzureAd:TenantId"] = "00000000-0000-0000-0000-000000000000",
+            ["AzureAd:ClientId"] = "00000000-0000-0000-0000-000000000001",
+        });
+        _factories.Add(entra);
+        using var anonymous = entra.CreateClient();
+
+        Assert.Equal(HttpStatusCode.Unauthorized, (await anonymous.GetAsync($"/api/tasks/{seeded.TaskId}/events/export?format=csv", Ct)).StatusCode);
     }
 }
 

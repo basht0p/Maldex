@@ -19,6 +19,8 @@
 .secondary { padding: 0.3rem 0.7rem; border: 1px solid var(--mx-control); border-radius: var(--mx-radius-control); background: var(--mx-surface); color: var(--mx-text); }
 .secondary:hover:not(:disabled) { background: var(--mx-raised); }
 .secondary:disabled { color: var(--mx-muted); border-color: var(--mx-border); cursor: default; }
+/* Wide tables scroll inside their panel, never the page. */
+.tableScroll { overflow-x: auto; max-width: 100%; }
 .table { width: 100%; border-collapse: collapse; background: var(--mx-surface); }
 .table th, .table td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--mx-border); vertical-align: top; }
 .table th { font-family: var(--mx-font-mono); font-size: 0.7rem; text-transform: uppercase; color: var(--mx-muted); background: var(--mx-raised); }

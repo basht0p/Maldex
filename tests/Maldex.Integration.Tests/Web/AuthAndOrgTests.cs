@@ -26,6 +26,7 @@ public sealed class AuthAndOrgTests(SqlServerFixture sql) : IDisposable
         Assert.Equal("Dev User", me.GetProperty("displayName").GetString());
         Assert.Equal("Admin", me.GetProperty("role").GetString());
         Assert.NotEqual(Guid.Empty, me.GetProperty("id").GetGuid());
+        Assert.Equal(268_435_456, me.GetProperty("maxUploadBytes").GetInt64()); // the effective submit cap
 
         using var named = _factory.CreateClient(UserRole.Analyst, "alice");
         var alice = await named.GetFromJsonAsync<JsonElement>("/api/me", Ct);
@@ -128,7 +129,7 @@ public sealed class AuthAndOrgTests(SqlServerFixture sql) : IDisposable
         using var client = _factory.CreateClient();
         var resp = await client.GetAsync("/api/me", Ct);
         Assert.Equal(
-            "default-src 'self'; connect-src 'self' https://login.microsoftonline.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
+            "default-src 'self'; connect-src 'self' https://login.microsoftonline.com; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
             resp.Headers.GetValues("Content-Security-Policy").Single());
         Assert.Equal("nosniff", resp.Headers.GetValues("X-Content-Type-Options").Single());
         Assert.Equal("no-referrer", resp.Headers.GetValues("Referrer-Policy").Single());

@@ -3,7 +3,7 @@ import { ApiError, createOrg, listOrgs, updateOrg } from '../api/client'
 import type { MeDto, OrgDto, ProblemDetails } from '../api/types'
 import { ErrorBanner } from '../kit/ErrorBanner'
 import { Skeleton } from '../kit/Skeleton'
-import { useToast } from '../kit/Toaster'
+import { useToast } from '../kit/useToast'
 import styles from './forms.module.css'
 
 function messageOf(e: unknown): string[] {
@@ -88,12 +88,14 @@ export default function OrgsAdminPage({ me }: { me: MeDto | null }) {
       <h1>Organizations</h1>
       {loadError && <ErrorBanner message={loadError} onRetry={() => void refresh()} />}
       {!loaded && <Skeleton rows={3} />}
+      <div className={styles.tableScroll}>
       <table className={styles.table}>
         <thead><tr><th>Name</th><th>Retention (days)</th><th /></tr></thead>
         <tbody>
           {orgs.map((o) => <OrgRow key={`${o.id}:${o.name}:${o.retentionDays}`} org={o} onSaved={() => void refresh()} />)}
         </tbody>
       </table>
+      </div>
 
       <h2>New organization</h2>
       <form className={styles.form} onSubmit={onCreate}>

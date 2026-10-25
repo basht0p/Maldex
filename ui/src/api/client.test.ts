@@ -2,7 +2,7 @@ import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import {
-  ApiError, cancelTask, cancelTemplateJob, discardTemplateVersion, extendTask, getMe, getTemplateJobTunnelToken, listTasks, publishTemplateVersion,
+  ApiError, cancelTask, cancelTemplateJob, discardTemplateVersion, downloadFile, extendTask, fetchBlob, getMe, getTemplateJobTunnelToken, listTasks, publishTemplateVersion,
   sealTemplateJob, startTemplateEdit, startTemplateRefresh, stopTask,
 } from './client'
 
@@ -57,6 +57,48 @@ describe('client', () => {
     )
     await getMe()
     expect(auth).toBe('Bearer tok123')
+  })
+
+  it('fetchBlob sends the bearer token and throws ApiError on a non-2xx response', async () => {
+    vi.mocked(getAccessToken).mockResolvedValue('tok123')
+    let auth: string | null = null
+    server.use(
+      http.get('/api/artifacts/a1/image', ({ request }) => {
+        auth = request.headers.get('authorization')
+        return new HttpResponse(new Uint8Array([0x89, 0x50]), { headers: { 'Content-Type': 'image/png' } })
+      }),
+      http.get('/api/artifacts/a2/image', () => HttpResponse.json({ title: 'Unauthorized' }, { status: 401 })),
+    )
+    const blob = await fetchBlob('/api/artifacts/a1/image')
+    expect(blob.size).toBe(2)
+    expect(auth).toBe('Bearer tok123')
+    const err = (await fetchBlob('/api/artifacts/a2/image').catch((e: unknown) => e)) as ApiError
+    expect(err).toBeInstanceOf(ApiError)
+    expect(err.status).toBe(401)
+    vi.mocked(getAccessToken).mockResolvedValue(null)
+  })
+
+  it('downloadFile saves the authenticated blob under the given name and revokes the URL', async () => {
+    vi.mocked(getAccessToken).mockResolvedValueOnce('tok123')
+    let auth: string | null = null
+    server.use(http.get('/api/tasks/t1/report.pdf', ({ request }) => {
+      auth = request.headers.get('authorization')
+      return new HttpResponse('%PDF', { headers: { 'Content-Type': 'application/pdf' } })
+    }))
+    const create = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:x/1')
+    const revoke = vi.spyOn(URL, 'revokeObjectURL')
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    await downloadFile('/api/tasks/t1/report.pdf', 'maldex-t1.pdf')
+    expect(auth).toBe('Bearer tok123')
+    const a = click.mock.contexts[0] as HTMLAnchorElement
+    expect(create).toHaveBeenCalledOnce()
+    expect(a.download).toBe('maldex-t1.pdf')
+    expect(a.getAttribute('href')).toBe('blob:x/1')
+    expect(a.isConnected).toBe(false)
+    await vi.waitFor(() => expect(revoke).toHaveBeenCalledWith('blob:x/1'))
+    click.mockRestore()
+    create.mockRestore()
+    revoke.mockRestore()
   })
 
   it('builds the task list query string', async () => {
