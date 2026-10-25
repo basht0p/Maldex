@@ -719,4 +719,186 @@ public class TemplateCoordinatorBuildTests(SqlServerFixture sql)
         Assert.Null(job.FailureReason);
         await rig.AssertNothingLeftAsync(id, "win11");
     }
+
+    // --- fix round (FIX_BASE 2bacdbd) ---
+
+    /// <summary>Holds the first query that asks whether a default template exists for a while (real time), after it has run.</summary>
+    private sealed class HoldFirstDefaultCheck(TimeSpan hold) : Microsoft.EntityFrameworkCore.Diagnostics.DbCommandInterceptor
+    {
+        private int _held;
+        public override async ValueTask<System.Data.Common.DbDataReader> ReaderExecutedAsync(System.Data.Common.DbCommand command,
+            Microsoft.EntityFrameworkCore.Diagnostics.CommandExecutedEventData eventData, System.Data.Common.DbDataReader result, CancellationToken cancellationToken = default)
+        {
+            // The check filters on IsDefault and Enabled (EF's "[IsDefault] = CAST(1 AS bit)" or the raw "IsDefault = 1"); loading a
+            // Template entity only lists the columns.
+            var text = command.CommandText;
+            var filtersDefault = text.Contains("IsDefault] = CAST(1 AS bit)", StringComparison.Ordinal) || text.Contains("IsDefault = 1", StringComparison.Ordinal);
+            if (filtersDefault && text.Contains("Enabled", StringComparison.Ordinal) && Interlocked.Exchange(ref _held, 1) == 0)
+                await Task.Delay(hold, CancellationToken.None);
+            return result;
+        }
+    }
+
+    [Fact]
+    public async Task Build_TwoFirstBuildsPublishingTogether_OnlyOneBecomesTheDefault_AndBothPublish()
+    {
+        var hold = new HoldFirstDefaultCheck(TimeSpan.FromSeconds(3));
+        await using var rig = await BuildRig.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Orchestrator:MaxConcurrentVms"] = "2" },
+            s => s.ConfigureDbContext<MaldexDbContext>(o => o.AddInterceptors(hold)));
+        await rig.SeedEmptyTemplateAsync("win11", clearOtherDefault: true);
+        await rig.SeedEmptyTemplateAsync("win12");
+        var os = await rig.SeedOsMediaAsync();
+        var a = await rig.SeedBuildAsync("win11", [os]);
+        var b = await rig.SeedBuildAsync("win12", [os]);
+        var runA = rig.R.Start(a);
+        var runB = rig.R.Start(b);
+        await rig.R.PumpUntilAsync(a, TemplateJobState.Configuring, runA);
+        await rig.R.PumpUntilAsync(b, TemplateJobState.Configuring, runB);
+
+        await rig.R.RequestSealAsync(a);
+        await rig.R.RequestSealAsync(b);
+        await rig.R.PumpAsync(Task.WhenAll(runA, runB));
+
+        Assert.Equal(TemplateJobState.Published, (await rig.R.JobAsync(a)).State);
+        Assert.Equal(TemplateJobState.Published, (await rig.R.JobAsync(b)).State);
+        Assert.Single(await rig.R.AuditsAsync(), x => x.Action == "template.default");
+        await using var db = rig.R.H.NewContext();
+        Assert.Single(await db.Templates.Where(t => t.IsDefault).ToListAsync(Ct));
+    }
+
+    /// <summary>Fails every save that carries the <c>template.default</c> audit row (the default step), as a database error would.</summary>
+    private sealed class FailingDefaultSave : Microsoft.EntityFrameworkCore.Diagnostics.SaveChangesInterceptor
+    {
+        public int Failures;
+        public override ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int>> SavingChangesAsync(Microsoft.EntityFrameworkCore.Diagnostics.DbContextEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int> result, CancellationToken cancellationToken = default)
+        {
+            if (eventData.Context!.ChangeTracker.Entries<AuditLog>().Any(e => e.State == EntityState.Added && e.Entity.Action == "template.default"))
+            {
+                Interlocked.Increment(ref Failures);
+                throw new DbUpdateException("the default could not be saved");
+            }
+            return base.SavingChangesAsync(eventData, result, cancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task Build_DefaultStepFails_TheVersionIsStillPublished_WithoutADefaultAudit()
+    {
+        var failing = new FailingDefaultSave();
+        await using var rig = await BuildRig.CreateAsync(sql, configure: s => s.ConfigureDbContext<MaldexDbContext>(o => o.AddInterceptors(failing)));
+        await rig.SeedEmptyTemplateAsync("win11", clearOtherDefault: true);
+        var id = await rig.SeedBuildAsync("win11", [await rig.SeedOsMediaAsync()]);
+        var run = rig.R.Start(id);
+        await rig.R.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+        await rig.R.RequestSealAsync(id);
+        await rig.R.PumpAsync(run);
+
+        Assert.True(failing.Failures > 0, "the default step was never tried");
+        var job = await rig.R.JobAsync(id);
+        Assert.Equal(TemplateJobState.Published, job.State);
+        var v1 = Assert.Single(await rig.VersionsOfAsync("win11"));
+        var template = await rig.TemplateAsync("win11");
+        Assert.Equal((v1.Id, false), (template.CurrentVersionId, template.IsDefault));
+        Assert.DoesNotContain(TemplateCoordinator.StemOf(id), rig.R.Store.Deleted); // the verified disk is kept
+        Assert.Equal(["template.seal", "template.publish"], (await rig.R.AuditsAsync()).Select(a => a.Action));
+    }
+
+    /// <summary>Holds the cancel watcher's polls until they are cancelled, so only the coordinator's own reads can see a cancel request.</summary>
+    private sealed class BlindCancelWatcher : Microsoft.EntityFrameworkCore.Diagnostics.DbCommandInterceptor
+    {
+        public volatile bool Armed;
+        public override async ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<System.Data.Common.DbDataReader>> ReaderExecutingAsync(System.Data.Common.DbCommand command,
+            Microsoft.EntityFrameworkCore.Diagnostics.CommandEventData eventData, Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<System.Data.Common.DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (Armed && command.CommandText.TrimStart().StartsWith("SELECT TOP(2) [t].[CancelRequestedAt]", StringComparison.Ordinal))
+                await Task.Delay(Timeout.Infinite, cancellationToken);
+            return result;
+        }
+    }
+
+    [Fact]
+    public async Task Cancel_ThatWinsOverTheDefenderRefusal_EndsCancelled_WithoutCheckingAgain()
+    {
+        var blind = new BlindCancelWatcher();
+        await using var rig = await BuildRig.CreateAsync(sql, configure: s => s.ConfigureDbContext<MaldexDbContext>(o => o.AddInterceptors(blind)));
+        rig.R.Guest.ProvenanceRealTimeProtection = true;
+        await rig.SeedEmptyTemplateAsync("win11");
+        var id = await rig.SeedBuildAsync("win11", [await rig.SeedOsMediaAsync()]);
+        var run = rig.R.Start(id);
+        await rig.R.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+        blind.Armed = true;
+        var asked = rig.R.Channels.SentTo(id).OfType<ProvenanceCommand>().Count();
+
+        // Seal and cancel arrive together: the Defender check runs, finds RTP on, and the refusal finds the cancel request.
+        await rig.R.WriteJobAsync(id, j => { j.SealRequestedAt = rig.R.H.Time.GetUtcNow(); j.CancelRequestedAt = rig.R.H.Time.GetUtcNow(); });
+        await rig.R.PumpAsync(run);
+
+        var job = await rig.R.JobAsync(id);
+        Assert.Equal((TemplateJobState.Cancelled, TemplateCoordinator.CancelledByAdmin, (string?)null), (job.State, job.Message, job.FailureReason));
+        // The check ran (one check may send its request twice: it resends when the fresh channel's ready frame arrives). That it did
+        // not loop is shown by the job ending at all: the cancel watcher is blind, and a looping coordinator never ends.
+        Assert.True(rig.R.Channels.SentTo(id).OfType<ProvenanceCommand>().Count() > asked, "the Defender check never ran");
+        Assert.NotNull(job.SealRequestedAt); // the refusal did not touch the row
+        await rig.AssertNothingLeftAsync(id, "win11");
+    }
+
+    /// <summary>The fake builder, but its ISO gets another name inside the work directory (the builder decides where it writes).</summary>
+    private sealed class RenamingProvisioningMedia(FakeProvisioningMediaBuilder inner) : IProvisioningMediaBuilder
+    {
+        public async Task<string> BuildAsync(ProvisioningInputs inputs, string workDir, CancellationToken ct)
+        {
+            var iso = await inner.BuildAsync(inputs, workDir, ct);
+            var renamed = Path.Combine(workDir, "maldex-provision.iso");
+            File.Move(iso, renamed);
+            return renamed;
+        }
+    }
+
+    [Fact]
+    public async Task Build_AttachesTheProvisioningIso_TheBuilderReturned()
+    {
+        await using var rig = await BuildRig.CreateAsync(sql, configure: s => s.Replace(ServiceDescriptor.Singleton<IProvisioningMediaBuilder>(sp =>
+            new RenamingProvisioningMedia(new FakeProvisioningMediaBuilder(sp.GetRequiredService<IOptions<BuildOptions>>())))));
+        await rig.SeedEmptyTemplateAsync("win11");
+        var id = await rig.SeedBuildAsync("win11", [await rig.SeedOsMediaAsync()]);
+        var run = rig.R.Start(id);
+        await rig.R.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+
+        Assert.Equal(Path.Combine(rig.WorkDirOf(id), "maldex-provision.iso"), rig.Hv.Starts.First(s => s.TaskId == id).CdRoms![2]);
+
+        await rig.R.RequestCancelAsync(id);
+        await rig.R.PumpAsync(run);
+    }
+
+    [Fact]
+    public async Task DefenderRefusal_MovesTheIdleDeadline_SoTheAdminHasTimeToTurnItOff()
+    {
+        await using var rig = await BuildRig.CreateAsync(sql);
+        rig.R.Guest.ProvenanceRealTimeProtection = true;
+        await rig.SeedEmptyTemplateAsync("win11");
+        var id = await rig.SeedBuildAsync("win11", [await rig.SeedOsMediaAsync()]);
+        var run = rig.R.Start(id);
+        await rig.R.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+
+        // Nobody connects for 1 h 50 min of the 2 h idle timeout, then Seal is pressed with Defender still on.
+        rig.R.H.Time.Advance(TimeSpan.FromMinutes(110));
+        await rig.R.RequestSealAsync(id);
+        await rig.PumpUntilAsync(id, j => j.SealRequestedAt is null, run, "the seal was refused");
+        var refusedAt = rig.R.H.Time.GetUtcNow();
+        var refused = await rig.R.JobAsync(id);
+        Assert.Equal(TemplateCoordinator.DefenderStillOn, refused.Message);
+        Assert.True(refused.LastConsoleAt >= refusedAt - TimeSpan.FromSeconds(5), $"LastConsoleAt {refused.LastConsoleAt} was not moved to the refusal ({refusedAt})");
+
+        // Past the old deadline (Configuring + 2 h) the session is still there.
+        rig.R.H.Time.Advance(TimeSpan.FromMinutes(30));
+        await rig.R.IdleAsync();
+        Assert.Equal(TemplateJobState.Configuring, (await rig.R.JobAsync(id)).State);
+
+        rig.R.Guest.ProvenanceRealTimeProtection = false;
+        await rig.R.RequestSealAsync(id);
+        await rig.R.PumpAsync(run);
+        Assert.Equal(TemplateJobState.Published, (await rig.R.JobAsync(id)).State);
+    }
 }

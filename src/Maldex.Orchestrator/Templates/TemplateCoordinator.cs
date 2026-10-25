@@ -420,7 +420,7 @@ public sealed class TemplateCoordinator(
                 return true;
             }, [], ct).ConfigureAwait(false);
 
-            if (await WaitForSealWithDefenderOffAsync(db, job.Id, held.Vm!, o, ct).ConfigureAwait(false) is { } idle) return idle;
+            if (await WaitForSealWithDefenderOffAsync(db, job, held.Vm!, o, ct).ConfigureAwait(false) is { } idle) return idle;
 
             // Nobody may keep driving the guest while it is sealed (R22): close the job's open consoles and wait, bounded, for them to go.
             if (consoles is not null && !await consoles.CloseAsync(job.Id, o.ConsoleCloseTimeout, ct).ConfigureAwait(false))
@@ -511,9 +511,10 @@ public sealed class TemplateCoordinator(
 
         held.WorkDir = WorkDirOf(b, job.Id);
         var office = media.Applications.Count > 0;
+        string provisionIso;
         try
         {
-            await provisioningMedia.BuildAsync(new ProvisioningInputs(bundle, media.Edition.Index, media.Edition.ProductKey, office), held.WorkDir, ct).ConfigureAwait(false);
+            provisionIso = Path.GetFullPath(await provisioningMedia.BuildAsync(new ProvisioningInputs(bundle, media.Edition.Index, media.Edition.ProductKey, office), held.WorkDir, ct).ConfigureAwait(false));
         }
         catch (Exception) when (ct.IsCancellationRequested)
         {
@@ -523,8 +524,10 @@ public sealed class TemplateCoordinator(
         {
             throw new JobFailedException($"the provisioning media could not be built: {GuestText.Clean(ex.Message, 300)}");
         }
-        // Only paths Maldex owns are attached: the library's files, the virtio ISO and this job's own provisioning ISO.
-        var provisionIso = Path.Combine(held.WorkDir, "provision.iso");
+        // Only paths Maldex owns are attached: the library's files, the virtio ISO and this job's own provisioning ISO, which must
+        // lie in the job's work directory.
+        if (Path.GetDirectoryName(provisionIso) != held.WorkDir)
+            throw new JobFailedException("the provisioning media was not written to the job's work directory");
 
         await TakeVmSlotAsync(db, job.Id, ct).ConfigureAwait(false);
         held.Lease = await egress.CreateAsync(job.Id, NetworkMode.None, null, ct).ConfigureAwait(false);
@@ -560,26 +563,29 @@ public sealed class TemplateCoordinator(
     /// <summary>
     /// Waits for the admin's seal (<see cref="WaitForSealAsync"/>) and checks Defender before anything is installed or isolated
     /// (decision 2, Build and Edit): real-time protection on refuses the seal — the request is cleared so the console opens again,
-    /// and the admin is told why — and the wait goes on. An unreadable state does not block. Returns the idle discard, or null to seal.
+    /// and the admin is told why, and the idle deadline restarts from the refusal (<see cref="TemplateJob.LastConsoleAt"/>), so the
+    /// admin has the whole idle timeout to turn it off — and the wait goes on. An unreadable state does not block. A cancel request
+    /// found by the refusal ends the job as a cancel does. Returns the discard (idle timeout or cancel), or null to seal.
     /// </summary>
-    private async Task<Discarded?> WaitForSealWithDefenderOffAsync(MaldexDbContext db, Guid jobId, VmHandle vm, TemplateJobOptions o, CancellationToken ct)
+    private async Task<Discarded?> WaitForSealWithDefenderOffAsync(MaldexDbContext db, TemplateJob job, VmHandle vm, TemplateJobOptions o, CancellationToken ct)
     {
         while (true)
         {
-            if (await WaitForSealAsync(db, jobId, ct).ConfigureAwait(false) is { } idle) return idle;
-            if (await DefenderCheckAsync(vm, jobId, o, ct).ConfigureAwait(false) != true) return null;
+            if (await WaitForSealAsync(db, job.Id, ct).ConfigureAwait(false) is { } idle) return idle;
+            if (await DefenderCheckAsync(vm, job.Id, o, ct).ConfigureAwait(false) != true) return null;
 
             var refused = false;
-            await SaveJobAsync(db, jobId, j =>
+            await SaveJobAsync(db, job.Id, j =>
             {
                 refused = false;
-                if (j.CancelRequestedAt is not null) return false; // the cancel wins; the watcher ends the job
+                if (j.CancelRequestedAt is not null) return false; // the cancel wins
                 j.SealRequestedAt = null;
+                j.LastConsoleAt = time.GetUtcNow();
                 j.Message = DefenderStillOn;
                 return refused = true;
             }, [], ct, publish: true).ConfigureAwait(false);
-            if (refused) logger.LogInformation("Template job {JobId}: seal refused, Defender real-time protection is still on.", jobId);
-            else await Task.Delay(o.PollInterval, time, ct).ConfigureAwait(false);
+            if (!refused) return new Discarded(CancelledByAdmin, job.RequestedByUserId);
+            logger.LogInformation("Template job {JobId}: seal refused, Defender real-time protection is still on.", job.Id);
         }
     }
 
@@ -873,6 +879,15 @@ public sealed class TemplateCoordinator(
                 var row = await db.TemplateJobs.SingleAsync(j => j.Id == job.Id, ct).ConfigureAwait(false);
                 if (row.CancelRequestedAt is not null) return false;
 
+                // A Build that may publish learns whether an enabled default exists, holding that answer until the commit (a range lock
+                // even when there is none), so of two first builds publishing together only one becomes the default. Taken before the
+                // template's own lock, so every Build takes the two in the same order.
+                var defaultExists = true;
+                if (row.Kind == TemplateJobKind.Build && row.PublishOnSuccess)
+                    defaultExists = await db.Templates
+                        .FromSqlRaw("SELECT * FROM Templates WITH (UPDLOCK, HOLDLOCK) WHERE IsDefault = 1 AND Enabled = 1")
+                        .AsNoTracking().AnyAsync(ct).ConfigureAwait(false);
+
                 // Locked until the commit, so a rollback or publish cannot slip in between this check and the publish below.
                 var currentId = await db.Templates
                     .FromSqlInterpolated($"SELECT * FROM Templates WITH (UPDLOCK, HOLDLOCK) WHERE Id = {row.TemplateId}")
@@ -930,11 +945,7 @@ public sealed class TemplateCoordinator(
                 if (publish)
                 {
                     await catalog.PublishAsync(row.TemplateId, version.Id, ct, new TemplateAudit(row.RequestedByUserId, "template.publish", $"to=v{number}; job={row.Id}")).ConfigureAwait(false);
-                    // The first template built becomes the default, in the same transaction (SetDefaultAsync joins it).
-                    if (row.Kind == TemplateJobKind.Build
-                        && !await db.Templates.AsNoTracking().AnyAsync(t => t.IsDefault && t.Enabled, ct).ConfigureAwait(false)
-                        && await db.Templates.AsNoTracking().AnyAsync(t => t.Id == row.TemplateId && t.Enabled, ct).ConfigureAwait(false))
-                        await catalog.SetDefaultAsync(row.TemplateId, ct, new TemplateAudit(null, "template.default", "first template")).ConfigureAwait(false);
+                    if (!defaultExists) await MakeFirstDefaultAsync(db, catalog, tx, row, ct).ConfigureAwait(false);
                 }
 
                 await tx.CommitAsync(ct).ConfigureAwait(false);
@@ -945,6 +956,30 @@ public sealed class TemplateCoordinator(
             {
                 // The API wrote the job row meanwhile (a console connect, say): roll back and decide again.
             }
+        }
+    }
+
+    /// <summary>
+    /// The first template built becomes the default, in the version's transaction (SetDefaultAsync joins it). Never fatal: a failure
+    /// rolls back to a savepoint taken just before it, so the version is still published, only without the default and its audit row.
+    /// </summary>
+    private async Task MakeFirstDefaultAsync(MaldexDbContext db, TemplateCatalog catalog, Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction tx,
+        TemplateJob row, CancellationToken ct)
+    {
+        const string savepoint = "first_default";
+        await tx.CreateSavepointAsync(savepoint, ct).ConfigureAwait(false);
+        try
+        {
+            if (!await db.Templates.AsNoTracking().AnyAsync(t => t.Id == row.TemplateId && t.Enabled, ct).ConfigureAwait(false)) return;
+            await catalog.SetDefaultAsync(row.TemplateId, ct, new TemplateAudit(null, "template.default", "first template")).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Template job {JobId}: making {TemplateId} the default template failed; it is published without becoming the default.", row.Id, row.TemplateId);
+            await tx.RollbackToSavepointAsync(savepoint, ct).ConfigureAwait(false);
+            // Nothing of the failed step may be saved later: drop its pending rows and changes.
+            foreach (var entry in db.ChangeTracker.Entries().Where(e => e.Entity is not TemplateJob).ToList())
+                entry.State = EntityState.Detached;
         }
     }
 
