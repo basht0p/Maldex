@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Pins and the host-setup helpers shared with packaging/bin/maldex-setup. Pure bash path math: the gate tests source this file with
+# an empty PATH.
+_mx_here="${BASH_SOURCE[0]%/*}"; [ "$_mx_here" != "${BASH_SOURCE[0]}" ] || _mx_here=.
+# shellcheck source=packaging/lib/maldex-common.sh
+source "$_mx_here/packaging/lib/maldex-common.sh"
+unset _mx_here
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # Non-interactive shells may not have dotnet on PATH.
@@ -158,12 +164,7 @@ cmd_smoke() {
 
 # ---- Real mode (Plan 1b) host toolchain ----
 
-MITMPROXY_VERSION="11.1.3"
-MITMPROXY_SHA256="f3f9aa0f719cfda9dac943891b6f3475bb869aa7a6115ee9e17c7e1c88bbc854"
 GUACD_IMAGE="guacamole/guacd:1.5.5"
-VIRTIO_WIN_VERSION="0.1.302-1"
-VIRTIO_WIN_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-$VIRTIO_WIN_VERSION/virtio-win.iso"
-VIRTIO_WIN_SHA256="303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d"
 ALPINE_ISO_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-virt-3.20.3-x86_64.iso"
 ALPINE_ISO_SHA256="81df854fbd7327d293c726b1eeeb82061d3bc8f5a86a6f77eea720f6be372261"
 OVMF_CODE_SECBOOT="/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
@@ -176,27 +177,6 @@ GUARD_UNIT="/etc/systemd/system/maldex-host-guard.service"
 DOCKER_USER_SRC="deploy/host/maldex-docker-user.sh"
 DOCKER_USER_DST="/etc/maldex/maldex-docker-user.sh"
 DOCKER_USER_UNIT="/etc/systemd/system/maldex-docker-user.service"
-
-# Verify file $1 against SHA-256 $2; on mismatch delete it and fail loudly.
-verify_sha256() {
-  local file="$1" want="$2"
-  if ! echo "$want  $file" | sha256sum -c --status -; then
-    echo "SHA-256 mismatch for $file (expected $want, got $(sha256sum "$file" | cut -d' ' -f1)); deleting." >&2
-    rm -f "$file"
-    return 1
-  fi
-}
-
-# Download $1 to $2 unless it already exists (atomic via .part), then verify it against SHA-256 $3.
-fetch_cached() {
-  local url="$1" dest="$2" sha="$3"
-  if [ ! -s "$dest" ]; then
-    echo "Downloading $url"
-    curl -fsSL --retry 3 -o "$dest.part" "$url"
-    mv "$dest.part" "$dest"
-  fi
-  verify_sha256 "$dest" "$sha"
-}
 
 # Install the host guard persistently: copy to /etc/maldex, load now, and re-load at every boot via a oneshot unit.
 install_host_guard() {
@@ -268,77 +248,11 @@ direct_docker_exception_present() {
     && sudo -n iptables -C DOCKER-USER -i "$i" -o 'mxu+' -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment maldex-direct -j ACCEPT
 }
 
-# Dedicated, powerless account for the per-run mitmproxy: own group, no supplementary groups, no home, no shell, no sudoers.
-ensure_mitm_user() {
-  if ! id maldex-mitm >/dev/null 2>&1; then
-    sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin maldex-mitm
-  fi
-}
-
-# Dedicated, powerless account for the per-run dnsmasq: own group, no supplementary groups, no home, no shell, no sudoers.
-# It runs with no capability at all (see NetnsEgressRouter).
-ensure_dns_user() {
-  if ! id maldex-dns >/dev/null 2>&1; then
-    sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin maldex-dns
-  fi
-}
-
-# INetSim insists on root; it runs in a user namespace whose root is maldex-isroot and whose 'inetsim' is maldex-isuser.
-# Both are dedicated, powerless system accounts: own group only, no home, no shell, no sudoers, own nothing on the host.
-ensure_inetsim_userns_ids() {
-  local u
-  for u in maldex-isroot maldex-isuser; do
-    if ! id "$u" >/dev/null 2>&1; then
-      sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "$u"
-    fi
-  done
-}
-
 # mitmproxy's CA (the guest image trusts it); generated once, copied per run into a private confdir for maldex-mitm.
 MITM_CA_DIR=".data/mitm/ca"
-ensure_mitm_ca() {
-  mkdir -p "$MITM_CA_DIR"
-  chmod 0700 "$MITM_CA_DIR"
-  if [ ! -f "$MITM_CA_DIR/mitmproxy-ca.pem" ]; then
-    # mitmdump writes the CA at startup and then idles; stop it after a few seconds.
-    timeout 8 mitmdump --set "confdir=$MITM_CA_DIR" -n -q >/dev/null 2>&1 || true
-  fi
-  [ -f "$MITM_CA_DIR/mitmproxy-ca.pem" ] && [ -f "$MITM_CA_DIR/mitmproxy-ca-cert.pem" ]
-}
 
-# libguestfs's fixed appliance (LIBGUESTFS_PATH): the guest disk editor writes the current agent into a template working copy with
-# guestfish as the app's own user. Ubuntu's 0600 /boot/vmlinuz-* stops supermin from building an appliance for a non-root user, so
-# one is built once as root into a world-readable directory. The stamp records the libguestfs version it was built from.
+# libguestfs's fixed appliance for the guest disk editor (see ensure_guestfs_appliance in packaging/lib/maldex-common.sh).
 GUESTFS_APPLIANCE_DIR="/var/lib/maldex/guestfs-appliance"
-guestfs_version() { dpkg-query -W -f='${Version}' libguestfs-tools; }
-ensure_guestfs_appliance() {
-  local want; want="$(guestfs_version)"
-  if [ -f "$GUESTFS_APPLIANCE_DIR/maldex-libguestfs-version" ] && [ "$(cat "$GUESTFS_APPLIANCE_DIR/maldex-libguestfs-version")" = "$want" ] \
-     && [ -f "$GUESTFS_APPLIANCE_DIR/kernel" ] && [ -f "$GUESTFS_APPLIANCE_DIR/initrd" ] && [ -f "$GUESTFS_APPLIANCE_DIR/root" ]; then
-    return 0
-  fi
-  local fresh="$GUESTFS_APPLIANCE_DIR.new"
-  sudo rm -rf "$fresh"
-  sudo mkdir -p "$(dirname "$GUESTFS_APPLIANCE_DIR")"
-  sudo libguestfs-make-fixed-appliance "$fresh"
-  echo "$want" | sudo tee "$fresh/maldex-libguestfs-version" >/dev/null
-  sudo chown -R root:root "$fresh"
-  sudo chmod -R a+rX,go-w "$fresh"
-  sudo rm -rf "$GUESTFS_APPLIANCE_DIR"
-  sudo mv "$fresh" "$GUESTFS_APPLIANCE_DIR"
-}
-
-# INetSim's template data is only ever read (as root) and copied per run, so it must be root-owned, not writable by others
-# and free of symlinks; the guest-facing INetSim user gets only fresh per-run leaf directories.
-harden_inetsim_template() {
-  sudo chown -R root:root /var/lib/inetsim
-  sudo chmod -R go-w /var/lib/inetsim
-  sudo chmod 0755 /var/lib/inetsim
-}
-
-inetsim_template_clean() {
-  [ -z "$(sudo find /var/lib/inetsim \( -type l -o ! -user root -o -perm /022 \) -print -quit)" ]
-}
 
 # Stop and disable a system unit Maldex runs per run; tolerate only a missing unit, then verify it is inactive.
 disable_system_unit() {
@@ -403,28 +317,15 @@ cmd_real_setup() {
 
   install_host_guard
   install_direct_docker_exception
-  ensure_mitm_user
-  ensure_dns_user
-  ensure_inetsim_userns_ids
-  ensure_mitm_ca
+  local u
+  for u in maldex-mitm maldex-dns maldex-isroot maldex-isuser; do ensure_system_user "$u"; done
+  ensure_mitm_ca "$MITM_CA_DIR" "$(id -un)"
   harden_inetsim_template
-  ensure_guestfs_appliance
+  ensure_guestfs_appliance "$GUESTFS_APPLIANCE_DIR"
   mkdir -p .data/media
   ensure_sysmon_zip
 
   real_verify
-}
-
-# Run "$@" quietly; on failure print the hint and record the failure.
-REAL_FAILED=0
-real_check() {
-  local what="$1" hint="$2"; shift 2
-  if "$@" >/dev/null 2>&1; then
-    echo "ok   $what"
-  else
-    echo "FAIL $what -- install/fix: $hint" >&2
-    REAL_FAILED=1
-  fi
 }
 
 real_verify() {
@@ -522,11 +423,6 @@ cmd_real_smoke() {
   fi
   echo "real-smoke OK: OVMF + TPM 2.0 + KVM work under $LIBVIRT_URI"
 }
-
-# Unattended Windows 11 26H2 guest image (needs MALDEX_WIN_ISO; see deploy/guest/README.md).
-# Sysmon.zip is pinned by the SHA-256 of a download on 2026-10-20 (Sysinternals publishes no checksum file).
-SYSMON_URL="https://download.sysinternals.com/files/Sysmon.zip"
-SYSMON_SHA256="00ecf1b46aec99299d3ae0bca79dc621458bd014b20b509d7c5c8e8c8611aa54"
 
 # Publishes the guest agent (self-contained single-file win-x64) to .data/agent/Maldex.Agent.exe. Used by template sealing and the Build from ISO.
 cmd_agent() {

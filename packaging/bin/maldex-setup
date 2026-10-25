@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# maldex-setup: the host setup a packaged Maldex install needs after the package is installed (spec §5). Run it as root; it is
+# safe to re-run, and each run starts from the first step and skips what is already done.
+#
+#   maldex-setup                    run every step, stop at the first failure
+#   maldex-setup --offline <dir>    take Sysmon.zip and virtio-win.iso from <dir> instead of downloading them (same hash checks)
+#   maldex-setup --check            run only the read-only checks, print every result, change nothing (root not required)
+#
+# Each step prints "ok   <step>" or "FAIL <step> -- <hint>". Paths can be moved for tests: MALDEX_ETC (default /etc/maldex),
+# MALDEX_DATA (default /var/lib/maldex, Maldex:Real:Root) and MALDEX_OPT (default /opt/maldex).
+set -uo pipefail
+
+usage() { echo "usage: maldex-setup [--check] [--offline <dir>]" >&2; exit 64; }
+
+CHECK=0
+OFFLINE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) CHECK=1; shift ;;
+    --offline) if [ $# -lt 2 ] || [ -z "$2" ]; then usage; fi; OFFLINE="$2"; shift 2 ;;
+    -h|--help) echo "usage: maldex-setup [--check] [--offline <dir>]"; exit 0 ;;
+    *) usage ;;
+  esac
+done
+
+if [ "$(id -u)" = 0 ]; then
+  MALDEX_SUDO=""
+elif [ "$CHECK" = 1 ]; then
+  MALDEX_SUDO="sudo -n"   # read-only checks that need root then fail instead of prompting
+else
+  echo "maldex-setup must run as root (sudo maldex-setup); 'maldex-setup --check' runs the read-only checks as any user" >&2
+  exit 1
+fi
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=SCRIPTDIR/../lib/maldex-common.sh
+source "$HERE/../lib/maldex-common.sh" || { echo "maldex-setup: cannot load $HERE/../lib/maldex-common.sh" >&2; exit 1; }
+
+MALDEX_ETC="${MALDEX_ETC:-/etc/maldex}"
+MALDEX_DATA="${MALDEX_DATA:-/var/lib/maldex}"
+MALDEX_OPT="${MALDEX_OPT:-/opt/maldex}"
+CONFIG="$MALDEX_ETC/appsettings.Production.json"
+APP_USER="maldex"
+ISO_DIR="$MALDEX_DATA/.data/vm/iso"
+MITM_CA="$MALDEX_DATA/.data/mitm/ca"
+AGENT_DIR="$MALDEX_DATA/.data/agent"
+MEDIA_DIR="$MALDEX_DATA/.data/media"
+GUESTFS_DIR="$MALDEX_DATA/guestfs-appliance"
+BROWSERS_DIR="$MALDEX_DATA/ms-playwright"
+APP_URL="http://127.0.0.1:5080"
+OVMF_SECBOOT_CANDIDATES=(/usr/share/OVMF/OVMF_CODE_4M.secboot.fd /usr/share/edk2/ovmf/OVMF_CODE.secboot.fd)
+SYSTEM_USERS=(maldex-mitm maldex-dns maldex-isroot maldex-isuser)
+
+HINT=""   # set by a failing step or check
+fail() { HINT="$*"; return 1; }
+
+# ---- db ----
+
+# The string value of ConnectionStrings:Maldex in JSON file $1 (empty when missing). A sed parse, so no JSON tool is needed on a
+# minimal host; the value runs to the first unescaped quote.
+connection_string() {
+  tr '\n\r\t' '   ' < "$1" \
+    | sed -nE 's/.*"ConnectionStrings"[[:space:]]*:[[:space:]]*\{([^}]*)\}.*/\1/p' \
+    | sed -nE 's/.*"Maldex"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)".*/\1/p'
+}
+
+# Prints "host port" from the Server (or Data Source / Address) part of connection string $1; the port defaults to 1433.
+sql_endpoint() {
+  local part key value server="" host port
+  local IFS=';'
+  for part in $1; do
+    key="${part%%=*}"; value="${part#*=}"
+    [ "$key" != "$part" ] || continue
+    key="$(echo "$key" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+    case "$key" in server|"data source"|address|addr|"network address") server="$value" ;; esac
+  done
+  server="$(echo "$server" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g; s/^tcp://I')"
+  [ -n "$server" ] || return 1
+  host="${server%%,*}"; port="1433"
+  [ "$host" = "$server" ] || port="${server#*,}"
+  host="${host%%\\*}"   # a named instance (host\instance) is reached on the given or default port
+  port="$(echo "$port" | tr -d '[:space:]')"
+  case "$host" in .|"(local)"|"(localdb)") host="localhost" ;; esac
+  [[ "$host" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  echo "$host $port"
+}
+
+db_check() {
+  local how="set ConnectionStrings:Maldex in $CONFIG, e.g. \"ConnectionStrings\": { \"Maldex\": \"Server=sqlhost,1433;Database=maldex;User Id=maldex;Password=...;TrustServerCertificate=True\" }"
+  [ -f "$CONFIG" ] || fail "$CONFIG is missing; $how" || return 1
+  [ -r "$CONFIG" ] || fail "$CONFIG is not readable; $how" || return 1
+  local cs ep host port
+  cs="$(connection_string "$CONFIG")"
+  [ -n "$cs" ] || fail "ConnectionStrings:Maldex is not set; $how" || return 1
+  ep="$(sql_endpoint "$cs")" || fail "ConnectionStrings:Maldex has no usable Server=host[,port]; $how" || return 1
+  host="${ep% *}"; port="${ep#* }"
+  # shellcheck disable=SC2016  # $1/$2 belong to the inner bash
+  timeout 5 bash -c '</dev/tcp/$1/$2' _ "$host" "$port" >/dev/null 2>&1 \
+    || fail "cannot reach SQL Server at $host:$port (from ConnectionStrings:Maldex in $CONFIG); check the server, the firewall and the host name" \
+    || return 1
+}
+
+# ---- downloads ----
+
+# Directory $1 (and missing parents up to it) owned by the app user, mode 0750.
+app_dir() {
+  local d="$1"
+  mkdir -p "$d" || return 1
+  chown "$APP_USER:$APP_USER" "$d" || return 1
+  chmod 0750 "$d"
+}
+
+data_layout() {
+  local d
+  for d in "$MALDEX_DATA" "$MALDEX_DATA/.data" "$MALDEX_DATA/.data/vm" "$MALDEX_DATA/.data/vm/base" "$MALDEX_DATA/.data/vm/run" \
+           "$ISO_DIR" "$MEDIA_DIR" "$MALDEX_DATA/.data/artifacts" "$AGENT_DIR" "$MALDEX_DATA/.data/mitm"; do
+    app_dir "$d" || return 1
+  done
+}
+
+# File $1 of the pinned set into $ISO_DIR: kept when it already verifies, else copied from --offline or downloaded, then verified.
+fetch_pinned() {
+  local name="$1" url="$2" sha="$3" dest="$ISO_DIR/$1"
+  if [ -s "$dest" ] && echo "$sha  $dest" | sha256sum -c --status - 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$dest" "$dest.part"
+  if [ -n "$OFFLINE" ]; then
+    [ -f "$OFFLINE/$name" ] || { echo "$OFFLINE/$name is missing" >&2; return 1; }
+    cp "$OFFLINE/$name" "$dest.part" || return 1
+    verify_sha256 "$dest.part" "$sha" || return 1
+    mv "$dest.part" "$dest" || return 1
+  else
+    fetch_cached "$url" "$dest" "$sha" || return 1
+  fi
+  chown "$APP_USER:$APP_USER" "$dest" && chmod 0640 "$dest"
+}
+
+step_downloads() {
+  local src="download (needs https access to download.sysinternals.com and fedorapeople.org), or supply the files with --offline <dir>"
+  [ -n "$OFFLINE" ] && src="put Sysmon.zip and virtio-win.iso with the pinned SHA-256 values in $OFFLINE"
+  [ -z "$OFFLINE" ] || [ -d "$OFFLINE" ] || fail "--offline: $OFFLINE is not a directory" || return 1
+  data_layout || fail "cannot create the data layout under $MALDEX_DATA" || return 1
+  fetch_pinned Sysmon.zip "$SYSMON_URL" "$SYSMON_SHA256" || fail "Sysmon.zip: $src" || return 1
+  fetch_pinned virtio-win.iso "$VIRTIO_WIN_URL" "$VIRTIO_WIN_SHA256" || fail "virtio-win.iso: $src" || return 1
+}
+
+# ---- mitm-ca, inetsim, guestfs ----
+
+step_mitm_ca() {
+  local u
+  for u in "${SYSTEM_USERS[@]}"; do
+    ensure_system_user "$u" || fail "cannot create the system user $u (useradd)" || return 1
+  done
+  ensure_mitm_ca "$MITM_CA" maldex-mitm || fail "mitmproxy CA not created in $MITM_CA; check that mitmdump runs (mitmdump --version)" || return 1
+  # The app reads the cert (template sealing) and checks the key exists; it copies them per run as root.
+  chgrp "$APP_USER" "$MITM_CA" "$MITM_CA/mitmproxy-ca-cert.pem" || fail "cannot hand $MITM_CA to group $APP_USER" || return 1
+  chmod 0750 "$MITM_CA" && chmod 0640 "$MITM_CA/mitmproxy-ca-cert.pem" || fail "cannot set the modes in $MITM_CA" || return 1
+}
+
+step_inetsim() {
+  [ -d "$INETSIM_TEMPLATE_DIR" ] || fail "$INETSIM_TEMPLATE_DIR is missing; install the inetsim package" || return 1
+  harden_inetsim_template || fail "cannot harden $INETSIM_TEMPLATE_DIR" || return 1
+  inetsim_template_clean || fail "$INETSIM_TEMPLATE_DIR still has symlinks, non-root or group/world-writable entries; remove them and re-run" || return 1
+}
+
+step_guestfs() {
+  ensure_guestfs_appliance "$GUESTFS_DIR" \
+    || fail "libguestfs-make-fixed-appliance failed; check libguestfs-test-tool, then re-run" || return 1
+}
+
+# ---- browsers, agent ----
+
+step_browsers() {
+  app_dir "$BROWSERS_DIR" || fail "cannot create $BROWSERS_DIR" || return 1
+  sudo -u "$APP_USER" env "PLAYWRIGHT_BROWSERS_PATH=$BROWSERS_DIR" "$MALDEX_OPT/app/Maldex.Web" --install-browsers --no-deps \
+    || fail "Playwright Chromium install failed (needs https access to the Playwright CDN); re-run when it is reachable" || return 1
+}
+
+step_agent() {
+  local f
+  for f in Maldex.Agent.exe Maldex.Agent.version; do
+    [ -f "$MALDEX_OPT/agent/$f" ] || fail "$MALDEX_OPT/agent/$f is missing; reinstall the maldex package" || return 1
+    if ! cmp -s "$MALDEX_OPT/agent/$f" "$AGENT_DIR/$f"; then
+      cp "$MALDEX_OPT/agent/$f" "$AGENT_DIR/$f.part" && mv "$AGENT_DIR/$f.part" "$AGENT_DIR/$f" \
+        || fail "cannot copy $f into $AGENT_DIR" || return 1
+    fi
+    chown "$APP_USER:$APP_USER" "$AGENT_DIR/$f" && chmod 0640 "$AGENT_DIR/$f" || fail "cannot set the owner of $AGENT_DIR/$f" || return 1
+  done
+}
+
+# ---- verify ----
+
+ovmf_present() { local f; for f in "${OVMF_SECBOOT_CANDIDATES[@]}"; do [ -f "$f" ] && return 0; done; return 1; }
+not_in_sudoers() { ! $MALDEX_SUDO grep -rqs -- "$1" /etc/sudoers /etc/sudoers.d; }
+powerless_user() { [ "$(id -nG "$1")" = "$1" ] && [ "$(id -u "$1")" != 0 ] && not_in_sudoers "$1"; }
+app_user_groups() { local g; g=" $(id -nG "$APP_USER") "; [[ "$g" == *" kvm "* ]] && [[ "$g" == *" libvirt "* ]]; }
+inetsim_ids_distinct() { [ "$(id -u maldex-isroot)" != "$(id -u maldex-isuser)" ] && [ "$(id -g maldex-isroot)" != "$(id -g maldex-isuser)" ]; }
+br_netfilter_off() { [ ! -e /proc/sys/net/bridge/bridge-nf-call-iptables ] || [ "$(cat /proc/sys/net/bridge/bridge-nf-call-iptables)" != 1 ]; }
+mitm_ca_present() { $MALDEX_SUDO test -f "$MITM_CA/mitmproxy-ca.pem" && $MALDEX_SUDO test -f "$MITM_CA/mitmproxy-ca-cert.pem"; }
+chromium_present() { compgen -G "$BROWSERS_DIR/chromium-*" >/dev/null; }
+agent_present() { [ -f "$AGENT_DIR/Maldex.Agent.exe" ] && [ -f "$AGENT_DIR/Maldex.Agent.version" ]; }
+kvm_usable() { maldex_as_user "$APP_USER" test -r /dev/kvm -a -w /dev/kvm; }
+guestfs_works() { maldex_as_user "$APP_USER" env LIBGUESTFS_BACKEND=direct "LIBGUESTFS_PATH=$GUESTFS_DIR" libguestfs-test-tool; }
+
+# The real_verify checks for a packaged host: no dev-only ones (pwsh, the docker guacd image, the Docker exception), plus the
+# guacd service and the host guard. Sets REAL_FAILED.
+verify_checks() {
+  local u
+  REAL_FAILED=0
+  real_check "maldex user in groups kvm and libvirt" "reinstall the maldex package (it creates the user)" app_user_groups
+  real_check "/dev/kvm usable by maldex" "enable virtualization in the firmware; load kvm_intel or kvm_amd" kvm_usable
+  real_check "libvirt (virsh)" "install libvirt (Ubuntu: libvirt-clients libvirt-daemon; RHEL: libvirt)" virsh --version
+  real_check "OVMF secboot firmware" "install OVMF (Ubuntu: ovmf; RHEL: edk2-ovmf)" ovmf_present
+  real_check "swtpm" "install swtpm and swtpm-tools" swtpm --version
+  real_check "suricata" "install suricata (RHEL: from EPEL)" suricata --build-info
+  real_check "mitmdump $MITMPROXY_VERSION" "reinstall the maldex package (it ships mitmproxy)" \
+    bash -c "mitmdump --version | grep -q -- '$MITMPROXY_VERSION'"
+  real_check "inetsim" "install inetsim (RHEL: from EPEL)" inetsim --version
+  real_check "wireguard-tools" "install wireguard-tools" wg --version
+  real_check "wiminfo" "install wimtools (Ubuntu) / wimlib-utils (RHEL, EPEL)" wiminfo --version
+  real_check "xorriso" "install xorriso" xorriso -version
+  real_check "xmllint" "install libxml2-utils (Ubuntu) / libxml2 (RHEL)" xmllint --version
+  real_check "Sysmon.zip" "maldex-setup (downloads step)" test -f "$ISO_DIR/Sysmon.zip"
+  real_check "virtio-win.iso" "maldex-setup (downloads step)" test -f "$ISO_DIR/virtio-win.iso"
+  real_check "media library ($MEDIA_DIR)" "maldex-setup (downloads step)" test -d "$MEDIA_DIR"
+  real_check "agent bundle ($AGENT_DIR)" "maldex-setup (agent step)" agent_present
+  real_check "Playwright Chromium ($BROWSERS_DIR)" "maldex-setup (browsers step)" chromium_present
+  # shellcheck disable=SC2086  # MALDEX_SUDO is empty or "sudo -n"
+  real_check "host guard table loaded" "systemctl restart maldex-host-guard" $MALDEX_SUDO nft list table inet maldex_guard
+  real_check "host guard enabled at boot" "systemctl enable --now maldex-host-guard" systemctl is-enabled maldex-host-guard
+  real_check "guacd active" "systemctl enable --now guacd (RHEL: guacd from EPEL)" systemctl is-active guacd
+  real_check "br_netfilter not filtering bridged traffic (host guard assumes this)" "sysctl -w net.bridge.bridge-nf-call-iptables=0 and do not load br_netfilter" \
+    br_netfilter_off
+  for u in "${SYSTEM_USERS[@]}"; do
+    real_check "$u user exists, non-root, own group only, no sudoers" "maldex-setup (mitm-ca step)" powerless_user "$u"
+  done
+  real_check "INetSim user-namespace ids are distinct" "maldex-setup (mitm-ca step)" inetsim_ids_distinct
+  real_check "mitmproxy CA present ($MITM_CA)" "maldex-setup (mitm-ca step)" mitm_ca_present
+  real_check "$INETSIM_TEMPLATE_DIR is root-owned, not group/world-writable, symlink-free" "maldex-setup (inetsim step)" inetsim_template_clean
+  real_check "guest disk editor (libguestfs appliance)" "maldex-setup (guestfs step); libguestfs-test-tool shows why" guestfs_works
+  return "$REAL_FAILED"
+}
+
+step_verify() {
+  verify_checks || fail "the checks marked FAIL above; fix them and re-run maldex-setup" || return 1
+}
+
+# ---- start ----
+
+step_start() {
+  systemctl enable --now maldex || fail "systemctl enable --now maldex failed; see journalctl -u maldex" || return 1
+}
+
+# ---- runner ----
+
+run_step() {
+  local name="$1" fn="$2"
+  HINT=""
+  if "$fn"; then
+    echo "ok   $name"
+  else
+    echo "FAIL $name -- ${HINT:-see the output above}" >&2
+    exit 1
+  fi
+}
+
+if [ "$CHECK" = 1 ]; then
+  rc=0
+  HINT=""
+  if db_check; then echo "ok   db"; else echo "FAIL db -- $HINT" >&2; rc=1; fi
+  verify_checks || rc=1
+  exit "$rc"
+fi
+
+run_step db db_check
+run_step downloads step_downloads
+run_step mitm-ca step_mitm_ca
+run_step inetsim step_inetsim
+run_step guestfs step_guestfs
+run_step browsers step_browsers
+run_step agent step_agent
+run_step verify step_verify
+run_step start step_start
+echo
+echo "Maldex is running on $APP_URL (localhost only: put a reverse proxy in front, or use ssh -L 5080:127.0.0.1:5080 <host>)."
+echo "Next: build the first template in the app under Admin → Sandbox Templates → New template."
