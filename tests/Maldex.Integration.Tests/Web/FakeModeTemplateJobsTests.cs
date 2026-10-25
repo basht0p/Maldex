@@ -52,7 +52,6 @@ public sealed class FakeModeTemplateJobsTests(SqlServerFixture sql) : IDisposabl
             ["Maldex:Templates:Jobs:MitmCaPemPath"] = P("ca.pem"),
             ["Maldex:Templates:Jobs:PollInterval"] = "00:00:00.1",
             ["Maldex:Templates:Jobs:MinFreeGiB"] = "1",
-            ["Maldex:Templates:Jobs:DefenderSettleWindow"] = "00:00:00", // real time: one Defender reading, not a minute of them
             ["Maldex:Templates:Build:VirtioIsoPath"] = P("virtio-win.iso"),
             ["Maldex:Templates:Build:WorkDir"] = P("build"),
             ["Maldex:Templates:Build:JobLogDir"] = P("jobs"),

@@ -18,6 +18,7 @@ public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactor
     private readonly ILogger _log = (ILogger?)logger ?? NullLogger.Instance;
 
     public const string DefenderUnreadableNote = "Defender state could not be read";
+    public const string DefenderNotSettled = "Defender state did not settle; not publishing";
 
     /// <exception cref="TemplateVerifyException">The disk failed verification or never answered.</exception>
     public async Task<VerifiedProvenance> VerifyAsync(string stem, ComponentBundle b, CancellationToken ct)
@@ -68,11 +69,13 @@ public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactor
                 {
                     // Resent until answered: a request sent while the agent reconnects is lost (as for the sealer and the job's check).
                     // Read over the settle window: right after this boot Defender briefly reports real-time protection off.
-                    settled = await session.AskSettledProvenanceAsync(o, o.VerifyTimeout, time, linked.Token).ConfigureAwait(false);
+                    settled = await session.AskSettledProvenanceAsync(o, o.ProvenanceTimeout, time, linked.Token).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested && (ex is TimeoutException || budget.IsCancellationRequested))
                 {
-                    throw new TemplateVerifyException($"no provenance answer from the sealed guest agent within {o.VerifyTimeout.TotalSeconds:0} s");
+                    // The whole budget ran out, or (each reading bounded by ProvenanceTimeout) no reading was answered.
+                    var limit = budget.IsCancellationRequested ? o.VerifyTimeout : o.ProvenanceTimeout;
+                    throw new TemplateVerifyException($"no provenance answer from the sealed guest agent within {limit.TotalSeconds:0} s");
                 }
             }
             catch (InvalidOperationException ex) when (!ct.IsCancellationRequested)
@@ -81,9 +84,10 @@ public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactor
             }
 
             var p = settled.First;
-            var rtp = settled.RealTimeProtectionEnabled;
             if (p.AgentVersion != b.AgentBuildId) throw new TemplateVerifyException("the sealed agent is not the current build");
-            if (rtp == true) throw new TemplateVerifyException("Defender real-time protection is on; turn it off in an Edit session");
+            if (settled.Defender == DefenderSettlement.On) throw new TemplateVerifyException("Defender real-time protection is on; turn it off in an Edit session");
+            if (settled.Defender == DefenderSettlement.NotSettled) throw new TemplateVerifyException(DefenderNotSettled);
+            bool? rtp = settled.Defender == DefenderSettlement.Off ? false : null;
 
             return new VerifiedProvenance(p.WindowsEdition, p.WindowsBuild, p.AgentVersion, p.OfficePresent, rtp, rtp is null ? DefenderUnreadableNote : null);
         }

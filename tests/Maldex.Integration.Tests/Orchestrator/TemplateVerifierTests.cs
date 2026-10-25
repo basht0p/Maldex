@@ -7,17 +7,19 @@ using Xunit;
 namespace Maldex.Integration.Tests.Orchestrator;
 
 /// <summary>What a scripted guest reports for real-time protection at one reading (<see cref="DefenderScriptChannel"/>).</summary>
-internal enum DefenderReading { Off, On, Unknown, Refused }
+internal enum DefenderReading { Off, On, Unknown, Refused, Silent }
 
 /// <summary>
 /// A channel whose provenance answers report real-time protection as <paramref name="script"/> says for the time since its first
 /// provenance answer (on <paramref name="time"/>; so the readings are scripted, not how long the boot took), as a guest whose Defender
-/// is still settling after boot; <c>Refused</c> turns the answer into a refusal. Every rewritten answer's time is recorded.
+/// is still settling after boot; <c>Refused</c> turns the answer into a refusal, <c>Silent</c> drops it (a hung agent). Every
+/// answer's time is recorded.
 /// </summary>
 internal sealed class DefenderScriptChannel(IAgentChannel inner, TimeProvider time, Func<TimeSpan, DefenderReading> script) : IAgentChannel
 {
     private DateTimeOffset? _first;
     private readonly List<TimeSpan> _readings = [];
+    private readonly HashSet<string> _silenced = [];
 
     /// <summary>When (since the first one) each provenance answer was read.</summary>
     public IReadOnlyList<TimeSpan> Readings { get { lock (_readings) return _readings.ToList(); } }
@@ -30,6 +32,7 @@ internal sealed class DefenderScriptChannel(IAgentChannel inner, TimeProvider ti
     {
         await foreach (var m in inner.ReadAsync(ct))
         {
+            if (m is CommandResultMessage r && _silenced.Contains(r.CommandId)) continue; // a dropped answer's trailing result
             if (m is not ProvenanceMessage p)
             {
                 yield return m;
@@ -42,7 +45,13 @@ internal sealed class DefenderScriptChannel(IAgentChannel inner, TimeProvider ti
                 at = time.GetUtcNow() - _first.Value;
                 _readings.Add(at);
             }
-            yield return script(at) switch
+            var reading = script(at);
+            if (reading == DefenderReading.Silent)
+            {
+                _silenced.Add(p.CommandId);
+                continue;
+            }
+            yield return reading switch
             {
                 DefenderReading.Off => p with { RealTimeProtectionEnabled = false },
                 DefenderReading.On => p with { RealTimeProtectionEnabled = true },
@@ -188,13 +197,16 @@ public class TemplateVerifierTests
     }
 
     /// <summary>A verification on the fake clock with the default settle window (60 s, a reading every 5 s) and a scripted Defender.</summary>
-    private static (TemplateJobKit Kit, ScriptedChannels Channels, Task<VerifiedProvenance> Run) VerifyScripted(Func<TimeSpan, DefenderReading> script)
+    private static (TemplateJobKit Kit, ScriptedChannels Channels, Task<VerifiedProvenance> Run) VerifyScripted(Func<TimeSpan, DefenderReading> script,
+        Action<TemplateJobOptions>? tune = null)
     {
         var kit = Kit();
         kit.UseFakeClock();
         var defaults = new TemplateJobOptions();
         kit.Options.DefenderSettleWindow = defaults.DefenderSettleWindow;
         kit.Options.DefenderSettleInterval = defaults.DefenderSettleInterval;
+        kit.Options.DefenderSettleMinReadings = defaults.DefenderSettleMinReadings;
+        tune?.Invoke(kit.Options);
         var channels = new ScriptedChannels(kit, script);
         var egress = new Maldex.Infrastructure.Fakes.NoopEgressRouter(Microsoft.Extensions.Options.Options.Create(new Maldex.Infrastructure.Fakes.FakeEgressOptions()), kit.Guest);
         var run = VerifierWith(kit, kit.Hypervisor, channels, egress, kit.Time).VerifyAsync("win11-v3", kit.Bundle, Ct);
@@ -217,7 +229,8 @@ public class TemplateVerifierTests
     [Fact]
     public async Task Verify_RealTimeProtectionOffThroughoutTheWindow_Passes_AfterReadingEveryFiveSecondsForAMinute()
     {
-        Assert.Equal((TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(5)), (new TemplateJobOptions().DefenderSettleWindow, new TemplateJobOptions().DefenderSettleInterval));
+        var defaults = new TemplateJobOptions();
+        Assert.Equal((TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(5), 10), (defaults.DefenderSettleWindow, defaults.DefenderSettleInterval, defaults.DefenderSettleMinReadings));
         var (kit, channels, run) = VerifyScripted(_ => DefenderReading.Off);
         await using var _ = kit;
 
@@ -225,8 +238,8 @@ public class TemplateVerifierTests
 
         Assert.Equal((false, (string?)null), (p.RealTimeProtectionEnabled, p.Note));
         var readings = channels.Last!.Readings;
-        Assert.True(readings.Count >= 13, $"only {readings.Count} readings");
-        Assert.InRange(readings[^1], TimeSpan.FromSeconds(59), TimeSpan.FromSeconds(70)); // the window is read to its end, and no further
+        Assert.True(readings.Count >= 10, $"only {readings.Count} readings");
+        Assert.InRange(readings[^1], TimeSpan.FromSeconds(55), TimeSpan.FromSeconds(61)); // the window is read to its end, and no further
     }
 
     [Fact]
@@ -262,6 +275,44 @@ public class TemplateVerifierTests
         var p = await kit.PumpAsync(run);
 
         Assert.Equal(((bool?)false, (string?)null), (p.RealTimeProtectionEnabled, p.Note));
+    }
+
+    [Fact]
+    public async Task Verify_OffThenEveryLaterReadingFails_DidNotSettle_Fails()
+    {
+        // One "off", then the agent refuses: one reading is not a settled state.
+        var (kit, _, run) = VerifyScripted(at => at < TimeSpan.FromSeconds(4) ? DefenderReading.Off : DefenderReading.Refused);
+        await using var _ = kit;
+
+        var ex = await Assert.ThrowsAsync<TemplateVerifyException>(() => kit.PumpAsync(run));
+
+        Assert.Equal("Defender state did not settle; not publishing", ex.Message);
+        Assert.Empty(await kit.Hypervisor.ListAsync(Ct));
+    }
+
+    [Fact]
+    public async Task Verify_OffThenAHang_DidNotSettle_Fails_EachReadingBoundedByTheProvenanceTimeout()
+    {
+        // VerifyTimeout is an hour here (the fake clock): only ProvenanceTimeout bounds a hung reading.
+        var (kit, _, run) = VerifyScripted(at => at < TimeSpan.FromSeconds(4) ? DefenderReading.Off : DefenderReading.Silent,
+            o => o.ProvenanceTimeout = TimeSpan.FromSeconds(10));
+        await using var _ = kit;
+
+        var ex = await Assert.ThrowsAsync<TemplateVerifyException>(() => kit.PumpAsync(run));
+
+        Assert.Equal("Defender state did not settle; not publishing", ex.Message);
+    }
+
+    [Fact]
+    public async Task Verify_FewerOffReadingsThanTheMinimum_DidNotSettle_Fails()
+    {
+        // A 60 s window read every 5 s gives at most 13 readings.
+        var (kit, _, run) = VerifyScripted(_ => DefenderReading.Off, o => o.DefenderSettleMinReadings = 14);
+        await using var _ = kit;
+
+        var ex = await Assert.ThrowsAsync<TemplateVerifyException>(() => kit.PumpAsync(run));
+
+        Assert.Equal("Defender state did not settle; not publishing", ex.Message);
     }
 
     [Fact]

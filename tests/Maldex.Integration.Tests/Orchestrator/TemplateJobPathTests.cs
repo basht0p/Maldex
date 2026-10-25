@@ -42,6 +42,30 @@ public sealed class TemplateJobPathTests
         Assert.Equal(Path.Combine(root, ".data", "mitm", "ca", "mitmproxy-ca-cert.pem"), o.MitmCaPemPath);
     }
 
+    [Theory]
+    [InlineData(null)]
+    [InlineData("Fake")]
+    public void FakeMode_TakesOneDefenderReading(string? mode)
+    {
+        // The fake guest's Defender never changes, so a minute of readings per check is only real time lost.
+        var o = Resolve(new() { ["Maldex:Mode"] = mode });
+        Assert.Equal(TimeSpan.Zero, o.DefenderSettleWindow);
+    }
+
+    [Fact]
+    public void FakeMode_AConfiguredSettleWindow_IsKept()
+    {
+        var o = Resolve(new() { ["Maldex:Mode"] = "Fake", [$"{TemplateJobOptions.SectionName}:DefenderSettleWindow"] = "00:01:00" });
+        Assert.Equal(TimeSpan.FromMinutes(1), o.DefenderSettleWindow);
+    }
+
+    [Fact]
+    public void RealMode_KeepsTheDefenderSettleWindow()
+    {
+        var o = Resolve(new() { ["Maldex:Mode"] = "Real" });
+        Assert.Equal(TimeSpan.FromSeconds(60), o.DefenderSettleWindow);
+    }
+
     [Fact]
     public void AbsolutePaths_AreLeftUnchanged()
     {

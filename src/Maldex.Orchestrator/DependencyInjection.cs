@@ -51,6 +51,9 @@ public static class DependencyInjection
         if (string.IsNullOrEmpty(mode) || mode == "Fake")
         {
             services.TryAddSingleton<IProvisioningMediaBuilder, FakeProvisioningMediaBuilder>();
+            // The fake guest's Defender state never changes: one reading per check, not a minute of real time (unless configured).
+            if (configuration[$"{TemplateJobOptions.SectionName}:{nameof(TemplateJobOptions.DefenderSettleWindow)}"] is null)
+                services.Configure<TemplateJobOptions>(o => o.DefenderSettleWindow = TimeSpan.Zero);
             // The fake guest "runs" the agent sealing installed, which is the one ./build.sh agent left on disk: so an Edit, Refresh or
             // Build passes the agent check. Before that agent exists it reports the fake build id (the bundle cannot load then anyway).
             services.Replace(ServiceDescriptor.Singleton(sp =>

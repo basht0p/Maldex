@@ -33,6 +33,11 @@ public sealed class TemplateJobOptions
     public TimeSpan DefenderSettleWindow { get; set; } = TimeSpan.FromSeconds(60);
     /// <summary>How often real-time protection is read within <see cref="DefenderSettleWindow"/>.</summary>
     public TimeSpan DefenderSettleInterval { get; set; } = TimeSpan.FromSeconds(5);
+    /// <summary>
+    /// How many readings (on or off, not unreadable) "off" takes: with fewer, or none near the window's end, the state did not
+    /// settle (R19). Not used when <see cref="DefenderSettleWindow"/> is zero (one reading decides).
+    /// </summary>
+    public int DefenderSettleMinReadings { get; set; } = 10;
     /// <summary>How long the coordinator waits for the open consoles of a job to close once a seal is requested, before sealing anyway.</summary>
     public TimeSpan ConsoleCloseTimeout { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan ConfigureIdleTimeout { get; set; } = TimeSpan.FromHours(2);

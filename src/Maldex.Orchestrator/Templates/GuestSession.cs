@@ -106,27 +106,38 @@ internal sealed class GuestSession : IAsyncDisposable
     /// <summary>
     /// Reads Defender's real-time protection until it has settled (right after a boot it briefly reads off before it turns on):
     /// a provenance reading (<see cref="AskProvenanceWithRetryAsync"/>, each bounded by <paramref name="timeout"/>) every
-    /// <see cref="TemplateJobOptions.DefenderSettleInterval"/> over <see cref="TemplateJobOptions.DefenderSettleWindow"/>. The state
-    /// is on if any reading says on (the readings stop there), else off if any says off, else null (unreadable). A failed reading
-    /// is skipped while others succeed.
+    /// <see cref="TemplateJobOptions.DefenderSettleInterval"/> over <see cref="TemplateJobOptions.DefenderSettleWindow"/>, measured from
+    /// the first successful reading. A failed reading is skipped. The state (R19) is on as soon as any reading says on; off only with at
+    /// least <see cref="TemplateJobOptions.DefenderSettleMinReadings"/> off readings, the last of them at or after window - interval past
+    /// the first; unreadable when no reading could read the state (R7); otherwise not settled. A zero window takes one reading, which decides.
     /// </summary>
     /// <returns>The first successful reading (for the other checks) and the settled state.</returns>
-    /// <exception cref="TimeoutException">No reading succeeded, the last one timed out.</exception>
-    /// <exception cref="InvalidOperationException">No reading succeeded, the last one was refused or the agent went away.</exception>
+    /// <exception cref="TimeoutException">No reading succeeded within the window, the last one timed out.</exception>
+    /// <exception cref="InvalidOperationException">No reading succeeded within the window, the last one was refused or the agent went away.</exception>
     public async Task<SettledProvenance> AskSettledProvenanceAsync(TemplateJobOptions o, TimeSpan timeout, TimeProvider time, CancellationToken ct)
     {
         var start = time.GetUtcNow();
         ProvenanceMessage? first = null;
+        DateTimeOffset firstAt = default, lastOffAt = default;
+        var offReadings = 0;
         Exception? lastFailure = null;
-        var sawOff = false;
         while (true)
         {
             try
             {
                 var p = await AskProvenanceWithRetryAsync(o.ProvenanceRetryInterval, timeout, time, ct).ConfigureAwait(false);
-                first ??= p;
-                if (p.RealTimeProtectionEnabled == true) return new SettledProvenance(first, true); // no later reading can change it
-                sawOff |= p.RealTimeProtectionEnabled == false;
+                var now = time.GetUtcNow();
+                if (first is null)
+                {
+                    first = p;
+                    firstAt = now;
+                }
+                if (p.RealTimeProtectionEnabled == true) return new SettledProvenance(first, DefenderSettlement.On); // no later reading can change it
+                if (p.RealTimeProtectionEnabled == false)
+                {
+                    offReadings++;
+                    lastOffAt = now;
+                }
             }
             catch (Exception) when (ct.IsCancellationRequested)
             {
@@ -134,15 +145,19 @@ internal sealed class GuestSession : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                lastFailure = ex; // skipped while another reading succeeds
+                lastFailure = ex; // skipped: the rules below decide whether the others are enough
             }
 
-            if (time.GetUtcNow() - start + o.DefenderSettleInterval > o.DefenderSettleWindow) break;
+            var from = first is null ? start : firstAt;
+            if (time.GetUtcNow() - from + o.DefenderSettleInterval > o.DefenderSettleWindow) break;
             await Task.Delay(o.DefenderSettleInterval, time, ct).ConfigureAwait(false);
         }
 
         if (first is null) ExceptionDispatchInfo.Throw(lastFailure!);
-        return new SettledProvenance(first, sawOff ? false : null);
+        if (offReadings == 0) return new SettledProvenance(first, DefenderSettlement.Unreadable);
+        if (o.DefenderSettleWindow <= TimeSpan.Zero) return new SettledProvenance(first, DefenderSettlement.Off); // one reading decides
+        var settled = offReadings >= o.DefenderSettleMinReadings && lastOffAt - firstAt >= o.DefenderSettleWindow - o.DefenderSettleInterval;
+        return new SettledProvenance(first, settled ? DefenderSettlement.Off : DefenderSettlement.NotSettled);
     }
 
     /// <summary>
@@ -234,5 +249,16 @@ internal sealed class GuestSession : IAsyncDisposable
     }
 }
 
+/// <summary>Defender real-time protection as <see cref="GuestSession.AskSettledProvenanceAsync"/> settled it.</summary>
+internal enum DefenderSettlement
+{
+    Off,
+    On,
+    /// <summary>The agent could not read the state (R7: does not block).</summary>
+    Unreadable,
+    /// <summary>Read off, but not often or not late enough in the window to be sure (R19: blocks).</summary>
+    NotSettled,
+}
+
 /// <summary>What <see cref="GuestSession.AskSettledProvenanceAsync"/> read: its first successful reading and the settled real-time protection state.</summary>
-internal sealed record SettledProvenance(ProvenanceMessage First, bool? RealTimeProtectionEnabled);
+internal sealed record SettledProvenance(ProvenanceMessage First, DefenderSettlement Defender);
