@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { deleteTemplate, discardTemplateVersion, publishTemplateVersion, rollBackTemplate } from '../../api/client'
+import { deleteTemplate, discardTemplateVersion, publishTemplateVersion, rollBackTemplate, setDefaultTemplate, setTemplateEnabled } from '../../api/client'
 import type { AdminTemplateDto, TemplateVersionDto } from '../../api/types'
 import { useConfirm } from '../../kit/useConfirm'
 import { useToast } from '../../kit/useToast'
@@ -30,8 +30,22 @@ export function useTemplateActions(t: AdminTemplateDto, onChanged: () => Promise
     }
   }
 
-  function publish(v: TemplateVersionDto) {
-    return run(() => publishTemplateVersion(t.id, v.id), `v${v.number} published`)
+  async function publish(v: TemplateVersionDto) {
+    const ok = await confirm({ title: `Publish v${v.number} of ${t.displayName}?`, body: `New tasks will use v${v.number}.`, confirmLabel: 'Publish' })
+    if (ok) await run(() => publishTemplateVersion(t.id, v.id), `v${v.number} published`)
+  }
+
+  async function makeDefault() {
+    const ok = await confirm({ title: `Make ${t.displayName} the default?`, body: 'New tasks use it when no template is chosen.', confirmLabel: 'Set as default' })
+    if (ok) await run(() => setDefaultTemplate(t.id), `${t.displayName} is the default`)
+  }
+
+  async function toggleEnabled() {
+    const enable = !t.enabled
+    const ok = await confirm(enable
+      ? { title: `Enable ${t.displayName}?`, body: 'Analysts can pick it for new tasks again.', confirmLabel: 'Enable' }
+      : { title: `Disable ${t.displayName}?`, body: 'Analysts can no longer pick it for new tasks. Its versions are kept.', confirmLabel: 'Disable' })
+    if (ok) await run(() => setTemplateEnabled(t.id, enable), enable ? 'Template enabled' : 'Template disabled')
   }
 
   async function discard(v: TemplateVersionDto) {
@@ -66,5 +80,5 @@ export function useTemplateActions(t: AdminTemplateDto, onChanged: () => Promise
     if (ok) await run(() => rollBackTemplate(t.id), `Rolled back to v${previous.number}`)
   }
 
-  return { busy, confirm, run, publish, discard, remove, rollBack }
+  return { busy, publish, makeDefault, toggleEnabled, discard, remove, rollBack }
 }

@@ -45,5 +45,9 @@ export const isActiveJob = (j: TemplateJobDto) => ACTIVE_JOB_STATES.includes(j.s
 
 /** Why Edit and Refresh are off while a job runs. */
 export function jobBlockReason(activeJob: TemplateJobDto | undefined): string | undefined {
-  return activeJob ? `A ${activeJob.kind} job is already ${activeJob.state.toLowerCase()} for this template.` : undefined
+  return activeJob ? `${/^[AEIOU]/i.test(activeJob.kind) ? 'An' : 'A'} ${activeJob.kind} job is already ${activeJob.state.toLowerCase()} for this template.` : undefined
 }
+
+/** Why Edit and Refresh are off when only the id of the active job is known (the list does not carry its kind or state). */
+export const JOB_ACTIVE = 'A job is already running for this template.'
+export const ALREADY_DEFAULT = 'Already the default.'

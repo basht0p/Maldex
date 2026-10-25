@@ -225,7 +225,7 @@ describe('TemplateDetailPage', () => {
     renderPage()
     const edit = await screen.findByRole('button', { name: 'Edit' })
     expect(edit).toBeDisabled()
-    expect(edit).toHaveAttribute('title', 'A Edit job is already configuring for this template.')
+    expect(edit).toHaveAttribute('title', 'An Edit job is already configuring for this template.')
     expect(screen.getByRole('link', { name: 'Open the job' })).toHaveAttribute('href', '/admin/template-jobs/j5')
   })
 

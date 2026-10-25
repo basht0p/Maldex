@@ -4,10 +4,10 @@ import type { AdminTemplateDto, TemplateJobDto, TemplateJobNetwork } from '../..
 import { messageOf } from '../../util/apiMessage'
 import { useDialogFocus } from '../dialogFocus'
 import styles from '../forms.module.css'
-import page from '../TemplatesAdminPage.module.css'
+import page from './JobDialog.module.css'
 
 /** Start dialog for an Edit (with the network choice) or a Refresh (confirm only). Errors, such as a 409 reason, show inside it. */
-export function JobDialog({ kind, template, onClose, onStarted }: {
+export default function JobDialog({ kind, template, onClose, onStarted }: {
   kind: 'Edit' | 'Refresh'
   template: AdminTemplateDto
   onClose: () => void
@@ -54,5 +54,3 @@ export function JobDialog({ kind, template, onClose, onStarted }: {
     </div>
   )
 }
-
-export default JobDialog
