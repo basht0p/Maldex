@@ -10,6 +10,7 @@ import type {
   OrgDto,
   OrgRequest,
   ProcessNodeDto,
+  ResubmitRequest,
   StartBuildRequest,
   StartUploadResponse,
   TaskDto,
@@ -142,3 +143,4 @@ export const deleteMedia = (id: string) => request<void>('DELETE', `/api/admin/m
 export const getTaskReport = (id: string) => get<TaskReportDto>(`/api/tasks/${encodeURIComponent(id)}/report`)
 export const screenshotUrl = (artifactId: string) => `/api/artifacts/${encodeURIComponent(artifactId)}/image`
 export const httpBodyUrl = (taskId: string, txId: number) => `/api/tasks/${encodeURIComponent(taskId)}/http/${txId}/body`
+export const resubmitTask = (id: string, req: ResubmitRequest) => post<TaskDto>(`/api/tasks/${encodeURIComponent(id)}/resubmit`, req)

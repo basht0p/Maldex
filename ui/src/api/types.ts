@@ -367,3 +367,12 @@ export interface TaskReportDto {
   samePrevious: SamePreviousDto
   truncated: TruncatedDto
 }
+
+export interface ResubmitRequest {
+  orgId?: string | null
+  image?: string | null
+  networkMode?: string | null
+  exitCountry?: string | null
+  durationSec?: number | null
+  interactive?: boolean | null
+}

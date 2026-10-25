@@ -17,6 +17,8 @@ using Microsoft.Net.Http.Headers;
 
 namespace Maldex.Web.Endpoints;
 
+public sealed record ResubmitRequest(Guid? OrgId, string? Image, string? NetworkMode, string? ExitCountry, int? DurationSec, bool? Interactive);
+
 public static class TaskEndpoints
 {
     private const int MaxFieldBytes = 4096;
@@ -30,6 +32,7 @@ public static class TaskEndpoints
         var g = app.MapGroup("/api/tasks").RequireAuthorization(AuthSetup.AnalystPolicy);
 
         g.MapPost("", SubmitAsync);
+        g.MapPost("{id:guid}/resubmit", ResubmitAsync);
 
         g.MapGet("", async (Guid? orgId, string? status, string? q, string? verdict, bool? mine, string? from, string? to, string? sort, string? dir,
             int? skip, int? take, MaldexDbContext db, CurrentUser user, CancellationToken ct) =>
@@ -219,6 +222,13 @@ public static class TaskEndpoints
             return Results.ValidationProblem(new Dictionary<string, string[]> { ["file"] = ["Malformed multipart body."] });
         }
 
+        return await ValidateAndCreateAsync(fields, blob, fileName, null, errors, db, audit, user, time, vpnCountries, templates, ct);
+    }
+
+    private static async Task<IResult> ValidateAndCreateAsync(
+        Dictionary<string, string> fields, StoredBlob? blob, string? fileName, Guid? resubmittedFrom, Dictionary<string, string[]> errors,
+        MaldexDbContext db, AuditWriter audit, CurrentUser user, TimeProvider time, List<string> vpnCountries, TemplateCatalog templates, CancellationToken ct)
+    {
         // ---- validate (the blob, if any, is kept on failure: it is content-addressed and a concurrent valid upload may share it) ----
         Org? org = null;
         if (!fields.TryGetValue("orgId", out var orgRaw) || !Guid.TryParse(orgRaw, out var orgId) || orgId == Guid.Empty)
@@ -294,10 +304,43 @@ public static class TaskEndpoints
         task.StatusHistory.Add(new TaskStatusHistory { TaskId = task.Id, From = null, To = RunStatus.Queued, At = now, Reason = "submitted" });
         db.Tasks.Add(task);
         await audit.WriteAsync("task.submit", task.Id.ToString(),
-            $"org={org.Id}; mode={mode}; " + (blob is not null ? $"sha256={blob.Sha256}" : "url"), ct);
+            $"org={org.Id}; mode={mode}; " + (blob is not null ? $"sha256={blob.Sha256}" : "url")
+            + (resubmittedFrom is not null ? $"; resubmittedFrom={resubmittedFrom}" : ""), ct);
 
         var queued = await QueuedAsync(db, ct);
         return Results.Created($"/api/tasks/{task.Id}", TaskDto.From(task, org.Name, PositionOf(task, queued)));
+    }
+
+    private static async Task<IResult> ResubmitAsync(
+        Guid id, ResubmitRequest body, MaldexDbContext db, IArtifactStore store, AuditWriter audit, CurrentUser user, TimeProvider time,
+        IOptions<EgressOptions> egressOptions, TemplateCatalog templates, CancellationToken ct)
+    {
+        var source = await db.Tasks.AsNoTracking().FirstOrDefaultAsync(t => t.Id == id, ct);
+        if (source is null) return Results.NotFound();
+
+        StoredBlob? blob = null;
+        if (source.SampleSha256 is not null)
+        {
+            var sample = await db.Samples.AsNoTracking().FirstOrDefaultAsync(s => s.Sha256 == source.SampleSha256, ct);
+            if (sample is null || !store.Exists(sample.BlobKey))
+                return Results.Problem(title: "The sample has been deleted under the retention policy.", statusCode: StatusCodes.Status409Conflict,
+                    type: "sample-unavailable");
+            blob = new StoredBlob(sample.BlobKey, sample.Sha256, sample.Sha1, sample.Md5, sample.Size);
+        }
+
+        var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["orgId"] = (body.OrgId ?? source.OrgId).ToString(),
+        };
+        if (source.Url is not null) fields["url"] = source.Url;
+        if (body.Image is not null) fields["image"] = body.Image;
+        if (body.NetworkMode is not null) fields["networkMode"] = body.NetworkMode;
+        if (body.ExitCountry is not null) fields["exitCountry"] = body.ExitCountry;
+        if (body.DurationSec is { } d) fields["durationSec"] = d.ToString(CultureInfo.InvariantCulture);
+        if (body.Interactive is { } i) fields["interactive"] = i ? "true" : "false";
+
+        return await ValidateAndCreateAsync(fields, blob, source.OriginalFileName, source.Id, new Dictionary<string, string[]>(),
+            db, audit, user, time, egressOptions.Value.VpnCountries, templates, ct);
     }
 
     private static async Task EnsureSampleAsync(MaldexDbContext db, StoredBlob blob, string? fileName, TimeProvider time, CancellationToken ct)
