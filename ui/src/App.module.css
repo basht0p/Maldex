@@ -26,3 +26,11 @@
 .user { font-size: 0.85rem; color: var(--mx-muted); }
 .main { padding: 1.5rem; max-width: 1200px; margin: 0 auto; }
 .error { color: var(--mx-critical); }
+.menu { position: relative; }
+.menuButton { padding: 0.15rem 0.6rem; border: 1px solid var(--mx-control); border-radius: var(--mx-radius-control); background: var(--mx-surface); color: var(--mx-text); font: inherit; cursor: pointer; }
+.menuButton:hover { background: var(--mx-raised); }
+.menuPanel { position: absolute; top: calc(100% + 0.4rem); left: 0; z-index: 1000; display: grid; min-width: 11rem; padding: 0.4rem; gap: 0.15rem; border: 1px solid var(--mx-border-strong); border-radius: var(--mx-radius-control); background: var(--mx-overlay); }
+.menuPanel a { padding: 0.35rem 0.6rem; border-bottom: 0; }
+.drawer { display: grid; gap: 0.25rem; padding: 0.6rem 1.5rem; background: var(--mx-surface); border-bottom: 1px solid var(--mx-border); }
+.drawer a { padding: 0.4rem 0; }
+@media (max-width: 767px) { .nav { padding: 0.6rem 1rem; gap: 0.75rem; } .main { padding: 1rem; } .user { display: none; } }
