@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# One run per ref at a time, so a re-pushed tag cannot race gh release create; a queued run waits instead of cancelling one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-24.04
