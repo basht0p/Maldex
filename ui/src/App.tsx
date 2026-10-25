@@ -18,6 +18,7 @@ import OrgsAdminPage from './pages/OrgsAdminPage'
 import StatusPage from './pages/StatusPage'
 import SubmitPage from './pages/SubmitPage'
 import TaskPage from './pages/TaskPage'
+import TemplateDetailPage from './pages/TemplateDetailPage'
 import TasksPage from './pages/TasksPage'
 import TemplateJobPage from './pages/TemplateJobPage'
 import TemplatesAdminPage from './pages/TemplatesAdminPage'
@@ -161,6 +162,7 @@ function Shell() {
           <Route path="/tasks/:id" element={<TaskPage />} />
           <Route path="/admin/orgs" element={<OrgsAdminPage me={me} />} />
           <Route path="/admin/templates" element={<TemplatesAdminPage me={me} />} />
+          <Route path="/admin/templates/:id" element={<TemplateDetailPage me={me} />} />
           <Route path="/admin/media" element={<MediaPage />} />
           <Route path="/admin/template-jobs/:id" element={<TemplateJobPage me={me} />} />
           <Route path="/admin/status" element={<StatusPage />} />
