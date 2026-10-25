@@ -1,4 +1,5 @@
 using Maldex.Data.Templates;
+using Maldex.Orchestrator.Media;
 using Maldex.Infrastructure.Real;
 using Maldex.Orchestrator.Templates;
 using Maldex.Orchestrator.Templates.Build;
@@ -57,6 +58,10 @@ public static class DependencyInjection
         services.AddSingleton<Reconciler>();
         // Hosted by Maldex.Web only when Maldex:Workers:Enabled (Task 13): AddHostedService(sp => sp.GetRequiredService<OrchestratorWorker>()).
         services.AddSingleton<OrchestratorWorker>();
+        // Media library: intake per request, the upload state and the worker (hosted by Maldex.Web) once.
+        services.AddSingleton<MediaUploadState>();
+        services.AddSingleton<MediaWorker>();
+        services.AddScoped<MediaIntake>();
         return services;
     }
 }
