@@ -44,6 +44,9 @@ export async function uploadMedia(
   let chunkBytes: number
   if (resumeId) {
     const row = await getMedia(resumeId)
+    if (file.name !== row.fileName || file.size !== row.size) {
+      throw new Error(`Choose the same file: ${row.fileName} (${row.size} bytes). The name and size must match.`)
+    }
     id = row.id
     offset = row.receivedBytes
     chunkBytes = RESUME_CHUNK_BYTES

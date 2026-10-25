@@ -51,6 +51,13 @@ describe('uploadMedia', () => {
     expect(sent()).toEqual([[8, 2]])
   })
 
+  it('refuses to resume with a file whose name or size differs from the row', async () => {
+    getMedia.mockResolvedValue(media({ receivedBytes: 8 }))
+    await expect(uploadMedia(new File([new Uint8Array(10)], 'other.iso'), 'OsInstaller', () => undefined, ctl(), 'm1')).rejects.toThrow(/same file/i)
+    await expect(uploadMedia(file(9), 'OsInstaller', () => undefined, ctl(), 'm1')).rejects.toThrow(/same file/i)
+    expect(putMediaChunk).not.toHaveBeenCalled()
+  })
+
   it('follows the offset the server reports in a 409', async () => {
     putMediaChunk.mockRejectedValueOnce(new ApiError(409, { title: 'offset', receivedBytes: 6 }))
     await uploadMedia(file(10), 'OsInstaller', () => undefined, ctl())
