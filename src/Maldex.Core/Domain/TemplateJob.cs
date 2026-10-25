@@ -35,6 +35,8 @@ public class TemplateJob
     /// <summary>When the job took a VM slot (before its first VM boots). A non-terminal job with this set counts as busy in <c>VmSlots</c>.</summary>
     public DateTimeOffset? SlotHeldAt { get; set; }
     public byte[] RowVersion { get; set; } = [];
+    /// <summary>The transitions made (one per <see cref="TransitionTo"/>), ordered by id. Not loaded by default: a fresh load holds none, and the steps a save finds here are inserted.</summary>
+    public List<TemplateJobStep> Steps { get; set; } = [];
 
     /// <summary>
     /// When an admin may drive the guest through the console (R22): Configuring and neither a seal nor a cancel requested.
@@ -50,5 +52,6 @@ public class TemplateJob
         State = to;
         Message = message;
         if (TemplateJobStateMachine.IsTerminal(to)) EndedAt = at;
+        Steps.Add(new TemplateJobStep { JobId = Id, State = to, At = at, Message = message });
     }
 }
