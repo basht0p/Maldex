@@ -12,6 +12,7 @@ import { Skeleton } from '../kit/Skeleton'
 import { SortHeader } from '../kit/SortHeader'
 import { useToast } from '../kit/Toaster'
 import { useUrlState, type UrlField } from '../kit/useUrlState'
+import { messageOf } from '../util/apiMessage'
 import { safeText } from '../util/safeText'
 import styles from './forms.module.css'
 
@@ -90,7 +91,7 @@ export default function TasksPage() {
       setError(null)
     } catch (e) {
       if (mine !== seq.current) return
-      setError(e instanceof Error ? e.message : 'Could not load tasks.')
+      setError(messageOf(e).join(' '))
     } finally {
       if (mine === seq.current) setLoaded(true)
     }
@@ -122,7 +123,7 @@ export default function TasksPage() {
       await cancelTask(id)
       toast.success('Task cancelled')
     } catch (e) {
-      toast.error(e instanceof ApiError && e.status === 409 ? 'Only queued tasks can be cancelled.' : e instanceof Error ? e.message : 'Cancel failed.')
+      toast.error(e instanceof ApiError && e.status === 409 ? 'Only queued tasks can be cancelled.' : messageOf(e).join(' '))
     }
     await refresh()
   }

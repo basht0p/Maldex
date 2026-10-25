@@ -189,18 +189,27 @@ describe('TasksPage', () => {
     })
 
     it('pauses polling while the tab is hidden and refreshes when visible again', async () => {
+      // Only the poll interval is faked; setTimeout stays real so msw responses still resolve.
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+      const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
+      const settle = () => act(async () => { await new Promise((r) => setTimeout(r, 60)) })
       renderWithKit(<Page />)
-      await screen.findByText('alice')
-      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
-      const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
+      await settle()
+      expect(urls.length).toBe(1)
+      act(() => { vi.advanceTimersByTime(5000) })
+      await settle()
+      expect(urls.length).toBe(2) // polls while visible
+
+      hidden.mockReturnValue(true)
       act(() => { document.dispatchEvent(new Event('visibilitychange')) })
-      const before = urls.length
       act(() => { vi.advanceTimersByTime(10_000) })
-      expect(urls.length).toBe(before)
+      await settle()
+      expect(urls.length).toBe(2) // paused
+
       hidden.mockReturnValue(false)
       act(() => { document.dispatchEvent(new Event('visibilitychange')) })
-      vi.useRealTimers()
-      await waitFor(() => expect(urls.length).toBe(before + 1))
+      await settle()
+      expect(urls.length).toBe(3) // immediate refresh
     })
 
     it('shows submitter and duration columns', async () => {
