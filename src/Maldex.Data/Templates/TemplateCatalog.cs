@@ -213,7 +213,8 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
     /// <summary>
     /// Makes the template the default and clears the old default in one transaction. The old default is saved cleared
     /// first because the unique index is checked per statement, not per transaction. Already the default: nothing changes
-    /// and nothing is audited.
+    /// and nothing is audited. Inside a transaction the caller opened (<c>db.Database.CurrentTransaction</c>), it joins that
+    /// transaction and commits (or rolls back) with it.
     /// </summary>
     /// <exception cref="TemplateRuleException">The template is disabled.</exception>
     public Task SetDefaultAsync(string templateId, CancellationToken ct, TemplateAudit? audit = null) =>
@@ -222,14 +223,14 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
             var template = await GetTemplateAsync(templateId, ct).ConfigureAwait(false);
             if (!template.Enabled) throw new TemplateRuleException($"template '{template.Id}' is disabled");
             if (template.IsDefault) return;
-            await using var tx = await db.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
+            await using var tx = db.Database.CurrentTransaction is null ? await db.Database.BeginTransactionAsync(ct).ConfigureAwait(false) : null;
             foreach (var old in await db.Templates.Where(t => t.IsDefault && t.Id != template.Id).ToListAsync(ct).ConfigureAwait(false))
                 old.IsDefault = false;
             await db.SaveChangesAsync(ct).ConfigureAwait(false);
             template.IsDefault = true;
             AddAudit(audit, template.Id);
             await db.SaveChangesAsync(ct).ConfigureAwait(false);
-            await tx.CommitAsync(ct).ConfigureAwait(false);
+            if (tx is not null) await tx.CommitAsync(ct).ConfigureAwait(false);
         }, ct);
 
     /// <summary>Enables or disables the template. Already in that state: nothing changes and nothing is audited.</summary>

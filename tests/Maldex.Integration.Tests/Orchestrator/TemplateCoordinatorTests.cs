@@ -33,7 +33,7 @@ internal sealed class SettableDiskSpace : IDiskSpaceProbe
 /// <summary>The fake template store, with disk sizes a test sets (the fake itself knows no sizes).</summary>
 internal sealed class SizedTemplateStore(FakeTemplateStore inner) : ITemplateStore
 {
-    public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
+    public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => inner.CreateBlankAsync(stem, diskBytes, varsTemplatePath, ct);
     public System.Collections.Concurrent.ConcurrentDictionary<string, long> Sizes { get; } = new();
     public bool Exists(string fileStem) => inner.Exists(fileStem);
     public long? SizeOf(string fileStem) => Sizes.TryGetValue(fileStem, out var size) ? size : inner.SizeOf(fileStem);
@@ -1394,6 +1394,42 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
 
         var job = await rig.JobAsync(id);
         Assert.Equal((TemplateJobState.Failed, "not enough disk space for a template copy: 40 GiB free, 45 GiB required"), (job.State, job.FailureReason));
+    }
+
+    [Fact]
+    public async Task LowDisk_CountsInFlightBuilds_AtDiskGiBEach_UntilTheyConfigure()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Templates:Build:DiskGiB"] = "2" });
+        foreach (var (template, state) in new[] { ("b1", TemplateJobState.Preparing), ("b2", TemplateJobState.Installing), ("b3", TemplateJobState.Provisioning), ("b4", TemplateJobState.Configuring) })
+        {
+            await rig.H.SeedTemplateAsync(template);
+            await rig.SeedJobAsync(TemplateJobKind.Build, state: state, templateId: template);
+        }
+        rig.Disk.Free = 40 * 1024;
+        rig.Sizes[rig.V1.FileStem] = 5 * GiB;
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
+
+        await rig.PumpAsync(rig.Start(id));
+
+        var job = await rig.JobAsync(id);
+        // 30 margin + 5 base + 3 builds × 2 (the configuring one's disk has stopped growing).
+        Assert.Equal((TemplateJobState.Failed, "not enough disk space for a template copy: 40 GiB free, 41 GiB required"), (job.State, job.FailureReason));
+    }
+
+    [Fact]
+    public async Task Seal_DefenderStillOn_StaysConfigured_ThenSealsWhenOff_Edit()
+    {
+        var publisher = new RecordingJobUpdates();
+        await using var rig = await TemplateJobRig.CreateAsync(sql, configure: s => s.AddSingleton<ITemplateJobPublisher>(publisher));
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit);
+        var run = rig.Start(id);
+        await rig.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+        Assert.Equal("waiting for the admin to configure and seal", (await rig.JobAsync(id)).Message);
+        rig.Guest.ProvenanceRealTimeProtection = true; // the admin turned Defender back on
+
+        await TemplateCoordinatorBuildTests.DefenderStillOnThenOffAsync(rig, publisher, id, run);
+
+        Assert.Equal(2, (await rig.VersionsAsync()).Count);
     }
 
     [Fact]

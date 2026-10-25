@@ -1,13 +1,17 @@
+using System.Text.Json;
 using Maldex.Core.Abstractions;
 using Maldex.Core.Agent;
 using Maldex.Core.Domain;
 using Maldex.Core.Lifecycle;
+using Maldex.Core.Media;
 using Maldex.Core.Text;
 using Maldex.Data;
 using Maldex.Data.Templates;
 using Maldex.Infrastructure.Isolation;
 using Maldex.Infrastructure.Libvirt;
+using Maldex.Infrastructure.Media;
 using Maldex.Infrastructure.Net;
+using Maldex.Orchestrator.Templates.Build;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -16,8 +20,9 @@ using Microsoft.Extensions.Options;
 namespace Maldex.Orchestrator.Templates;
 
 /// <summary>
-/// Drives one Edit or Refresh job from <c>Queued</c> to a terminal state: copy the base version to a new stem, boot it writable,
-/// (Edit) wait for the admin, seal, verify, and record the new version (published unless <see cref="TemplateJob.PublishOnSuccess"/>
+/// Drives one Edit, Refresh or Build job from <c>Queued</c> to a terminal state: copy the base version to a new stem (Edit, Refresh)
+/// or install Windows onto a blank disk from installer media and provision it (Build), boot it writable, (Edit, Build) wait for
+/// the admin and check Defender is off, seal, verify, and record the new version (published unless <see cref="TemplateJob.PublishOnSuccess"/>
 /// is false). The job row is polled for the admin's seal and cancel requests, as <see cref="RunCoordinator"/> polls its task.
 /// On failure or cancel the VM is destroyed, the lease released and the job's files deleted before the job is marked; no
 /// version row is ever written for a job that did not verify.
@@ -35,6 +40,10 @@ public sealed class TemplateCoordinator(
     IDiskSpaceProbe disk,
     TemplateSealer sealer,
     TemplateVerifier verifier,
+    TemplateInstaller installer,
+    IProvisioningMediaBuilder provisioningMedia,
+    MediaStore mediaStore,
+    IOptions<BuildOptions> buildOptions,
     VmSlotGate slotGate,
     IOptions<OrchestratorOptions> orchestrator,
     IOptions<TemplateJobOptions> options,
@@ -51,6 +60,10 @@ public sealed class TemplateCoordinator(
     public const string CancelledByAdmin = "cancelled by an admin";
     public const string BaseDiskMissing = "the base version's disk is missing";
     public const string AlreadyRunning = "a job is already running for this template";
+    /// <summary>A Build's Configuring message when provisioning reported Defender real-time protection on (Pro media: Tamper Protection).</summary>
+    public const string DefenderGuidance = "Defender real-time protection is on. In the console open Windows Security, turn off Tamper Protection, then Real-time protection, then press Seal.";
+    /// <summary>The message when a Seal was refused because the pre-seal check found real-time protection still on.</summary>
+    public const string DefenderStillOn = "Defender real-time protection is still on; turn it off in the console, then press Seal again.";
 
     private const int MaxSaveAttempts = 5;
     /// <summary>Tries to record a terminal state (the database may be briefly unreachable), waiting 1, 2, 4 … s in between.</summary>
@@ -78,7 +91,17 @@ public sealed class TemplateCoordinator(
         public bool FilesCreated;
         /// <summary>A Direct egress session is open (audited start, no stop yet).</summary>
         public bool DirectOpen;
+        /// <summary>A Build's per-job work directory (<see cref="WorkDirOf"/>), deleted on every way out.</summary>
+        public string? WorkDir;
     }
+
+    /// <summary>What a Build installs: its installer media, the application media (Office, at most one) and the chosen edition.</summary>
+    private sealed record BuildMedia(MediaFile Os, IReadOnlyList<MediaFile> Applications, EditionChoice Edition);
+
+    /// <summary>A Build's work directory: the provisioning ISO and its stage, <c>&lt;WorkDir&gt;/&lt;stem&gt;</c>.</summary>
+    public static string WorkDirOf(BuildOptions build, Guid jobId) => Path.Combine(Path.GetFullPath(build.WorkDir), StemOf(jobId));
+
+    private const long GiB = 1024L * 1024 * 1024;
 
     /// <summary>Why a job stopped early; the message is safe as the job's failure reason.</summary>
     private sealed class JobFailedException(string message) : Exception(message);
@@ -113,17 +136,28 @@ public sealed class TemplateCoordinator(
             return;
         }
 
+        // A Build starts from installer media and loads no base version.
         TemplateVersion? baseVersion = null;
-        if (job.BaseVersionId is { } baseId)
-            baseVersion = await db.TemplateVersions.AsNoTracking().SingleOrDefaultAsync(v => v.Id == baseId, ct).ConfigureAwait(false);
-        var refusal = await RefusalAsync(db, catalog, job, baseVersion, ct).ConfigureAwait(false);
+        BuildMedia? buildMedia = null;
+        string? refusal;
+        if (job.Kind == TemplateJobKind.Build)
+        {
+            (refusal, buildMedia) = await BuildRefusalAsync(db, job, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            if (job.BaseVersionId is { } baseId)
+                baseVersion = await db.TemplateVersions.AsNoTracking().SingleOrDefaultAsync(v => v.Id == baseId, ct).ConfigureAwait(false);
+            refusal = await RefusalAsync(db, catalog, job, baseVersion, ct).ConfigureAwait(false);
+        }
         if (refusal is not null)
         {
             await FailAsync(db, job, refusal, new Held(), ct).ConfigureAwait(false);
             return;
         }
 
-        if (!await ClaimAsync(db, jobId, ct).ConfigureAwait(false)) return;
+        var preparing = job.Kind == TemplateJobKind.Build ? "preparing the disk and the provisioning media" : "copying the base version";
+        if (!await ClaimAsync(db, jobId, preparing, ct).ConfigureAwait(false)) return;
 
         using var jobCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         using var watcherCts = new CancellationTokenSource();
@@ -131,7 +165,7 @@ public sealed class TemplateCoordinator(
         var held = new Held();
         try
         {
-            var outcome = await ExecuteAsync(db, job, baseVersion!, held, jobCts.Token).ConfigureAwait(false);
+            var outcome = await ExecuteAsync(db, job, baseVersion, buildMedia, held, jobCts.Token).ConfigureAwait(false);
             await StopWatchingAsync(watcherCts, watcher).ConfigureAwait(false);
             switch (outcome)
             {
@@ -165,54 +199,153 @@ public sealed class TemplateCoordinator(
             await StopWatchingAsync(watcherCts, watcher).ConfigureAwait(false);
             var reason = ex switch
             {
-                JobFailedException or TemplateSealException or TemplateVerifyException or TemplateAgentInstallException => ex.Message,
+                _ when IsSafeReason(ex) => ex.Message,
                 VmStartException => $"the VM could not be started: {ex.Message}",
                 EgressUnavailableException => $"egress unavailable: {ex.Message}",
                 _ => $"job failed: {GuestText.Clean(ex.Message, 300)}",
             };
-            if (ex is not (JobFailedException or TemplateSealException or TemplateVerifyException or TemplateAgentInstallException)) logger.LogError(ex, "Template job {JobId} failed.", jobId);
+            if (!IsSafeReason(ex)) logger.LogError(ex, "Template job {JobId} failed.", jobId);
             else logger.LogWarning("Template job {JobId} failed: {Reason}", jobId, reason);
             await FailAsync(db, job, reason, held, ct).ConfigureAwait(false);
         }
     }
 
-    /// <summary>Why the job may not start, or null. The endpoint refuses these up front; this catches a race.</summary>
+    /// <summary>The failures whose message is safe as the job's failure reason, used as it is.</summary>
+    private static bool IsSafeReason(Exception ex) =>
+        ex is JobFailedException or TemplateSealException or TemplateVerifyException or TemplateAgentInstallException
+            or TemplateBuildException or EditionNotSupportedException;
+
+    /// <summary>Why the Edit or Refresh job may not start, or null. The endpoint refuses these up front; this catches a race.</summary>
     private async Task<string?> RefusalAsync(MaldexDbContext db, TemplateCatalog catalog, TemplateJob job, TemplateVersion? baseVersion, CancellationToken ct)
     {
-        // Temporary guard: Task 10 replaces it with the Build path.
-        if (job.Kind == TemplateJobKind.Build) return "build jobs are not available yet";
         if (job.Kind == TemplateJobKind.Edit && job.Network is not (NetworkMode.None or NetworkMode.Direct))
             return $"network {job.Network} is not available for an edit";
         if (baseVersion is null || baseVersion.TemplateId != job.TemplateId) return "the base version does not belong to this template";
         if (baseVersion.Status != TemplateVersionStatus.Ready) return $"the base version v{baseVersion.Number} is {baseVersion.Status}";
         if (!catalog.DiskPresent(baseVersion.FileStem)) return BaseDiskMissing;
-        // Another active job blocks this one when it is already past Queued or was queued earlier (ties: the lower id), so of
-        // two raced queued jobs the older one runs.
+        if (await ActiveJobRefusalAsync(db, job, ct).ConfigureAwait(false) is { } running) return running;
+
+        return await DiskSpaceRefusalAsync(db, store, disk, libvirt.Value, options.Value.MinFreeGiB, buildOptions.Value.DiskGiB, baseVersion, job.Id, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Why the Build may not start (null: it may), and what it installs: its media are Ready and their files present, the first an
+    /// installer and the others at most one Office image; the edition is one a build supports; no other job runs for the template;
+    /// the disk fits (<see cref="BuildDiskSpaceRefusalAsync"/>). The endpoint refuses these up front; this catches a race.
+    /// </summary>
+    private async Task<(string? Refusal, BuildMedia? Media)> BuildRefusalAsync(MaldexDbContext db, TemplateJob job, CancellationToken ct)
+    {
+        if (job.Network != NetworkMode.None) return ($"network {job.Network} is not available for a build", null);
+
+        List<Guid>? ids;
+        try
+        {
+            ids = JsonSerializer.Deserialize<List<Guid>>(job.MediaIds);
+        }
+        catch (JsonException)
+        {
+            ids = null;
+        }
+        if (ids is not { Count: > 0 }) return ("the build names no installer media", null);
+        var rows = await db.MediaFiles.AsNoTracking().Where(m => ids.Contains(m.Id)).ToListAsync(ct).ConfigureAwait(false);
+        var media = new List<MediaFile>();
+        foreach (var id in ids)
+        {
+            if (rows.SingleOrDefault(m => m.Id == id) is not { } row) return ("a media image of the build is no longer in the library", null);
+            media.Add(row);
+        }
+
+        var os = media[0];
+        if (os.Kind != MediaKind.OsInstaller) return ($"{MediaName(os)} is not installer media", null);
+        var applications = media.Skip(1).ToList();
+        if (applications.Count > 1 || applications.Any(a => a.Kind != MediaKind.Application || MediaContentsJson.Parse(a.Contents)?.Application != "Office"))
+            return ("only Office media can be installed by a build", null);
+        foreach (var m in media)
+            if (MediaRefusal(m) is { } unusable) return (unusable, null);
+
+        if (MediaContentsJson.Parse(os.Contents) is not { } contents) return ($"the installer media {MediaName(os)} has not been inspected", null);
+        EditionChoice edition;
+        try
+        {
+            edition = EditionSelector.Choose(contents.Images, job.EditionIndex);
+        }
+        catch (EditionNotSupportedException ex)
+        {
+            return (ex.Message, null);
+        }
+
+        if (await ActiveJobRefusalAsync(db, job, ct).ConfigureAwait(false) is { } running) return (running, null);
+        var lowSpace = await BuildDiskSpaceRefusalAsync(db, store, disk, libvirt.Value, options.Value.MinFreeGiB, buildOptions.Value.DiskGiB, job.Id, ct).ConfigureAwait(false);
+        return lowSpace is not null ? (lowSpace, null) : (null, new BuildMedia(os, applications, edition));
+    }
+
+    /// <summary>Why the media image cannot be attached (not Ready, or its file is gone), or null.</summary>
+    private string? MediaRefusal(MediaFile media)
+    {
+        var what = media.Kind == MediaKind.OsInstaller ? "installer" : "application";
+        if (media.Status != MediaStatus.Ready || media.Sha256 is null) return $"the {what} media {MediaName(media)} is {media.Status}";
+        return File.Exists(mediaStore.FinalPath(media.Sha256)) ? null : $"the {what} media {MediaName(media)} is missing";
+    }
+
+    private static string MediaName(MediaFile media) => GuestText.Clean(media.FileName, 255);
+
+    /// <summary>
+    /// Another active job blocks this one when it is already past Queued or was queued earlier (ties: the lower id), so of two raced
+    /// queued jobs the older one runs.
+    /// </summary>
+    private static async Task<string?> ActiveJobRefusalAsync(MaldexDbContext db, TemplateJob job, CancellationToken ct)
+    {
         var others = await db.TemplateJobs.AsNoTracking()
             .Where(j => j.TemplateId == job.TemplateId && j.Id != job.Id && Active.Contains(j.State))
             .Select(j => new { j.Id, j.State, j.CreatedAt }).ToListAsync(ct).ConfigureAwait(false);
-        if (others.Any(j => j.State != TemplateJobState.Queued || j.CreatedAt < job.CreatedAt || (j.CreatedAt == job.CreatedAt && j.Id.CompareTo(job.Id) < 0)))
-            return AlreadyRunning;
-
-        return await DiskSpaceRefusalAsync(db, store, disk, libvirt.Value, options.Value.MinFreeGiB, baseVersion, job.Id, ct).ConfigureAwait(false);
+        return others.Any(j => j.State != TemplateJobState.Queued || j.CreatedAt < job.CreatedAt || (j.CreatedAt == job.CreatedAt && j.Id.CompareTo(job.Id) < 0))
+            ? AlreadyRunning : null;
     }
 
     /// <summary>
     /// The refusal for a template copy that would not fit, or null; the endpoint's up-front check and the coordinator's. Required
-    /// free space is the base version's size (unknown: 0) plus <paramref name="minFreeGiB"/>, plus the base sizes of the other
-    /// jobs still in Preparing, whose copies may be in flight (<paramref name="jobId"/>, the job being checked, is not one of them).
+    /// free space is the base version's size (unknown: 0) plus <paramref name="minFreeGiB"/>, plus what the other jobs in flight may
+    /// still write (<see cref="InFlightBytesAsync"/>; <paramref name="jobId"/>, the job being checked, is not one of them).
     /// </summary>
     public static async Task<string?> DiskSpaceRefusalAsync(MaldexDbContext db, ITemplateStore store, IDiskSpaceProbe disk, LibvirtOptions libvirt,
-        int minFreeGiB, TemplateVersion baseVersion, Guid jobId, CancellationToken ct)
+        int minFreeGiB, int buildDiskGiB, TemplateVersion baseVersion, Guid jobId, CancellationToken ct)
+    {
+        var bytes = SizeOrZero(store, baseVersion.FileStem) + await InFlightBytesAsync(db, store, buildDiskGiB, jobId, ct).ConfigureAwait(false);
+        return LowDiskSpace(disk.FreeMiB(Path.GetFullPath(libvirt.BaseImageDir)), RequiredMiB(minFreeGiB, bytes));
+    }
+
+    /// <summary>
+    /// As <see cref="DiskSpaceRefusalAsync"/>, for a Build: its blank disk may grow to <paramref name="diskGiB"/>, plus
+    /// <paramref name="minFreeGiB"/>, plus what the other jobs in flight may still write, on the <see cref="LibvirtOptions.BaseImageDir"/> volume.
+    /// </summary>
+    public static async Task<string?> BuildDiskSpaceRefusalAsync(MaldexDbContext db, ITemplateStore store, IDiskSpaceProbe disk, LibvirtOptions libvirt,
+        int minFreeGiB, int diskGiB, Guid jobId, CancellationToken ct)
+    {
+        var bytes = diskGiB * GiB + await InFlightBytesAsync(db, store, diskGiB, jobId, ct).ConfigureAwait(false);
+        return LowDiskSpace(disk.FreeMiB(Path.GetFullPath(libvirt.BaseImageDir)), RequiredMiB(minFreeGiB, bytes));
+    }
+
+    /// <summary>
+    /// What the other jobs (not <paramref name="jobId"/>) may still write to the base image volume: an Edit or Refresh in Preparing is
+    /// copying its base version (its size); a Build in Preparing, Installing or Provisioning has a blank disk that may grow to
+    /// <paramref name="buildDiskGiB"/>.
+    /// </summary>
+    private static async Task<long> InFlightBytesAsync(MaldexDbContext db, ITemplateStore store, int buildDiskGiB, Guid jobId, CancellationToken ct)
     {
         var copying = await (from j in db.TemplateJobs.AsNoTracking()
                              where j.State == TemplateJobState.Preparing && j.Id != jobId
                              join v in db.TemplateVersions.AsNoTracking() on j.BaseVersionId equals (Guid?)v.Id
                              select v.FileStem).ToListAsync(ct).ConfigureAwait(false);
-        var bytes = SizeOrZero(store, baseVersion.FileStem) + copying.Sum(stem => SizeOrZero(store, stem));
+        var builds = await db.TemplateJobs.AsNoTracking()
+            .CountAsync(j => j.Kind == TemplateJobKind.Build && j.Id != jobId
+                && (j.State == TemplateJobState.Preparing || j.State == TemplateJobState.Installing || j.State == TemplateJobState.Provisioning), ct).ConfigureAwait(false);
+        return copying.Sum(stem => SizeOrZero(store, stem)) + builds * buildDiskGiB * GiB;
+    }
+
+    private static long RequiredMiB(int minFreeGiB, long bytes)
+    {
         const long MiB = 1024 * 1024;
-        var requiredMiB = minFreeGiB * 1024L + (bytes + MiB - 1) / MiB;
-        return LowDiskSpace(disk.FreeMiB(Path.GetFullPath(libvirt.BaseImageDir)), requiredMiB);
+        return minFreeGiB * 1024L + (bytes + MiB - 1) / MiB;
     }
 
     private static long SizeOrZero(ITemplateStore store, string stem)
@@ -233,8 +366,8 @@ public sealed class TemplateCoordinator(
             ? $"not enough disk space for a template copy: {freeMiB / 1024.0:0.#} GiB free, {requiredMiB / 1024.0:0.#} GiB required"
             : null;
 
-    /// <summary>Queued → Preparing. False when the job is no longer Queued (someone else got there first).</summary>
-    private async Task<bool> ClaimAsync(MaldexDbContext db, Guid jobId, CancellationToken ct)
+    /// <summary>Queued → Preparing, saying <paramref name="message"/>. False when the job is no longer Queued (someone else got there first).</summary>
+    private async Task<bool> ClaimAsync(MaldexDbContext db, Guid jobId, string message, CancellationToken ct)
     {
         var claimed = false;
         await SaveJobAsync(db, jobId, j =>
@@ -242,7 +375,7 @@ public sealed class TemplateCoordinator(
             claimed = false;
             if (j.State != TemplateJobState.Queued) return false;
             var now = time.GetUtcNow();
-            j.TransitionTo(TemplateJobState.Preparing, "copying the base version", now);
+            j.TransitionTo(TemplateJobState.Preparing, message, now);
             j.StartedAt = now;
             return claimed = true;
         }, [], ct).ConfigureAwait(false);
@@ -250,7 +383,7 @@ public sealed class TemplateCoordinator(
     }
 
     /// <summary>The job's steps up to a verified disk: <see cref="Verified"/>, or <see cref="Discarded"/> on the idle timeout.</summary>
-    private async Task<Outcome> ExecuteAsync(MaldexDbContext db, TemplateJob job, TemplateVersion baseVersion, Held held, CancellationToken ct)
+    private async Task<Outcome> ExecuteAsync(MaldexDbContext db, TemplateJob job, TemplateVersion? baseVersion, BuildMedia? buildMedia, Held held, CancellationToken ct)
     {
         var o = options.Value;
         var stem = StemOf(job.Id);
@@ -265,6 +398,77 @@ public sealed class TemplateCoordinator(
             throw new JobFailedException(ex.Message);
         }
 
+        var configuringMessage = "waiting for the admin to configure and seal";
+        if (job.Kind == TemplateJobKind.Build)
+        {
+            var report = await InstallAndProvisionAsync(db, job, buildMedia!, bundle, held, ct).ConfigureAwait(false);
+            if (report.RealTimeProtectionEnabled == true) configuringMessage = DefenderGuidance;
+        }
+        else
+        {
+            await CopyAndBootAsync(db, job, baseVersion!, bundle, held, ct).ConfigureAwait(false);
+        }
+
+        // From Configuring on, Build and Edit share one path.
+        if (job.Kind != TemplateJobKind.Refresh)
+        {
+            await SaveJobAsync(db, job.Id, j =>
+            {
+                var now = time.GetUtcNow();
+                j.TransitionTo(TemplateJobState.Configuring, configuringMessage, now);
+                j.ConfiguringSince = now;
+                return true;
+            }, [], ct).ConfigureAwait(false);
+
+            if (await WaitForSealWithDefenderOffAsync(db, job.Id, held.Vm!, o, ct).ConfigureAwait(false) is { } idle) return idle;
+
+            // Nobody may keep driving the guest while it is sealed (R22): close the job's open consoles and wait, bounded, for them to go.
+            if (consoles is not null && !await consoles.CloseAsync(job.Id, o.ConsoleCloseTimeout, ct).ConfigureAwait(false))
+                logger.LogWarning("A console of template job {JobId} was still open {Timeout} after it was told to close; sealing anyway.", job.Id, o.ConsoleCloseTimeout);
+
+            // Sealing runs without any network: cut the running guest off before anything is installed.
+            await egress.IsolateAsync(held.Lease!, ct).ConfigureAwait(false);
+            List<AuditLog> egressStop = [];
+            if (held.DirectOpen)
+            {
+                held.DirectOpen = false;
+                egressStop.Add(Audit(job, job.RequestedByUserId, "template.egress.stop", DirectSessionDetails(job.Id)));
+            }
+            await TransitionAsync(db, job.Id, TemplateJobState.Sealing, "installing the components and shutting down", egressStop, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            await TransitionAsync(db, job.Id, TemplateJobState.Sealing, "installing the components and shutting down", [], ct).ConfigureAwait(false);
+        }
+
+        // A fresh channel for the sealer: it proves the agent answers with its own provenance round trip (no ready needed, R25).
+        var vm = held.Vm!;
+        var channel = await channels.ConnectAsync(vm, ct).ConfigureAwait(false);
+        try
+        {
+            await sealer.SealAsync(channel, vm, stem, bundle, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            await DisposeQuietlyAsync(channel, job.Id).ConfigureAwait(false);
+        }
+
+        // The edit VM is off and gone; its lease goes with it.
+        await ReleaseGuestAsync(job, held).ConfigureAwait(false);
+
+        await TransitionAsync(db, job.Id, TemplateJobState.Verifying, "verifying the sealed version", [], ct).ConfigureAwait(false);
+        var provenance = await verifier.VerifyAsync(stem, bundle, ct).ConfigureAwait(false);
+        return new Verified(provenance, bundle);
+    }
+
+    /// <summary>
+    /// Edit and Refresh (Preparing): copies the base version to the job's stem, writes the current agent into it, takes a VM slot and
+    /// a lease (Direct for a Direct edit, audited), boots the copy writable and checks its agent (running a Direct session's self-test).
+    /// </summary>
+    private async Task CopyAndBootAsync(MaldexDbContext db, TemplateJob job, TemplateVersion baseVersion, ComponentBundle bundle, Held held, CancellationToken ct)
+    {
+        var o = options.Value;
+        var stem = StemOf(job.Id);
         held.FilesCreated = true; // a partial copy is deleted too
         await store.CreateWorkingCopyAsync(baseVersion.FileStem, stem, ct).ConfigureAwait(false);
 
@@ -286,55 +490,159 @@ public sealed class TemplateCoordinator(
 
         await SaveJobAsync(db, job.Id, j => { j.Message = "checking the guest agent"; return true; }, [], ct).ConfigureAwait(false);
         await CheckAgentAsync(db, job, held.Vm!, mode == NetworkMode.Direct ? held.Lease : null, bundle, o, ct).ConfigureAwait(false);
+    }
 
-        if (job.Kind == TemplateJobKind.Edit)
-        {
-            await SaveJobAsync(db, job.Id, j =>
-            {
-                var now = time.GetUtcNow();
-                j.TransitionTo(TemplateJobState.Configuring, "waiting for the admin to configure and seal", now);
-                j.ConfiguringSince = now;
-                return true;
-            }, [], ct).ConfigureAwait(false);
+    /// <summary>
+    /// Build (Preparing → Installing → Provisioning): creates the blank disk, builds the provisioning ISO in the job's work directory
+    /// (it carries the bundle's agent, so nothing is written into the disk), takes a VM slot and a None lease, boots the installer
+    /// from its media, lets <see cref="TemplateInstaller"/> install and provision Windows, then boots the disk again without media
+    /// (the slot and the lease stay held across the reboot) and checks its agent. Returns what provisioning reported.
+    /// </summary>
+    private async Task<ProvisionReport> InstallAndProvisionAsync(MaldexDbContext db, TemplateJob job, BuildMedia media, ComponentBundle bundle, Held held, CancellationToken ct)
+    {
+        var o = options.Value;
+        var b = buildOptions.Value;
+        var stem = StemOf(job.Id);
+        var virtio = Path.GetFullPath(b.VirtioIsoPath);
+        if (!File.Exists(virtio)) throw new JobFailedException("the virtio driver ISO is missing; run ./build.sh real-setup");
 
-            if (await WaitForSealAsync(db, job.Id, ct).ConfigureAwait(false) is { } idle) return idle;
+        held.FilesCreated = true; // a partly created disk is deleted too
+        await store.CreateBlankAsync(stem, b.DiskGiB * GiB, libvirt.Value.OvmfVarsTemplatePath, ct).ConfigureAwait(false);
 
-            // Nobody may keep driving the guest while it is sealed (R22): close the job's open consoles and wait, bounded, for them to go.
-            if (consoles is not null && !await consoles.CloseAsync(job.Id, o.ConsoleCloseTimeout, ct).ConfigureAwait(false))
-                logger.LogWarning("A console of template job {JobId} was still open {Timeout} after it was told to close; sealing anyway.", job.Id, o.ConsoleCloseTimeout);
-
-            // Sealing runs without any network: cut the running guest off before anything is installed.
-            await egress.IsolateAsync(held.Lease, ct).ConfigureAwait(false);
-            List<AuditLog> egressStop = [];
-            if (held.DirectOpen)
-            {
-                held.DirectOpen = false;
-                egressStop.Add(Audit(job, job.RequestedByUserId, "template.egress.stop", DirectSessionDetails(job.Id)));
-            }
-            await TransitionAsync(db, job.Id, TemplateJobState.Sealing, "installing the components and shutting down", egressStop, ct).ConfigureAwait(false);
-        }
-        else
-        {
-            await TransitionAsync(db, job.Id, TemplateJobState.Sealing, "installing the components and shutting down", [], ct).ConfigureAwait(false);
-        }
-
-        // A fresh channel for the sealer: it proves the agent answers with its own provenance round trip (no ready needed, R25).
-        var channel = await channels.ConnectAsync(held.Vm, ct).ConfigureAwait(false);
+        held.WorkDir = WorkDirOf(b, job.Id);
+        var office = media.Applications.Count > 0;
         try
         {
-            await sealer.SealAsync(channel, held.Vm, stem, bundle, ct).ConfigureAwait(false);
+            await provisioningMedia.BuildAsync(new ProvisioningInputs(bundle, media.Edition.Index, media.Edition.ProductKey, office), held.WorkDir, ct).ConfigureAwait(false);
+        }
+        catch (Exception) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            throw new JobFailedException($"the provisioning media could not be built: {GuestText.Clean(ex.Message, 300)}");
+        }
+        // Only paths Maldex owns are attached: the library's files, the virtio ISO and this job's own provisioning ISO.
+        var provisionIso = Path.Combine(held.WorkDir, "provision.iso");
+
+        await TakeVmSlotAsync(db, job.Id, ct).ConfigureAwait(false);
+        held.Lease = await egress.CreateAsync(job.Id, NetworkMode.None, null, ct).ConfigureAwait(false);
+
+        // Checked again right before the boot: a file can vanish after the job was accepted, and then no VM starts.
+        foreach (var m in media.Applications.Prepend(media.Os))
+            if (MediaRefusal(m) is { } unusable) throw new JobFailedException(unusable);
+        List<string> cdRoms = [mediaStore.FinalPath(media.Os.Sha256!), virtio, provisionIso, .. media.Applications.Select(a => mediaStore.FinalPath(a.Sha256!))];
+
+        var vmOptions = orchestrator.Value;
+        held.Vm = await hypervisor.StartAsync(new VmSpec(job.Id, stem, vmOptions.VmMemoryMiB, vmOptions.VmVCpus, held.Lease.NetworkId, Writable: true,
+            CdRoms: cdRoms, BootFromCdRom: true), ct).ConfigureAwait(false);
+        await TransitionAsync(db, job.Id, TemplateJobState.Installing, InstallingMessage(media.Edition.Name), [], ct).ConfigureAwait(false);
+
+        var report = await installer.InstallAsync(held.Vm, job.Id, office,
+            (state, note) => TransitionAsync(db, job.Id, state, note, [], ct), ct).ConfigureAwait(false);
+
+        // The installer powered the guest off; the media go with it. The slot and the lease stay held for the configure boot.
+        await hypervisor.DestroyAsync(held.Vm, ct).ConfigureAwait(false);
+        held.Vm = null;
+        DeleteWorkDir(job, held);
+
+        held.Vm = await hypervisor.StartAsync(new VmSpec(job.Id, stem, vmOptions.VmMemoryMiB, vmOptions.VmVCpus, held.Lease.NetworkId, Writable: true), ct).ConfigureAwait(false);
+        await SaveJobAsync(db, job.Id, j => { j.Message = "checking the guest agent"; return true; }, [], ct).ConfigureAwait(false);
+        await CheckAgentAsync(db, job, held.Vm, null, bundle, o, ct).ConfigureAwait(false);
+        return report;
+    }
+
+    /// <summary>"installing Windows 11 Pro" for the edition "Windows 11 Pro" (the edition names already start with "Windows").</summary>
+    private static string InstallingMessage(string edition) =>
+        edition.StartsWith("Windows ", StringComparison.Ordinal) ? $"installing {edition}" : $"installing Windows {edition}";
+
+    /// <summary>
+    /// Waits for the admin's seal (<see cref="WaitForSealAsync"/>) and checks Defender before anything is installed or isolated
+    /// (decision 2, Build and Edit): real-time protection on refuses the seal — the request is cleared so the console opens again,
+    /// and the admin is told why — and the wait goes on. An unreadable state does not block. Returns the idle discard, or null to seal.
+    /// </summary>
+    private async Task<Discarded?> WaitForSealWithDefenderOffAsync(MaldexDbContext db, Guid jobId, VmHandle vm, TemplateJobOptions o, CancellationToken ct)
+    {
+        while (true)
+        {
+            if (await WaitForSealAsync(db, jobId, ct).ConfigureAwait(false) is { } idle) return idle;
+            if (await DefenderCheckAsync(vm, jobId, o, ct).ConfigureAwait(false) != true) return null;
+
+            var refused = false;
+            await SaveJobAsync(db, jobId, j =>
+            {
+                refused = false;
+                if (j.CancelRequestedAt is not null) return false; // the cancel wins; the watcher ends the job
+                j.SealRequestedAt = null;
+                j.Message = DefenderStillOn;
+                return refused = true;
+            }, [], ct, publish: true).ConfigureAwait(false);
+            if (refused) logger.LogInformation("Template job {JobId}: seal refused, Defender real-time protection is still on.", jobId);
+            else await Task.Delay(o.PollInterval, time, ct).ConfigureAwait(false);
+        }
+    }
+
+    private const string DefenderCheckFailed = "the guest agent did not answer the Defender check; not sealing";
+
+    /// <summary>
+    /// The pre-seal Defender check: one provenance round trip on a fresh channel (no ready wait, R25), closed again afterwards.
+    /// Returns the guest's real-time protection state (null: unreadable). No answer or a refusal fails the job.
+    /// </summary>
+    private async Task<bool?> DefenderCheckAsync(VmHandle vm, Guid jobId, TemplateJobOptions o, CancellationToken ct)
+    {
+        IAgentChannel channel;
+        try
+        {
+            channel = await channels.ConnectAsync(vm, ct).ConfigureAwait(false);
+        }
+        catch (Exception) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Template job {JobId}: connecting for the Defender check failed.", jobId);
+            throw new JobFailedException(DefenderCheckFailed);
+        }
+
+        try
+        {
+            await using var session = new GuestSession(channel);
+            try
+            {
+                var answer = await session.AskProvenanceWithRetryAsync(o.ProvenanceRetryInterval, o.ProvenanceTimeout, time, ct).ConfigureAwait(false);
+                return answer.RealTimeProtectionEnabled;
+            }
+            catch (Exception) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Template job {JobId}: the Defender check got no answer.", jobId);
+                throw new JobFailedException(DefenderCheckFailed);
+            }
         }
         finally
         {
-            await DisposeQuietlyAsync(channel, job.Id).ConfigureAwait(false);
+            await DisposeQuietlyAsync(channel, jobId).ConfigureAwait(false);
         }
+    }
 
-        // The edit VM is off and gone; its lease goes with it.
-        await ReleaseGuestAsync(job, held).ConfigureAwait(false);
-
-        await TransitionAsync(db, job.Id, TemplateJobState.Verifying, "verifying the sealed version", [], ct).ConfigureAwait(false);
-        var provenance = await verifier.VerifyAsync(stem, bundle, ct).ConfigureAwait(false);
-        return new Verified(provenance, bundle);
+    /// <summary>Deletes a Build's work directory (the provisioning ISO and its stage). Best effort: never throws.</summary>
+    private void DeleteWorkDir(TemplateJob job, Held held)
+    {
+        if (held.WorkDir is not { } dir) return;
+        try
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+            held.WorkDir = null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogError(ex, "Deleting the work directory {Dir} of template job {JobId} failed.", dir, job.Id);
+        }
     }
 
     /// <summary>Writes the current agent into the working copy's disk, bounded by <see cref="TemplateJobOptions.AgentInstallTimeout"/>.</summary>
@@ -570,8 +878,10 @@ public sealed class TemplateCoordinator(
                     .FromSqlInterpolated($"SELECT * FROM Templates WITH (UPDLOCK, HOLDLOCK) WHERE Id = {row.TemplateId}")
                     .AsNoTracking().Select(t => t.CurrentVersionId).SingleAsync(ct).ConfigureAwait(false);
                 // A rollback or another publish while the job ran: the new version is held for an admin, never published over that choice.
+                // An Edit or Refresh expects its base to be current; a Build what was current when it was queued (null: no version).
+                var expectedId = row.Kind == TemplateJobKind.Build ? row.ExpectedCurrentVersionId : row.BaseVersionId;
                 string? superseded = null;
-                if (row.PublishOnSuccess && currentId != row.BaseVersionId)
+                if (row.PublishOnSuccess && currentId != expectedId)
                 {
                     var currentNumber = currentId is null ? null
                         : await db.TemplateVersions.AsNoTracking().Where(v => v.Id == currentId).Select(v => (int?)v.Number).SingleOrDefaultAsync(ct).ConfigureAwait(false);
@@ -588,7 +898,13 @@ public sealed class TemplateCoordinator(
                     TemplateId = row.TemplateId,
                     Number = number,
                     ParentVersionId = row.BaseVersionId,
-                    Origin = row.Kind == TemplateJobKind.Edit ? TemplateVersionOrigin.Edit : TemplateVersionOrigin.Refresh,
+                    Origin = row.Kind switch
+                    {
+                        TemplateJobKind.Edit => TemplateVersionOrigin.Edit,
+                        TemplateJobKind.Build => TemplateVersionOrigin.IsoBuild,
+                        _ => TemplateVersionOrigin.Refresh,
+                    },
+                    SourceMediaIds = row.MediaIds,
                     FileStem = stem,
                     WindowsEdition = provenance.WindowsEdition,
                     WindowsBuild = provenance.WindowsBuild,
@@ -612,7 +928,14 @@ public sealed class TemplateCoordinator(
                 await db.SaveChangesAsync(ct).ConfigureAwait(false);
 
                 if (publish)
+                {
                     await catalog.PublishAsync(row.TemplateId, version.Id, ct, new TemplateAudit(row.RequestedByUserId, "template.publish", $"to=v{number}; job={row.Id}")).ConfigureAwait(false);
+                    // The first template built becomes the default, in the same transaction (SetDefaultAsync joins it).
+                    if (row.Kind == TemplateJobKind.Build
+                        && !await db.Templates.AsNoTracking().AnyAsync(t => t.IsDefault && t.Enabled, ct).ConfigureAwait(false)
+                        && await db.Templates.AsNoTracking().AnyAsync(t => t.Id == row.TemplateId && t.Enabled, ct).ConfigureAwait(false))
+                        await catalog.SetDefaultAsync(row.TemplateId, ct, new TemplateAudit(null, "template.default", "first template")).ConfigureAwait(false);
+                }
 
                 await tx.CommitAsync(ct).ConfigureAwait(false);
                 await PublishAsync(db, row).ConfigureAwait(false);
@@ -725,12 +1048,13 @@ public sealed class TemplateCoordinator(
     }
 
     /// <summary>
-    /// Destroys the VM, releases the lease and (when asked) deletes the job's files; never throws. Returns the egress-stop audit
-    /// row of a Direct session that was still open, for the caller to save.
+    /// Destroys the VM, releases the lease, deletes a Build's work directory and (when asked) the job's files; never throws. Returns
+    /// the egress-stop audit row of a Direct session that was still open, for the caller to save.
     /// </summary>
     private async Task<AuditLog?> ReleaseAsync(TemplateJob job, Held held, bool deleteFiles)
     {
         await ReleaseGuestAsync(job, held).ConfigureAwait(false);
+        DeleteWorkDir(job, held);
         if (deleteFiles && held.FilesCreated)
         {
             try
@@ -823,7 +1147,8 @@ public sealed class TemplateCoordinator(
     /// Reloads the job, applies <paramref name="change"/> (false: nothing to save) and saves it with <paramref name="audits"/>.
     /// The API writes the same row (seal/cancel requests, console connects), so a conflict reloads and tries again.
     /// </summary>
-    private async Task SaveJobAsync(MaldexDbContext db, Guid jobId, Func<TemplateJob, bool> change, IReadOnlyList<AuditLog> audits, CancellationToken ct)
+    /// <param name="publish">Push the saved job to the watchers even when neither its state nor its message changed (a cleared seal request).</param>
+    private async Task SaveJobAsync(MaldexDbContext db, Guid jobId, Func<TemplateJob, bool> change, IReadOnlyList<AuditLog> audits, CancellationToken ct, bool publish = false)
     {
         for (var attempt = 1; ; attempt++)
         {
@@ -835,7 +1160,7 @@ public sealed class TemplateCoordinator(
             try
             {
                 await db.SaveChangesAsync(ct).ConfigureAwait(false);
-                var changed = job.State != stateBefore || job.Message != messageBefore;
+                var changed = publish || job.State != stateBefore || job.Message != messageBefore;
                 var saved = job;
                 db.ChangeTracker.Clear();
                 if (changed) await PublishAsync(db, saved).ConfigureAwait(false);

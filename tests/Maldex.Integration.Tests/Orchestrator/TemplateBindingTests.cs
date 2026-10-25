@@ -21,7 +21,7 @@ public class TemplateBindingTests(SqlServerFixture sql)
     /// <summary>Wraps the fake hypervisor and records every spec it is asked to start.</summary>
     private sealed class SpyHypervisor(IHypervisor inner) : IHypervisor
     {
-        public Task SendKeyAsync(VmHandle vm, string key, CancellationToken ct) => throw new NotSupportedException();
+        public Task SendKeyAsync(VmHandle vm, string key, CancellationToken ct) => inner.SendKeyAsync(vm, key, ct);
         public List<VmSpec> Specs { get; } = [];
         public Task<VmHandle> StartAsync(VmSpec spec, CancellationToken ct)
         {

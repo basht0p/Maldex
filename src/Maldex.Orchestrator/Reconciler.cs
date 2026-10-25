@@ -4,6 +4,7 @@ using Maldex.Core.Lifecycle;
 using Maldex.Data;
 using Maldex.Infrastructure.Libvirt;
 using Maldex.Orchestrator.Templates;
+using Maldex.Orchestrator.Templates.Build;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -15,7 +16,7 @@ namespace Maldex.Orchestrator;
 /// Runs once when the orchestrator starts. Nothing survives a restart of the control plane, so every VM and
 /// network lease still around is a leftover and every task that was mid-run is failed. <c>Processing</c> tasks
 /// only need the database, so they are left for the processing worker to resume. Template jobs that had started are
-/// failed as interrupted and their working files deleted; queued ones simply run later.
+/// failed as interrupted and their working files (and a Build's work directory) deleted; queued ones simply run later.
 /// </summary>
 public sealed class Reconciler(
     IServiceScopeFactory scopes,
@@ -23,6 +24,7 @@ public sealed class Reconciler(
     IEgressRouter egress,
     ITemplateStore templates,
     IOptions<LibvirtOptions> libvirt,
+    IOptions<BuildOptions> build,
     TimeProvider time,
     ILogger<Reconciler> logger)
 {
@@ -33,6 +35,8 @@ public sealed class Reconciler(
     private static readonly RunStatus[] InFlight = [RunStatus.Preparing, RunStatus.Running, RunStatus.Collecting];
 
     private static readonly IReadOnlyList<TemplateJobState> JobsInFlight = TemplateJobStateMachine.StartedStates;
+
+    private static readonly IReadOnlyList<TemplateJobState> ActiveJobs = TemplateJobStateMachine.ActiveStates;
 
     private readonly TaskCompletionSource _reconciled = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -94,6 +98,8 @@ public sealed class Reconciler(
 
         if (jobIds.Count > 0) logger.LogWarning("Failed {Count} interrupted template job(s) after an orchestrator restart.", jobIds.Count);
 
+        await DeleteOrphanedWorkDirsAsync(db, ct).ConfigureAwait(false);
+
         _reconciled.TrySetResult();
     }
 
@@ -117,7 +123,46 @@ public sealed class Reconciler(
     }
 
     /// <summary>
-    /// Deletes the job's files (working copy or sealed, never recorded), then marks it Failed with its system audit row. A Direct
+    /// The work directories of Builds (<c>&lt;WorkDir&gt;/&lt;stem&gt;</c>) that belong to no active job: a crash's leftovers, as
+    /// <see cref="DeleteAgentCopies"/> are. Only directories named like a job stem are touched.
+    /// </summary>
+    private async Task DeleteOrphanedWorkDirsAsync(MaldexDbContext db, CancellationToken ct)
+    {
+        var root = Path.GetFullPath(build.Value.WorkDir);
+        if (!Directory.Exists(root)) return;
+        var active = (await db.TemplateJobs.AsNoTracking().Where(j => ActiveJobs.Contains(j.State)).Select(j => j.Id).ToListAsync(ct).ConfigureAwait(false))
+            .Select(TemplateCoordinator.StemOf).ToHashSet(StringComparer.Ordinal);
+        try
+        {
+            foreach (var dir in Directory.EnumerateDirectories(root))
+            {
+                var name = Path.GetFileName(dir);
+                if (!Guid.TryParseExact(name, "N", out var id) || TemplateCoordinator.StemOf(id) != name || active.Contains(name)) continue;
+                Directory.Delete(dir, recursive: true);
+                logger.LogWarning("Deleted leftover build work directory {Dir}.", dir);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogError(ex, "Deleting the leftover build work directories in {Dir} failed.", root);
+        }
+    }
+
+    private void DeleteWorkDir(Guid jobId)
+    {
+        var dir = TemplateCoordinator.WorkDirOf(build.Value, jobId);
+        try
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogError(ex, "Deleting the work directory {Dir} of interrupted template job {JobId} failed.", dir, jobId);
+        }
+    }
+
+    /// <summary>
+    /// Deletes the job's files (working copy or sealed, never recorded) and a Build's work directory, then marks it Failed with its system audit row. A Direct
     /// session still open (its egress start audited, no stop) gets its <c>template.egress.stop</c> row in the same save.
     /// </summary>
     private async Task FailJobAsync(MaldexDbContext db, Guid id, CancellationToken ct)
@@ -131,6 +176,7 @@ public sealed class Reconciler(
         {
             logger.LogError(ex, "Deleting the files of interrupted template job {JobId} ({Stem}) failed.", id, stem);
         }
+        DeleteWorkDir(id);
 
         for (var attempt = 1; ; attempt++)
         {
