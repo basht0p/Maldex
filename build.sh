@@ -353,6 +353,12 @@ disable_system_unit() {
   fi
 }
 
+# The pinned Sysmon.zip the provisioning CD of a Build from ISO carries (Sysmon64.exe is extracted from it).
+ensure_sysmon_zip() {
+  mkdir -p "$VM_DIR/iso"
+  fetch_cached "$SYSMON_URL" "$VM_DIR/iso/Sysmon.zip" "$SYSMON_SHA256"
+}
+
 cmd_real_setup() {
   local me="${SUDO_USER:-$(id -un)}"
   sudo apt-get update -qq
@@ -403,6 +409,7 @@ cmd_real_setup() {
   ensure_mitm_ca
   harden_inetsim_template
   ensure_guestfs_appliance
+  ensure_sysmon_zip
 
   real_verify
 }
