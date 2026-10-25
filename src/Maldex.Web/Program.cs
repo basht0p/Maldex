@@ -5,6 +5,7 @@ using Maldex.Data.Templates;
 using Maldex.Infrastructure;
 using Maldex.Infrastructure.Real;
 using Maldex.Orchestrator;
+using Maldex.Orchestrator.Media;
 using Maldex.Orchestrator.Templates;
 using Maldex.Processing;
 using Maldex.Web;
@@ -57,6 +58,8 @@ if ((builder.Configuration.GetSection(WorkersOptions.SectionName).Get<WorkersOpt
     builder.Services.AddGatedHostedService<OrchestratorWorker>();
     // Template jobs run VMs too: same gate, and they start only after the orchestrator's startup reconcile.
     builder.Services.AddGatedHostedService<TemplateJobWorker>();
+    // Media uploads, fetches and inspection: same gate (Real mode mounts images, with sudo).
+    builder.Services.AddGatedHostedService<MediaWorker>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<ProcessingWorker>());
     builder.Services.AddHostedService(sp => sp.GetRequiredService<RetentionWorker>());
 }
