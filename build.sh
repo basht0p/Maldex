@@ -249,6 +249,7 @@ PartOf=docker.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=$DOCKER_USER_DST
+ExecStop=$DOCKER_USER_DST stop
 
 [Install]
 WantedBy=docker.service multi-user.target
@@ -538,31 +539,141 @@ cmd_build_guest() {
     deploy/guest/build-guest.sh
 }
 
-# Harmless real-VM end-to-end suite (needs the built guest image; see deploy/guest/README.md "Running the E2E suite").
-cmd_e2e() {
+# The code a real template E2E (./build.sh e2e-templates) exercises. When any of it changed since the commit recorded in
+# $TEMPLATE_E2E_STAMP, ./build.sh e2e points at e2e-templates. The one list for both the notice and the stamp.
+TEMPLATE_E2E_PATHS=(
+  src/Maldex.Orchestrator/Templates/
+  src/Maldex.Orchestrator/VmSlotGate.cs
+  src/Maldex.Orchestrator/Reconciler.cs
+  src/Maldex.Agent/
+  src/Maldex.Core/Agent/
+  'src/Maldex.Core/Domain/TemplateJob*'
+  'src/Maldex.Core/Lifecycle/TemplateJob*'
+  src/Maldex.Data/Templates/
+  src/Maldex.Data/VmSlots.cs
+  src/Maldex.Infrastructure/Libvirt/
+  src/Maldex.Infrastructure/Agent/
+  src/Maldex.Infrastructure/Net/
+  src/Maldex.Infrastructure/Isolation/
+  src/Maldex.Web/Endpoints/TemplateEndpoints.cs
+  src/Maldex.Web/Endpoints/GuacamoleTunnelEndpoint.cs
+  deploy/guest/provision/sysmon-config.xml
+  deploy/host/
+  tests/Maldex.Integration.Tests/E2E/RealTemplateJobTests.cs
+  tests/Maldex.Integration.Tests/E2E/RealGuestDiskEditorTests.cs
+)
+TEMPLATE_E2E_STAMP=".data/e2e-templates.validated"
+
+# Exit 0 when a real template E2E is due (the reason and the changed files go to stdout), 1 when the stamp covers HEAD: the stamp
+# names a commit that is an ancestor of HEAD, nothing under TEMPLATE_E2E_PATHS changed since it, and nothing there is uncommitted.
+template_e2e_check() {
+  local sha="" changed
+  [ -f "$TEMPLATE_E2E_STAMP" ] || { echo "no validated template E2E run is recorded ($TEMPLATE_E2E_STAMP)"; return 0; }
+  sha="$(tr -d '[:space:]' < "$TEMPLATE_E2E_STAMP")"
+  if [ -z "$sha" ] || ! git cat-file -e "$sha^{commit}" 2>/dev/null || ! git merge-base --is-ancestor "$sha" HEAD 2>/dev/null; then
+    echo "the commit recorded in $TEMPLATE_E2E_STAMP ('${sha:-empty}') is not an ancestor of HEAD"
+    return 0
+  fi
+  local due=1
+  changed="$(git diff --name-only "$sha" HEAD -- "${TEMPLATE_E2E_PATHS[@]}")"
+  if [ -n "$changed" ]; then
+    echo "changed since the last validated template E2E ($sha):"
+    printf '%s\n' "$changed" | sed 's/^/  /'
+    due=0
+  fi
+  # Uncommitted or untracked files under the watched paths (porcelain: "XY path").
+  changed="$(git status --porcelain --untracked-files=all -- "${TEMPLATE_E2E_PATHS[@]}" | cut -c4-)"
+  if [ -n "$changed" ]; then
+    echo "uncommitted changes in template-affecting paths:"
+    printf '%s\n' "$changed" | sed 's/^/  /'
+    due=0
+  fi
+  return "$due"
+}
+
+# The end of ./build.sh e2e: say when the real template E2E is due; ask only on a terminal (default No).
+template_e2e_gate_notice() {
+  local out answer
+  out="$(template_e2e_check)" || return 0
+  echo
+  echo "NOTE: the real template E2E (RealTemplateJobTests, RealGuestDiskEditorTests) is due; plain e2e does not run it."
+  printf '%s\n' "$out"
+  echo "Run it with: ./build.sh e2e-templates"
+  if [ -t 0 ] && [ -t 1 ]; then
+    read -r -p "run ./build.sh e2e-templates now? [y/N] " answer || answer=""
+    case "$answer" in y|Y|yes|YES) cmd_e2e_templates ;; esac
+  fi
+  return 0
+}
+
+require_base_image() {
   local base="$VM_DIR/base"
   if [ ! -f "$base/win11-26h2.qcow2" ] || [ ! -f "$base/win11-26h2.vars.fd" ]; then
     echo "The Windows 11 26H2 base image is missing ($base/win11-26h2.qcow2 and .vars.fd)." >&2
     echo "Build it first:  MALDEX_WIN_ISO=/path/to/Win11_26H2.iso ./build.sh build-guest" >&2
     return 2
   fi
-  MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 dotnet test --project tests/Maldex.Integration.Tests --filter-class "*RealVmE2ETests"
 }
 
-case "${1:-}" in
-  setup)  cmd_setup ;;
-  dev-db) cmd_dev_db ;;
-  test)   cmd_test ;;
-  run)    cmd_run ;;
-  smoke)  cmd_smoke ;;
-  build)  cmd_build ;;
-  real-setup) cmd_real_setup ;;
-  real-smoke) cmd_real_smoke ;;
-  agent) cmd_agent ;;
-  build-guest) cmd_build_guest ;;
-  prepare-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" deploy/guest/prepare-guest.sh prepare ;;
-  finalize-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" deploy/guest/prepare-guest.sh finalize ;;
-  discard-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" deploy/guest/prepare-guest.sh discard ;;
-  e2e)    cmd_e2e ;;
-  *) echo "usage: $0 setup|dev-db|run|test|smoke|build|agent|real-setup|real-smoke|build-guest|prepare-guest|finalize-guest|discard-guest|e2e" >&2; exit 64 ;;
-esac
+# Harmless real-VM end-to-end suite (needs the built guest image; see deploy/guest/README.md "Running the E2E suite").
+cmd_e2e() {
+  require_base_image || return $?
+  MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 dotnet test --project tests/Maldex.Integration.Tests --filter-class "*RealVmE2ETests"
+  template_e2e_gate_notice
+}
+
+# The real template-job E2E (Refresh, Edit with Direct network, Roll back, guest disk editor): up to about two hours, so it runs
+# only when affecting code changed. A full green run records HEAD in $TEMPLATE_E2E_STAMP. Optional $1: one test (method-name part).
+cmd_e2e_templates() {
+  local filter="${1:-}" log rc=0 head dirty
+  require_base_image || return $?
+  case "$filter" in *[!A-Za-z0-9_.*]*) echo "e2e-templates: the filter may contain only letters, digits, _ . and *" >&2; return 64 ;; esac
+  if [ ! -f .data/agent/Maldex.Agent.exe ] || [ ! -f .data/agent/Maldex.Agent.version ]; then
+    echo "The guest agent build is missing; running ./build.sh agent first."
+    cmd_agent
+  fi
+  local args=(--project tests/Maldex.Integration.Tests --filter-class "*RealTemplateJobTests" --filter-class "*RealGuestDiskEditorTests")
+  [ -z "$filter" ] || args+=(--filter-method "*$filter*")
+  log="$(mktemp)"
+  MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 MALDEX_REAL_TEMPLATES=1 dotnet test "${args[@]}" 2>&1 | tee "$log" || rc=$?
+  if [ "$rc" -ne 0 ]; then rm -f "$log"; return "$rc"; fi
+  if [ -n "$filter" ]; then
+    rm -f "$log"; echo "Filtered run passed; $TEMPLATE_E2E_STAMP not updated (only a full run validates)."; return 0
+  fi
+  if ! grep -Eq '^[[:space:]]*skipped: 0[[:space:]]*$' "$log" || grep -Eq '^[[:space:]]*total: 0[[:space:]]*$' "$log"; then
+    rm -f "$log"; echo "Some template E2E tests were skipped or none ran; $TEMPLATE_E2E_STAMP not updated." >&2; return 1
+  fi
+  rm -f "$log"
+  dirty="$(git status --porcelain --untracked-files=all -- "${TEMPLATE_E2E_PATHS[@]}")"
+  if [ -n "$dirty" ]; then
+    echo "Green, but $TEMPLATE_E2E_STAMP not updated: uncommitted changes in template-affecting paths (commit them and run again):" >&2
+    printf '%s\n' "$dirty" >&2
+    return 0
+  fi
+  head="$(git rev-parse HEAD)"
+  mkdir -p "$(dirname "$TEMPLATE_E2E_STAMP")"
+  printf '%s\n' "$head" > "$TEMPLATE_E2E_STAMP"
+  echo "Template E2E validated at $head ($TEMPLATE_E2E_STAMP)."
+}
+
+# Sourced by the gate tests (tests/Maldex.Core.Tests/Build); only dispatch when executed.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-}" in
+    setup)  cmd_setup ;;
+    dev-db) cmd_dev_db ;;
+    test)   cmd_test ;;
+    run)    cmd_run ;;
+    smoke)  cmd_smoke ;;
+    build)  cmd_build ;;
+    real-setup) cmd_real_setup ;;
+    real-smoke) cmd_real_smoke ;;
+    agent) cmd_agent ;;
+    build-guest) cmd_build_guest ;;
+    prepare-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" deploy/guest/prepare-guest.sh prepare ;;
+    finalize-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" deploy/guest/prepare-guest.sh finalize ;;
+    discard-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" deploy/guest/prepare-guest.sh discard ;;
+    e2e)    cmd_e2e ;;
+    e2e-templates) cmd_e2e_templates "${2:-}" ;;
+    *) echo "usage: $0 setup|dev-db|run|test|smoke|build|agent|real-setup|real-smoke|build-guest|prepare-guest|finalize-guest|discard-guest|e2e|e2e-templates [test-filter]" >&2; exit 64 ;;
+  esac
+fi

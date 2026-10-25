@@ -24,6 +24,7 @@ public class DockerUserScriptTests : IDisposable
             "op=$1; shift; [ \"$1\" = DOCKER-USER ] && shift",
             "line=\"$*\"",
             "case \"$op\" in",
+            "  -S) while IFS= read -r r; do printf '%s\\n' \"-A DOCKER-USER $r\"; done < \"$RULES\" ;;",
             "  -C) grep -qxF -- \"$line\" \"$RULES\" ;;",
             "  -I) printf '%s\\n' \"$line\" >> \"$RULES\" ;;",
             "  -D) grep -qxF -- \"$line\" \"$RULES\" || exit 1; grep -vxF -- \"$line\" \"$RULES\" > \"$RULES.new\" || true; mv \"$RULES.new\" \"$RULES\" ;;",
@@ -41,11 +42,12 @@ public class DockerUserScriptTests : IDisposable
         File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
     }
 
-    private int Run(string iface, string? extraRule = null)
+    private int Run(string iface, string? extraRule = null, string? arg = null)
     {
         if (extraRule is not null) File.AppendAllText(Rules, extraRule + "\n");
         var psi = new ProcessStartInfo("sh") { RedirectStandardOutput = true, RedirectStandardError = true };
         psi.ArgumentList.Add(FindScript());
+        if (arg is not null) psi.ArgumentList.Add(arg);
         psi.Environment["PATH"] = _tmp + ":" + Environment.GetEnvironmentVariable("PATH");
         psi.Environment["RULES"] = Rules;
         psi.Environment["FAKE_IFACE"] = iface;
@@ -109,6 +111,45 @@ public class DockerUserScriptTests : IDisposable
     {
         Assert.NotEqual(0, Run(iface));
         Assert.Empty(Current());
+    }
+
+    [Fact]
+    public void Stop_RemovesExactlyTheTwoMaldexDirectRules_AndTheStateFile()
+    {
+        var foreign = "-s 1.2.3.4 -j DROP -m comment --comment other-maldex-direct-lookalike";
+        var lookalike = "-i mxu+ -o eth0 -m comment --comment maldex-direct -j DROP";
+        Assert.Equal(0, Run("eth0", foreign));
+        File.AppendAllText(Rules, lookalike + "\n");
+        Assert.Equal(0, Run("eth0", arg: "stop"));
+        Assert.Equal(new[] { foreign, lookalike }.Order(), Current().Order());
+        Assert.False(File.Exists(State));
+    }
+
+    [Fact]
+    public void Stop_WithoutAStateFile_StillRemovesTheStaleRulesOfAnotherInterface()
+    {
+        Assert.Equal(0, Run("eth0"));
+        File.Delete(State);
+        Assert.Equal(0, Run("wlan0", arg: "stop"));
+        Assert.Empty(Current());
+    }
+
+    [Fact]
+    public void Stop_WithNothingToRemove_Succeeds()
+    {
+        Assert.Equal(0, Run("eth0", arg: "stop"));
+        Assert.Empty(Current());
+    }
+
+    [Fact]
+    public void Start_WithoutAStateFile_RemovesStaleRulesOfAnotherInterface_ByExactTokens()
+    {
+        var foreign = "-s 1.2.3.4 -j DROP -m comment --comment maldex-direct";
+        var lookalike = "-i mxu+ -o eth0 -m comment --comment maldex-direct -j DROP";
+        var padded = "-i mxu+ -o eth0 -m comment --comment maldex-direct-x -j ACCEPT";
+        File.AppendAllText(Rules, string.Join('\n', foreign, lookalike, padded, string.Format(Out, "eth0"), string.Format(Back, "eth0")) + "\n");
+        Assert.Equal(0, Run("wlan0"));
+        Assert.Equal(new[] { foreign, lookalike, padded, string.Format(Out, "wlan0"), string.Format(Back, "wlan0") }.Order(), Current().Order());
     }
 
     [Fact]
