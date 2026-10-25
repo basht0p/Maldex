@@ -22,3 +22,7 @@ TestResults/
 node_modules/
 ui/dist/
 src/Maldex.Web/wwwroot/
+
+# Packaging output (./build.sh package)
+dist/
+packaging/stage/

@@ -49,6 +49,11 @@ cmd_test() {
   if [ -f ui/package.json ]; then
     npm --prefix ui test -- --run
   fi
+  local t
+  for t in packaging/tests/*.sh; do
+    echo "== $t"
+    bash "$t"
+  done
 }
 
 # The dev backend needs the SA password that `setup` wrote to .env (appsettings.Development.json carries no secret).
@@ -427,14 +432,117 @@ cmd_real_smoke() {
 
 # Publishes the guest agent (self-contained single-file win-x64) to .data/agent/Maldex.Agent.exe. Used by template sealing and the Build from ISO.
 cmd_agent() {
-  dotnet publish src/Maldex.Agent -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o "$PWD/.data/agent" --nologo -v q
-  [ -f .data/agent/Maldex.Agent.exe ] || { echo "Agent publish did not produce Maldex.Agent.exe" >&2; return 1; }
+  publish_agent "$PWD/.data/agent"
+}
+
+# The agent bundle into directory $1 (absolute): Maldex.Agent.exe plus Maldex.Agent.version.
+publish_agent() {
+  local out="$1"
+  dotnet publish src/Maldex.Agent -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o "$out" --nologo -v q
+  [ -f "$out/Maldex.Agent.exe" ] || { echo "Agent publish did not produce Maldex.Agent.exe" >&2; return 1; }
   # The agent reports "<version>+<12 hex of its exe>"; the hash half the host computes from the exe, the version half is
   # recorded here from the same project properties the exe was just compiled with (a Windows exe's file version is the .NET host's).
   local version
   version="$(dotnet msbuild src/Maldex.Agent -getProperty:Version -p:Configuration=Release -p:RuntimeIdentifier=win-x64 --nologo | head -n 1 | cut -d+ -f1 | tr -d '[:space:]')"
   [ -n "$version" ] || { echo "Could not read the agent version" >&2; return 1; }
-  printf '%s\n' "$version" > .data/agent/Maldex.Agent.version
+  printf '%s\n' "$version" > "$out/Maldex.Agent.version"
+}
+
+# nfpm builds the .deb and the .rpm (build time only), pinned by version and the SHA-256 of its release tarball
+# (github.com/goreleaser/nfpm, checksums.txt of the release), verified on every use.
+NFPM_VERSION="2.47.0"
+NFPM_SHA256="0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783"
+TOOLS_DIR=".data/tools"
+PKG_STAGE="packaging/stage"
+
+# Verifies the pinned nfpm tarball (downloading it once into $TOOLS_DIR) and extracts a fresh binary from it; prints its path.
+ensure_nfpm() {
+  local tarball="$TOOLS_DIR/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" dir="$TOOLS_DIR/nfpm-$NFPM_VERSION"
+  mkdir -p "$TOOLS_DIR"
+  fetch_cached "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+    "$tarball" "$NFPM_SHA256" >&2 || return 1
+  rm -rf "$dir"; mkdir -p "$dir"
+  tar -xzf "$tarball" -C "$dir" nfpm || return 1
+  echo "$PWD/$dir/nfpm"
+}
+
+# ./build.sh package [--stage-only] [version]: stage packaging/stage/ and build dist/maldex_<v>_amd64.deb and
+# dist/maldex-<v>-<release>.x86_64.rpm with nfpm. Without a version: 0.0.0~dev+<sha> (deb), 0.0.0 release 0.dev.<sha> (rpm).
+# --stage-only stops before nfpm (packaging/tests/check-package.sh --stage uses it).
+cmd_package() {
+  local stage_only=0 version="" arg sha deb_version rpm_version rpm_release
+  for arg in "$@"; do
+    case "$arg" in
+      --stage-only) stage_only=1 ;;
+      -*) echo "usage: $0 package [--stage-only] [version]" >&2; return 64 ;;
+      *) version="$arg" ;;
+    esac
+  done
+  if [ -z "$version" ]; then
+    sha="$(git rev-parse --short HEAD)"
+    deb_version="0.0.0~dev+$sha"; rpm_version="0.0.0"; rpm_release="0.dev.$sha"
+  else
+    # One string valid as a Debian upstream version and an rpm version: no '-', starts with a digit.
+    [[ "$version" =~ ^[0-9][A-Za-z0-9.+~]*$ ]] || { echo "package: version '$version' must match [0-9][A-Za-z0-9.+~]*" >&2; return 64; }
+    deb_version="$version"; rpm_version="$version"; rpm_release="1"
+  fi
+
+  local opt="$PKG_STAGE/opt/maldex"
+  rm -rf "$PKG_STAGE"
+  mkdir -p "$opt" "$PKG_STAGE/etc"
+
+  # 1-2. the SPA, then the self-contained web app (it hosts the SPA from wwwroot)
+  cmd_build_spa
+  # Stamped with the package version: Maldex.Web --version prints it (InformationalVersion, no +commit suffix appended);
+  # Version takes the numeric core (assembly and file versions accept only up to four numbers).
+  local core
+  core="$(grep -oE '^[0-9]+(\.[0-9]+){0,3}' <<<"$deb_version")"
+  dotnet publish src/Maldex.Web -c Release -r linux-x64 --self-contained -o "$PWD/$opt/app" --nologo -v q \
+    "-p:Version=$core" "-p:InformationalVersion=$deb_version" -p:IncludeSourceRevisionInInformationalVersion=false
+  [ -x "$opt/app/Maldex.Web" ] || { echo "package: the publish did not produce Maldex.Web" >&2; return 1; }
+  printf '%s\n' "$deb_version" > "$PKG_STAGE/VERSION"   # read by packaging/tests/check-package.sh
+  [ -f "$opt/app/appsettings.Package.json" ] || { echo "package: appsettings.Package.json is not in the publish output" >&2; return 1; }
+  [ -f "$opt/app/wwwroot/index.html" ] || { echo "package: the SPA is not in the publish output" >&2; return 1; }
+
+  # 3. the guest agent, as cmd_agent publishes it
+  publish_agent "$PWD/$opt/agent"
+
+  # 4. the pinned mitmproxy
+  local mitm_tgz="$TOOLS_DIR/mitmproxy-$MITMPROXY_VERSION-linux-x86_64.tar.gz"
+  mkdir -p "$TOOLS_DIR" "$opt/mitmproxy"
+  fetch_cached "https://downloads.mitmproxy.org/$MITMPROXY_VERSION/mitmproxy-$MITMPROXY_VERSION-linux-x86_64.tar.gz" \
+    "$mitm_tgz" "$MITMPROXY_SHA256"
+  # Only mitmdump: the app and maldex-setup run nothing else (mitmproxy and mitmweb would add about 100 MB).
+  tar -xzf "$mitm_tgz" -C "$opt/mitmproxy" --no-same-owner mitmdump
+  [ -x "$opt/mitmproxy/mitmdump" ] || { echo "package: the mitmproxy tarball has no mitmdump" >&2; return 1; }
+
+  # 5. bundled assets (tracked files only), the setup command and its library
+  git ls-files -z -- deploy rules | tar --null -T - -cf - | tar -xf - -C "$opt"
+  install -D -m 0755 packaging/bin/maldex-setup "$opt/bin/maldex-setup"
+  install -D -m 0644 packaging/lib/maldex-common.sh "$opt/lib/maldex-common.sh"
+  # The admin template, with RHEL 9's edk2-ovmf firmware paths for the .rpm.
+  sed -e 's#/usr/share/OVMF/OVMF_CODE_4M\.secboot\.fd#/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd#' \
+      -e 's#/usr/share/OVMF/OVMF_VARS_4M\.ms\.fd#/usr/share/edk2/ovmf/OVMF_VARS.secboot.fd#' \
+      packaging/etc/appsettings.Production.json > "$PKG_STAGE/etc/appsettings.Production.rpm.json"
+  if grep -q '/usr/share/OVMF/' "$PKG_STAGE/etc/appsettings.Production.rpm.json"; then
+    echo "package: the rpm config template still names an Ubuntu OVMF path" >&2; return 1
+  fi
+  # Packaged files are root-owned and not writable by group or others, whatever the build umask was.
+  chmod -R u+rwX,go+rX,go-w "$PKG_STAGE"
+
+  if [ "$stage_only" = 1 ]; then echo "Staged $PKG_STAGE (stage only)."; return 0; fi
+
+  # 6-7. nfpm
+  local nfpm deb rpm
+  nfpm="$(ensure_nfpm)"
+  mkdir -p dist
+  rm -f dist/maldex_*.deb dist/maldex-*.rpm
+  deb="dist/maldex_${deb_version}_amd64.deb"
+  rpm="dist/maldex-${rpm_version}-${rpm_release}.x86_64.rpm"
+  MALDEX_VERSION="$deb_version" MALDEX_RELEASE="" "$nfpm" package -f packaging/nfpm.yaml -p deb -t "$deb"
+  MALDEX_VERSION="$rpm_version" MALDEX_RELEASE="$rpm_release" "$nfpm" package -f packaging/nfpm.yaml -p rpm -t "$rpm"
+  [ -f "$deb" ] && [ -f "$rpm" ] || { echo "package: nfpm did not write $deb and $rpm" >&2; return 1; }
+  echo "Built $deb and $rpm"
 }
 
 # build-guest, prepare-guest, finalize-guest and discard-guest are retired: the app builds and edits templates.
@@ -624,10 +732,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     real-setup) cmd_real_setup ;;
     real-smoke) cmd_real_smoke ;;
     agent) cmd_agent ;;
+    package) shift; cmd_package "$@" ;;
     build-guest|prepare-guest|finalize-guest|discard-guest) cmd_retired ;;
     e2e)    cmd_e2e ;;
     e2e-templates) cmd_e2e_templates "${2:-}" ;;
     e2e-build-acceptance) cmd_e2e_build_acceptance ;;
-    *) echo "usage: $0 setup|dev-db|run|test|smoke|build|agent|real-setup|real-smoke|e2e|e2e-templates [test-filter]|e2e-build-acceptance" >&2; exit 64 ;;
+    *) echo "usage: $0 setup|dev-db|run|test|smoke|build|agent|package [--stage-only] [version]|real-setup|real-smoke|e2e|e2e-templates [test-filter]|e2e-build-acceptance" >&2; exit 64 ;;
   esac
 fi

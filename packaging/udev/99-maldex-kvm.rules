@@ -1,0 +1,2 @@
+# Installed by the maldex package: /dev/kvm is usable by the kvm group (the maldex service user is a member).
+KERNEL=="kvm", GROUP="kvm", MODE="0660", OPTIONS+="static_node=kvm"
