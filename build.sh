@@ -564,7 +564,12 @@ TEMPLATE_E2E_PATHS=(
   src/Maldex.Infrastructure/Isolation/
   src/Maldex.Web/Endpoints/TemplateEndpoints.cs
   src/Maldex.Web/Endpoints/GuacamoleTunnelEndpoint.cs
-  deploy/guest/provision/sysmon-config.xml
+  src/Maldex.Web/Endpoints/MediaEndpoints.cs
+  src/Maldex.Core/Media/
+  src/Maldex.Infrastructure/Media/
+  src/Maldex.Orchestrator/Media/
+  deploy/guest/provision/
+  deploy/guest/autounattend/
   deploy/host/
   src/Maldex.Orchestrator/SelfTestGate.cs
   src/Maldex.Orchestrator/TransferInbox.cs
@@ -578,6 +583,7 @@ TEMPLATE_E2E_PATHS=(
   tests/Maldex.Integration.Tests/E2E/RealGuestDiskEditorTests.cs
   tests/Maldex.Integration.Tests/E2E/RealVmE2ETests.cs
   tests/Maldex.Integration.Tests/E2E/ProvenanceRoundTrips.cs
+  tests/Maldex.Integration.Tests/E2E/RealTemplateBuildTests.cs
 )
 TEMPLATE_E2E_STAMP=".data/e2e-templates.validated"
 
@@ -613,9 +619,9 @@ template_e2e_gate_notice() {
   local out answer
   out="$(template_e2e_check)" || return 0
   echo
-  echo "NOTE: the real template E2E (RealTemplateJobTests, RealGuestDiskEditorTests) is due; plain e2e does not run it."
+  echo "NOTE: the real template E2E (RealTemplateJobTests, RealGuestDiskEditorTests, RealTemplateBuildTests) is due; plain e2e does not run it."
   printf '%s\n' "$out"
-  echo "Run it with: ./build.sh e2e-templates"
+  echo "Run it with: MALDEX_WIN_ISO=/path/to/win11.iso ./build.sh e2e-templates"
   if [ -t 0 ] && [ -t 1 ]; then
     read -r -p "run ./build.sh e2e-templates now? [y/N] " answer || answer=""
     case "$answer" in y|Y|yes|YES) cmd_e2e_templates ;; esac
@@ -641,17 +647,30 @@ cmd_e2e() {
   return "$rc"
 }
 
-# The real template-job E2E (Refresh, Edit with Direct network, Roll back, guest disk editor): up to about two hours, so it runs
-# only when affecting code changed. A full green run records HEAD in $TEMPLATE_E2E_STAMP. Optional $1: one test (method-name part).
+# The Build-from-ISO E2E targets need installer media: $1 names the target in the refusal. Makes MALDEX_WIN_ISO absolute.
+require_win_iso() {
+  if [ -z "${MALDEX_WIN_ISO:-}" ] || [ ! -f "${MALDEX_WIN_ISO:-}" ]; then
+    echo "$1: MALDEX_WIN_ISO must point to a Windows 11 x64 installer ISO to build a template from (got: '${MALDEX_WIN_ISO:-}')." >&2
+    return 2
+  fi
+  MALDEX_WIN_ISO="$(realpath -- "$MALDEX_WIN_ISO")"
+  export MALDEX_WIN_ISO
+}
+
+# The real template-job E2E (Refresh, Edit with Direct network, Roll back, guest disk editor, Build from MALDEX_WIN_ISO): about two
+# to three hours, so it runs only when affecting code changed. A full green run records HEAD in $TEMPLATE_E2E_STAMP. It refuses
+# without MALDEX_WIN_ISO (the Build test would only skip, and a skip never validates). Optional $1: one test (method-name part).
 cmd_e2e_templates() {
   local filter="${1:-}" log rc=0 head dirty
+  require_win_iso e2e-templates || return $?
   require_base_image || return $?
   case "$filter" in *[!A-Za-z0-9_.*]*) echo "e2e-templates: the filter may contain only letters, digits, _ . and *" >&2; return 64 ;; esac
   if [ ! -f .data/agent/Maldex.Agent.exe ] || [ ! -f .data/agent/Maldex.Agent.version ]; then
     echo "The guest agent build is missing; running ./build.sh agent first."
     cmd_agent
   fi
-  local args=(--project tests/Maldex.Integration.Tests --filter-class "*RealTemplateJobTests" --filter-class "*RealGuestDiskEditorTests")
+  local args=(--project tests/Maldex.Integration.Tests --filter-class "*RealTemplateJobTests" --filter-class "*RealGuestDiskEditorTests"
+    --filter-class "*RealTemplateBuildTests")
   [ -z "$filter" ] || args+=(--filter-method "*$filter*")
   log="$(mktemp)"
   MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 MALDEX_REAL_TEMPLATES=1 dotnet test "${args[@]}" 2>&1 | tee "$log" || rc=$?
@@ -675,6 +694,28 @@ cmd_e2e_templates() {
   echo "Template E2E validated at $head ($TEMPLATE_E2E_STAMP)."
 }
 
+# Interactive acceptance of a Build from MALDEX_WIN_ISO (RealTemplateBuildAcceptanceTests; a person runs it, it is never part of
+# e2e-templates and never writes the stamp). The web host listens on localhost:5080 only (DevAuth): open it through an SSH forward
+# (ssh -L 5080:localhost:5080 <user>@<host>), turn off Tamper Protection and Defender in the job's console and press Seal.
+cmd_e2e_build_acceptance() {
+  local rc=0
+  require_win_iso e2e-build-acceptance || return $?
+  require_base_image || return $?
+  if port_5080_busy; then echo "e2e-build-acceptance: something is already listening on :5080; stop it first." >&2; return 1; fi
+  if [ ! -f .data/agent/Maldex.Agent.exe ] || [ ! -f .data/agent/Maldex.Agent.version ]; then
+    echo "The guest agent build is missing; running ./build.sh agent first."
+    cmd_agent
+  fi
+  cmd_build_spa   # the job page and its console are the hosted SPA
+  trap stop_guacd EXIT INT TERM
+  MALDEX_MODE=Real start_guacd
+  MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 MALDEX_REAL_TEMPLATES=1 MALDEX_E2E_INTERACTIVE=1 \
+    dotnet test --project tests/Maldex.Integration.Tests --filter-class "*RealTemplateBuildAcceptanceTests" || rc=$?
+  stop_guacd
+  trap - EXIT INT TERM
+  return "$rc"
+}
+
 # Sourced by the gate tests (tests/Maldex.Core.Tests/Build); only dispatch when executed.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
@@ -693,6 +734,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     discard-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" deploy/guest/prepare-guest.sh discard ;;
     e2e)    cmd_e2e ;;
     e2e-templates) cmd_e2e_templates "${2:-}" ;;
-    *) echo "usage: $0 setup|dev-db|run|test|smoke|build|agent|real-setup|real-smoke|build-guest|prepare-guest|finalize-guest|discard-guest|e2e|e2e-templates [test-filter]" >&2; exit 64 ;;
+    e2e-build-acceptance) cmd_e2e_build_acceptance ;;
+    *) echo "usage: $0 setup|dev-db|run|test|smoke|build|agent|real-setup|real-smoke|build-guest|prepare-guest|finalize-guest|discard-guest|e2e|e2e-templates [test-filter]|e2e-build-acceptance" >&2; exit 64 ;;
   esac
 fi

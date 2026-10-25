@@ -200,4 +200,42 @@ public class TemplateE2EGateTests : IDisposable
         Assert.DoesNotContain("missing:", output);
         Assert.DoesNotContain("count=0", output);
     }
+
+    /// <summary>The Build-from-ISO code is watched too: a change to it makes the real template E2E due.</summary>
+    [Fact]
+    public void TheRealWatchedPaths_CoverTheBuildFromIsoCode()
+    {
+        var root = Path.GetDirectoryName(BuildSh())!;
+        var (code, output) = Bash($"source '{BuildSh()}'; printf '%s\\n' \"${{TEMPLATE_E2E_PATHS[@]}}\"", root);
+        Assert.Equal(0, code);
+        var paths = output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        foreach (var expected in new[]
+                 {
+                     "src/Maldex.Core/Media/", "src/Maldex.Infrastructure/Media/", "src/Maldex.Orchestrator/Media/",
+                     "src/Maldex.Web/Endpoints/MediaEndpoints.cs", "deploy/guest/provision/", "deploy/guest/autounattend/",
+                     "tests/Maldex.Integration.Tests/E2E/RealTemplateBuildTests.cs",
+                 })
+            Assert.Contains(expected, paths);
+        // The whole provisioning directory replaces the single Sysmon config entry.
+        Assert.DoesNotContain("deploy/guest/provision/sysmon-config.xml", paths);
+    }
+
+    // ---- the ISO requirement of the real Build targets ---------------------------------------------------------------
+
+    /// <summary>The Build E2E would only skip without installer media, and a skip never writes the stamp: refuse up front.</summary>
+    [Theory]
+    [InlineData("cmd_e2e_templates", "")]
+    [InlineData("cmd_e2e_templates", "/nonexistent/win11.iso")]
+    [InlineData("cmd_e2e_build_acceptance", "")]
+    [InlineData("cmd_e2e_build_acceptance", "/nonexistent/win11.iso")]
+    public void TheRealBuildTargets_RefuseWithoutAnInstallerIso(string target, string iso)
+    {
+        // Everything else is in place (a stand-in base image), so the ISO is the only reason to refuse.
+        Write(".data/vm/base/win11-26h2.qcow2", "");
+        Write(".data/vm/base/win11-26h2.vars.fd", "");
+        var (code, output) = Bash($"source '{BuildSh()}'; cd '{_repo}'; export MALDEX_WIN_ISO='{iso}'; {target}");
+        Assert.Equal(2, code);
+        Assert.Contains("MALDEX_WIN_ISO must point to", output);
+        Assert.DoesNotContain("dotnet", output); // refused before anything was built or run
+    }
 }
