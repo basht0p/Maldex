@@ -16,7 +16,7 @@ const dto = { id: 'job-1', state: 'Queued' } as TemplateJobDto
 class FlakyHub implements HubConnectionLike {
   joins = 0
   failJoins = 0
-  on() {}
+  on(_name: string, _cb: (...args: never[]) => void) {}
   onreconnecting() {}
   onreconnected() {}
   onclose() {}
@@ -71,5 +71,28 @@ describe('useTemplateJobLive retry', () => {
     unmount()
     await wait(120000)
     expect(hub.joins).toBe(5)
+  })
+})
+
+describe('useTemplateJobLive merge', () => {
+  const step = (state: string, n: number) => ({ state, at: `2026-10-24T10:0${n}:00Z`, message: null })
+
+  it('keeps held steps and the requester when a push has none, and takes longer histories', async () => {
+    let push!: (d: TemplateJobDto) => void
+    class PushHub extends FlakyHub {
+      on(name: string, cb: (...args: never[]) => void) { if (name === 'templateJob') push = cb as unknown as typeof push }
+    }
+    getTemplateJob.mockResolvedValue({ id: 'job-1', state: 'Configuring', requestedByName: 'Ada', steps: [step('Preparing', 1), step('Installing', 2), step('Configuring', 3)] })
+    const { result } = renderHook(() => useTemplateJobLive('job-1', () => new PushHub()))
+    await settle()
+    expect(result.current.job?.steps).toHaveLength(3)
+    act(() => push({ id: 'job-1', state: 'Sealing', message: 'm', requestedByName: null } as TemplateJobDto))
+    expect(result.current.job?.state).toBe('Sealing')
+    expect(result.current.job?.steps).toHaveLength(3)
+    expect(result.current.job?.requestedByName).toBe('Ada')
+    act(() => push({ id: 'job-1', state: 'Sealing', steps: [step('Preparing', 1)] } as TemplateJobDto))
+    expect(result.current.job?.steps).toHaveLength(3)
+    act(() => push({ id: 'job-1', state: 'Verifying', steps: [step('a', 1), step('b', 2), step('c', 3), step('d', 4)] } as TemplateJobDto))
+    expect(result.current.job?.steps).toHaveLength(4)
   })
 })
