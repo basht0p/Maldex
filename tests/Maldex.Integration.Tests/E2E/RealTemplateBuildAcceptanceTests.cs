@@ -34,6 +34,8 @@ public sealed class RealTemplateBuildAcceptanceTests(SqlServerFixture sql, ITest
             var v1 = (await run.TemplateAsync(RealBuildHarness.BaseTemplateId)).GetProperty("current").GetProperty("id").GetGuid();
             var media = await run.FetchIsoAsync();
             var job = await run.StartBuildAsync(RealBuildHarness.BaseTemplateId, "Windows 11 26H2", media, publish: true);
+            // DevAuth makes every caller an Admin: the app must listen on loopback only, never on the LAN.
+            AssertListensOnLoopbackOnly(Port);
             var page = $"http://localhost:{Port}/admin/template-jobs/{job}";
             run.Progress($"the job page: {page} (forward first: {SshForward})");
 
@@ -71,5 +73,14 @@ public sealed class RealTemplateBuildAcceptanceTests(SqlServerFixture sql, ITest
                 run.Progress($"analysis {name} on v2 passed");
             }
         }, port: Port);
+    }
+
+    private static void AssertListensOnLoopbackOnly(int port)
+    {
+        var listeners = System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners()
+            .Where(e => e.Port == port).ToList();
+        Assert.NotEmpty(listeners);
+        Assert.All(listeners, e => Assert.True(System.Net.IPAddress.IsLoopback(e.Address),
+            $"the acceptance app listens on {e} — it must be loopback only (DevAuth)"));
     }
 }
