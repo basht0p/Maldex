@@ -52,7 +52,7 @@ public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactor
             // One budget for "ready" and "provenance" together.
             using var budget = new CancellationTokenSource(o.VerifyTimeout, time);
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, budget.Token);
-            ProvenanceMessage p;
+            SettledProvenance settled;
             try
             {
                 try
@@ -67,7 +67,8 @@ public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactor
                 try
                 {
                     // Resent until answered: a request sent while the agent reconnects is lost (as for the sealer and the job's check).
-                    p = await session.AskProvenanceWithRetryAsync(o.ProvenanceRetryInterval, o.VerifyTimeout, time, linked.Token).ConfigureAwait(false);
+                    // Read over the settle window: right after this boot Defender briefly reports real-time protection off.
+                    settled = await session.AskSettledProvenanceAsync(o, o.VerifyTimeout, time, linked.Token).ConfigureAwait(false);
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested && (ex is TimeoutException || budget.IsCancellationRequested))
                 {
@@ -79,11 +80,12 @@ public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactor
                 throw new TemplateVerifyException($"provenance check failed: {ex.Message}");
             }
 
+            var p = settled.First;
+            var rtp = settled.RealTimeProtectionEnabled;
             if (p.AgentVersion != b.AgentBuildId) throw new TemplateVerifyException("the sealed agent is not the current build");
-            if (p.RealTimeProtectionEnabled == true) throw new TemplateVerifyException("Defender real-time protection is on; turn it off in an Edit session");
+            if (rtp == true) throw new TemplateVerifyException("Defender real-time protection is on; turn it off in an Edit session");
 
-            return new VerifiedProvenance(p.WindowsEdition, p.WindowsBuild, p.AgentVersion, p.OfficePresent, p.RealTimeProtectionEnabled,
-                p.RealTimeProtectionEnabled is null ? DefenderUnreadableNote : null);
+            return new VerifiedProvenance(p.WindowsEdition, p.WindowsBuild, p.AgentVersion, p.OfficePresent, rtp, rtp is null ? DefenderUnreadableNote : null);
         }
         finally
         {

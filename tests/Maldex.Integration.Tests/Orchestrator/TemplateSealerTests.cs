@@ -27,6 +27,7 @@ internal sealed class TemplateJobKit : IAsyncDisposable
         ApplyComponentsTimeout = TimeSpan.FromSeconds(10),
         ChunkTimeout = TimeSpan.FromSeconds(10),
         PollInterval = TimeSpan.FromMilliseconds(10),
+        DefenderSettleWindow = TimeSpan.Zero, // one Defender reading; the settle tests set the window they are about
     };
     public ComponentBundle Bundle { get; } = MakeBundle();
     public List<ReplayAgentChannel> Channels { get; } = [];

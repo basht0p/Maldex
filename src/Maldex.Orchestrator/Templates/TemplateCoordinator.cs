@@ -592,8 +592,9 @@ public sealed class TemplateCoordinator(
     private const string DefenderCheckFailed = "the guest agent did not answer the Defender check; not sealing";
 
     /// <summary>
-    /// The pre-seal Defender check: one provenance round trip on a fresh channel (no ready wait, R25), closed again afterwards.
-    /// Returns the guest's real-time protection state (null: unreadable). No answer or a refusal fails the job.
+    /// The pre-seal Defender check: provenance readings over <see cref="TemplateJobOptions.DefenderSettleWindow"/> on a fresh channel
+    /// (no ready wait, R25), closed again afterwards. Returns the guest's settled real-time protection state (on if any reading says
+    /// on; null: unreadable). No successful reading fails the job.
     /// </summary>
     private async Task<bool?> DefenderCheckAsync(VmHandle vm, Guid jobId, TemplateJobOptions o, CancellationToken ct)
     {
@@ -617,8 +618,8 @@ public sealed class TemplateCoordinator(
             await using var session = new GuestSession(channel);
             try
             {
-                var answer = await session.AskProvenanceWithRetryAsync(o.ProvenanceRetryInterval, o.ProvenanceTimeout, time, ct).ConfigureAwait(false);
-                return answer.RealTimeProtectionEnabled;
+                var settled = await session.AskSettledProvenanceAsync(o, o.ProvenanceTimeout, time, ct).ConfigureAwait(false);
+                return settled.RealTimeProtectionEnabled;
             }
             catch (Exception) when (ct.IsCancellationRequested)
             {

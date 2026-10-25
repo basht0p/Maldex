@@ -6,6 +6,53 @@ using Xunit;
 
 namespace Maldex.Integration.Tests.Orchestrator;
 
+/// <summary>What a scripted guest reports for real-time protection at one reading (<see cref="DefenderScriptChannel"/>).</summary>
+internal enum DefenderReading { Off, On, Unknown, Refused }
+
+/// <summary>
+/// A channel whose provenance answers report real-time protection as <paramref name="script"/> says for the time since its first
+/// provenance answer (on <paramref name="time"/>; so the readings are scripted, not how long the boot took), as a guest whose Defender
+/// is still settling after boot; <c>Refused</c> turns the answer into a refusal. Every rewritten answer's time is recorded.
+/// </summary>
+internal sealed class DefenderScriptChannel(IAgentChannel inner, TimeProvider time, Func<TimeSpan, DefenderReading> script) : IAgentChannel
+{
+    private DateTimeOffset? _first;
+    private readonly List<TimeSpan> _readings = [];
+
+    /// <summary>When (since the first one) each provenance answer was read.</summary>
+    public IReadOnlyList<TimeSpan> Readings { get { lock (_readings) return _readings.ToList(); } }
+
+    public int Violations => inner.Violations;
+    public Task SendAsync(AgentCommand command, CancellationToken ct) => inner.SendAsync(command, ct);
+    public ValueTask DisposeAsync() => inner.DisposeAsync();
+
+    public async IAsyncEnumerable<AgentMessage> ReadAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+    {
+        await foreach (var m in inner.ReadAsync(ct))
+        {
+            if (m is not ProvenanceMessage p)
+            {
+                yield return m;
+                continue;
+            }
+            TimeSpan at;
+            lock (_readings)
+            {
+                _first ??= time.GetUtcNow();
+                at = time.GetUtcNow() - _first.Value;
+                _readings.Add(at);
+            }
+            yield return script(at) switch
+            {
+                DefenderReading.Off => p with { RealTimeProtectionEnabled = false },
+                DefenderReading.On => p with { RealTimeProtectionEnabled = true },
+                DefenderReading.Unknown => p with { RealTimeProtectionEnabled = null },
+                _ => new CommandResultMessage(p.CommandId, false, "the Defender query failed"),
+            };
+        }
+    }
+}
+
 public class TemplateVerifierTests
 {
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
@@ -127,9 +174,107 @@ public class TemplateVerifierTests
         }
     }
 
-    private static TemplateVerifier VerifierWith(TemplateJobKit kit, IHypervisor hypervisor, IAgentChannelFactory channels, IEgressRouter egress) =>
+    private static TemplateVerifier VerifierWith(TemplateJobKit kit, IHypervisor hypervisor, IAgentChannelFactory channels, IEgressRouter egress, TimeProvider? time = null) =>
         new(hypervisor, channels, egress, Microsoft.Extensions.Options.Options.Create(new OrchestratorOptions()), Microsoft.Extensions.Options.Options.Create(kit.Options),
-            Microsoft.Extensions.Options.Options.Create(new Maldex.Infrastructure.Net.NetOptions { RunDir = kit.RunDir }), TimeProvider.System);
+            Microsoft.Extensions.Options.Options.Create(new Maldex.Infrastructure.Net.NetOptions { RunDir = kit.RunDir }), time ?? TimeProvider.System);
+
+    /// <summary>Opens the kit's channels through a <see cref="DefenderScriptChannel"/> and remembers the last one.</summary>
+    private sealed class ScriptedChannels(TemplateJobKit kit, Func<TimeSpan, DefenderReading> script) : IAgentChannelFactory
+    {
+        public DefenderScriptChannel? Last { get; private set; }
+
+        public async Task<IAgentChannel> ConnectAsync(VmHandle vm, CancellationToken ct) =>
+            Last = new DefenderScriptChannel(await kit.ChannelFactory.ConnectAsync(vm, ct), kit.Time, script);
+    }
+
+    /// <summary>A verification on the fake clock with the default settle window (60 s, a reading every 5 s) and a scripted Defender.</summary>
+    private static (TemplateJobKit Kit, ScriptedChannels Channels, Task<VerifiedProvenance> Run) VerifyScripted(Func<TimeSpan, DefenderReading> script)
+    {
+        var kit = Kit();
+        kit.UseFakeClock();
+        var defaults = new TemplateJobOptions();
+        kit.Options.DefenderSettleWindow = defaults.DefenderSettleWindow;
+        kit.Options.DefenderSettleInterval = defaults.DefenderSettleInterval;
+        var channels = new ScriptedChannels(kit, script);
+        var egress = new Maldex.Infrastructure.Fakes.NoopEgressRouter(Microsoft.Extensions.Options.Options.Create(new Maldex.Infrastructure.Fakes.FakeEgressOptions()), kit.Guest);
+        var run = VerifierWith(kit, kit.Hypervisor, channels, egress, kit.Time).VerifyAsync("win11-v3", kit.Bundle, Ct);
+        return (kit, channels, run);
+    }
+
+    [Fact]
+    public async Task Verify_RealTimeProtectionTurningOnWithinTheSettleWindow_Fails()
+    {
+        // Right after boot Defender reads off, off, then on: the first reading alone would pass an image whose Defender is on.
+        var (kit, _, run) = VerifyScripted(at => at < TimeSpan.FromSeconds(8) ? DefenderReading.Off : DefenderReading.On);
+        await using var _ = kit;
+
+        var ex = await Assert.ThrowsAsync<TemplateVerifyException>(() => kit.PumpAsync(run));
+
+        Assert.Equal("Defender real-time protection is on; turn it off in an Edit session", ex.Message);
+        Assert.Empty(await kit.Hypervisor.ListAsync(Ct));
+    }
+
+    [Fact]
+    public async Task Verify_RealTimeProtectionOffThroughoutTheWindow_Passes_AfterReadingEveryFiveSecondsForAMinute()
+    {
+        Assert.Equal((TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(5)), (new TemplateJobOptions().DefenderSettleWindow, new TemplateJobOptions().DefenderSettleInterval));
+        var (kit, channels, run) = VerifyScripted(_ => DefenderReading.Off);
+        await using var _ = kit;
+
+        var p = await kit.PumpAsync(run);
+
+        Assert.Equal((false, (string?)null), (p.RealTimeProtectionEnabled, p.Note));
+        var readings = channels.Last!.Readings;
+        Assert.True(readings.Count >= 13, $"only {readings.Count} readings");
+        Assert.InRange(readings[^1], TimeSpan.FromSeconds(59), TimeSpan.FromSeconds(70)); // the window is read to its end, and no further
+    }
+
+    [Fact]
+    public async Task Verify_AFailedReadingMidWindow_IsSkipped_AndTheLaterReadingsStillCount()
+    {
+        // Off, then a failed reading, then on: the failure neither fails the check nor ends the readings.
+        var (kit, _, run) = VerifyScripted(at =>
+            at < TimeSpan.FromSeconds(4) ? DefenderReading.Off : at < TimeSpan.FromSeconds(8) ? DefenderReading.Refused : DefenderReading.On);
+        await using var _ = kit;
+
+        var ex = await Assert.ThrowsAsync<TemplateVerifyException>(() => kit.PumpAsync(run));
+
+        Assert.Equal("Defender real-time protection is on; turn it off in an Edit session", ex.Message);
+    }
+
+    [Fact]
+    public async Task Verify_AFailedFirstReading_IsSkipped_AndTheOtherChecksUseTheFirstSuccessfulOne()
+    {
+        var (kit, _, run) = VerifyScripted(at => at < TimeSpan.FromSeconds(4) ? DefenderReading.Refused : DefenderReading.Off);
+        await using var _ = kit;
+
+        var p = await kit.PumpAsync(run);
+
+        Assert.Equal((kit.Bundle.AgentBuildId, (bool?)false, (string?)null), (p.AgentVersion, p.RealTimeProtectionEnabled, p.Note));
+    }
+
+    [Fact]
+    public async Task Verify_UnreadableAtFirst_ThenOff_IsOff_WithoutTheNote()
+    {
+        var (kit, _, run) = VerifyScripted(at => at < TimeSpan.FromSeconds(8) ? DefenderReading.Unknown : DefenderReading.Off);
+        await using var _ = kit;
+
+        var p = await kit.PumpAsync(run);
+
+        Assert.Equal(((bool?)false, (string?)null), (p.RealTimeProtectionEnabled, p.Note));
+    }
+
+    [Fact]
+    public async Task Verify_EveryReadingFails_FailsTheVerification()
+    {
+        var (kit, _, run) = VerifyScripted(_ => DefenderReading.Refused);
+        await using var _ = kit;
+
+        var ex = await Assert.ThrowsAsync<TemplateVerifyException>(() => kit.PumpAsync(run));
+
+        Assert.StartsWith("provenance check failed", ex.Message);
+        Assert.Empty(await kit.Hypervisor.ListAsync(Ct));
+    }
 
     [Fact]
     public async Task Verify_AFailingChannelClose_StillDestroysTheVm_AndReleasesTheLease_AndKeepsTheResult()

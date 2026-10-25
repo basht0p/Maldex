@@ -88,6 +88,9 @@ internal sealed class SilenceableChannels(IAgentChannelFactory inner, FakeGuest 
     public int DropOnConnections { get => _dropConnections; set => _dropConnections = value; }
     private int _dropConnections = int.MaxValue;
 
+    /// <summary>Wraps each channel opened from now on (say, to script the guest's Defender readings).</summary>
+    public Func<VmHandle, IAgentChannel, IAgentChannel>? Wrap { get; set; }
+
     private readonly List<(Guid TaskId, ReplayAgentChannel Channel)> _opened = [];
 
     /// <summary>The commands sent on every channel opened to the VM of <paramref name="taskId"/>.</summary>
@@ -102,7 +105,8 @@ internal sealed class SilenceableChannels(IAgentChannelFactory inner, FakeGuest 
         if (Silent?.Invoke(vm) == true) return new ReplayAgentChannel([], 1, holdOpen: true, time, guest, vm.TaskId);
         var channel = await inner.ConnectAsync(vm, ct);
         if (channel is ReplayAgentChannel replay) lock (_opened) _opened.Add((vm.TaskId, replay));
-        return DropProvenanceRequests > 0 && Interlocked.Decrement(ref _dropConnections) >= 0 ? new ReconnectGapChannel((ReplayAgentChannel)channel, DropProvenanceRequests) : channel;
+        var result = DropProvenanceRequests > 0 && Interlocked.Decrement(ref _dropConnections) >= 0 ? new ReconnectGapChannel((ReplayAgentChannel)channel, DropProvenanceRequests) : channel;
+        return Wrap is { } wrap ? wrap(vm, result) : result;
     }
 }
 
@@ -169,6 +173,8 @@ internal sealed class TemplateJobRig : IAsyncDisposable
             // Long enough that only a test's own cancel ends a silent guest's wait.
             ["Maldex:Templates:Jobs:AgentReadyTimeout"] = "01:00:00",
             ["Maldex:Templates:Jobs:VerifyTimeout"] = "01:00:00",
+            // One Defender reading per check; the settle tests set the window they are about.
+            ["Maldex:Templates:Jobs:DefenderSettleWindow"] = "00:00:00",
         };
         foreach (var (k, v) in extra ?? new Dictionary<string, string?>()) settings[k] = v;
 
@@ -1430,6 +1436,67 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         await TemplateCoordinatorBuildTests.DefenderStillOnThenOffAsync(rig, publisher, id, run);
 
         Assert.Equal(2, (await rig.VersionsAsync()).Count);
+    }
+
+    /// <summary>An Edit job on the default Defender settle window (60 s, a reading every 5 s), in Configuring.</summary>
+    private async Task<(TemplateJobRig Rig, Guid Id, Task Run)> ConfiguringWithSettleWindowAsync()
+    {
+        var defaults = new TemplateJobOptions();
+        var rig = await TemplateJobRig.CreateAsync(sql, new Dictionary<string, string?>
+        {
+            ["Maldex:Templates:Jobs:DefenderSettleWindow"] = defaults.DefenderSettleWindow.ToString(),
+            ["Maldex:Templates:Jobs:DefenderSettleInterval"] = defaults.DefenderSettleInterval.ToString(),
+        });
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit);
+        var run = rig.Start(id);
+        await rig.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+        return (rig, id, run);
+    }
+
+    [Fact]
+    public async Task Seal_DefenderTurningOnWithinTheSettleWindow_IsRefused()
+    {
+        var (rig, id, run) = await ConfiguringWithSettleWindowAsync();
+        await using var _ = rig;
+        // The check's guest reads off, off, then on (Defender settling after boot): one reading would seal it with Defender on.
+        rig.Channels.Wrap = (vm, ch) => vm.TaskId == id
+            ? new DefenderScriptChannel(ch, rig.H.Time, at => at < TimeSpan.FromSeconds(8) ? DefenderReading.Off : DefenderReading.On)
+            : ch;
+
+        await rig.RequestSealAsync(id);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while ((await rig.JobAsync(id)).SealRequestedAt is not null)
+        {
+            Assert.False(run.IsCompleted, $"the job ended ({(await rig.JobAsync(id)).State}) instead of refusing the seal");
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(60), "the seal request was never answered");
+            rig.H.Time.Advance(TimeSpan.FromMilliseconds(50));
+            await Task.Delay(1, Ct);
+        }
+
+        var job = await rig.JobAsync(id);
+        Assert.Equal((TemplateJobState.Configuring, TemplateCoordinator.DefenderStillOn), (job.State, job.Message));
+        Assert.Empty(rig.Guest.AppliedComponentIds);
+        Assert.Empty(rig.Store.Sealed);
+        await rig.RequestCancelAsync(id);
+        await rig.PumpAsync(run);
+    }
+
+    [Fact]
+    public async Task Seal_DefenderOffThroughoutTheWindow_DespiteAFailedReading_Seals()
+    {
+        var (rig, id, run) = await ConfiguringWithSettleWindowAsync();
+        await using var _ = rig;
+        DefenderScriptChannel? check = null;
+        rig.Channels.Wrap = (vm, ch) => vm.TaskId == id && check is null
+            ? check = new DefenderScriptChannel(ch, rig.H.Time,
+                at => at >= TimeSpan.FromSeconds(4) && at < TimeSpan.FromSeconds(8) ? DefenderReading.Refused : DefenderReading.Off)
+            : ch;
+
+        await rig.RequestSealAsync(id);
+        await rig.PumpAsync(run);
+
+        Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
+        Assert.True(check!.Readings.Count >= 13, $"the check took only {check.Readings.Count} readings");
     }
 
     [Fact]

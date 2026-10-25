@@ -25,6 +25,14 @@ public sealed class TemplateJobOptions
     /// 1-10 s, and a request sent in that gap is lost (QEMU does not hold it).
     /// </summary>
     public TimeSpan ProvenanceRetryInterval { get; set; } = TimeSpan.FromSeconds(3);
+    /// <summary>
+    /// How long the Defender checks (before a seal, and the verification boot) keep reading real-time protection. Right after a boot
+    /// Defender briefly reports it off before it settles on, so one reading is not enough: any "on" within the window counts.
+    /// Zero takes a single reading.
+    /// </summary>
+    public TimeSpan DefenderSettleWindow { get; set; } = TimeSpan.FromSeconds(60);
+    /// <summary>How often real-time protection is read within <see cref="DefenderSettleWindow"/>.</summary>
+    public TimeSpan DefenderSettleInterval { get; set; } = TimeSpan.FromSeconds(5);
     /// <summary>How long the coordinator waits for the open consoles of a job to close once a seal is requested, before sealing anyway.</summary>
     public TimeSpan ConsoleCloseTimeout { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan ConfigureIdleTimeout { get; set; } = TimeSpan.FromHours(2);

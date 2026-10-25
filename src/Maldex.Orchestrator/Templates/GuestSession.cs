@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.ExceptionServices;
 using System.Threading.Channels;
 using Maldex.Core.Abstractions;
 using Maldex.Core.Agent;
@@ -103,6 +104,48 @@ internal sealed class GuestSession : IAsyncDisposable
     }
 
     /// <summary>
+    /// Reads Defender's real-time protection until it has settled (right after a boot it briefly reads off before it turns on):
+    /// a provenance reading (<see cref="AskProvenanceWithRetryAsync"/>, each bounded by <paramref name="timeout"/>) every
+    /// <see cref="TemplateJobOptions.DefenderSettleInterval"/> over <see cref="TemplateJobOptions.DefenderSettleWindow"/>. The state
+    /// is on if any reading says on (the readings stop there), else off if any says off, else null (unreadable). A failed reading
+    /// is skipped while others succeed.
+    /// </summary>
+    /// <returns>The first successful reading (for the other checks) and the settled state.</returns>
+    /// <exception cref="TimeoutException">No reading succeeded, the last one timed out.</exception>
+    /// <exception cref="InvalidOperationException">No reading succeeded, the last one was refused or the agent went away.</exception>
+    public async Task<SettledProvenance> AskSettledProvenanceAsync(TemplateJobOptions o, TimeSpan timeout, TimeProvider time, CancellationToken ct)
+    {
+        var start = time.GetUtcNow();
+        ProvenanceMessage? first = null;
+        Exception? lastFailure = null;
+        var sawOff = false;
+        while (true)
+        {
+            try
+            {
+                var p = await AskProvenanceWithRetryAsync(o.ProvenanceRetryInterval, timeout, time, ct).ConfigureAwait(false);
+                first ??= p;
+                if (p.RealTimeProtectionEnabled == true) return new SettledProvenance(first, true); // no later reading can change it
+                sawOff |= p.RealTimeProtectionEnabled == false;
+            }
+            catch (Exception) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                lastFailure = ex; // skipped while another reading succeeds
+            }
+
+            if (time.GetUtcNow() - start + o.DefenderSettleInterval > o.DefenderSettleWindow) break;
+            await Task.Delay(o.DefenderSettleInterval, time, ct).ConfigureAwait(false);
+        }
+
+        if (first is null) ExceptionDispatchInfo.Throw(lastFailure!);
+        return new SettledProvenance(first, sawOff ? false : null);
+    }
+
+    /// <summary>
     /// Fetches one file from the guest with <c>collect_file</c> through the <see cref="Inbox"/> (which must not be open elsewhere),
     /// reassembled and hash-checked as dropped files are.
     /// </summary>
@@ -190,3 +233,6 @@ internal sealed class GuestSession : IAsyncDisposable
         _cts.Dispose();
     }
 }
+
+/// <summary>What <see cref="GuestSession.AskSettledProvenanceAsync"/> read: its first successful reading and the settled real-time protection state.</summary>
+internal sealed record SettledProvenance(ProvenanceMessage First, bool? RealTimeProtectionEnabled);
