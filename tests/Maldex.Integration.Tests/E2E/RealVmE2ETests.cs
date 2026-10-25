@@ -38,8 +38,8 @@ public sealed class RealVmE2ETests(SqlServerFixture sql, ITestOutputHelper outpu
         var missing = new[] { "win11-26h2.qcow2", "win11-26h2.vars.fd" }.Where(f => !File.Exists(Path.Combine(baseDir, f))).ToList();
         Assert.SkipUnless(Environment.GetEnvironmentVariable("MALDEX_REAL_VM") == "1"
             && Environment.GetEnvironmentVariable("MALDEX_REAL_NET") == "1" && missing.Count == 0,
-            "Real-VM E2E skipped: set MALDEX_REAL_VM=1 and MALDEX_REAL_NET=1 and build the guest image "
-            + $"(MALDEX_WIN_ISO=/path/to/Win11_26H2.iso ./build.sh build-guest; missing in {baseDir}: {(missing.Count == 0 ? "none" : string.Join(", ", missing))}). Then run ./build.sh e2e.");
+            "Real-VM E2E skipped: set MALDEX_REAL_VM=1 and MALDEX_REAL_NET=1 and have the default template's image "
+            + $"(win11-26h2: build it in the app under Admin → Sandbox Templates → New template; missing in {baseDir}: {(missing.Count == 0 ? "none" : string.Join(", ", missing))}). Then run ./build.sh e2e.");
     }
 
     // ---- harness ------------------------------------------------------------------------------------------------

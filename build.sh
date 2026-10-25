@@ -409,6 +409,7 @@ cmd_real_setup() {
   ensure_mitm_ca
   harden_inetsim_template
   ensure_guestfs_appliance
+  mkdir -p .data/media
   ensure_sysmon_zip
 
   real_verify
@@ -438,8 +439,12 @@ real_verify() {
   real_check "guacd image" "docker pull $GUACD_IMAGE" docker image inspect "$GUACD_IMAGE"
   real_check "inetsim" "apt install inetsim" inetsim --version
   real_check "wireguard-tools" "apt install wireguard-tools" wg --version
+  real_check "wiminfo" "apt install wimtools" wiminfo --version
   real_check "xorriso" "apt install xorriso" xorriso -version
   real_check "xmllint" "apt install libxml2-utils" xmllint --version
+  real_check "Sysmon.zip" "./build.sh real-setup" test -f "$VM_DIR/iso/Sysmon.zip"
+  real_check "virtio-win.iso" "./build.sh real-setup" test -f "$VM_DIR/iso/virtio-win.iso"
+  real_check "media library (.data/media)" "./build.sh real-setup" test -d .data/media
   real_check "pwsh" "sudo snap install powershell --classic" pwsh -v
   real_check "host guard table loaded" "./build.sh real-setup" sudo -n nft list table inet maldex_guard
   real_check "br_netfilter not filtering bridged traffic (host guard assumes this)" "sudo sysctl -w net.bridge.bridge-nf-call-iptables=0 and do not load br_netfilter" \
@@ -523,7 +528,7 @@ cmd_real_smoke() {
 SYSMON_URL="https://download.sysinternals.com/files/Sysmon.zip"
 SYSMON_SHA256="00ecf1b46aec99299d3ae0bca79dc621458bd014b20b509d7c5c8e8c8611aa54"
 
-# Publishes the guest agent (self-contained single-file win-x64) to .data/agent/Maldex.Agent.exe. Used by build-guest and by template sealing.
+# Publishes the guest agent (self-contained single-file win-x64) to .data/agent/Maldex.Agent.exe. Used by template sealing and the Build from ISO.
 cmd_agent() {
   dotnet publish src/Maldex.Agent -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o "$PWD/.data/agent" --nologo -v q
   [ -f .data/agent/Maldex.Agent.exe ] || { echo "Agent publish did not produce Maldex.Agent.exe" >&2; return 1; }
@@ -535,15 +540,10 @@ cmd_agent() {
   printf '%s\n' "$version" > .data/agent/Maldex.Agent.version
 }
 
-cmd_build_guest() {
-  if [ -z "${MALDEX_WIN_ISO:-}" ] || [ ! -f "${MALDEX_WIN_ISO:-}" ]; then
-    echo "MALDEX_WIN_ISO must point to a Windows 11 x64 Enterprise (evaluation) ISO (got: '${MALDEX_WIN_ISO:-}')." >&2
-    return 2
-  fi
-  mkdir -p "$VM_DIR/iso"
-  fetch_cached "$SYSMON_URL" "$VM_DIR/iso/Sysmon.zip" "$SYSMON_SHA256"
-  SYSMON_ZIP="$PWD/$VM_DIR/iso/Sysmon.zip" VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" \
-    deploy/guest/build-guest.sh
+# build-guest, prepare-guest, finalize-guest and discard-guest are retired: the app builds and edits templates.
+cmd_retired() {
+  echo "retired: use Admin → Sandbox Templates → New template (build from media) or Edit" >&2
+  return 2
 }
 
 # The code a real template E2E (./build.sh e2e-templates) exercises. When any of it changed since the commit recorded in
@@ -633,14 +633,13 @@ require_base_image() {
   local base="$VM_DIR/base"
   if [ ! -f "$base/win11-26h2.qcow2" ] || [ ! -f "$base/win11-26h2.vars.fd" ]; then
     echo "The Windows 11 26H2 base image is missing ($base/win11-26h2.qcow2 and .vars.fd)." >&2
-    echo "Build it first:  MALDEX_WIN_ISO=/path/to/Win11_26H2.iso ./build.sh build-guest" >&2
+    echo "Build it first: Admin → Sandbox Templates → New template (build from media), or import an existing image (Maldex:Images)." >&2
     return 2
   fi
 }
 
-# Harmless real-VM end-to-end suite (needs the built guest image; see deploy/guest/README.md "Running the E2E suite").
+# Harmless real-VM end-to-end suite (the tests skip with a message when the default template's image is missing; see deploy/guest/README.md "Running the E2E suite").
 cmd_e2e() {
-  require_base_image || return $?
   local rc=0
   MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 dotnet test --project tests/Maldex.Integration.Tests --filter-class "*RealVmE2ETests" || rc=$?
   template_e2e_gate_notice
@@ -728,13 +727,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     real-setup) cmd_real_setup ;;
     real-smoke) cmd_real_smoke ;;
     agent) cmd_agent ;;
-    build-guest) cmd_build_guest ;;
-    prepare-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" deploy/guest/prepare-guest.sh prepare ;;
-    finalize-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" OVMF_CODE_SECBOOT="$OVMF_CODE_SECBOOT" deploy/guest/prepare-guest.sh finalize ;;
-    discard-guest) VM_DIR="$VM_DIR" LIBVIRT_URI="$LIBVIRT_URI" deploy/guest/prepare-guest.sh discard ;;
+    build-guest|prepare-guest|finalize-guest|discard-guest) cmd_retired ;;
     e2e)    cmd_e2e ;;
     e2e-templates) cmd_e2e_templates "${2:-}" ;;
     e2e-build-acceptance) cmd_e2e_build_acceptance ;;
-    *) echo "usage: $0 setup|dev-db|run|test|smoke|build|agent|real-setup|real-smoke|build-guest|prepare-guest|finalize-guest|discard-guest|e2e|e2e-templates [test-filter]|e2e-build-acceptance" >&2; exit 64 ;;
+    *) echo "usage: $0 setup|dev-db|run|test|smoke|build|agent|real-setup|real-smoke|e2e|e2e-templates [test-filter]|e2e-build-acceptance" >&2; exit 64 ;;
   esac
 fi

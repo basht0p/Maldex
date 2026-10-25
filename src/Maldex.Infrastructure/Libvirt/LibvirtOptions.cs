@@ -15,7 +15,7 @@ public sealed class LibvirtOptions
     /// </summary>
     public string GuestfsAppliancePath { get; set; } = "/var/lib/maldex/guestfs-appliance";
     public string OvmfCodePath { get; set; } = "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd";
-    /// <summary>The UEFI variable store a new guest starts from (Microsoft keys enrolled, as build-guest uses).</summary>
+    /// <summary>The UEFI variable store a new guest starts from (Microsoft keys enrolled, as the template Build uses).</summary>
     public string OvmfVarsTemplatePath { get; set; } = "/usr/share/OVMF/OVMF_VARS_4M.ms.fd";
     public string BaseImageDir { get; set; } = ".data/vm/base";
     public string RunDir { get; set; } = ".data/vm/run";

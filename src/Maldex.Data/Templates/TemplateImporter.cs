@@ -28,7 +28,7 @@ public static class TemplateImporter
             }
             if (!exists)
             {
-                logger.LogWarning("Image {Image} is configured in Maldex:Images but its files do not exist; not imported as a template (build it with ./build.sh build-guest).", id);
+                logger.LogWarning("Image {Image} is configured in Maldex:Images but its files do not exist; not imported as a template (build it in the app: Admin → Sandbox Templates → New template).", id);
                 continue;
             }
 

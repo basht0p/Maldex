@@ -68,6 +68,28 @@ public class TemplateImporterTests(SqlServerFixture sql)
         Assert.Null(v.ParentVersionId);
     }
 
+    private sealed class CapturingLogger : Microsoft.Extensions.Logging.ILogger
+    {
+        public List<string> Messages { get; } = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) =>
+            Messages.Add(formatter(state, exception));
+    }
+
+    [Fact]
+    public async Task Import_MissingFiles_LogsThatTheAppBuildsTemplates_NotTheRetiredScript()
+    {
+        await using var db = await FreshAsync();
+        var log = new CapturingLogger();
+
+        await TemplateImporter.ImportAsync(db, new FakeStore(), ["win11-26h2"], new FixedTime(Now), log, Ct);
+
+        var message = Assert.Single(log.Messages);
+        Assert.Contains("Admin → Sandbox Templates → New template", message);
+        Assert.DoesNotContain("build-guest", message);
+    }
+
     [Fact]
     public async Task Import_IsIdempotent()
     {
