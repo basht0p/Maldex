@@ -1,9 +1,10 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
-import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
+import { Route, Routes } from 'react-router-dom'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { renderWithKit } from '../test/renderWithKit'
 import SubmitPage from './SubmitPage'
 
 const ORG = { id: '11111111-1111-1111-1111-111111111111', name: 'Acme', retentionDays: 30 }
@@ -17,6 +18,7 @@ let templatesAnswered = false
 const server = setupServer(
   http.get('/api/orgs', () => HttpResponse.json([ORG])),
   http.get('/api/templates', () => HttpResponse.json([WIN11])),
+  http.get('/api/tasks', () => HttpResponse.json({ items: [], total: 0 })),
 )
 server.events.on('response:mocked', ({ request }) => {
   if (new URL(request.url).pathname === '/api/templates') templatesAnswered = true
@@ -26,6 +28,8 @@ afterEach(() => {
   server.resetHandlers()
   submitCalls = 0
   templatesAnswered = false
+  localStorage.clear()
+  vi.unstubAllGlobals()
 })
 afterAll(() => server.close())
 
@@ -38,14 +42,13 @@ function countSubmits(response: () => Response) {
   )
 }
 
-async function renderPage() {
-  render(
-    <MemoryRouter initialEntries={['/submit']}>
-      <Routes>
-        <Route path="/submit" element={<SubmitPage />} />
-        <Route path="/tasks/:id" element={<div>task page placeholder</div>} />
-      </Routes>
-    </MemoryRouter>,
+async function renderPage(route = '/submit') {
+  renderWithKit(
+    <Routes>
+      <Route path="/submit" element={<SubmitPage />} />
+      <Route path="/tasks/:id" element={<div>task page placeholder</div>} />
+    </Routes>,
+    { route },
   )
   // wait for the org list to load
   await screen.findByRole('option', { name: 'Acme' })
@@ -234,6 +237,206 @@ describe('SubmitPage', () => {
 
       expect(await screen.findByText('Template is disabled.')).toBeInTheDocument()
       expect(screen.queryByText(/image:/)).toBeNull()
+    })
+  })
+
+  describe('multiple files', () => {
+    const pick = (...names: string[]) => userEvent.upload(screen.getByLabelText('File'), names.map((n) => new File([n], `${n}.bin`)))
+
+    it('submits several dropped files as separate tasks and reports each', async () => {
+      const bodies: string[] = []
+      server.use(
+        http.post('/api/tasks', async ({ request }) => {
+          const f = (await request.formData()).get('file') as Blob
+          bodies.push(await f.text())
+          if (bodies.length === 2) return HttpResponse.json({ title: 'Sample rejected by the server.', status: 400 }, { status: 400 })
+          return HttpResponse.json({ id: `task-${bodies.length}` }, { status: 201 })
+        }),
+      )
+      await renderPage()
+      await userEvent.selectOptions(screen.getByLabelText(/organization/i), ORG.id)
+      await pick('a', 'b', 'c')
+      await submit()
+
+      expect(await screen.findByText('Failed: Sample rejected by the server.')).toBeInTheDocument()
+      await waitFor(() => expect(screen.getAllByText('Created')).toHaveLength(2))
+      expect(bodies).toEqual(['a', 'b', 'c'])
+      expect(screen.getByText('Created 2 tasks')).toBeInTheDocument()
+      expect(screen.getAllByRole('link', { name: 'Open task' })[0]).toHaveAttribute('href', '/tasks/task-1')
+      expect(screen.queryByText('task page placeholder')).toBeNull()
+    })
+
+    it('disables Submit while a batch is running', async () => {
+      let release: () => void = () => {}
+      const gate = new Promise<void>((r) => (release = r))
+      server.use(
+        http.post('/api/tasks', async () => {
+          await gate
+          return HttpResponse.json({ id: 'task-1' }, { status: 201 })
+        }),
+      )
+      await renderPage()
+      await userEvent.selectOptions(screen.getByLabelText(/organization/i), ORG.id)
+      await pick('a', 'b')
+      await submit()
+
+      await waitFor(() => expect(screen.getByRole('button', { name: /submit/i })).toBeDisabled())
+      expect(await screen.findByText('Uploading')).toBeInTheDocument()
+      expect(screen.getByText('Queued for upload')).toBeInTheDocument()
+      release()
+      await waitFor(() => expect(screen.getByRole('button', { name: /submit/i })).toBeEnabled())
+    })
+
+    it('removes a listed file', async () => {
+      await renderPage()
+      await pick('a', 'b')
+      await userEvent.click(screen.getByRole('button', { name: 'Remove a.bin' }))
+      expect(screen.queryByText('a.bin')).toBeNull()
+      expect(screen.getByText('b.bin')).toBeInTheDocument()
+    })
+  })
+
+  describe('remembered options', () => {
+    it('prefills the last options and ignores a vanished template', async () => {
+      localStorage.setItem(
+        'maldex.submit.lastOptions',
+        JSON.stringify({ orgId: ORG.id, image: 'gone-template', networkMode: 'None', exitCountry: '', durationSec: '120', interactive: false }),
+      )
+      server.use(http.get('/api/templates', () => HttpResponse.json([WIN11, GOLDEN])))
+      await renderPage()
+      await screen.findByLabelText('Template')
+      expect(screen.getByLabelText(/organization/i)).toHaveValue(ORG.id)
+      expect(screen.getByLabelText('Template')).toHaveValue(WIN11.id)
+      expect(screen.getByLabelText(/network mode/i)).toHaveValue('None')
+      expect(screen.getByLabelText(/duration/i)).toHaveValue(120)
+      expect(screen.getByLabelText(/interactive/i)).not.toBeChecked()
+      expect(screen.queryByRole('alert')).toBeNull()
+    })
+
+    it('falls back to no organization when the remembered one vanished', async () => {
+      localStorage.setItem('maldex.submit.lastOptions', JSON.stringify({ orgId: 'someone-else' }))
+      await renderPage()
+      expect(screen.getByLabelText(/organization/i)).toHaveValue('')
+    })
+
+    it('saves the options after a successful submission', async () => {
+      server.use(http.post('/api/tasks', () => HttpResponse.json({ id: 'task-1' }, { status: 201 })))
+      await renderPage()
+      await userEvent.selectOptions(screen.getByLabelText(/organization/i), ORG.id)
+      await userEvent.selectOptions(screen.getByLabelText(/network mode/i), 'None')
+      await userEvent.type(screen.getByLabelText(/url/i), 'https://example.com/a')
+      await submit()
+      await waitFor(() => expect(screen.getByText('task page placeholder')).toBeInTheDocument())
+      expect(JSON.parse(localStorage.getItem('maldex.submit.lastOptions') ?? '{}')).toMatchObject({ orgId: ORG.id, networkMode: 'None', durationSec: '300', interactive: true })
+    })
+  })
+
+  describe('duplicate notice', () => {
+    const stubDigest = () => {
+      const digest = vi.fn().mockResolvedValue(new Uint8Array(32).fill(0xab).buffer)
+      vi.stubGlobal('crypto', { subtle: { digest } })
+      return digest
+    }
+    const withBuffer = (name: string, size?: number) => {
+      const f = new File(['MZ'], name)
+      f.arrayBuffer = () => Promise.resolve(new TextEncoder().encode('MZ').buffer as ArrayBuffer)
+      if (size !== undefined) Object.defineProperty(f, 'size', { value: size })
+      return f
+    }
+
+    it('shows a duplicate notice when the hash was analysed before', async () => {
+      stubDigest()
+      const qs: (string | null)[] = []
+      server.use(
+        http.get('/api/tasks', ({ request }) => {
+          const u = new URL(request.url)
+          qs.push(u.searchParams.get('q'))
+          expect(u.searchParams.get('take')).toBe('1')
+          return HttpResponse.json({ items: [{ id: 'old-1', verdict: 'Malicious', createdAt: new Date().toISOString() }], total: 2 })
+        }),
+      )
+      await renderPage()
+      await userEvent.upload(screen.getByLabelText('File'), withBuffer('dup.exe'))
+
+      expect(await screen.findByText(/Analysed 2 times before/)).toBeInTheDocument()
+      expect(qs).toEqual(['ab'.repeat(32)])
+      expect(screen.getByText('Malicious')).toBeInTheDocument()
+      expect(screen.getByRole('link', { name: 'View' })).toHaveAttribute('href', '/tasks/old-1')
+    })
+
+    it('skips the duplicate check for files over 512 MiB', async () => {
+      stubDigest()
+      let calls = 0
+      server.use(
+        http.get('/api/tasks', () => {
+          calls++
+          return HttpResponse.json({ items: [], total: 0 })
+        }),
+      )
+      await renderPage()
+      await userEvent.upload(screen.getByLabelText('File'), withBuffer('big.iso', 513 * 1024 ** 2))
+      await screen.findByText('big.iso')
+      await new Promise((r) => setTimeout(r, 50))
+      expect(calls).toBe(0)
+      expect(screen.queryByText(/Analysed/)).toBeNull()
+    })
+  })
+
+  describe('resubmit', () => {
+    const SOURCE = { id: 't1', orgId: ORG.id, originalFileName: 'invoice.exe', url: null, image: 'win11-26h2', networkMode: 'None', exitCountry: null, durationSec: 120, interactive: false }
+    const source = (over: object = {}) => server.use(http.get('/api/tasks/t1', () => HttpResponse.json({ ...SOURCE, ...over })))
+
+    it('resubmits from a task with prefilled options', async () => {
+      source()
+      let body: unknown
+      server.use(
+        http.post('/api/tasks/t1/resubmit', async ({ request }) => {
+          body = await request.json()
+          return HttpResponse.json({ id: 't2' }, { status: 201 })
+        }),
+      )
+      await renderPage('/submit?from=t1')
+      expect(await screen.findByText('invoice.exe')).toBeInTheDocument()
+      expect(screen.queryByLabelText('File')).toBeNull()
+      await waitFor(() => expect(screen.getByLabelText(/organization/i)).toHaveValue(ORG.id))
+      expect(screen.getByLabelText(/network mode/i)).toHaveValue('None')
+      expect(screen.getByLabelText(/duration/i)).toHaveValue(120)
+      await submit()
+
+      await waitFor(() => expect(screen.getByText('task page placeholder')).toBeInTheDocument())
+      expect(body).toMatchObject({ orgId: ORG.id, networkMode: 'None', durationSec: 120, interactive: false })
+    })
+
+    it('ends resubmit mode with a toast when the sample expired', async () => {
+      source()
+      server.use(
+        http.post('/api/tasks/t1/resubmit', () =>
+          HttpResponse.json({ title: 'The sample has been deleted under the retention policy.', status: 409, type: 'sample-unavailable' }, { status: 409 }),
+        ),
+      )
+      await renderPage('/submit?from=t1')
+      await screen.findByText('invoice.exe')
+      await waitFor(() => expect(screen.getByLabelText(/organization/i)).toHaveValue(ORG.id))
+      await submit()
+
+      expect(await screen.findByText('This sample has expired under retention. Upload it again.')).toBeInTheDocument()
+      expect(screen.queryByText('invoice.exe')).toBeNull()
+      expect(screen.getByLabelText('File')).toBeInTheDocument()
+    })
+
+    it('resubmits a URL task', async () => {
+      source({ originalFileName: null, url: 'https://evil.test/payload' })
+      await renderPage('/submit?from=t1')
+      expect(await screen.findByText('https://evil.test/payload')).toBeInTheDocument()
+    })
+
+    it('leaves resubmit mode through Change sample', async () => {
+      source()
+      await renderPage('/submit?from=t1')
+      await screen.findByText('invoice.exe')
+      await userEvent.click(screen.getByRole('button', { name: 'Change sample' }))
+      expect(screen.queryByText('invoice.exe')).toBeNull()
+      expect(screen.getByLabelText('File')).toBeInTheDocument()
     })
   })
 })
