@@ -5,7 +5,9 @@ using Maldex.Core.Lifecycle;
 using Maldex.Core.Text;
 using Maldex.Data;
 using Maldex.Data.Templates;
+using Maldex.Infrastructure.Isolation;
 using Maldex.Infrastructure.Libvirt;
+using Maldex.Infrastructure.Net;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -37,6 +39,9 @@ public sealed class TemplateCoordinator(
     IOptions<OrchestratorOptions> orchestrator,
     IOptions<TemplateJobOptions> options,
     IOptions<LibvirtOptions> libvirt,
+    IRunNetworkInfo networkInfo,
+    IOptions<NetOptions> net,
+    IOptions<SelfTestOptions> selfTest,
     TimeProvider time,
     ILogger<TemplateCoordinator> logger,
     ITemplateJobPublisher? publisher = null,
@@ -52,7 +57,15 @@ public sealed class TemplateCoordinator(
     private const int MaxTerminalSaveAttempts = 6;
     private const int MaxMessageLength = 500, MaxReasonLength = 1000;
 
-    private static readonly TemplateJobState[] Active = TemplateJobStateMachine.ActiveStates;
+    private static readonly IReadOnlyList<TemplateJobState> Active = TemplateJobStateMachine.ActiveStates;
+
+    /// <summary>Where the temporary copies of the agent exe are written for the disk editor (swept by the reconciler at start).</summary>
+    public static string AgentCopyDir(LibvirtOptions libvirt) => Path.Combine(Path.GetFullPath(libvirt.RunDir), "template-agent");
+
+    public const string AgentCopyPrefix = "maldex-agent-";
+
+    /// <summary>The details of a Direct session's <c>template.egress.start</c> and <c>.stop</c> audit rows.</summary>
+    public static string DirectSessionDetails(Guid jobId) => $"job={jobId}; network=Direct";
 
     /// <summary>The file stem of the job's working copy, and of the version it produces.</summary>
     public static string StemOf(Guid jobId) => jobId.ToString("N");
@@ -96,7 +109,7 @@ public sealed class TemplateCoordinator(
 
         if (job.CancelRequestedAt is not null)
         {
-            await DiscardAsync(db, job, new Discarded(CancelledByAdmin, job.RequestedByUserId), new Held()).ConfigureAwait(false);
+            await DiscardAsync(db, job, new Discarded(CancelledByAdmin, job.RequestedByUserId), new Held(), ct).ConfigureAwait(false);
             return;
         }
 
@@ -104,7 +117,7 @@ public sealed class TemplateCoordinator(
         var refusal = await RefusalAsync(db, catalog, job, baseVersion, ct).ConfigureAwait(false);
         if (refusal is not null)
         {
-            await FailAsync(db, job, refusal, new Held()).ConfigureAwait(false);
+            await FailAsync(db, job, refusal, new Held(), ct).ConfigureAwait(false);
             return;
         }
 
@@ -121,27 +134,29 @@ public sealed class TemplateCoordinator(
             switch (outcome)
             {
                 case Discarded discarded:
-                    await DiscardAsync(db, job, discarded, held).ConfigureAwait(false);
+                    await DiscardAsync(db, job, discarded, held, ct).ConfigureAwait(false);
                     break;
                 case Verified verified:
                     // Both VMs are gone by now; the files stay unless the version cannot be recorded.
                     await ReleaseAsync(job, held, deleteFiles: false).ConfigureAwait(false);
-                    if (!await RecordVersionAsync(db, catalog, job, verified.Provenance, verified.Bundle).ConfigureAwait(false))
-                        await DiscardAsync(db, job, new Discarded(CancelledByAdmin, job.RequestedByUserId), held).ConfigureAwait(false);
+                    if (!await RecordVersionOrKeepAsync(db, catalog, job, verified, held).ConfigureAwait(false))
+                        await DiscardAsync(db, job, new Discarded(CancelledByAdmin, job.RequestedByUserId), held, ct).ConfigureAwait(false);
                     break;
             }
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        // Cancellation is decided by the tokens, never by the exception's type: a cancelled SQL command, say, surfaces as a
+        // SqlException ("Operation cancelled by user"), not as an OperationCanceledException.
+        catch (Exception) when (ct.IsCancellationRequested)
         {
             await StopWatchingAsync(watcherCts, watcher).ConfigureAwait(false);
             if (await ReleaseAsync(job, held, deleteFiles: true).ConfigureAwait(false) is { } egressStop)
                 await SaveAuditQuietlyAsync(db, egressStop).ConfigureAwait(false);
             throw; // host shutdown: the reconciler fails the job on the next start
         }
-        catch (OperationCanceledException) when (jobCts.IsCancellationRequested)
+        catch (Exception) when (jobCts.IsCancellationRequested)
         {
             await StopWatchingAsync(watcherCts, watcher).ConfigureAwait(false);
-            await DiscardAsync(db, job, new Discarded(CancelledByAdmin, job.RequestedByUserId), held).ConfigureAwait(false);
+            await DiscardAsync(db, job, new Discarded(CancelledByAdmin, job.RequestedByUserId), held, ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -155,7 +170,7 @@ public sealed class TemplateCoordinator(
             };
             if (ex is not (JobFailedException or TemplateSealException or TemplateVerifyException or TemplateAgentInstallException)) logger.LogError(ex, "Template job {JobId} failed.", jobId);
             else logger.LogWarning("Template job {JobId} failed: {Reason}", jobId, reason);
-            await FailAsync(db, job, reason, held).ConfigureAwait(false);
+            await FailAsync(db, job, reason, held, ct).ConfigureAwait(false);
         }
     }
 
@@ -175,13 +190,43 @@ public sealed class TemplateCoordinator(
         if (others.Any(j => j.State != TemplateJobState.Queued || j.CreatedAt < job.CreatedAt || (j.CreatedAt == job.CreatedAt && j.Id.CompareTo(job.Id) < 0)))
             return AlreadyRunning;
 
-        return LowDiskSpace(disk.FreeMiB(Path.GetFullPath(libvirt.Value.BaseImageDir)), options.Value.MinFreeGiB);
+        return await DiskSpaceRefusalAsync(db, store, disk, libvirt.Value, options.Value.MinFreeGiB, baseVersion, job.Id, ct).ConfigureAwait(false);
     }
 
-    /// <summary>The refusal for a template copy that would not fit, or null. One wording for the endpoint's up-front check and the coordinator's.</summary>
-    public static string? LowDiskSpace(long freeMiB, int requiredGiB) =>
-        freeMiB < requiredGiB * 1024L
-            ? $"not enough disk space for a template copy: {freeMiB / 1024.0:0.#} GiB free, {requiredGiB} GiB required"
+    /// <summary>
+    /// The refusal for a template copy that would not fit, or null; the endpoint's up-front check and the coordinator's. Required
+    /// free space is the base version's size (unknown: 0) plus <paramref name="minFreeGiB"/>, plus the base sizes of the other
+    /// jobs still in Preparing, whose copies may be in flight (<paramref name="jobId"/>, the job being checked, is not one of them).
+    /// </summary>
+    public static async Task<string?> DiskSpaceRefusalAsync(MaldexDbContext db, ITemplateStore store, IDiskSpaceProbe disk, LibvirtOptions libvirt,
+        int minFreeGiB, TemplateVersion baseVersion, Guid jobId, CancellationToken ct)
+    {
+        var copying = await (from j in db.TemplateJobs.AsNoTracking()
+                             where j.State == TemplateJobState.Preparing && j.Id != jobId
+                             join v in db.TemplateVersions.AsNoTracking() on j.BaseVersionId equals v.Id
+                             select v.FileStem).ToListAsync(ct).ConfigureAwait(false);
+        var bytes = SizeOrZero(store, baseVersion.FileStem) + copying.Sum(stem => SizeOrZero(store, stem));
+        const long MiB = 1024 * 1024;
+        var requiredMiB = minFreeGiB * 1024L + (bytes + MiB - 1) / MiB;
+        return LowDiskSpace(disk.FreeMiB(Path.GetFullPath(libvirt.BaseImageDir)), requiredMiB);
+    }
+
+    private static long SizeOrZero(ITemplateStore store, string stem)
+    {
+        try
+        {
+            return store.SizeOf(stem) ?? 0;
+        }
+        catch (ArgumentException)
+        {
+            return 0; // a stem the store rejects has no disk
+        }
+    }
+
+    /// <summary>The refusal wording for a template copy that would not fit, or null.</summary>
+    public static string? LowDiskSpace(long freeMiB, long requiredMiB) =>
+        freeMiB < requiredMiB
+            ? $"not enough disk space for a template copy: {freeMiB / 1024.0:0.#} GiB free, {requiredMiB / 1024.0:0.#} GiB required"
             : null;
 
     /// <summary>Queued → Preparing. False when the job is no longer Queued (someone else got there first).</summary>
@@ -230,13 +275,13 @@ public sealed class TemplateCoordinator(
         if (mode == NetworkMode.Direct)
         {
             held.DirectOpen = true;
-            await SaveJobAsync(db, job.Id, _ => true, [Audit(job, job.RequestedByUserId, "template.egress.start", $"job={job.Id}; network=Direct")], ct).ConfigureAwait(false);
+            await SaveJobAsync(db, job.Id, _ => true, [Audit(job, job.RequestedByUserId, "template.egress.start", DirectSessionDetails(job.Id))], ct).ConfigureAwait(false);
         }
         var vmOptions = orchestrator.Value;
         held.Vm = await hypervisor.StartAsync(new VmSpec(job.Id, stem, vmOptions.VmMemoryMiB, vmOptions.VmVCpus, held.Lease.NetworkId, Writable: true), ct).ConfigureAwait(false);
 
         await SaveJobAsync(db, job.Id, j => { j.Message = "checking the guest agent"; return true; }, [], ct).ConfigureAwait(false);
-        await CheckAgentAsync(held.Vm!, bundle, o, ct).ConfigureAwait(false);
+        await CheckAgentAsync(db, job, held.Vm!, mode == NetworkMode.Direct ? held.Lease : null, bundle, o, ct).ConfigureAwait(false);
 
         if (job.Kind == TemplateJobKind.Edit)
         {
@@ -260,7 +305,7 @@ public sealed class TemplateCoordinator(
             if (held.DirectOpen)
             {
                 held.DirectOpen = false;
-                egressStop.Add(Audit(job, job.RequestedByUserId, "template.egress.stop", $"job={job.Id}; network=Direct"));
+                egressStop.Add(Audit(job, job.RequestedByUserId, "template.egress.stop", DirectSessionDetails(job.Id)));
             }
             await TransitionAsync(db, job.Id, TemplateJobState.Sealing, "installing the components and shutting down", egressStop, ct).ConfigureAwait(false);
         }
@@ -269,7 +314,7 @@ public sealed class TemplateCoordinator(
             await TransitionAsync(db, job.Id, TemplateJobState.Sealing, "installing the components and shutting down", [], ct).ConfigureAwait(false);
         }
 
-        // The sealer reads the agent's ready message itself: hand it an untouched channel.
+        // A fresh channel for the sealer: it proves the agent answers with its own provenance round trip (no ready needed, R25).
         var channel = await channels.ConnectAsync(held.Vm, ct).ConfigureAwait(false);
         try
         {
@@ -292,9 +337,12 @@ public sealed class TemplateCoordinator(
     private async Task InstallAgentAsync(string stem, ComponentBundle bundle, TemplateJobOptions o, CancellationToken ct)
     {
         // The bundle's own bytes (what the later checks compare against), not a re-read of AgentExePath, which a rebuild could replace.
-        var file = Path.Combine(Path.GetTempPath(), "maldex-agent-" + Guid.NewGuid().ToString("N") + ".exe");
+        // Under the run directory, not /tmp: the reconciler removes what a crash leaves there.
+        var dir = AgentCopyDir(libvirt.Value);
+        var file = Path.Combine(dir, AgentCopyPrefix + Guid.NewGuid().ToString("N") + ".exe");
         try
         {
+            Directory.CreateDirectory(dir);
             var fileOptions = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
             if (!OperatingSystem.IsWindows()) fileOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
             await using (var stream = new FileStream(file, fileOptions))
@@ -306,7 +354,7 @@ public sealed class TemplateCoordinator(
             {
                 await diskEditor.InstallAgentAsync(stem, file, linked.Token).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (timeout.IsCancellationRequested && !ct.IsCancellationRequested)
+            catch (Exception) when (timeout.IsCancellationRequested && !ct.IsCancellationRequested)
             {
                 throw new JobFailedException($"writing the agent into the working copy did not finish within {o.AgentInstallTimeout.TotalSeconds:0} s");
             }
@@ -320,18 +368,18 @@ public sealed class TemplateCoordinator(
 
     /// <summary>
     /// Proves the booted working copy runs the agent that was written into it: waits for ready, asks <c>provenance</c> and compares the
-    /// build id. An agent that is older (refuses the command, never answers) or different fails the job. The channel is closed again
-    /// afterwards: the sealer connects its own and reads that connection's ready message (an agent whose host end is not connected
-    /// retries its connection and says ready again, which is how a long-idle Edit guest reaches the sealer too).
+    /// build id. An agent that is older (refuses the command, never answers) or different fails the job. A Direct session then runs
+    /// its isolation self-test on the same channel (<paramref name="directLease"/>). The channel is closed again afterwards: the
+    /// sealer connects its own and proves liveness with a provenance round trip, never by waiting for ready (R25).
     /// </summary>
-    private async Task CheckAgentAsync(VmHandle vm, ComponentBundle bundle, TemplateJobOptions o, CancellationToken ct)
+    private async Task CheckAgentAsync(MaldexDbContext db, TemplateJob job, VmHandle vm, NetworkLease? directLease, ComponentBundle bundle, TemplateJobOptions o, CancellationToken ct)
     {
         IAgentChannel channel;
         try
         {
             channel = await channels.ConnectAsync(vm, ct).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException && !ct.IsCancellationRequested)
         {
             throw new JobFailedException($"could not connect to the guest agent ({GuestText.Clean(ex.Message, 200)}); the agent could not be checked");
         }
@@ -371,11 +419,47 @@ public sealed class TemplateCoordinator(
 
             if (answer.AgentVersion != bundle.AgentBuildId)
                 throw new JobFailedException($"the working copy still runs agent {GuestText.Clean(answer.AgentVersion, 100)}; the agent could not be updated");
+
+            if (directLease is not null) await DirectSelfTestAsync(db, job, directLease, channel, session.Inbox, ct).ConfigureAwait(false);
         }
         finally
         {
             await DisposeQuietlyAsync(channel, vm.TaskId).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// The isolation self-test of a Direct session (spec §4), before the admin gets the guest: LAN, host and control plane must be
+    /// unreachable and the internet reachable. Fails closed: any other verdict, or an error running it, fails the job.
+    /// </summary>
+    private async Task DirectSelfTestAsync(MaldexDbContext db, TemplateJob job, NetworkLease lease, IAgentChannel channel, TransferInbox inbox, CancellationToken ct)
+    {
+        await SaveJobAsync(db, job.Id, j => { j.Message = "checking the isolation of the Direct network"; return true; }, [], ct).ConfigureAwait(false);
+        IsolationVerdict verdict;
+        try
+        {
+            var info = await networkInfo.GetAsync(lease, ct).ConfigureAwait(false);
+            if (info is null) verdict = IsolationVerdict.Fail("the job's network addressing is unknown");
+            else if (info.Mode != NetworkMode.Direct) verdict = IsolationVerdict.Fail($"network mode mismatch: lease {info.Mode}, job Direct");
+            else
+            {
+                var plan = IsolationProbePlan.Build(net.Value, info);
+                verdict = selfTest.Value.RequireControlPlaneProbes && !plan.Targets.Any(t => t.Name.StartsWith("control_plane_", StringComparison.Ordinal))
+                    ? IsolationVerdict.Fail("no control-plane probe targets configured")
+                    : await new SelfTestGate(time, pollInterval: options.Value.PollInterval).RunAsync(channel, inbox, NetworkMode.Direct, null, plan, ct).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException && !ct.IsCancellationRequested)
+        {
+            logger.LogError(ex, "The Direct isolation self-test of template job {JobId} failed unexpectedly.", job.Id);
+            verdict = IsolationVerdict.Fail($"self-test error: {GuestText.Clean(ex.Message, 200)}");
+        }
+
+        // Audited as an analysis' self-test is (RunCoordinator): the same actions and details, with the job named first.
+        var audit = Audit(job, null, verdict.Isolated ? "isolation.selftest.passed" : "isolation.selftest.failed",
+            $"job={job.Id}; mode={NetworkMode.Direct}; {(verdict.Isolated ? "guest-reported probes all blocked" : "not isolated: " + GuestText.Clean(verdict.Reason, 500))}");
+        await SaveJobAsync(db, job.Id, _ => true, [audit], ct).ConfigureAwait(false);
+        if (!verdict.Isolated) throw new JobFailedException($"isolation self-test failed: {GuestText.Clean(verdict.Reason, 500)}");
     }
 
     /// <summary>
@@ -418,8 +502,7 @@ public sealed class TemplateCoordinator(
                 .Select(j => new { j.SealRequestedAt, j.ConfiguringSince, j.LastConsoleAt }).SingleAsync(ct).ConfigureAwait(false);
             if (row.SealRequestedAt is not null) return null;
 
-            var since = row.LastConsoleAt is { } console && console > row.ConfiguringSince!.Value ? console : row.ConfiguringSince!.Value;
-            var left = since + o.ConfigureIdleTimeout - time.GetUtcNow();
+            var left = TemplateJobStateMachine.IdleDeadline(row.ConfiguringSince!.Value, row.LastConsoleAt, o.ConfigureIdleTimeout) - time.GetUtcNow();
             if (left <= TimeSpan.Zero)
                 return new Discarded($"discarded after {o.ConfigureIdleTimeout.TotalHours:0.##} h without a console connection", null);
             await Task.Delay(left < o.PollInterval ? left : o.PollInterval, time, ct).ConfigureAwait(false);
@@ -463,7 +546,8 @@ public sealed class TemplateCoordinator(
 
     /// <summary>
     /// Inserts the version and moves the job to Published or Sealed (publishing the version when asked), all in one transaction.
-    /// False when a cancel request arrived first: nothing is written then.
+    /// When the template's current version is no longer the job's base (a rollback or another publish while it ran), the version
+    /// is held (Sealed, Pending) instead of published. False when a cancel request arrived first: nothing is written then.
     /// </summary>
     private async Task<bool> RecordVersionAsync(MaldexDbContext db, TemplateCatalog catalog, TemplateJob job, VerifiedProvenance provenance, ComponentBundle bundle)
     {
@@ -476,6 +560,20 @@ public sealed class TemplateCoordinator(
             {
                 var row = await db.TemplateJobs.SingleAsync(j => j.Id == job.Id, ct).ConfigureAwait(false);
                 if (row.CancelRequestedAt is not null) return false;
+
+                // Locked until the commit, so a rollback or publish cannot slip in between this check and the publish below.
+                var currentId = await db.Templates
+                    .FromSqlInterpolated($"SELECT * FROM Templates WITH (UPDLOCK, HOLDLOCK) WHERE Id = {row.TemplateId}")
+                    .AsNoTracking().Select(t => t.CurrentVersionId).SingleAsync(ct).ConfigureAwait(false);
+                // A rollback or another publish while the job ran: the new version is held for an admin, never published over that choice.
+                string? superseded = null;
+                if (row.PublishOnSuccess && currentId != row.BaseVersionId)
+                {
+                    var currentNumber = currentId is null ? null
+                        : await db.TemplateVersions.AsNoTracking().Where(v => v.Id == currentId).Select(v => (int?)v.Number).SingleOrDefaultAsync(ct).ConfigureAwait(false);
+                    superseded = $"not published: the template's current version changed while this job ran ({(currentNumber is { } n ? $"v{n}" : "no version")} is current); publish it from the template page if wanted";
+                }
+                var publish = row.PublishOnSuccess && superseded is null;
 
                 var number = (await db.TemplateVersions.Where(v => v.TemplateId == row.TemplateId).MaxAsync(v => (int?)v.Number, ct).ConfigureAwait(false) ?? 0) + 1;
                 var now = time.GetUtcNow();
@@ -502,14 +600,14 @@ public sealed class TemplateCoordinator(
                 };
                 db.TemplateVersions.Add(version);
 
-                var message = row.PublishOnSuccess ? $"published as v{number}" : $"sealed as v{number}; not published";
+                var message = superseded ?? (publish ? $"published as v{number}" : $"sealed as v{number}; not published");
                 if (provenance.Note is not null) message += "; " + provenance.Note;
-                row.TransitionTo(row.PublishOnSuccess ? TemplateJobState.Published : TemplateJobState.Sealed, Clip(message, MaxMessageLength), now);
+                row.TransitionTo(publish ? TemplateJobState.Published : TemplateJobState.Sealed, Clip(message, MaxMessageLength), now);
                 row.ResultVersionId = version.Id;
                 db.AuditLogs.Add(Audit(row, row.RequestedByUserId, "template.seal", $"job={row.Id}; v={number}"));
                 await db.SaveChangesAsync(ct).ConfigureAwait(false);
 
-                if (row.PublishOnSuccess)
+                if (publish)
                     await catalog.PublishAsync(row.TemplateId, version.Id, ct, new TemplateAudit(row.RequestedByUserId, "template.publish", $"to=v{number}; job={row.Id}")).ConfigureAwait(false);
 
                 await tx.CommitAsync(ct).ConfigureAwait(false);
@@ -523,23 +621,63 @@ public sealed class TemplateCoordinator(
         }
     }
 
-    private Task FailAsync(MaldexDbContext db, TemplateJob job, string reason, Held held)
+    /// <summary>
+    /// <see cref="RecordVersionAsync"/>, where an error after the commit (the commit's answer lost, say) never costs the files of a
+    /// version that was recorded: the version row (id = job id) is looked up again, and when it exists the job is already terminal
+    /// (it committed together with the version) and the files stay. When the lookup fails too, the files are kept and logged
+    /// rather than deleted; the job then fails as usual.
+    /// </summary>
+    private async Task<bool> RecordVersionOrKeepAsync(MaldexDbContext db, TemplateCatalog catalog, TemplateJob job, Verified verified, Held held)
+    {
+        try
+        {
+            return await RecordVersionAsync(db, catalog, job, verified.Provenance, verified.Bundle).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            bool recorded;
+            try
+            {
+                db.ChangeTracker.Clear();
+                recorded = await db.TemplateVersions.AsNoTracking().AnyAsync(v => v.Id == job.Id, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception lookup)
+            {
+                held.FilesCreated = false;
+                logger.LogError(lookup, "Template job {JobId}: recording its version failed and whether it was recorded is unknown; keeping its files ({Stem}).", job.Id, StemOf(job.Id));
+                throw new JobFailedException($"recording the new version failed: {GuestText.Clean(ex.Message, 300)}");
+            }
+            if (!recorded) throw;
+
+            held.FilesCreated = false;
+            logger.LogWarning(ex, "Template job {JobId}: its version was recorded although the commit reported an error.", job.Id);
+            var row = await db.TemplateJobs.AsNoTracking().SingleAsync(j => j.Id == job.Id, CancellationToken.None).ConfigureAwait(false);
+            await PublishAsync(db, row).ConfigureAwait(false);
+            return true;
+        }
+    }
+
+    private Task FailAsync(MaldexDbContext db, TemplateJob job, string reason, Held held, CancellationToken shutdown)
     {
         reason = Clip(reason, MaxReasonLength);
         return EndAsync(db, job, held, TemplateJobState.Failed, Clip(reason, MaxMessageLength), reason,
-            Audit(job, null, "template.job.fail", Clip($"job={job.Id}; reason={reason}", MaxReasonLength)));
+            Audit(job, null, "template.job.fail", Clip($"job={job.Id}; reason={reason}", MaxReasonLength)), shutdown);
     }
 
     /// <summary>
     /// A cancel an admin asked for is audited by the cancel endpoint (with that admin as the actor), so only a system discard
     /// (the idle timeout; <see cref="Discarded.UserId"/> null) writes <c>template.job.cancel</c> here.
     /// </summary>
-    private Task DiscardAsync(MaldexDbContext db, TemplateJob job, Discarded discarded, Held held) =>
+    private Task DiscardAsync(MaldexDbContext db, TemplateJob job, Discarded discarded, Held held, CancellationToken shutdown) =>
         EndAsync(db, job, held, TemplateJobState.Cancelled, discarded.Message, null,
-            discarded.UserId is null ? Audit(job, null, "template.job.cancel", $"job={job.Id}; reason={discarded.Message}") : null);
+            discarded.UserId is null ? Audit(job, null, "template.job.cancel", $"job={job.Id}; reason={discarded.Message}") : null, shutdown);
 
-    /// <summary>Releases what the job holds (deleting its files), then marks it terminal with its audit row.</summary>
-    private async Task EndAsync(MaldexDbContext db, TemplateJob job, Held held, TemplateJobState to, string message, string? failureReason, AuditLog? audit)
+    /// <summary>
+    /// Releases what the job holds (deleting its files), then marks it terminal with its audit row. The save is retried while the
+    /// database is unreachable, but not past host shutdown (<paramref name="shutdown"/>): the reconciler ends the job on the next start.
+    /// </summary>
+    private async Task EndAsync(MaldexDbContext db, TemplateJob job, Held held, TemplateJobState to, string message, string? failureReason, AuditLog? audit,
+        CancellationToken shutdown)
     {
         var egressStop = await ReleaseAsync(job, held, deleteFiles: true).ConfigureAwait(false);
         IReadOnlyList<AuditLog> audits = [.. new[] { egressStop, audit }.OfType<AuditLog>()];
@@ -560,7 +698,15 @@ public sealed class TemplateCoordinator(
             catch (Exception ex) when (attempt < MaxTerminalSaveAttempts)
             {
                 logger.LogWarning(ex, "Recording template job {JobId} as {State} failed (attempt {Attempt}); retrying in {Delay}.", job.Id, to, attempt, delay);
-                await Task.Delay(delay, time).ConfigureAwait(false);
+                try
+                {
+                    await Task.Delay(delay, time, shutdown).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    logger.LogError("Shutting down before template job {JobId} could be recorded as {State}; the reconciler fails it on the next start.", job.Id, to);
+                    return;
+                }
                 delay *= 2;
             }
             catch (Exception ex)
@@ -595,7 +741,7 @@ public sealed class TemplateCoordinator(
         }
         if (!held.DirectOpen) return null;
         held.DirectOpen = false;
-        return Audit(job, job.RequestedByUserId, "template.egress.stop", $"job={job.Id}; network=Direct");
+        return Audit(job, job.RequestedByUserId, "template.egress.stop", DirectSessionDetails(job.Id));
     }
 
     private async Task ReleaseGuestAsync(TemplateJob job, Held held)
@@ -619,11 +765,26 @@ public sealed class TemplateCoordinator(
             {
                 await egress.ReleaseAsync(lease, CancellationToken.None).ConfigureAwait(false);
                 held.Lease = null;
+                DeleteRunNetDir(net.Value, job.Id, logger);
             }
             catch (Exception ex)
             {
                 logger.LogError(ex, "Releasing the network lease of template job {JobId} failed.", job.Id);
             }
+        }
+    }
+
+    /// <summary>A released lease's leftovers (lease record, logs) under <c>run/net/&lt;namespace&gt;</c>, as for analyses. Best effort.</summary>
+    internal static void DeleteRunNetDir(NetOptions net, Guid leaseId, ILogger logger)
+    {
+        try
+        {
+            var dir = Path.Combine(Path.GetFullPath(net.RunDir), "net", RunNetNames.For(leaseId).Namespace);
+            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogWarning(ex, "Could not delete the network run directory of lease {LeaseId}.", leaseId);
         }
     }
 

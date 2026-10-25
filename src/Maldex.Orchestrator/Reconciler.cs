@@ -1,10 +1,13 @@
 using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
+using Maldex.Core.Lifecycle;
 using Maldex.Data;
+using Maldex.Infrastructure.Libvirt;
 using Maldex.Orchestrator.Templates;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Maldex.Orchestrator;
 
@@ -19,6 +22,7 @@ public sealed class Reconciler(
     IHypervisor hypervisor,
     IEgressRouter egress,
     ITemplateStore templates,
+    IOptions<LibvirtOptions> libvirt,
     TimeProvider time,
     ILogger<Reconciler> logger)
 {
@@ -28,8 +32,7 @@ public sealed class Reconciler(
 
     private static readonly RunStatus[] InFlight = [RunStatus.Preparing, RunStatus.Running, RunStatus.Collecting];
 
-    private static readonly TemplateJobState[] JobsInFlight =
-        [TemplateJobState.Preparing, TemplateJobState.Configuring, TemplateJobState.Sealing, TemplateJobState.Verifying];
+    private static readonly IReadOnlyList<TemplateJobState> JobsInFlight = TemplateJobStateMachine.StartedStates;
 
     private readonly TaskCompletionSource _reconciled = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -67,6 +70,8 @@ public sealed class Reconciler(
             }
         }
 
+        DeleteAgentCopies();
+
         await using var scope = scopes.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
         var ids = await db.Tasks.AsNoTracking()
@@ -92,7 +97,29 @@ public sealed class Reconciler(
         _reconciled.TrySetResult();
     }
 
-    /// <summary>Deletes the job's files (working copy or sealed, never recorded), then marks it Failed with its system audit row.</summary>
+    /// <summary>The temporary agent copies a template job writes for the disk editor; one left behind is a crash's leftover.</summary>
+    private void DeleteAgentCopies()
+    {
+        var dir = TemplateCoordinator.AgentCopyDir(libvirt.Value);
+        try
+        {
+            if (!Directory.Exists(dir)) return;
+            foreach (var file in Directory.EnumerateFiles(dir, TemplateCoordinator.AgentCopyPrefix + "*"))
+            {
+                File.Delete(file);
+                logger.LogWarning("Deleted leftover agent copy {File}.", file);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogError(ex, "Deleting the leftover agent copies in {Dir} failed.", dir);
+        }
+    }
+
+    /// <summary>
+    /// Deletes the job's files (working copy or sealed, never recorded), then marks it Failed with its system audit row. A Direct
+    /// session still open (its egress start audited, no stop) gets its <c>template.egress.stop</c> row in the same save.
+    /// </summary>
     private async Task FailJobAsync(MaldexDbContext db, Guid id, CancellationToken ct)
     {
         var stem = TemplateCoordinator.StemOf(id);
@@ -112,6 +139,11 @@ public sealed class Reconciler(
             if (!JobsInFlight.Contains(job.State)) return;
 
             var now = time.GetUtcNow();
+            if (job.Network == NetworkMode.Direct && await DirectSessionOpenAsync(db, job, ct).ConfigureAwait(false))
+                db.AuditLogs.Add(new AuditLog
+                {
+                    At = now, UserId = null, Action = "template.egress.stop", Target = job.TemplateId, Details = TemplateCoordinator.DirectSessionDetails(job.Id),
+                });
             job.TransitionTo(TemplateJobState.Failed, TemplateCoordinator.InterruptedReason, now);
             job.FailureReason = TemplateCoordinator.InterruptedReason;
             db.AuditLogs.Add(new AuditLog
@@ -129,6 +161,15 @@ public sealed class Reconciler(
                 // the API wrote the job meanwhile (a cancel request): re-read and decide again
             }
         }
+    }
+
+    private static async Task<bool> DirectSessionOpenAsync(MaldexDbContext db, TemplateJob job, CancellationToken ct)
+    {
+        var details = TemplateCoordinator.DirectSessionDetails(job.Id);
+        var actions = await db.AuditLogs.AsNoTracking()
+            .Where(a => a.Target == job.TemplateId && a.Details == details && (a.Action == "template.egress.start" || a.Action == "template.egress.stop"))
+            .Select(a => a.Action).ToListAsync(ct).ConfigureAwait(false);
+        return actions.Count(a => a == "template.egress.start") > actions.Count(a => a == "template.egress.stop");
     }
 
     /// <summary>Reload-and-retry: the API may write the same row (a stop request) while the reconciler saves.</summary>

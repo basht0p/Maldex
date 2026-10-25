@@ -147,7 +147,7 @@ public sealed class GuestfishDiskEditorTests : IDisposable
         {
             var now = Interlocked.Increment(ref concurrent);
             lock (this) most = Math.Max(most, now);
-            await gate.WaitAsync(Ct);
+            await WaitBoundedAsync(gate);
             Interlocked.Decrement(ref concurrent);
         });
         var a = new GuestfishDiskEditor(slow, Options.Create(new LibvirtOptions { BaseImageDir = _dir }));
@@ -155,13 +155,21 @@ public sealed class GuestfishDiskEditorTests : IDisposable
 
         var first = a.InstallAgentAsync(Stem, _exe, Ct);
         var second = b.InstallAgentAsync(Stem, _exe, Ct); // another editor instance: the limit is per process
-        await Task.Delay(300, Ct);
-        Assert.Equal(1, slow.Started); // the second waits for the first
-        gate.Release();
-        await Task.Delay(300, Ct);
-        Assert.Equal(2, slow.Started);
-        gate.Release();
-        await Task.WhenAll(first, second);
+        try
+        {
+            await Task.Delay(300, Ct);
+            Assert.Equal(1, slow.Started); // the second waits for the first
+            gate.Release();
+            await Task.Delay(300, Ct);
+            Assert.Equal(2, slow.Started);
+            gate.Release();
+            await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(10), Ct);
+        }
+        finally
+        {
+            gate.Release(2); // a failed assertion must not leave the installs (and the process-wide turn) waiting
+            await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(10), Ct).ContinueWith(_ => { }, TaskScheduler.Default);
+        }
 
         Assert.Equal(1, most);
     }
@@ -171,16 +179,27 @@ public sealed class GuestfishDiskEditorTests : IDisposable
     {
         WorkingCopy();
         var gate = new SemaphoreSlim(0);
-        var slow = new SlowRecorder(() => gate.WaitAsync(Ct));
+        var slow = new SlowRecorder(() => WaitBoundedAsync(gate));
         var editor = new GuestfishDiskEditor(slow, Options.Create(new LibvirtOptions { BaseImageDir = _dir }));
         var first = editor.InstallAgentAsync(Stem, _exe, Ct);
-        await Task.Delay(200, Ct);
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+        try
+        {
+            await Task.Delay(200, Ct);
+            using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => editor.InstallAgentAsync(Stem, _exe, cts.Token));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => editor.InstallAgentAsync(Stem, _exe, cts.Token).WaitAsync(TimeSpan.FromSeconds(10), Ct));
+        }
+        finally
+        {
+            gate.Release(); // the first install always finishes, so the process-wide turn is free for the other tests
+        }
+        await first.WaitAsync(TimeSpan.FromSeconds(10), Ct);
+    }
 
-        gate.Release();
-        await first;
+    /// <summary>Waits for the test to release <paramref name="gate"/>; a test that never does fails here instead of hanging the run.</summary>
+    private static async Task WaitBoundedAsync(SemaphoreSlim gate)
+    {
+        if (!await gate.WaitAsync(TimeSpan.FromSeconds(10), Ct)) throw new TimeoutException("the test never released the install");
     }
 
     private sealed class SlowRecorder(Func<Task> onRun) : IProcessRunner

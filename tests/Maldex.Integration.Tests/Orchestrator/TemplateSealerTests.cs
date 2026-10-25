@@ -39,7 +39,11 @@ internal sealed class TemplateJobKit : IAsyncDisposable
     public TemplateSealer Sealer => new(Hypervisor, Store, Microsoft.Extensions.Options.Options.Create(Options), TimeProvider.System);
 
     public TemplateVerifier Verifier => new(Hypervisor, new Factory(this), new NoopEgressRouter(Microsoft.Extensions.Options.Options.Create(new FakeEgressOptions()), Guest),
-        Microsoft.Extensions.Options.Options.Create(new OrchestratorOptions()), Microsoft.Extensions.Options.Options.Create(Options), TimeProvider.System);
+        Microsoft.Extensions.Options.Options.Create(new OrchestratorOptions()), Microsoft.Extensions.Options.Options.Create(Options),
+        Microsoft.Extensions.Options.Options.Create(new Maldex.Infrastructure.Net.NetOptions { RunDir = RunDir }), TimeProvider.System);
+
+    /// <summary>The run directory the verifier cleans its lease leftovers from (a private temp dir).</summary>
+    public string RunDir { get; } = Path.Combine(Path.GetTempPath(), "maldex-kit-run-" + Guid.NewGuid().ToString("N"));
 
     /// <summary>A channel to a guest that is ready at once, or never (<paramref name="ready"/> false).</summary>
     public ReplayAgentChannel NewChannel(Guid taskId, bool ready = true)
@@ -78,13 +82,24 @@ internal sealed class TemplateJobKit : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         foreach (var c in Channels) await c.DisposeAsync();
+        try { Directory.Delete(RunDir, recursive: true); } catch (DirectoryNotFoundException) { }
     }
 
     private sealed class Factory(TemplateJobKit kit) : IAgentChannelFactory
     {
-        public Task<IAgentChannel> ConnectAsync(VmHandle vm, CancellationToken ct) =>
-            kit.ConnectFails ? throw new IOException("the agent socket is not there") : Task.FromResult<IAgentChannel>(kit.NewChannel(vm.TaskId, kit.VerifyAgentReady));
+        public Task<IAgentChannel> ConnectAsync(VmHandle vm, CancellationToken ct)
+        {
+            if (kit.ConnectFails) throw new IOException("the agent socket is not there");
+            var channel = kit.NewChannel(vm.TaskId, kit.VerifyAgentReady);
+            return Task.FromResult<IAgentChannel>(kit.DropProvenanceRequests > 0 ? new ReconnectGapChannel(channel, kit.DropProvenanceRequests) : channel);
+        }
     }
+
+    /// <summary>The channels the verifier connects (what <see cref="Verifier"/> uses).</summary>
+    public IAgentChannelFactory ChannelFactory => new Factory(this);
+
+    /// <summary>The verifier's connections lose their first N provenance requests (the agent is still reconnecting).</summary>
+    public int DropProvenanceRequests { get; set; }
 
     public bool VerifyAgentReady { get; set; } = true;
     public bool ConnectFails { get; set; }
