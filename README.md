@@ -180,6 +180,38 @@ MALDEX_MODE=Real ./build.sh run
 | `e2e-templates` | Real template-job E2E (Refresh, Edit, Roll back, Build from `MALDEX_WIN_ISO`); a green full run writes the validation stamp |
 | `e2e-build-acceptance` | Interactive Build from `MALDEX_WIN_ISO`: you turn off Defender in the job's console (localhost:5080 over an SSH forward) and press Seal |
 
+## Install on a server
+
+Release packages are built and signed by the release workflow: a `.deb` for Ubuntu 24.04 and an `.rpm` for RHEL 9 and its rebuilds (x86_64). Maldex assumes a **dedicated host**: the package creates five system users (`maldex`, `maldex-mitm`, `maldex-dns`, `maldex-isroot`, `maldex-isuser`) and a sudoers file that gives the `maldex` service user passwordless `sudo` for a fixed list of commands (`chmod chown cp find install ip iptables kill mount nft rm setsid sysctl umount`), because the app drives libvirt, nftables and network namespaces through `sudo -n`. Do not install it on a shared machine.
+
+1. **Download and verify.** Download the `.deb` or `.rpm`, `SHA256SUMS`, `SHA256SUMS.asc` and `maldex-signing-key.asc` from the GitHub release, then:
+
+   ```bash
+   gpg --import maldex-signing-key.asc
+   gpg --verify SHA256SUMS.asc SHA256SUMS
+   sha256sum -c SHA256SUMS --ignore-missing
+   ```
+
+2. **Install.**
+
+   ```bash
+   sudo apt install ./maldex_*.deb
+   ```
+
+   On RHEL, first `sudo dnf install epel-release` and enable the CRB repository (`sudo dnf config-manager --set-enabled crb`), then `sudo dnf install ./maldex-*.rpm`. For the rpm you can also `sudo rpm --import maldex-signing-key.asc` and check it with `rpm -K maldex-*.rpm`.
+
+3. **Configure.** Edit `/etc/maldex/appsettings.Production.json` (mode 0640, `root:maldex`): set the SQL Server connection string and the `AzureAd` section (tenant, client ID, audience).
+
+4. **Run the host setup.**
+
+   ```bash
+   sudo maldex-setup
+   ```
+
+   It installs and checks the rest of the host (libvirt/KVM, mitmproxy, guest tooling, Sysmon and the virtio drivers). On a host without internet access, copy `Sysmon.zip` and `virtio-win.iso` over and run `sudo maldex-setup --offline <dir>`. `maldex-setup --check` re-runs only the read-only checks.
+
+5. **Open the app.** It listens on `http://127.0.0.1:5080` only; reach it through an SSH forward (`ssh -L 5080:127.0.0.1:5080 <host>`) or a reverse proxy you provide. Then build the first guest image under **Admin → Sandbox Templates → New template**.
+
 ## Development progress
 
 MALdex is delivered in sub-projects. **Sub-project 1, the core detonation slice, is code complete** and runs green end to end on a real Windows 11 guest.
