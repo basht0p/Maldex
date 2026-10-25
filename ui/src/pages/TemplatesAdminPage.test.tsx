@@ -13,6 +13,9 @@ const startTemplateEdit = vi.fn()
 const startTemplateRefresh = vi.fn()
 const publishTemplateVersion = vi.fn()
 const discardTemplateVersion = vi.fn()
+const deleteTemplate = vi.fn()
+const startTemplateBuild = vi.fn()
+const listMedia = vi.fn()
 vi.mock('../api/client', async (orig) => ({
   ...(await orig<typeof import('../api/client')>()),
   listAdminTemplates: (...a: unknown[]) => listAdminTemplates(...a),
@@ -24,6 +27,9 @@ vi.mock('../api/client', async (orig) => ({
   startTemplateRefresh: (...a: unknown[]) => startTemplateRefresh(...a),
   publishTemplateVersion: (...a: unknown[]) => publishTemplateVersion(...a),
   discardTemplateVersion: (...a: unknown[]) => discardTemplateVersion(...a),
+  deleteTemplate: (...a: unknown[]) => deleteTemplate(...a),
+  startTemplateBuild: (...a: unknown[]) => startTemplateBuild(...a),
+  listMedia: (...a: unknown[]) => listMedia(...a),
 }))
 
 import { ApiError } from '../api/client'
@@ -75,6 +81,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   listAdminTemplates.mockResolvedValue([base(), golden()])
   listTemplateJobs.mockResolvedValue([])
+  listMedia.mockResolvedValue([])
 })
 afterEach(() => vi.restoreAllMocks())
 
@@ -420,5 +427,137 @@ describe('TemplatesAdminPage', () => {
       expect(within(g).queryByRole('button', { name: /^Publish v/ })).toBeNull()
       expect(within(g).queryByRole('button', { name: /^Discard v/ })).toBeNull()
     })
+  })
+
+  describe('Media, New template and Delete', () => {
+    const empty = (over: Partial<AdminTemplateDto> = {}): AdminTemplateDto => ({
+      id: 'win11-new', displayName: 'Windows 11 New', description: null, isDefault: false, enabled: true, current: null, versions: [], ...over,
+    })
+    const iso = {
+      id: 'os1', kind: 'OsInstaller', fileName: 'win11.iso', size: 10, receivedBytes: 10, sha256: 'ab', source: 'Upload', status: 'Ready',
+      images: [{ index: 6, name: 'Windows 11 Pro', build: '26300', supported: true }], preferredImageIndex: 6, addedBy: 'dev', addedAt: '2026-10-25T10:00:00Z', usedBy: [],
+    }
+
+    it('has Templates and Media tabs; the Media tab shows the library', async () => {
+      renderPage()
+      await region('Windows 11 Golden')
+      expect(screen.getByRole('tab', { name: 'Templates' })).toHaveAttribute('aria-selected', 'true')
+      await userEvent.click(screen.getByRole('tab', { name: 'Media' }))
+      expect(screen.getByRole('tab', { name: 'Media' })).toHaveAttribute('aria-selected', 'true')
+      expect(await screen.findByRole('region', { name: 'Media library' })).toBeInTheDocument()
+      expect(listMedia).toHaveBeenCalled()
+      expect(screen.queryByRole('region', { name: 'Windows 11 Golden' })).toBeNull()
+      await userEvent.click(screen.getByRole('tab', { name: 'Templates' }))
+      expect(await region('Windows 11 Golden')).toBeInTheDocument()
+    })
+
+    it('New template opens the Build dialog with the same focus handling and returns focus to its button', async () => {
+      renderPage()
+      await region('Windows 11 Golden')
+      const trigger = screen.getByRole('button', { name: 'New template' })
+      await userEvent.click(trigger)
+      const dlg = await screen.findByRole('dialog', { name: 'New template' })
+      await waitFor(() => expect(dlg).toContainElement(document.activeElement as HTMLElement))
+      for (let i = 0; i < 12; i++) {
+        await userEvent.tab()
+        expect(dlg).toContainElement(document.activeElement as HTMLElement)
+      }
+      await userEvent.keyboard('{Escape}')
+      expect(screen.queryByRole('dialog')).toBeNull()
+      expect(trigger).toHaveFocus()
+    })
+
+    it('starting the build opens its job page', async () => {
+      listMedia.mockResolvedValue([iso])
+      startTemplateBuild.mockResolvedValue(job({ id: 'job-b', kind: 'Build', baseVersionNumber: null }))
+      renderPage()
+      await region('Windows 11 Golden')
+      await userEvent.click(screen.getByRole('button', { name: 'New template' }))
+      const dlg = await screen.findByRole('dialog', { name: 'New template' })
+      await within(dlg).findByRole('option', { name: 'win11.iso' })
+      await userEvent.type(within(dlg).getByLabelText('Template id'), 'win11-new')
+      await userEvent.type(within(dlg).getByLabelText('Display name'), 'Windows 11 New')
+      await userEvent.click(within(dlg).getByRole('button', { name: 'Start build' }))
+      expect(startTemplateBuild).toHaveBeenCalledWith(expect.objectContaining({ templateId: 'win11-new', osMediaId: 'os1' }))
+      expect(await screen.findByTestId('where')).toHaveTextContent('/admin/template-jobs/job-b')
+    })
+
+    it('a template without a version says so and, when it can be deleted, offers Delete', async () => {
+      listAdminTemplates.mockResolvedValue([base(), empty()])
+      renderPage()
+      const e = await region('Windows 11 New')
+      expect(within(e).getByText('No version yet')).toBeInTheDocument()
+      expect(await within(e).findByRole('button', { name: 'Delete' })).toBeEnabled()
+    })
+
+    it('offers no Delete when the template has versions, is the default, or has an active job', async () => {
+      const emptyDefault = empty({ id: 'win11-def', displayName: 'Empty Default', isDefault: true })
+      const busy = empty({ id: 'win11-busy', displayName: 'Building' })
+      listAdminTemplates.mockResolvedValue([base(), golden(), emptyDefault, busy])
+      listTemplateJobs.mockImplementation(async (id: string) => (id === 'win11-busy' ? [job({ kind: 'Build', state: 'Installing', baseVersionNumber: null })] : []))
+      renderPage()
+      const b = await region('Building')
+      await waitFor(() => expect(within(b).getByRole('link', { name: 'Open the job' })).toBeInTheDocument())
+      for (const name of ['Windows 11 26H2', 'Windows 11 Golden', 'Empty Default', 'Building']) {
+        expect(within(await region(name)).queryByRole('button', { name: 'Delete' })).toBeNull()
+      }
+    })
+
+    it('offers no Delete until the jobs are known (an active Build must not look absent)', async () => {
+      listAdminTemplates.mockResolvedValue([base(), empty()])
+      listTemplateJobs.mockImplementation(() => new Promise(() => undefined))
+      renderPage()
+      const e = await region('Windows 11 New')
+      expect(within(e).getByText('No version yet')).toBeInTheDocument()
+      expect(within(e).queryByRole('button', { name: 'Delete' })).toBeNull()
+    })
+
+    it('Delete asks first, then deletes and reloads', async () => {
+      listAdminTemplates.mockResolvedValue([base(), empty()])
+      deleteTemplate.mockResolvedValue(undefined)
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true)
+      renderPage()
+      const e = await region('Windows 11 New')
+      const del = await within(e).findByRole('button', { name: 'Delete' })
+      await userEvent.click(del)
+      expect(deleteTemplate).not.toHaveBeenCalled()
+      await userEvent.click(del)
+      expect(confirm).toHaveBeenCalledTimes(2)
+      expect(deleteTemplate).toHaveBeenCalledWith('win11-new')
+      await waitFor(() => expect(listAdminTemplates).toHaveBeenCalledTimes(2))
+    })
+
+    it('shows the 409 reason from Delete inline', async () => {
+      listAdminTemplates.mockResolvedValue([base(), empty()])
+      deleteTemplate.mockRejectedValue(new ApiError(409, { title: 'A job is active for this template.', status: 409 }))
+      vi.spyOn(window, 'confirm').mockReturnValue(true)
+      renderPage()
+      const e = await region('Windows 11 New')
+      await userEvent.click(await within(e).findByRole('button', { name: 'Delete' }))
+      expect(await within(e).findByRole('alert')).toHaveTextContent('A job is active for this template.')
+    })
+
+    it('the jobs table shows a Build as base "new"', async () => {
+      listTemplateJobs.mockResolvedValue([job({ id: 'jb', kind: 'Build', baseVersionNumber: null, resultVersionNumber: 1, state: 'Published' })])
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      const jobs = await within(g).findByRole('table', { name: 'Jobs' })
+      expect(within(jobs).getByRole('link', { name: 'Build' })).toBeInTheDocument()
+      expect(within(jobs).getAllByRole('row')[1]).toHaveTextContent(/new\s*v1/)
+    })
+
+    it('a failed reload after a job ends keeps the last versions and offers a retry', async () => {
+      listTemplateJobs.mockResolvedValue([job({ state: 'Sealing' })])
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await waitFor(() => expect(within(g).getByRole('button', { name: 'Edit' })).toBeDisabled())
+      listTemplateJobs.mockResolvedValue([job({ state: 'Published', resultVersionNumber: 4 })])
+      listAdminTemplates.mockRejectedValue(new ApiError(500, { title: 'Boom' }))
+      expect(await screen.findByText(/showing the last loaded versions/i, undefined, { timeout: 8000 })).toHaveTextContent('Boom')
+      expect(within(g).getByText('Current: v3 (Windows 11 Pro 26300, agent 1.0.0, sealed 2026-10-24 by basht0p)')).toBeInTheDocument()
+      listAdminTemplates.mockResolvedValue([base(), golden()])
+      await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
+      await waitFor(() => expect(screen.queryByText(/showing the last loaded versions/i)).toBeNull())
+    }, 15000)
   })
 })
