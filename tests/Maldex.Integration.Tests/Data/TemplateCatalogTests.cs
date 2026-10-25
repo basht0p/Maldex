@@ -763,6 +763,60 @@ public class TemplateCatalogTests(SqlServerFixture sql)
         }
     }
 
+    private static async Task SeedJobAsync(MaldexDbContext db, string templateId, Guid baseVersionId, TemplateJobState state)
+    {
+        db.TemplateJobs.Add(new TemplateJob
+        {
+            Id = Guid.NewGuid(), Kind = TemplateJobKind.Refresh, TemplateId = templateId, BaseVersionId = baseVersionId, State = state,
+            RequestedByUserId = await AddUserAsync(db), CreatedAt = Now,
+        });
+        await db.SaveChangesAsync(Ct);
+    }
+
+    [Theory]
+    [InlineData(TemplateJobState.Queued)]
+    [InlineData(TemplateJobState.Preparing)]
+    [InlineData(TemplateJobState.Configuring)]
+    [InlineData(TemplateJobState.Sealing)]
+    [InlineData(TemplateJobState.Verifying)]
+    public async Task Sweep_KeepsRetiredVersion_ThatIsTheBaseOfAnActiveJob(TemplateJobState state)
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            var retired = await AddVersionAsync(db, "a", 1, TemplateVersionStatus.Retired);
+            await SeedJobAsync(db, "a", retired.Id, state);
+            var store = new RecordingStore();
+
+            Assert.Empty(await Catalog(db, store: store).SweepAsync(Ct));
+
+            Assert.Empty(store.Deleted);
+            Assert.Equal(TemplateVersionStatus.Retired, (await StatusesAsync(db, "a"))[1]);
+        }
+    }
+
+    [Theory]
+    [InlineData(TemplateJobState.Published)]
+    [InlineData(TemplateJobState.Sealed)]
+    [InlineData(TemplateJobState.Failed)]
+    [InlineData(TemplateJobState.Cancelled)]
+    public async Task Sweep_EndedJob_DoesNotKeepItsRetiredBaseVersion(TemplateJobState state)
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a");
+            var retired = await AddVersionAsync(db, "a", 1, TemplateVersionStatus.Retired);
+            await SeedJobAsync(db, "a", retired.Id, state);
+            var store = new RecordingStore();
+
+            Assert.Single(await Catalog(db, store: store).SweepAsync(Ct));
+
+            Assert.Equal([retired.FileStem], store.Deleted);
+        }
+    }
+
     // --- audit ---
 
     /// <summary>Fails any save that carries an audit row, as a failing audit write would.</summary>

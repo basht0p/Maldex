@@ -429,6 +429,47 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
     }
 
     [Fact]
+    public async Task RollbackWhileARefreshRuns_HoldsTheNewVersionPending_AndTheRolledBackToVersionStaysCurrent()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        // v2 is published over v1 (so v1 is the rollback target), and the refresh works from v2.
+        var v2 = rig.H.NewVersion("win10", 2);
+        await using (var db = rig.H.NewContext())
+        {
+            db.TemplateVersions.Add(v2);
+            await db.SaveChangesAsync(Ct);
+        }
+        await using (var scope = rig.H.Services.CreateAsyncScope())
+            await scope.ServiceProvider.GetRequiredService<TemplateCatalog>().PublishAsync("win10", v2.Id, Ct);
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh, baseVersionId: v2.Id);
+        // While the job prepares its copy, an admin rolls back (v2 is retired) and the retention sweep runs.
+        IReadOnlyList<TemplateVersion>? swept = null;
+        rig.DiskEditor.OnInstall = async (_, _) =>
+        {
+            await using var scope = rig.H.Services.CreateAsyncScope();
+            var catalog = scope.ServiceProvider.GetRequiredService<TemplateCatalog>();
+            await catalog.RollBackAsync("win10", Ct);
+            swept = await catalog.SweepAsync(Ct);
+        };
+
+        await rig.PumpAsync(rig.Start(id));
+
+        var job = await rig.JobAsync(id);
+        Assert.Equal(TemplateJobState.Sealed, job.State);
+        Assert.Equal("not published: the template's current version changed while this job ran (v1 is current); publish it from the template page if wanted", job.Message);
+        Assert.Equal(rig.V1.Id, await rig.CurrentVersionIdAsync());
+        var versions = await rig.VersionsAsync();
+        var v3 = versions.Single(v => v.Number == 3);
+        Assert.Equal((job.ResultVersionId, TemplateVersionStatus.Ready, (Guid?)v2.Id), (v3.Id, v3.Status, v3.ParentVersionId));
+        Assert.Equal("Pending", TemplateCatalog.RolesOf(versions, rig.V1.Id)[v3.Id]);
+        // The job's base was kept while it ran: retired, but its disk not deleted.
+        Assert.Empty(swept!);
+        Assert.Equal(TemplateVersionStatus.Retired, versions.Single(v => v.Id == v2.Id).Status);
+        Assert.DoesNotContain(v2.FileStem, rig.Store.Deleted);
+        Assert.Equal(["template.seal"], (await rig.AuditsAsync()).Select(a => a.Action));
+    }
+
+    [Fact]
     public async Task Seal_ClosesTheOpenConsole_AndWaitsForIt_BeforeTheGuestIsIsolated()
     {
         await using var rig = await TemplateJobRig.CreateAsync(sql, new Dictionary<string, string?> { ["Maldex:Templates:Jobs:ConsoleCloseTimeout"] = "01:00:00" });

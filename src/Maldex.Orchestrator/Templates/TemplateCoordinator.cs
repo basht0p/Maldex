@@ -463,7 +463,8 @@ public sealed class TemplateCoordinator(
 
     /// <summary>
     /// Inserts the version and moves the job to Published or Sealed (publishing the version when asked), all in one transaction.
-    /// False when a cancel request arrived first: nothing is written then.
+    /// When the template's current version is no longer the job's base (a rollback or another publish while it ran), the version
+    /// is held (Sealed, Pending) instead of published. False when a cancel request arrived first: nothing is written then.
     /// </summary>
     private async Task<bool> RecordVersionAsync(MaldexDbContext db, TemplateCatalog catalog, TemplateJob job, VerifiedProvenance provenance, ComponentBundle bundle)
     {
@@ -476,6 +477,20 @@ public sealed class TemplateCoordinator(
             {
                 var row = await db.TemplateJobs.SingleAsync(j => j.Id == job.Id, ct).ConfigureAwait(false);
                 if (row.CancelRequestedAt is not null) return false;
+
+                // Locked until the commit, so a rollback or publish cannot slip in between this check and the publish below.
+                var currentId = await db.Templates
+                    .FromSqlInterpolated($"SELECT * FROM Templates WITH (UPDLOCK, HOLDLOCK) WHERE Id = {row.TemplateId}")
+                    .AsNoTracking().Select(t => t.CurrentVersionId).SingleAsync(ct).ConfigureAwait(false);
+                // A rollback or another publish while the job ran: the new version is held for an admin, never published over that choice.
+                string? superseded = null;
+                if (row.PublishOnSuccess && currentId != row.BaseVersionId)
+                {
+                    var currentNumber = currentId is null ? null
+                        : await db.TemplateVersions.AsNoTracking().Where(v => v.Id == currentId).Select(v => (int?)v.Number).SingleOrDefaultAsync(ct).ConfigureAwait(false);
+                    superseded = $"not published: the template's current version changed while this job ran ({(currentNumber is { } n ? $"v{n}" : "no version")} is current); publish it from the template page if wanted";
+                }
+                var publish = row.PublishOnSuccess && superseded is null;
 
                 var number = (await db.TemplateVersions.Where(v => v.TemplateId == row.TemplateId).MaxAsync(v => (int?)v.Number, ct).ConfigureAwait(false) ?? 0) + 1;
                 var now = time.GetUtcNow();
@@ -502,14 +517,14 @@ public sealed class TemplateCoordinator(
                 };
                 db.TemplateVersions.Add(version);
 
-                var message = row.PublishOnSuccess ? $"published as v{number}" : $"sealed as v{number}; not published";
+                var message = superseded ?? (publish ? $"published as v{number}" : $"sealed as v{number}; not published");
                 if (provenance.Note is not null) message += "; " + provenance.Note;
-                row.TransitionTo(row.PublishOnSuccess ? TemplateJobState.Published : TemplateJobState.Sealed, Clip(message, MaxMessageLength), now);
+                row.TransitionTo(publish ? TemplateJobState.Published : TemplateJobState.Sealed, Clip(message, MaxMessageLength), now);
                 row.ResultVersionId = version.Id;
                 db.AuditLogs.Add(Audit(row, row.RequestedByUserId, "template.seal", $"job={row.Id}; v={number}"));
                 await db.SaveChangesAsync(ct).ConfigureAwait(false);
 
-                if (row.PublishOnSuccess)
+                if (publish)
                     await catalog.PublishAsync(row.TemplateId, version.Id, ct, new TemplateAudit(row.RequestedByUserId, "template.publish", $"to=v{number}; job={row.Id}")).ConfigureAwait(false);
 
                 await tx.CommitAsync(ct).ConfigureAwait(false);

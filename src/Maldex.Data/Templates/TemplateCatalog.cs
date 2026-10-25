@@ -1,6 +1,7 @@
 using System.Linq.Expressions;
 using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
+using Maldex.Core.Lifecycle;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Logging;
@@ -36,6 +37,8 @@ public sealed record RollBackResult(int? From, int To);
 public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IOptions<TemplateOptions> options, TimeProvider time, ILogger<TemplateCatalog>? log = null)
 {
     public const int MaxAttempts = 3;
+
+    private static readonly IReadOnlyList<TemplateJobState> ActiveJobStates = TemplateJobStateMachine.ActiveStates;
 
     /// <summary>Every available template, the default first, then by display name.</summary>
     public Task<List<Template>> AvailableAsync(CancellationToken ct) => AvailableWhereAsync(_ => true, ct);
@@ -242,7 +245,8 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
         }, ct);
 
     /// <summary>
-    /// Deletes the disk of every Retired version that no Preparing, Running or Collecting task uses, and marks it Deleted.
+    /// Deletes the disk of every Retired version that no Preparing, Running or Collecting task uses and that is not the base
+    /// of a non-terminal template job, and marks it Deleted.
     /// Each version is recorded on its own (delete, then mark it and add its system audit row in one save); a failing
     /// version is logged, stays Retired, and the others carry on. Never touches Ready versions. Returns the versions deleted.
     /// </summary>
@@ -264,6 +268,9 @@ public sealed class TemplateCatalog(MaldexDbContext db, ITemplateStore store, IO
                     var inUse = await db.Tasks.AnyAsync(t => t.TemplateVersionId == version.Id
                         && (t.Status == RunStatus.Preparing || t.Status == RunStatus.Running || t.Status == RunStatus.Collecting), ct).ConfigureAwait(false);
                     if (inUse) return;
+                    // A job still working from it may not have copied it yet (a rollback can retire a running job's base).
+                    var jobBase = await db.TemplateJobs.AnyAsync(j => j.BaseVersionId == version.Id && ActiveJobStates.Contains(j.State), ct).ConfigureAwait(false);
+                    if (jobBase) return;
                     await store.DeleteAsync(version.FileStem, ct).ConfigureAwait(false); // idempotent, so safe to repeat on retry
                     version.Status = TemplateVersionStatus.Deleted;
                     AddAudit(new TemplateAudit(null, "template.version.delete", $"template={version.TemplateId}; v={version.Number}"), version.Id.ToString());
