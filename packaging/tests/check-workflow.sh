@@ -39,6 +39,11 @@ if [ -f "$WF" ]; then
   if grep -q 'github.event_name' "$WF" && ! grep -q 'ref_type' "$WF" && grep -q 'dryrun' "$WF"; then ok "version chosen by event"; else fail "build version must be chosen by github.event_name, not ref_type"; fi
   if [ "$(grep -c 'persist-credentials: false' "$WF")" = "$(grep -c 'actions/checkout@' "$WF")" ]; then ok "checkouts do not persist credentials"; else fail "every checkout needs persist-credentials: false"; fi
   if grep -q "rpm -K.*signatures OK" "$WF"; then ok "rpm signature asserted"; else fail "smoke-rpm must assert 'signatures OK' from rpm -K"; fi
+  # CI-only: the rpm job installs ~450 packages from a mirror; it needs fast mirrors, parallel downloads and a timeout (all in smoke-rpm)
+  rpmjob=$(awk '/^  smoke-rpm:/{j=1;print;next} /^  [A-Za-z0-9_-]+:[ \t]*$/{j=0} j' "$WF")
+  if printf '%s\n' "$rpmjob" | grep -q 'fastestmirror=True' && printf '%s\n' "$rpmjob" | grep -q 'max_parallel_downloads' && printf '%s\n' "$rpmjob" | grep -q 'timeout-minutes:'; then ok "smoke-rpm dnf tuning and timeout"; else fail "smoke-rpm needs dnf fastestmirror/max_parallel_downloads and timeout-minutes"; fi
+  # a branch push must not be mistaken for a release tag: the tag version needs the push event AND a v* ref name
+  if grep -qF 'if [ "$EVENT" = push ] && [[ "$REF_NAME" == v* ]]; then' "$WF"; then ok "tag version needs push event and v* ref"; else fail "version derivation must require EVENT=push and [[ \"\$REF_NAME\" == v* ]]"; fi
   if grep -q 'if: always()' "$WF"; then ok "always() cleanup step"; else fail "missing if: always() cleanup step"; fi
 fi
 
