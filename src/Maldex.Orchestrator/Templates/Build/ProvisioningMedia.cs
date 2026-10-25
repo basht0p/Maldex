@@ -59,19 +59,24 @@ public sealed class XorrisoProvisioningMediaBuilder(IProcessRunner runner, IOpti
         var opts = options.Value;
         Directory.CreateDirectory(workDir);
         var iso = Path.Combine(workDir, "provision.iso");
-        var stage = await ProvisioningStage.WriteAsync(opts, inputs, workDir, placeholderSysmon: false, ct).ConfigureAwait(false);
+        var stage = Path.Combine(workDir, "stage");
+        var built = false;
         try
         {
+            // Inside the try: a missing Sysmon.zip or a cancel while staging must not leave the agent and the rendered unattend behind.
+            stage = await ProvisioningStage.WriteAsync(opts, inputs, workDir, placeholderSysmon: false, ct).ConfigureAwait(false);
             if (File.Exists(iso)) File.Delete(iso);
             var result = await runner.RunAsync(opts.XorrisoBinary,
                 ["-as", "mkisofs", "-quiet", "-J", "-R", "-V", "MALDEXPROV", "-o", iso, stage], ct,
                 timeout: TimeSpan.FromMinutes(5)).ConfigureAwait(false);
             if (result.ExitCode != 0)
                 throw new InvalidOperationException($"xorriso failed with exit code {result.ExitCode}: {result.Stderr.Trim()}");
+            built = true;
         }
         finally
         {
-            try { Directory.Delete(stage, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            try { if (Directory.Exists(stage)) Directory.Delete(stage, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            if (!built) try { File.Delete(iso); } catch (IOException) { } catch (UnauthorizedAccessException) { }
         }
         return iso;
     }

@@ -152,6 +152,9 @@ public sealed class ProvisioningMediaTests : IDisposable
             Real(new CapturingRunner()).BuildAsync(new ProvisioningInputs(TemplateJobKit.MakeBundle(), 1, null, false), Path.Combine(_dir, "work"), CancellationToken.None));
 
         Assert.Contains("./build.sh real-setup", ex.Message);
+        // Nothing staged is left behind: no agent exe or rendered unattend on disk after a failed build.
+        Assert.False(Directory.Exists(Path.Combine(_dir, "work", "stage")));
+        Assert.False(File.Exists(Path.Combine(_dir, "work", "provision.iso")));
     }
 
     [Fact]

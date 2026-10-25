@@ -181,14 +181,14 @@ catch { Write-Host "FATAL: $_"; $script:failed = $true; $script:failedSteps += '
 finally {
     if ($script:failed) { Write-Host "PROVISIONING FAILED: $($script:failedSteps -join '; ')." }
     else { Write-Host 'Provisioning complete.' }
-    try { Stop-Transcript | Out-Null } catch { }
-
     # The host reads this marker through the agent. UTF-8 without BOM, written to .tmp and renamed so a reader never sees a partial file.
+    # Written before the transcript stops, so a failure to write it is still in provision.log.
     try {
         $json = (@{ ok = (-not $script:failed); failedSteps = @($script:failedSteps) } | ConvertTo-Json -Compress)
         $tmp = "$ResultFile.tmp"
         [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
         Move-Item -Force -Path $tmp -Destination $ResultFile
     } catch { Write-Host "Could not write ${ResultFile}: $_" }
+    try { Stop-Transcript | Out-Null } catch { }
 }
 exit ([int]$script:failed)
