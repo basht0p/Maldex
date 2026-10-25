@@ -7,7 +7,9 @@ media) or Edit` and exits 2. This directory keeps the files the Build uses as it
 
 ## Build a template from media
 
-1. **Host setup once:** `./build.sh real-setup` installs the toolchain (including `wimtools` for `wiminfo`, `xorriso` and
+1. **Host setup once:** on a server installed from the `.deb`/`.rpm` package, run `sudo maldex-setup` instead (it installs and
+   checks the same host prerequisites; see "Install on a server" in the top-level README). On a development checkout,
+   `./build.sh real-setup` installs the toolchain (including `wimtools` for `wiminfo`, `xorriso` and
    libguestfs), caches the virtio drivers ISO (`.data/vm/iso/virtio-win.iso`) and the pinned `Sysmon.zip`, and creates the
    media library (`.data/media`). `./build.sh agent` publishes the guest agent (`.data/agent/Maldex.Agent.exe`).
 2. **Media:** under **Admin → Sandbox Templates → Media**, upload or fetch a Windows 11 x64 ISO (Enterprise evaluation, or
