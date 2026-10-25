@@ -175,3 +175,5 @@ export const getTaskReport = (id: string) => get<TaskReportDto>(`/api/tasks/${en
 export const screenshotUrl = (artifactId: string) => `/api/artifacts/${encodeURIComponent(artifactId)}/image`
 export const httpBodyUrl = (taskId: string, txId: number) => `/api/tasks/${encodeURIComponent(taskId)}/http/${txId}/body`
 export const resubmitTask = (id: string, req: ResubmitRequest) => post<TaskDto>(`/api/tasks/${encodeURIComponent(id)}/resubmit`, req)
+
+export const getSystemStatus = () => get<import('./types').SystemStatusDto>('/api/admin/status')

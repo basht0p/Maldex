@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
+using Maldex.Core.Health;
 using Maldex.Core.Scheduling;
 using Maldex.Data;
 using Maldex.Infrastructure.Storage;
@@ -26,7 +27,8 @@ public sealed class OrchestratorWorker(
     IOptions<OrchestratorOptions> options,
     IOptions<ArtifactStoreOptions> artifactOptions,
     TimeProvider time,
-    ILogger<OrchestratorWorker> logger) : BackgroundService
+    ILogger<OrchestratorWorker> logger,
+    WorkerHealth? health = null) : BackgroundService
 {
     public static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(1);
 
@@ -36,15 +38,20 @@ public sealed class OrchestratorWorker(
     private readonly CancellationTokenSource _runsCts = new();
     private readonly ConcurrentDictionary<Guid, Task> _runs = new();
 
+    // Registered at construction: a worker the start gate never lets run shows up as stalled.
+    private readonly WorkerHealth? _health = WorkerHealth.RegisterOn(health, "orchestrator", PollInterval);
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         try
         {
+            _health?.Tick("orchestrator");
             await ReconcileWithRetryAsync(stoppingToken).ConfigureAwait(false);
 
             using var timer = new PeriodicTimer(PollInterval, time);
             do
             {
+                _health?.Tick("orchestrator");
                 try
                 {
                     await ClaimAndStartAsync(stoppingToken).ConfigureAwait(false);

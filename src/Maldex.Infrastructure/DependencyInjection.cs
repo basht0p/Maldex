@@ -1,3 +1,4 @@
+using Maldex.Core.Health;
 using Maldex.Core.Abstractions;
 using Maldex.Infrastructure.Agent;
 using Maldex.Infrastructure.Execution;
@@ -36,6 +37,10 @@ public static class DependencyInjection
 
         if (!OperatingSystem.IsWindows()) services.AddSingleton<IArtifactStore, FileSystemArtifactStore>();
         services.AddSingleton<IDiskSpaceProbe, DiskSpaceProbe>();
+        services.AddSingleton<IDiskUsageProbe, DriveDiskUsageProbe>();
+        services.AddSingleton<WorkerHealth>();
+        // Startup + hourly sweep of stale loop mounts (a no-op outside Real mode); hosted in every mode so its liveness is always reported.
+        services.AddHostedService<MediaMountSweepService>();
         services.Configure<MediaOptions>(configuration.GetSection(MediaOptions.SectionName));
         // Resolved against the same base as real mode, in both modes (the media root must not depend on the working directory).
         services.PostConfigure<MediaOptions>(o =>
@@ -139,6 +144,5 @@ public static class DependencyInjection
         services.AddSingleton<IWorkerStartGate, GuardedWorkerStartGate>();
         services.AddSingleton<LoopMountMediaInspector>();
         services.AddSingleton<IMediaInspector>(sp => sp.GetRequiredService<LoopMountMediaInspector>());
-        services.AddHostedService<MediaMountSweepService>();
     }
 }

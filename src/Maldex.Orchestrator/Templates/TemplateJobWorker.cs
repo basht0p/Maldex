@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Maldex.Core.Domain;
+using Maldex.Core.Health;
 using Maldex.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -22,7 +23,8 @@ public sealed class TemplateJobWorker(
     TemplateCoordinator coordinator,
     IOptions<OrchestratorOptions> options,
     TimeProvider time,
-    ILogger<TemplateJobWorker> logger) : BackgroundService
+    ILogger<TemplateJobWorker> logger,
+    WorkerHealth? health = null) : BackgroundService
 {
     public static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(1);
 
@@ -31,16 +33,21 @@ public sealed class TemplateJobWorker(
     private readonly CancellationTokenSource _runsCts = new();
     private readonly ConcurrentDictionary<Guid, Task> _runs = new();
 
+    // Registered at construction: a worker the start gate never lets run shows up as stalled.
+    private readonly WorkerHealth? _health = WorkerHealth.RegisterOn(health, "template-jobs", PollInterval);
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         try
         {
+            _health?.Tick("template-jobs");
             // The reconcile destroys every VM it finds and fails interrupted jobs: never start one before it has finished.
             await reconciler.Reconciled.WaitAsync(stoppingToken).ConfigureAwait(false);
 
             using var timer = new PeriodicTimer(PollInterval, time);
             do
             {
+                _health?.Tick("template-jobs");
                 try
                 {
                     await ClaimAndStartAsync(stoppingToken).ConfigureAwait(false);

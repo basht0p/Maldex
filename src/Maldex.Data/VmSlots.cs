@@ -10,9 +10,9 @@ namespace Maldex.Data;
 /// </summary>
 public static class VmSlots
 {
-    private static readonly RunStatus[] TaskStates = [RunStatus.Preparing, RunStatus.Running, RunStatus.Collecting];
+    public static readonly RunStatus[] TaskStates = [RunStatus.Preparing, RunStatus.Running, RunStatus.Collecting];
 
-    private static readonly IReadOnlyList<TemplateJobState> Terminal = TemplateJobStateMachine.TerminalStates;
+    public static readonly IReadOnlyList<TemplateJobState> Terminal = TemplateJobStateMachine.TerminalStates;
 
     public static async Task<int> BusyAsync(MaldexDbContext db, CancellationToken ct)
     {
