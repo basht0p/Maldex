@@ -37,12 +37,15 @@ public sealed class MediaUploadState : IDisposable
 
     public Channel<MediaWork> Queue { get; } = Channel.CreateUnbounded<MediaWork>(new UnboundedChannelOptions { SingleReader = true });
 
+    /// <summary>How many uploads have an entry (lock and hash).</summary>
+    public int TrackedUploads => _uploads.Count;
+
     public Upload Get(Guid id) => _uploads.GetOrAdd(id, _ => new Upload());
 
-    /// <summary>Drops the running hash of an upload (the lock stays, so a chunk in flight is not disturbed).</summary>
-    public void Forget(Guid id)
+    /// <summary>Drops an upload's entry (its running hash too) when it has ended; a chunk still holding the lock finishes on its own copy.</summary>
+    public void Remove(Guid id)
     {
-        if (_uploads.TryGetValue(id, out var upload)) upload.DropHash();
+        if (_uploads.TryRemove(id, out var upload)) upload.DropHash();
     }
 
     public void RegisterFetch(Guid id, CancellationTokenSource cts) => _fetches[id] = cts;

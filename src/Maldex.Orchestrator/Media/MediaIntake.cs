@@ -24,6 +24,12 @@ public sealed class MediaOffsetException(long receivedBytes) : Exception($"the c
     public long ReceivedBytes { get; } = receivedBytes;
 }
 
+/// <summary>No such media file: 404.</summary>
+public sealed class MediaNotFoundException(Guid id) : Exception("media file not found")
+{
+    public Guid Id { get; } = id;
+}
+
 /// <summary>The file is used by an active template job: 409.</summary>
 public sealed class MediaInUseException(string message) : Exception(message);
 
@@ -55,13 +61,7 @@ public sealed class MediaIntake(
         await state.StartGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var expected = await db.MediaFiles.AsNoTracking()
-                .Where(m => m.Status == MediaStatus.Receiving && m.Source == MediaSource.Upload)
-                .SumAsync(m => (long?)(m.Size - m.ReceivedBytes), ct).ConfigureAwait(false) ?? 0;
-            var requiredMiB = (size + MiB - 1) / MiB + jobs.Value.MinFreeGiB * 1024L + (expected + MiB - 1) / MiB;
-            var freeMiB = store.FreeMiB();
-            if (freeMiB < requiredMiB)
-                throw new MediaRefusedException($"not enough disk space for this file: {freeMiB / 1024.0:0.#} GiB free, {requiredMiB / 1024.0:0.#} GiB required");
+            await RequireDiskSpaceAsync(size, ct).ConfigureAwait(false);
 
             var now = time.GetUtcNow();
             var media = new MediaFile
@@ -81,13 +81,28 @@ public sealed class MediaIntake(
         }
     }
 
+    /// <summary>Refuses when free space is short of <paramref name="size"/> + the reserve + what other uploads still expect (a fetch passes 0: its size is unknown).</summary>
+    private async Task RequireDiskSpaceAsync(long size, CancellationToken ct)
+    {
+        var expected = await db.MediaFiles.AsNoTracking()
+            .Where(m => m.Status == MediaStatus.Receiving && m.Source == MediaSource.Upload)
+            .SumAsync(m => (long?)(m.Size - m.ReceivedBytes), ct).ConfigureAwait(false) ?? 0;
+        var requiredMiB = (size + MiB - 1) / MiB + jobs.Value.MinFreeGiB * 1024L + (expected + MiB - 1) / MiB;
+        var freeMiB = store.FreeMiB();
+        if (freeMiB < requiredMiB)
+            throw new MediaRefusedException($"not enough disk space for this file: {freeMiB / 1024.0:0.#} GiB free, {requiredMiB / 1024.0:0.#} GiB required");
+    }
+
     public async Task<(long ReceivedBytes, MediaStatus Status)> AppendChunkAsync(Guid id, long offset, Stream body, CancellationToken ct)
     {
+        // No entry is made for an id that is not an upload receiving data.
+        var first = await LoadAsync(id, ct).ConfigureAwait(false) ?? throw new MediaNotFoundException(id);
+        if (first.Status != MediaStatus.Receiving || first.Source != MediaSource.Upload) throw new MediaRefusedException("this upload is no longer receiving data");
         var upload = state.Get(id);
         await upload.Lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var row = await LoadAsync(id, ct).ConfigureAwait(false) ?? throw new KeyNotFoundException("media file not found");
+            var row = await LoadAsync(id, ct).ConfigureAwait(false) ?? throw new MediaNotFoundException(id);
             if (row.Status != MediaStatus.Receiving || row.Source != MediaSource.Upload)
                 throw new MediaRefusedException("this upload is no longer receiving data");
             if (offset != row.ReceivedBytes) throw new MediaOffsetException(row.ReceivedBytes);
@@ -193,16 +208,26 @@ public sealed class MediaIntake(
         var shown = StripQuery(url);
         var name = given ?? CleanFileName(Uri.UnescapeDataString(Path.GetFileName(url.AbsolutePath))) ?? FallbackFetchName;
 
-        var now = time.GetUtcNow();
-        var media = new MediaFile
+        MediaFile media;
+        await state.StartGate.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            Id = Guid.NewGuid(), Kind = kind, FileName = name, Source = MediaSource.Url, SourceUrl = shown,
-            Status = MediaStatus.Receiving, AddedByUserId = userId, AddedAt = now, LastActivityAt = now,
-        };
-        db.MediaFiles.Add(media);
-        db.AuditLogs.Add(Audit(media.Id, userId, "media.fetch.start", $"url={shown}; kind={kind}"));
-        try { await db.SaveChangesAsync(ct).ConfigureAwait(false); }
-        finally { db.ChangeTracker.Clear(); }
+            await RequireDiskSpaceAsync(0, ct).ConfigureAwait(false);
+            var now = time.GetUtcNow();
+            media = new MediaFile
+            {
+                Id = Guid.NewGuid(), Kind = kind, FileName = name, Source = MediaSource.Url, SourceUrl = shown,
+                Status = MediaStatus.Receiving, AddedByUserId = userId, AddedAt = now, LastActivityAt = now,
+            };
+            db.MediaFiles.Add(media);
+            db.AuditLogs.Add(Audit(media.Id, userId, "media.fetch.start", $"url={shown}; kind={kind}"));
+            try { await db.SaveChangesAsync(ct).ConfigureAwait(false); }
+            finally { db.ChangeTracker.Clear(); }
+        }
+        finally
+        {
+            state.StartGate.Release();
+        }
         // The full URL (its query may carry a token) lives only in memory: a restart interrupts the fetch anyway.
         state.Queue.Writer.TryWrite(new MediaWork(media.Id, url, given is not null));
         return media;
@@ -211,12 +236,20 @@ public sealed class MediaIntake(
     /// <summary>Worker: hashes a fully received upload, de-duplicates and inspects it.</summary>
     public async Task CompleteAsync(Guid id, CancellationToken ct)
     {
+        if (await LoadAsync(id, ct).ConfigureAwait(false) is not { Status: MediaStatus.Receiving, Source: MediaSource.Upload }) return;
         var upload = state.Get(id);
         await upload.Lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             var row = await LoadAsync(id, ct).ConfigureAwait(false);
             if (row is not { Status: MediaStatus.Receiving, Source: MediaSource.Upload } || row.ReceivedBytes != row.Size) return;
+
+            // Interrupted after the file was moved into place: its name is its (verified) hash, so pick up from there.
+            if (row.Sha256 is { } known && !File.Exists(store.StagingPath(id)) && File.Exists(store.FinalPath(known)))
+            {
+                await FinishAsync(row, known, ct).ConfigureAwait(false);
+                return;
+            }
 
             string sha;
             if (upload.Hash is not null && upload.HashedBytes == row.Size) sha = Convert.ToHexStringLower(upload.Hash.GetCurrentHash());
@@ -247,6 +280,7 @@ public sealed class MediaIntake(
         finally
         {
             upload.Lock.Release();
+            state.Remove(id); // whatever happened, nothing more arrives for a completed upload
         }
     }
 
@@ -261,12 +295,20 @@ public sealed class MediaIntake(
         try
         {
             FetchResult result;
+            long? stoppedAt = null;
             try
             {
                 long reported = 0;
                 await using var file = store.OpenStagingForAppend(id, 0);
                 result = await fetcher.FetchAsync(url, file, async bytes =>
                 {
+                    if (stoppedAt is null && store.FreeMiB() < jobs.Value.MinFreeGiB * 1024L)
+                    {
+                        // Another download or upload used the space meanwhile: stop before the volume fills.
+                        stoppedAt = bytes;
+                        cts.Cancel();
+                        return;
+                    }
                     if (bytes - reported < 16 * MiB) return;
                     reported = bytes;
                     var now = time.GetUtcNow();
@@ -285,7 +327,9 @@ public sealed class MediaIntake(
             {
                 // A delete cancels the fetch: then the row is no longer Receiving and there is nothing to record.
                 var current = await LoadAsync(id, CancellationToken.None).ConfigureAwait(false);
-                if (current is { Status: MediaStatus.Receiving }) await FailAsync(current, e is OperationCanceledException ? "the download was cancelled" : Clip(e.Message), ct).ConfigureAwait(false);
+                var reason = stoppedAt is { } stopped ? $"not enough disk space: the fetch was stopped at {stopped / (double)(MiB * 1024):0.#} GiB"
+                    : e is OperationCanceledException ? "the download was cancelled" : Clip(e.Message);
+                if (current is { Status: MediaStatus.Receiving }) await FailAsync(current, reason, ct).ConfigureAwait(false);
                 else DeleteStaging(id);
                 return;
             }
@@ -335,7 +379,13 @@ public sealed class MediaIntake(
         string path;
         try
         {
-            path = store.Finalize(row.Id, sha);
+            // The hash is recorded first: if the process stops before the inspection ends, the next start finds the file by it.
+            await SaveAsync(row, null, ct).ConfigureAwait(false);
+            path = File.Exists(store.StagingPath(row.Id)) ? store.Finalize(row.Id, sha) : store.FinalPath(sha);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            return; // deleted meanwhile
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
@@ -389,14 +439,13 @@ public sealed class MediaIntake(
     {
         await using (var tx = await db.Database.BeginTransactionAsync(ct).ConfigureAwait(false))
         {
-            var row = (await MediaLocks.LockAsync(db, [id], ct).ConfigureAwait(false)).SingleOrDefault() ?? throw new KeyNotFoundException("media file not found");
+            var row = (await MediaLocks.LockAsync(db, [id], ct).ConfigureAwait(false)).SingleOrDefault() ?? throw new MediaNotFoundException(id);
             if (row.Status == MediaStatus.Deleted) throw new MediaRefusedException("the file is already deleted");
 
-            var idText = id.ToString();
             var active = (await db.TemplateJobs.AsNoTracking()
                     .Where(j => TemplateJobStateMachine.ActiveStates.Contains(j.State) && j.MediaIds != "[]")
                     .Select(j => new { j.Id, j.TemplateId, j.MediaIds }).ToListAsync(ct).ConfigureAwait(false))
-                .FirstOrDefault(j => j.MediaIds.Contains(idText, StringComparison.OrdinalIgnoreCase));
+                .FirstOrDefault(j => UsesMedia(j.MediaIds, id));
             if (active is not null)
             {
                 var template = await db.Templates.AsNoTracking().Where(t => t.Id == active.TemplateId).Select(t => t.DisplayName).FirstOrDefaultAsync(ct).ConfigureAwait(false);
@@ -420,7 +469,7 @@ public sealed class MediaIntake(
         }
         state.CancelFetch(id);
         DeleteStaging(id);
-        state.Forget(id);
+        state.Remove(id);
     }
 
     /// <summary>Fails uploads idle for longer than <see cref="MediaOptions.AbandonAfter"/> and deletes staging files nothing is receiving into.</summary>
@@ -428,7 +477,7 @@ public sealed class MediaIntake(
     {
         var cutoff = time.GetUtcNow() - Opt.AbandonAfter;
         var idle = await db.MediaFiles.AsNoTracking()
-            .Where(m => m.Status == MediaStatus.Receiving && m.Source == MediaSource.Upload && m.LastActivityAt < cutoff)
+            .Where(m => m.Status == MediaStatus.Receiving && m.Source == MediaSource.Upload && m.ReceivedBytes < m.Size && m.LastActivityAt < cutoff)
             .ToListAsync(ct).ConfigureAwait(false);
         foreach (var row in idle)
         {
@@ -444,12 +493,23 @@ public sealed class MediaIntake(
                 continue; // a chunk arrived (or a delete) in the meantime
             }
             DeleteStaging(row.Id);
-            state.Forget(row.Id);
+            state.Remove(row.Id);
         }
 
         var receiving = (await db.MediaFiles.AsNoTracking().Where(m => m.Status == MediaStatus.Receiving).Select(m => m.Id).ToListAsync(ct).ConfigureAwait(false)).ToHashSet();
         foreach (var staged in store.StagingIds().ToList())
             if (!receiving.Contains(staged)) DeleteStaging(staged);
+
+        // Final files (<sha256>.iso) that no Ready file, and no upload on its way to Ready, holds are leftovers of a stop: delete them.
+        var held = (await db.MediaFiles.AsNoTracking()
+                .Where(m => m.Sha256 != null && (m.Status == MediaStatus.Ready || m.Status == MediaStatus.Receiving))
+                .Select(m => m.Sha256!).ToListAsync(ct).ConfigureAwait(false)).ToHashSet();
+        if (Directory.Exists(Opt.Root))
+            foreach (var file in Directory.EnumerateFiles(Opt.Root, "*.iso").ToList())
+            {
+                var sha = Path.GetFileNameWithoutExtension(file);
+                if (sha.Length == 64 && sha.All(c => char.IsAsciiHexDigitLower(c)) && !held.Contains(sha)) DeleteFinal(sha);
+            }
     }
 
     /// <summary>Once at start: fetches cannot resume, so they fail; uploads that had all their bytes are completed.</summary>
@@ -477,7 +537,7 @@ public sealed class MediaIntake(
             // deleted meanwhile: the delete's outcome stands
         }
         DeleteStaging(row.Id);
-        state.Forget(row.Id);
+        state.Remove(row.Id);
     }
 
     private Task<MediaFile?> LoadAsync(Guid id, CancellationToken ct) =>
@@ -494,6 +554,19 @@ public sealed class MediaIntake(
 
     private AuditLog Audit(Guid mediaId, Guid? userId, string action, string details) =>
         new() { At = time.GetUtcNow(), UserId = userId, Action = action, Target = mediaId.ToString(), Details = Clip(details, 1000) };
+
+    /// <summary>Whether a job's media id list names the file. A list that cannot be read counts as naming it: deleting is the risky side.</summary>
+    private static bool UsesMedia(string mediaIds, Guid id)
+    {
+        try
+        {
+            return System.Text.Json.JsonSerializer.Deserialize<List<Guid>>(mediaIds)?.Contains(id) ?? true;
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return true;
+        }
+    }
 
     // A file or directory that is not there is not an error: these run on clean-up paths.
     private void DeleteStaging(Guid id)

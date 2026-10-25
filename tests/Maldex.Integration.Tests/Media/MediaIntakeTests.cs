@@ -82,8 +82,8 @@ public sealed class MediaIntakeTests : IAsyncLifetime
 
     private SafeHttpFetcher NewFetcher() => new(Options.Create(_options), _time, NullLogger<SafeHttpFetcher>.Instance);
 
-    private MediaIntake NewIntake(MaldexDbContext? db = null, MediaUploadState? state = null) =>
-        new(db ?? NewDb(), NewStore(), _inspector, NewFetcher(), Options.Create(_options), Options.Create(new TemplateJobOptions { MinFreeGiB = 30 }), _time, state ?? _state);
+    private MediaIntake NewIntake(MaldexDbContext? db = null, MediaUploadState? state = null, Maldex.Core.Abstractions.IMediaInspector? inspector = null) =>
+        new(db ?? NewDb(), NewStore(), inspector ?? _inspector, NewFetcher(), Options.Create(_options), Options.Create(new TemplateJobOptions { MinFreeGiB = 30 }), _time, state ?? _state);
 
     private static byte[] Bytes(int length) => RandomNumberGenerator.GetBytes(length);
 
@@ -361,13 +361,13 @@ public sealed class MediaIntakeTests : IAsyncLifetime
         Assert.Equal(["media.upload.start", "media.failed"], await AuditAsync(media.Id));
     }
 
-    private async Task<(string TemplateId, Guid JobId)> SeedBuildJobAsync(Guid mediaId, TemplateJobState state)
+    private async Task<(string TemplateId, Guid JobId)> SeedBuildJobAsync(Guid mediaId, TemplateJobState state, string? mediaIds = null)
     {
         await using var db = _sql.CreateContext(_connection);
         var template = new Template { Id = "t" + Guid.NewGuid().ToString("N")[..8], DisplayName = "Win 11 Lab", CreatedAt = _time.GetUtcNow() };
         var job = new TemplateJob
         {
-            Id = Guid.NewGuid(), Kind = TemplateJobKind.Build, TemplateId = template.Id, MediaIds = $"[\"{mediaId}\"]", State = state,
+            Id = Guid.NewGuid(), Kind = TemplateJobKind.Build, TemplateId = template.Id, MediaIds = mediaIds ?? $"[\"{mediaId}\"]", State = state,
             RequestedByUserId = _userId, CreatedAt = _time.GetUtcNow(),
         };
         db.Add(template);
@@ -657,6 +657,187 @@ public sealed class MediaIntakeTests : IAsyncLifetime
         {
             await worker.StopAsync(CancellationToken.None);
         }
+    }
+
+    [Fact]
+    public async Task Fetch_NotEnoughDisk_409_CountingUploadsStillExpected()
+    {
+        var url = new Uri("http://example.test/win.iso");
+        _disk.Free = 30 * 1024 - 1;
+        var ex = await Assert.ThrowsAsync<MediaRefusedException>(() => NewIntake().StartFetchAsync(url, MediaKind.OsInstaller, null, _userId, Ct));
+        Assert.Equal("not enough disk space for this file: 30 GiB free, 30 GiB required", ex.Message);
+        Assert.Empty(await NewDb().MediaFiles.ToListAsync(Ct));
+
+        _disk.Free = 30 * 1024 + 5;
+        await NewIntake().StartUploadAsync("a.iso", 5 * MiB, MediaKind.OsInstaller, null, _userId, Ct);
+        _disk.Free = 30 * 1024 + 4; // the upload still expects 5 MiB
+        await Assert.ThrowsAsync<MediaRefusedException>(() => NewIntake().StartFetchAsync(url, MediaKind.OsInstaller, null, _userId, Ct));
+        _disk.Free = 30 * 1024 + 5;
+        await NewIntake().StartFetchAsync(url, MediaKind.OsInstaller, null, _userId, Ct);
+    }
+
+    [Fact]
+    public async Task Fetch_StopsWhenFreeSpaceDropsBelowTheReserve()
+    {
+        var firstSent = new TaskCompletionSource();
+        var go = new TaskCompletionSource();
+        var port = await ServeAsync(app => app.MapGet("/big", async (HttpContext c) =>
+        {
+            await c.Response.Body.WriteAsync(new byte[100_000], c.RequestAborted);
+            await c.Response.Body.FlushAsync(c.RequestAborted);
+            firstSent.TrySetResult();
+            await go.Task;
+            for (var i = 0; i < 50; i++)
+            {
+                await c.Response.Body.WriteAsync(new byte[100_000], c.RequestAborted);
+                await c.Response.Body.FlushAsync(c.RequestAborted);
+            }
+        }));
+        var url = new Uri($"http://127.0.0.1:{port}/big");
+        var media = await NewIntake().StartFetchAsync(url, MediaKind.OsInstaller, null, _userId, Ct);
+        var run = NewIntake().RunFetchAsync(media.Id, url, false, Ct);
+        await firstSent.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct);
+        _disk.Free = 30 * 1024 - 1;
+        go.SetResult();
+        await run.WaitAsync(TimeSpan.FromSeconds(30), Ct);
+
+        var row = await RowAsync(media.Id);
+        Assert.Equal(MediaStatus.Failed, row.Status);
+        Assert.StartsWith("not enough disk space: the fetch was stopped at ", row.FailureReason);
+        Assert.Empty(StagingFiles());
+        Assert.Empty(FinalFiles());
+        Assert.Contains("media.failed", await AuditAsync(media.Id));
+    }
+
+    private sealed class ShutdownInspector(CancellationTokenSource cts) : Maldex.Core.Abstractions.IMediaInspector
+    {
+        public Task<Maldex.Core.Abstractions.MediaInspection> InspectAsync(string isoPath, MediaKind kind, CancellationToken ct)
+        {
+            cts.Cancel();
+            ct.ThrowIfCancellationRequested();
+            throw new InvalidOperationException("unreachable");
+        }
+    }
+
+    [Fact]
+    public async Task ShutdownDuringInspection_IsResumedFromTheFinalFile()
+    {
+        var data = Bytes(8000);
+        var intake = NewIntake();
+        var media = await StartAsync(intake, data);
+        await Send(intake, media.Id, data, 0, 8000);
+
+        using var shutdown = new CancellationTokenSource();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            NewIntake(inspector: new ShutdownInspector(shutdown)).CompleteAsync(media.Id, shutdown.Token));
+        var interrupted = await RowAsync(media.Id);
+        Assert.Equal(MediaStatus.Receiving, interrupted.Status);
+        Assert.Equal(Hex(data), interrupted.Sha256);
+        Assert.Empty(StagingFiles());
+        Assert.Single(FinalFiles());
+
+        _state.Dispose();
+        _state = new MediaUploadState();
+        await NewIntake().RecoverAsync(Ct);
+        Assert.Equal(media.Id, Assert.Single(state_QueueSnapshot()).Id);
+        await NewIntake().CompleteAsync(media.Id, Ct);
+
+        var row = await RowAsync(media.Id);
+        Assert.Equal(MediaStatus.Ready, row.Status);
+        Assert.Equal(Hex(data), row.Sha256);
+        Assert.Single(FinalFiles());
+    }
+
+    [Fact]
+    public async Task StagingGone_AndNoFinalFile_FailsTheUpload()
+    {
+        var data = Bytes(3000);
+        var intake = NewIntake();
+        var media = await StartAsync(intake, data);
+        await Send(intake, media.Id, data, 0, 3000);
+        File.Delete(Assert.Single(StagingFiles()));
+        _state.Dispose();
+        _state = new MediaUploadState();
+
+        await NewIntake().CompleteAsync(media.Id, Ct);
+        Assert.Equal(MediaStatus.Failed, (await RowAsync(media.Id)).Status);
+        Assert.Empty(FinalFiles());
+    }
+
+    [Fact]
+    public async Task Sweep_DeletesFinalFilesNoLiveRowHolds()
+    {
+        var kept = await UploadReadyAsync(Bytes(4000), "kept.iso");
+        var gone = await UploadReadyAsync(Bytes(4001), "gone.iso");
+        await NewIntake().DeleteAsync(gone.Id, _userId, Ct);
+        var orphan = Path.Combine(_root, new string('b', 64) + ".iso");
+        await File.WriteAllBytesAsync(orphan, Bytes(10), Ct);
+        var strayName = Path.Combine(_root, "notes.iso");
+        await File.WriteAllBytesAsync(strayName, Bytes(10), Ct);
+
+        await NewIntake().SweepAsync(Ct);
+
+        Assert.False(File.Exists(orphan));
+        Assert.True(File.Exists(strayName), "files that are not <sha256>.iso are not ours to delete");
+        Assert.Contains(FinalFiles(), f => Path.GetFileName(f) == kept.Sha256 + ".iso");
+    }
+
+    [Fact]
+    public async Task Sweep_NeverAbandonsAFullyReceivedUpload()
+    {
+        var data = Bytes(2000);
+        var intake = NewIntake();
+        var media = await StartAsync(intake, data);
+        await Send(intake, media.Id, data, 0, 2000);
+
+        _time.Advance(TimeSpan.FromHours(48));
+        await NewIntake().SweepAsync(Ct);
+
+        Assert.Equal(MediaStatus.Receiving, (await RowAsync(media.Id)).Status);
+        Assert.Single(StagingFiles());
+    }
+
+    [Fact]
+    public async Task Delete_UnparsableMediaIds_CountsAsInUse()
+    {
+        var media = await UploadReadyAsync(Bytes(5000));
+        await SeedBuildJobAsync(media.Id, TemplateJobState.Queued, "not json");
+        await Assert.ThrowsAsync<MediaInUseException>(() => NewIntake().DeleteAsync(media.Id, _userId, Ct));
+    }
+
+    [Fact]
+    public async Task Delete_OtherMediaInJob_DoesNotBlock_AndIdsMatchExactly()
+    {
+        var media = await UploadReadyAsync(Bytes(5000));
+        await SeedBuildJobAsync(media.Id, TemplateJobState.Queued, $"[\"{Guid.NewGuid()}\"]");
+        await NewIntake().DeleteAsync(media.Id, _userId, Ct);
+        Assert.Equal(MediaStatus.Deleted, (await RowAsync(media.Id)).Status);
+    }
+
+    [Fact]
+    public async Task UnknownId_IsNotFound_AndLeavesNoState()
+    {
+        var id = Guid.NewGuid();
+        var ex = await Assert.ThrowsAsync<MediaNotFoundException>(() => Send(NewIntake(), id, Bytes(10), 0, 10));
+        Assert.Equal(id, ex.Id);
+        await Assert.ThrowsAsync<MediaNotFoundException>(() => NewIntake().DeleteAsync(id, _userId, Ct));
+        await NewIntake().CompleteAsync(id, Ct);
+        Assert.Equal(0, _state.TrackedUploads);
+    }
+
+    [Fact]
+    public async Task EndedUploads_DropTheirStateEntry()
+    {
+        await UploadReadyAsync(Bytes(5000));
+        Assert.Equal(0, _state.TrackedUploads);
+
+        var data = Bytes(1000);
+        var intake = NewIntake();
+        var media = await StartAsync(intake, data);
+        await Send(intake, media.Id, data, 0, 300);
+        Assert.Equal(1, _state.TrackedUploads);
+        await NewIntake().DeleteAsync(media.Id, _userId, Ct);
+        Assert.Equal(0, _state.TrackedUploads);
     }
 
     private async Task<MediaFile> WaitForAsync(Guid id, MediaStatus status)
