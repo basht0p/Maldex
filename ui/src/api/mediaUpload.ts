@@ -8,6 +8,15 @@ const RETRY_WAITS_MS = [1000, 2000, 4000]
 /** The server's offset answers (409) in a row that we follow before giving up. */
 const MAX_OFFSET_CORRECTIONS = 5
 
+/** Speed and ETA are averaged over the progress samples of this many ms. */
+const SPEED_WINDOW_MS = 5000
+
+export interface UploadRate {
+  bytesPerSec: number
+  /** Seconds left at the current speed; null while the speed is unknown or zero. */
+  etaSec: number | null
+}
+
 function aborted(): Error {
   return new DOMException('The upload was aborted.', 'AbortError')
 }
@@ -35,7 +44,7 @@ function serverOffset(e: unknown): number | null {
 export async function uploadMedia(
   file: File,
   kind: MediaKind,
-  onProgress: (received: number, size: number) => void,
+  onProgress: (received: number, size: number, rate: UploadRate) => void,
   signal: AbortSignal,
   resumeId?: string,
 ): Promise<MediaFileDto> {
@@ -56,7 +65,17 @@ export async function uploadMedia(
     offset = started.media.receivedBytes
     chunkBytes = started.chunkBytes
   }
-  onProgress(offset, file.size)
+  const samples: { t: number; received: number }[] = []
+  const report = () => {
+    const now = Date.now()
+    samples.push({ t: now, received: offset })
+    while (samples.length > 2 && now - samples[0].t > SPEED_WINDOW_MS) samples.shift()
+    const first = samples[0]
+    const seconds = (now - first.t) / 1000
+    const bytesPerSec = seconds > 0 ? Math.max(0, (offset - first.received) / seconds) : 0
+    onProgress(offset, file.size, { bytesPerSec, etaSec: bytesPerSec > 0 ? Math.ceil((file.size - offset) / bytesPerSec) : null })
+  }
+  report()
 
   let corrections = 0
   while (offset < file.size) {
@@ -81,7 +100,7 @@ export async function uploadMedia(
         await wait(RETRY_WAITS_MS[attempt++], signal)
       }
     }
-    onProgress(offset, file.size)
+    report()
   }
   return getMedia(id)
 }

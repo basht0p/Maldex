@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { deleteMedia, fetchMedia, listMedia } from '../api/client'
-import { uploadMedia } from '../api/mediaUpload'
-import type { MediaFileDto, MediaKind } from '../api/types'
+import { uploadMedia, type UploadRate } from '../api/mediaUpload'
+import type { MediaFileDto, MediaKind, MediaUsageDto } from '../api/types'
 import { useConfirm } from '../kit/useConfirm'
 import { CopyButton } from '../kit/CopyButton'
 import { EmptyState } from '../kit/EmptyState'
 import { ErrorBanner } from '../kit/ErrorBanner'
-import { RelativeTime, FileSize } from '../kit/RelativeTime'
+import { Duration, RelativeTime, FileSize } from '../kit/RelativeTime'
 import { Skeleton } from '../kit/Skeleton'
+import { formatFileSize } from '../kit/format'
 import { useToast } from '../kit/useToast'
 import { messageOf } from '../util/apiMessage'
 import styles from './forms.module.css'
@@ -33,11 +35,48 @@ function reasonOf(i: MediaFileDto['images'][number]): string {
   return reason.startsWith(lead) ? reason.slice(lead.length).replace(/^[:\s]+/, '') || 'not supported' : reason
 }
 
-/** e.g. `6 · Windows 11 Pro (26300.1)`; an unsupported edition says why. */
-function detected(m: MediaFileDto): string[] {
-  const lines = m.images.map((i) => `${i.index} · ${i.name}${i.build ? ` (${i.build})` : ''}${i.supported ? '' : `: ${reasonOf(i)}`}`)
-  if (m.application) lines.push(m.application)
-  return lines
+function usageLabel(u: MediaUsageDto): string {
+  return `${u.templateName} v${u.versionNumber}`
+}
+
+/** Template versions link to their template (plain text once it is gone); active jobs and anything else stay text. */
+function UsedBy({ m }: { m: MediaFileDto }) {
+  const refs = m.usedByRefs ?? []
+  const linked = new Set(refs.map(usageLabel))
+  const others = m.usedBy.filter((u) => !linked.has(u))
+  const items = [
+    ...refs.map((u) => (
+      <span key={`${u.templateId}/${u.versionNumber}`}>
+        {u.templateExists ? <Link to={`/admin/templates/${encodeURIComponent(u.templateId)}`}>{usageLabel(u)}</Link> : usageLabel(u)}
+      </span>
+    )),
+    ...others.map((u) => <span key={u}>{u}</span>),
+  ]
+  return <>{items.map((it, i) => <span key={i}>{i > 0 && ', '}{it}</span>)}</>
+}
+
+/** Every edition found in an installer, with the one a Build picks by default marked. */
+function Editions({ m }: { m: MediaFileDto }) {
+  if (m.images.length === 0) return null
+  return (
+    <details>
+      <summary>Editions ({m.images.length})</summary>
+      <table className={styles.table} aria-label={`Editions of ${m.fileName}`}>
+        <thead><tr><th>Index</th><th>Name</th><th>Architecture</th><th>Build</th><th>Note</th></tr></thead>
+        <tbody>
+          {m.images.map((i) => (
+            <tr key={i.index}>
+              <td>{i.index}</td>
+              <td>{i.name}{i.index === m.preferredImageIndex && <> <strong>Default</strong></>}</td>
+              <td>{i.architecture ?? ''}</td>
+              <td>{i.build ?? ''}</td>
+              <td>{i.supported ? '' : reasonOf(i)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </details>
+  )
 }
 
 function KindSelect({ id, value, onChange }: { id: string; value: MediaKind; onChange: (k: MediaKind) => void }) {
@@ -52,7 +91,7 @@ function KindSelect({ id, value, onChange }: { id: string; value: MediaKind; onC
   )
 }
 
-/** The media tab of the templates page: installers and application media that Builds use. */
+/** Installers and application media that Builds use: upload, fetch, inspect editions, see what uses each file, delete. */
 export default function MediaLibrary() {
   const toast = useToast()
   const confirm = useConfirm()
@@ -61,7 +100,7 @@ export default function MediaLibrary() {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [file, setFile] = useState<File | null>(null)
   const [uploadKind, setUploadKind] = useState<MediaKind>('OsInstaller')
-  const [upload, setUpload] = useState<{ name: string; received: number; size: number } | null>(null)
+  const [upload, setUpload] = useState<{ name: string; received: number; size: number; rate?: UploadRate } | null>(null)
   const abort = useRef<AbortController | null>(null)
   const resumeTarget = useRef<MediaFileDto | null>(null)
   const resumeInput = useRef<HTMLInputElement>(null)
@@ -106,7 +145,7 @@ export default function MediaLibrary() {
     abort.current = controller
     setUpload({ name: f.name, received: 0, size: f.size })
     try {
-      await uploadMedia(f, kind, (received, size) => { if (mounted.current) setUpload({ name: f.name, received, size }) }, controller.signal, resumeId)
+      await uploadMedia(f, kind, (received, size, rate) => { if (mounted.current) setUpload({ name: f.name, received, size, rate }) }, controller.signal, resumeId)
       if (mounted.current) toast.success(`${f.name} uploaded`)
     } catch (e) {
       if (mounted.current) {
@@ -135,7 +174,9 @@ export default function MediaLibrary() {
   async function remove(m: MediaFileDto) {
     const ok = await confirm({
       title: `Delete ${m.fileName}?`,
-      body: 'Its file is removed from the library.',
+      body: m.usedBy.length > 0
+        ? `Used by ${m.usedBy.join(', ')}. The server will refuse to delete it while it is in use.`
+        : 'Its file is removed from the library.',
       confirmLabel: 'Delete',
       danger: true,
     })
@@ -178,7 +219,8 @@ export default function MediaLibrary() {
             <button type="button" className={styles.primary} disabled={uploading || !file} onClick={() => file && void startUpload(file, uploadKind)}>Upload</button>
             {upload && <button type="button" className={styles.secondary} onClick={() => abort.current?.abort()}>Stop</button>}
           </div>
-          {upload && <p className={styles.hint} role="status">{`Uploading ${upload.name}: ${upload.size > 0 ? Math.floor((upload.received * 100) / upload.size) : 0}%`}</p>}
+          {upload && <p className={styles.hint} role="status">{`Uploading ${upload.name}: ${upload.size > 0 ? Math.floor((upload.received * 100) / upload.size) : 0}%`}
+            {upload.rate && upload.rate.bytesPerSec > 0 && <> · <span>{formatFileSize(Math.round(upload.rate.bytesPerSec))}/s</span>{upload.rate.etaSec !== null && <> · ETA <Duration seconds={upload.rate.etaSec} /></>}</>}</p>}
         </fieldset>
         <fieldset className={page.group}>
           <legend className={styles.legend}>Fetch from URL</legend>
@@ -212,9 +254,9 @@ export default function MediaLibrary() {
               <td><FileSize bytes={m.size} /></td>
               <td className={styles.mono}>{m.sha256 ? <>{m.sha256.slice(0, 12)}<CopyButton value={m.sha256} label="Copy SHA-256" /></> : ''}</td>
               <td>{statusText(m)}</td>
-              <td>{detected(m).map((d) => <div key={d}>{d}</div>)}</td>
+              <td><Editions m={m} />{m.application && <div>{m.application}</div>}</td>
               <td>{m.addedBy} <RelativeTime iso={m.addedAt} /></td>
-              <td>{m.usedBy.join(', ')}</td>
+              <td><UsedBy m={m} /></td>
               <td>
                 <span className={page.actions}>
                   {m.status === 'Receiving' && m.source === 'Upload' && m.receivedBytes < m.size && (

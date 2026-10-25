@@ -17,7 +17,10 @@ public sealed record InstallerImageDto(int Index, string Name, string? Build, st
 
 public sealed record MediaFileDto(Guid Id, string Kind, string FileName, long Size, long ReceivedBytes, string? Sha256, string Source,
     string? SourceUrl, string Status, string? FailureReason, IReadOnlyList<InstallerImageDto> Images, int? PreferredImageIndex,
-    string? Application, string AddedBy, DateTimeOffset AddedAt, IReadOnlyList<string> UsedBy);
+    string? Application, string AddedBy, DateTimeOffset AddedAt, IReadOnlyList<string> UsedBy,
+    IReadOnlyList<MediaUsageDto> UsedByRefs);
+
+public sealed record MediaUsageDto(string TemplateId, string TemplateName, int VersionNumber, bool TemplateExists);
 
 public sealed record StartUploadRequest(string? FileName, long Size, string? Kind, string? Sha256);
 
@@ -147,6 +150,7 @@ public static class MediaEndpoints
         var names = await db.Users.AsNoTracking().Where(u => userIds.Contains(u.Id)).ToDictionaryAsync(u => u.Id, u => u.DisplayName, ct);
 
         var usedBy = rows.ToDictionary(r => r.Id, _ => new List<string>());
+        var usedByRefs = rows.ToDictionary(r => r.Id, _ => new List<MediaUsageDto>());
         var versions = await db.TemplateVersions.AsNoTracking().Where(v => v.SourceMediaIds != "[]")
             .Select(v => new { v.TemplateId, v.Number, v.SourceMediaIds }).ToListAsync(ct);
         var jobs = await db.TemplateJobs.AsNoTracking()
@@ -155,7 +159,12 @@ public static class MediaEndpoints
         var templateNames = await db.Templates.AsNoTracking().ToDictionaryAsync(t => t.Id, t => t.DisplayName, ct);
         foreach (var v in versions)
             foreach (var id in IdsOf(v.SourceMediaIds).Distinct())
-                if (usedBy.TryGetValue(id, out var list)) list.Add($"{templateNames.GetValueOrDefault(v.TemplateId, v.TemplateId)} v{v.Number}");
+                if (usedBy.TryGetValue(id, out var list))
+                {
+                    var name = templateNames.GetValueOrDefault(v.TemplateId, v.TemplateId);
+                    list.Add($"{name} v{v.Number}");
+                    usedByRefs[id].Add(new MediaUsageDto(v.TemplateId, name, v.Number, templateNames.ContainsKey(v.TemplateId)));
+                }
         foreach (var j in jobs)
             foreach (var id in IdsOf(j.MediaIds).Distinct())
                 if (usedBy.TryGetValue(id, out var list)) list.Add($"job {j.Id}");
@@ -170,7 +179,7 @@ public static class MediaEndpoints
             }).ToList() ?? [];
             return new MediaFileDto(r.Id, r.Kind.ToString(), r.FileName, r.Size, r.ReceivedBytes, r.Sha256, r.Source.ToString(), r.SourceUrl,
                 r.Status.ToString(), r.FailureReason, images, contents is null ? null : EditionSelector.Preferred(contents.Images)?.Index,
-                contents?.Application, names.GetValueOrDefault(r.AddedByUserId, ""), r.AddedAt, usedBy[r.Id]);
+                contents?.Application, names.GetValueOrDefault(r.AddedByUserId, ""), r.AddedAt, usedBy[r.Id], usedByRefs[r.Id]);
         }).ToList();
     }
 }
