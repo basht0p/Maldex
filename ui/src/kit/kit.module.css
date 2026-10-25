@@ -35,3 +35,8 @@
   background: var(--mx-surface); color: var(--mx-text); cursor: pointer;
 }
 .retry:hover { background: var(--mx-raised); }
+
+.themeSelect { padding: 0.25rem 0.4rem; border: 1px solid var(--mx-control); border-radius: var(--mx-radius-control); background: var(--mx-surface); color: var(--mx-text); font: inherit; font-size: 0.85rem; }
+.shortcutList { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; font-size: 0.9rem; }
+.shortcutList li { display: grid; grid-template-columns: 5rem 1fr; align-items: center; gap: 0.75rem; color: var(--mx-muted); }
+.shortcutList kbd { display: inline-block; min-width: 1.4rem; margin-right: 0.25rem; padding: 0.1rem 0.4rem; border: 1px solid var(--mx-border-strong); border-radius: 4px; background: var(--mx-raised); color: var(--mx-text); font-family: var(--mx-font-mono); font-size: 0.8rem; text-align: center; }
