@@ -1,0 +1,43 @@
+WIM Information:
+----------------
+Path:           /mnt/iso/sources/install.wim
+GUID:           0xb2e90c47d3f14a85a6c01e7d58f4c293
+Version:        68864
+Image Count:    1
+Compression:    LZMS
+Chunk Size:     131072 bytes
+Part Number:    1/1
+Boot Index:     0
+Size:           5120345678 bytes
+Attributes:     Relative path junction
+
+Available Images:
+-----------------
+Index:                  1
+Name:                   Windows 11 Enterprise Evaluation
+Description:            Windows 11 Enterprise Evaluation
+Display Name:           Windows 11 Enterprise Evaluation
+Display Description:    Windows 11 Enterprise Evaluation
+Directory Count:        27114
+File Count:             118642
+Total Bytes:            17891345216
+Hard Link Bytes:        6193040781
+Creation Time:          Tue Sep 30 11:14:52 2025 UTC
+Last Modification Time: Tue Sep 30 11:41:09 2025 UTC
+Architecture:           x86_64
+Product Name:           Microsoft® Windows® Operating System
+Edition ID:             EnterpriseEval
+Installation Type:      Client
+HAL:                    acpiapic
+Product Type:           WinNT
+Product Suite:          Terminal Server
+Languages:              en-US
+Default Language:       en-US
+System Root:            WINDOWS
+Major Version:          10
+Minor Version:          0
+Build:                  26100
+Service Pack Build:     1
+Service Pack Level:     0
+Flags:                  EnterpriseEval
+WIMBoot compatible:     no
