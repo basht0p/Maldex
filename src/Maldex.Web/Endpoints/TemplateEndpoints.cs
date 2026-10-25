@@ -537,8 +537,11 @@ public static class TemplateEndpoints
             .Select(j => new { j.TemplateId, j.Id, j.CreatedAt }).ToListAsync(ct))
             .GroupBy(j => j.TemplateId).ToDictionary(g => g.Key, g => g.OrderByDescending(j => j.CreatedAt).ThenByDescending(j => j.Id).First().Id);
 
-        var mediaIds = versions.SelectMany(v => IdsOf(v.SourceMediaIds)).Distinct().ToList();
-        var mediaNames = await db.MediaFiles.AsNoTracking().Where(m => mediaIds.Contains(m.Id)).ToDictionaryAsync(m => m.Id, m => m.FileName, ct);
+        var sources = versions.ToDictionary(v => v.Id, v => IdsOf(v.SourceMediaIds).Distinct().ToList());
+        var mediaIds = sources.Values.SelectMany(x => x).Distinct().ToList();
+        // A soft-deleted row (Status Deleted) is gone as far as the UI goes: it shows as "(deleted)".
+        var mediaNames = await db.MediaFiles.AsNoTracking().Where(m => mediaIds.Contains(m.Id) && m.Status != MediaStatus.Deleted)
+            .ToDictionaryAsync(m => m.Id, m => m.FileName, ct);
         var numberOf = versions.ToDictionary(v => v.Id, v => v.Number);
 
         return templates.Select(t =>
@@ -553,7 +556,7 @@ public static class TemplateEndpoints
                 v.SealedAt, v.Note, v.SizeBytes, roles[v.Id],
                 v.ParentVersionId, v.ParentVersionId is { } p && numberOf.TryGetValue(p, out var pn) ? pn : null,
                 v.SysmonConfigSha256, v.MitmCaSha256,
-                IdsOf(v.SourceMediaIds).Distinct().Select(m => new MediaRefDto(m, mediaNames.GetValueOrDefault(m, "(deleted)"))).ToList(),
+                sources[v.Id].Select(m => new MediaRefDto(m, mediaNames.GetValueOrDefault(m, "(deleted)"))).ToList(),
                 usage.TryGetValue(v.Id, out var us) ? us.Total : 0)).ToList();
             var current = dtos.FirstOrDefault(d => d.IsCurrent);
             var refreshDue = current is not null && current.SealedAt < now.AddDays(-options.RefreshDueDays);

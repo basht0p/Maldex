@@ -181,6 +181,25 @@ public sealed class TemplateDetailTests(SqlServerFixture sql) : IDisposable
     }
 
     [Fact]
+    public async Task Detail_marks_soft_deleted_source_media()
+    {
+        var f = Factory();
+        var s = await SeedAsync(f, v2AgeDays: 2);
+        await using (var scope = f.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+            (await db.MediaFiles.SingleAsync(m => m.Id == s.Media, Ct)).Status = MediaStatus.Deleted; // what MediaIntake.DeleteAsync leaves behind
+            await db.SaveChangesAsync(Ct);
+        }
+        using var client = f.CreateClient(UserRole.Admin);
+
+        var detail = await client.GetFromJsonAsync<JsonElement>("/api/admin/templates/t1", Ct);
+        var media = detail.GetProperty("template").GetProperty("versions")[0].GetProperty("sourceMedia").EnumerateArray().ToList();
+        var gone = media.Single(m => m.GetProperty("id").GetGuid() == s.Media);
+        Assert.Equal("(deleted)", gone.GetProperty("name").GetString());
+    }
+
+    [Fact]
     public async Task Detail_lists_jobs_newest_first_with_requester()
     {
         var f = Factory();
