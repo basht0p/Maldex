@@ -16,6 +16,9 @@ public class TemplateJobStateMachineTests
         (Configuring, Sealing), (Configuring, Cancelled), (Configuring, Failed),
         (Sealing, Verifying), (Sealing, Failed), (Sealing, Cancelled),
         (Verifying, Published), (Verifying, Sealed), (Verifying, Failed), (Verifying, Cancelled),
+        (Preparing, Installing),
+        (Installing, Provisioning), (Installing, Failed), (Installing, Cancelled),
+        (Provisioning, Configuring), (Provisioning, Failed), (Provisioning, Cancelled),
     ];
 
     public static TheoryData<TemplateJobState, TemplateJobState> Allowed()
@@ -50,8 +53,8 @@ public class TemplateJobStateMachineTests
     public void TheStateLists_PartitionTheStates_FromOneDefinition()
     {
         Assert.Equal([Published, Sealed, Failed, Cancelled], TemplateJobStateMachine.TerminalStates);
-        Assert.Equal([Queued, Preparing, Configuring, Sealing, Verifying], TemplateJobStateMachine.ActiveStates);
-        Assert.Equal([Preparing, Configuring, Sealing, Verifying], TemplateJobStateMachine.StartedStates);
+        Assert.Equal([Queued, Preparing, Configuring, Sealing, Verifying, Installing, Provisioning], TemplateJobStateMachine.ActiveStates);
+        Assert.Equal([Preparing, Configuring, Sealing, Verifying, Installing, Provisioning], TemplateJobStateMachine.StartedStates);
         Assert.Equal(Enum.GetValues<TemplateJobState>().Order(), TemplateJobStateMachine.TerminalStates.Concat(TemplateJobStateMachine.ActiveStates).Order());
         Assert.All(TemplateJobStateMachine.ActiveStates, s => Assert.False(TemplateJobStateMachine.IsTerminal(s)));
     }
@@ -73,6 +76,34 @@ public class TemplateJobStateMachineTests
         Assert.True(TemplateJobStateMachine.CanTransition(Preparing, Sealing, TemplateJobKind.Refresh));
         Assert.False(TemplateJobStateMachine.CanTransition(Preparing, Configuring, TemplateJobKind.Refresh));
     }
+
+    [Fact]
+    public void ActiveAndStartedStates_IncludeInstallingAndProvisioning()
+    {
+        Assert.Contains(Installing, TemplateJobStateMachine.ActiveStates);
+        Assert.Contains(Provisioning, TemplateJobStateMachine.ActiveStates);
+        Assert.Contains(Installing, TemplateJobStateMachine.StartedStates);
+        Assert.Contains(Provisioning, TemplateJobStateMachine.StartedStates);
+    }
+
+    [Fact]
+    public void Build_WalksPreparingInstallingProvisioningConfiguring_AndCannotSkipInstalling()
+    {
+        const TemplateJobKind build = TemplateJobKind.Build;
+        Assert.True(TemplateJobStateMachine.CanTransition(Queued, Preparing, build));
+        Assert.True(TemplateJobStateMachine.CanTransition(Preparing, Installing, build));
+        Assert.True(TemplateJobStateMachine.CanTransition(Installing, Provisioning, build));
+        Assert.True(TemplateJobStateMachine.CanTransition(Provisioning, Configuring, build));
+        Assert.True(TemplateJobStateMachine.CanTransition(Configuring, Sealing, build));
+        Assert.False(TemplateJobStateMachine.CanTransition(Preparing, Configuring, build));
+        Assert.False(TemplateJobStateMachine.CanTransition(Preparing, Sealing, build));
+    }
+
+    [Theory]
+    [InlineData(TemplateJobKind.Edit)]
+    [InlineData(TemplateJobKind.Refresh)]
+    public void OnlyABuildInstalls(TemplateJobKind kind) =>
+        Assert.False(TemplateJobStateMachine.CanTransition(Preparing, Installing, kind));
 
     [Fact]
     public void TransitionTo_MovesState_SetsMessage_AndStampsEndOnTerminal()

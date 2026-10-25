@@ -204,7 +204,7 @@ internal sealed class TemplateJobRig : IAsyncDisposable
         await using var db = H.NewContext();
         var job = new TemplateJob
         {
-            Id = Guid.NewGuid(), Kind = kind, TemplateId = templateId, BaseVersionId = baseVersionId ?? V1.Id, Network = network, State = state,
+            Id = Guid.NewGuid(), Kind = kind, TemplateId = templateId, BaseVersionId = kind == TemplateJobKind.Build ? null : baseVersionId ?? V1.Id, Network = network, State = state,
             RequestedByUserId = AdminId, CreatedAt = H.Time.GetUtcNow(), PublishOnSuccess = publish, Note = note,
         };
         db.TemplateJobs.Add(job);
@@ -1448,6 +1448,27 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         Assert.Equal(TemplateJobState.Queued, (await rig.JobAsync(waiting)).State); // a queued job never started: it simply runs later
         var fail = Assert.Single(await rig.AuditsAsync());
         Assert.Equal(("template.job.fail", (Guid?)null, "win10"), (fail.Action, fail.UserId, fail.Target));
+    }
+
+    [Theory]
+    [InlineData(TemplateJobState.Installing)]
+    [InlineData(TemplateJobState.Provisioning)]
+    public async Task Reconcile_FailsInterruptedBuildJob_InInstallingOrProvisioning(TemplateJobState state)
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        var id = await rig.SeedJobAsync(TemplateJobKind.Build, state: state);
+        var lease = await rig.Egress.CreateAsync(id, NetworkMode.None, null, Ct);
+        await rig.Hypervisor.StartAsync(new VmSpec(id, TemplateCoordinator.StemOf(id), 4096, 2, lease.NetworkId, Writable: true), Ct);
+
+        await rig.H.Get<Reconciler>().ReconcileAsync(Ct);
+
+        var job = await rig.JobAsync(id);
+        Assert.Equal(TemplateJobState.Failed, job.State);
+        Assert.Equal("interrupted", job.FailureReason);
+        Assert.NotNull(job.EndedAt);
+        await rig.AssertDiscardedAsync(id);
+        var fail = Assert.Single(await rig.AuditsAsync());
+        Assert.Equal(("template.job.fail", (Guid?)null), (fail.Action, fail.UserId));
     }
 
     [Fact]

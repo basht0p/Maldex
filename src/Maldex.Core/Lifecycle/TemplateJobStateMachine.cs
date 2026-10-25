@@ -10,7 +10,9 @@ public static class TemplateJobStateMachine
         new Dictionary<TemplateJobState, FrozenSet<TemplateJobState>>
         {
             [Queued] = new[] { Preparing, Cancelled, Failed }.ToFrozenSet(),
-            [Preparing] = new[] { Configuring, Sealing, Failed, Cancelled }.ToFrozenSet(),
+            [Preparing] = new[] { Configuring, Sealing, Installing, Failed, Cancelled }.ToFrozenSet(),
+            [Installing] = new[] { Provisioning, Failed, Cancelled }.ToFrozenSet(),
+            [Provisioning] = new[] { Configuring, Failed, Cancelled }.ToFrozenSet(),
             [Configuring] = new[] { Sealing, Cancelled, Failed }.ToFrozenSet(),
             [Sealing] = new[] { Verifying, Failed, Cancelled }.ToFrozenSet(),
             [Verifying] = new[] { Published, Sealed, Failed, Cancelled }.ToFrozenSet(),
@@ -24,13 +26,14 @@ public static class TemplateJobStateMachine
     public static bool CanTransition(TemplateJobState from, TemplateJobState to) =>
         Allowed.TryGetValue(from, out var set) && set.Contains(to);
 
-    /// <summary>As the kind-less overload, and an Edit job configures after preparing while a Refresh job goes straight to sealing.</summary>
+    /// <summary>As the kind-less overload, and after preparing an Edit job configures, a Refresh job goes straight to sealing and a Build job installs.</summary>
     public static bool CanTransition(TemplateJobState from, TemplateJobState to, TemplateJobKind kind)
     {
         if (!CanTransition(from, to)) return false;
         if (from != Preparing) return true;
         if (to == Configuring) return kind == TemplateJobKind.Edit;
         if (to == Sealing) return kind == TemplateJobKind.Refresh;
+        if (to == Installing) return kind == TemplateJobKind.Build;
         return true;
     }
 
