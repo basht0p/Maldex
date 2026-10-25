@@ -683,6 +683,60 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         Assert.Equal(["template.egress.start", "template.egress.stop"], audits.Select(a => a.Action));
     }
 
+    /// <summary>
+    /// Once armed, holds the coordinator's next seal-request poll until its token fires and then fails it with a non-cancellation
+    /// exception, as SqlClient does ("Operation cancelled by user") when a running command is cancelled.
+    /// </summary>
+    private sealed class CancelAsSqlError : Microsoft.EntityFrameworkCore.Diagnostics.DbCommandInterceptor
+    {
+        public volatile bool Armed;
+        public int Thrown;
+        /// <summary>Completes when a poll is being held (so the cancel arrives while the query runs).</summary>
+        public TaskCompletionSource Holding { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override async ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<System.Data.Common.DbDataReader>> ReaderExecutingAsync(
+            System.Data.Common.DbCommand command, Microsoft.EntityFrameworkCore.Diagnostics.CommandEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<System.Data.Common.DbDataReader> result, CancellationToken cancellationToken = default)
+        {
+            if (Armed && command.CommandText.Contains("[SealRequestedAt]") && cancellationToken.CanBeCanceled)
+            {
+                Armed = false;
+                Holding.TrySetResult();
+                try { await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken); }
+                catch (OperationCanceledException) { }
+                Interlocked.Increment(ref Thrown);
+                throw new InvalidOperationException("A severe error occurred on the current command. Operation cancelled by user.");
+            }
+            return result;
+        }
+    }
+
+    [Fact]
+    public async Task Cancel_WhileAQueryRuns_ThatFailsWithANonCancellationError_StillEndsCancelled()
+    {
+        var sqlCancel = new CancelAsSqlError();
+        await using var rig = await TemplateJobRig.CreateAsync(sql, configure: s => s.ConfigureDbContext<MaldexDbContext>(o => o.AddInterceptors(sqlCancel)));
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit);
+        var run = rig.Start(id);
+        await rig.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+
+        sqlCancel.Armed = true;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!sqlCancel.Holding.Task.IsCompleted)
+        {
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30), "The coordinator never polled for the seal request.");
+            await rig.IdleAsync(1);
+        }
+        await rig.RequestCancelAsync(id); // while the poll runs
+        await rig.PumpAsync(run);
+
+        Assert.Equal(1, sqlCancel.Thrown);
+        var job = await rig.JobAsync(id);
+        Assert.Equal((TemplateJobState.Cancelled, (string?)null), (job.State, job.FailureReason));
+        await rig.AssertDiscardedAsync(id);
+        Assert.DoesNotContain(await rig.AuditsAsync(), a => a.Action == "template.job.fail");
+    }
+
     [Fact]
     public async Task Cancel_InSealing_DestroysTheVm_AndDeletesTheWorkingCopy()
     {

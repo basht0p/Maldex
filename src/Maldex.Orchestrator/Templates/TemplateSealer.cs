@@ -32,11 +32,11 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
         {
             await session.AskProvenanceWithRetryAsync(o.ProvenanceRetryInterval, o.ProvenanceTimeout, time, ct).ConfigureAwait(false);
         }
-        catch (TimeoutException)
+        catch (TimeoutException) when (!ct.IsCancellationRequested)
         {
             throw new TemplateSealException($"the guest agent did not answer: no reply within {o.ProvenanceTimeout.TotalSeconds:0} s; not sealing");
         }
-        catch (Exception ex) when (ex is InvalidOperationException or IOException or ObjectDisposedException or ChannelClosedException)
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or ObjectDisposedException or ChannelClosedException && !ct.IsCancellationRequested)
         {
             throw new TemplateSealException($"the guest agent did not answer: {GuestText.Clean(ex.Message, 200)}; not sealing", ex);
         }
@@ -67,7 +67,7 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
         {
             await hypervisor.DestroyAsync(vm, ct).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException && !ct.IsCancellationRequested)
         {
             throw new TemplateSealException($"cleaning up the powered-off guest failed: {GuestText.Clean(ex.Message, 200)}", ex);
         }
@@ -93,7 +93,7 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
                 return;
             }
         }
-        catch (Exception ex) when (ex is ChannelClosedException or OperationCanceledException or IOException or ObjectDisposedException)
+        catch (Exception ex) when (ex is ChannelClosedException or OperationCanceledException or IOException or ObjectDisposedException || ct.IsCancellationRequested)
         {
             // Disconnected, or out of time: the running-wait decides.
         }
@@ -112,9 +112,9 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
                 if (!await hypervisor.IsRunningAsync(vm, ct).ConfigureAwait(false)) return true;
                 await Task.Delay(o.PollInterval, time, ct).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            catch (Exception) when (ct.IsCancellationRequested)
             {
-                break;
+                break; // whatever the error, the deadline or the caller ended the wait
             }
             catch (Exception ex)
             {
@@ -129,11 +129,11 @@ public sealed class TemplateSealer(IHypervisor hypervisor, ITemplateStore store,
         {
             return !await hypervisor.IsRunningAsync(vm, last.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (!callerCt.IsCancellationRequested && lastTimeout.IsCancellationRequested)
+        catch (Exception) when (!callerCt.IsCancellationRequested && lastTimeout.IsCancellationRequested)
         {
             return false; // the last look itself ran out of time: it did not power off
         }
-        catch (Exception ex) when (ex is not OperationCanceledException || !callerCt.IsCancellationRequested)
+        catch (Exception ex) when (!callerCt.IsCancellationRequested)
         {
             throw new TemplateSealException($"could not check whether the guest stopped: {GuestText.Clean(ex.Message, 200)}", ex);
         }

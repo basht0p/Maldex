@@ -34,7 +34,7 @@ public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactor
                 lease = await egress.CreateAsync(taskId, NetworkMode.None, null, ct).ConfigureAwait(false);
                 vm = await hypervisor.StartAsync(new VmSpec(taskId, stem, orchestrator.Value.VmMemoryMiB, orchestrator.Value.VmVCpus, lease.NetworkId), ct).ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is VmStartException or EgressUnavailableException)
+            catch (Exception ex) when (ex is VmStartException or EgressUnavailableException && !ct.IsCancellationRequested)
             {
                 throw new TemplateVerifyException($"the sealed disk could not be booted: {ex.Message}");
             }
@@ -43,7 +43,7 @@ public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactor
             {
                 channel = await channels.ConnectAsync(vm, ct).ConfigureAwait(false);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception ex) when (ex is not OperationCanceledException && !ct.IsCancellationRequested)
             {
                 throw new TemplateVerifyException($"could not connect to the sealed guest agent: {ex.Message}");
             }
@@ -59,7 +59,7 @@ public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactor
                 {
                     await session.Ready.WaitAsync(linked.Token).ConfigureAwait(false);
                 }
-                catch (OperationCanceledException) when (budget.IsCancellationRequested && !ct.IsCancellationRequested)
+                catch (Exception) when (budget.IsCancellationRequested && !ct.IsCancellationRequested)
                 {
                     throw new TemplateVerifyException($"the sealed guest agent did not become ready within {o.VerifyTimeout.TotalSeconds:0} s");
                 }
@@ -69,13 +69,12 @@ public sealed class TemplateVerifier(IHypervisor hypervisor, IAgentChannelFactor
                     // Resent until answered: a request sent while the agent reconnects is lost (as for the sealer and the job's check).
                     p = await session.AskProvenanceWithRetryAsync(o.ProvenanceRetryInterval, o.VerifyTimeout, time, linked.Token).ConfigureAwait(false);
                 }
-                catch (Exception ex) when (ex is TimeoutException
-                    || (ex is OperationCanceledException && budget.IsCancellationRequested && !ct.IsCancellationRequested))
+                catch (Exception ex) when (!ct.IsCancellationRequested && (ex is TimeoutException || budget.IsCancellationRequested))
                 {
                     throw new TemplateVerifyException($"no provenance answer from the sealed guest agent within {o.VerifyTimeout.TotalSeconds:0} s");
                 }
             }
-            catch (InvalidOperationException ex)
+            catch (InvalidOperationException ex) when (!ct.IsCancellationRequested)
             {
                 throw new TemplateVerifyException($"provenance check failed: {ex.Message}");
             }

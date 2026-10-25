@@ -45,14 +45,14 @@ public sealed class TemplateJobWorker(
                 {
                     await ClaimAndStartAsync(stoppingToken).ConfigureAwait(false);
                 }
-                catch (Exception ex) when (ex is not OperationCanceledException)
+                catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
                 {
                     logger.LogError(ex, "Starting queued template jobs failed; will retry.");
                 }
             }
             while (await timer.WaitForNextTickAsync(stoppingToken).ConfigureAwait(false));
         }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        catch (Exception) when (stoppingToken.IsCancellationRequested)
         {
             // host shutdown
         }
@@ -109,7 +109,7 @@ public sealed class TemplateJobWorker(
             {
                 await coordinator.RunAsync(id, token).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            catch (Exception) when (token.IsCancellationRequested)
             {
                 // shutting down
             }

@@ -84,7 +84,7 @@ internal sealed class GuestSession : IAsyncDisposable
                 linked.Token.ThrowIfCancellationRequested();
             }
         }
-        catch (OperationCanceledException) when (deadline.IsCancellationRequested && !ct.IsCancellationRequested)
+        catch (Exception) when (deadline.IsCancellationRequested && !ct.IsCancellationRequested)
         {
             throw new TimeoutException($"no provenance answer within {timeout.TotalSeconds:0} s");
         }

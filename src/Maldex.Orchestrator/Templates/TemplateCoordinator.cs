@@ -144,14 +144,16 @@ public sealed class TemplateCoordinator(
                     break;
             }
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        // Cancellation is decided by the tokens, never by the exception's type: a cancelled SQL command, say, surfaces as a
+        // SqlException ("Operation cancelled by user"), not as an OperationCanceledException.
+        catch (Exception) when (ct.IsCancellationRequested)
         {
             await StopWatchingAsync(watcherCts, watcher).ConfigureAwait(false);
             if (await ReleaseAsync(job, held, deleteFiles: true).ConfigureAwait(false) is { } egressStop)
                 await SaveAuditQuietlyAsync(db, egressStop).ConfigureAwait(false);
             throw; // host shutdown: the reconciler fails the job on the next start
         }
-        catch (OperationCanceledException) when (jobCts.IsCancellationRequested)
+        catch (Exception) when (jobCts.IsCancellationRequested)
         {
             await StopWatchingAsync(watcherCts, watcher).ConfigureAwait(false);
             await DiscardAsync(db, job, new Discarded(CancelledByAdmin, job.RequestedByUserId), held, ct).ConfigureAwait(false);
@@ -352,7 +354,7 @@ public sealed class TemplateCoordinator(
             {
                 await diskEditor.InstallAgentAsync(stem, file, linked.Token).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (timeout.IsCancellationRequested && !ct.IsCancellationRequested)
+            catch (Exception) when (timeout.IsCancellationRequested && !ct.IsCancellationRequested)
             {
                 throw new JobFailedException($"writing the agent into the working copy did not finish within {o.AgentInstallTimeout.TotalSeconds:0} s");
             }
@@ -377,7 +379,7 @@ public sealed class TemplateCoordinator(
         {
             channel = await channels.ConnectAsync(vm, ct).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException && !ct.IsCancellationRequested)
         {
             throw new JobFailedException($"could not connect to the guest agent ({GuestText.Clean(ex.Message, 200)}); the agent could not be checked");
         }
@@ -447,11 +449,12 @@ public sealed class TemplateCoordinator(
                     : await new SelfTestGate(time, pollInterval: options.Value.PollInterval).RunAsync(channel, inbox, NetworkMode.Direct, null, plan, ct).ConfigureAwait(false);
             }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException && !ct.IsCancellationRequested)
         {
             logger.LogError(ex, "The Direct isolation self-test of template job {JobId} failed unexpectedly.", job.Id);
             verdict = IsolationVerdict.Fail($"self-test error: {GuestText.Clean(ex.Message, 200)}");
         }
+
         if (!verdict.Isolated) throw new JobFailedException($"isolation self-test failed: {GuestText.Clean(verdict.Reason, 500)}");
     }
 
