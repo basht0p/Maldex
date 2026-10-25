@@ -18,10 +18,21 @@ public class WorkerHealthTests
         var (health, time) = Create();
         health.Register("w", TimeSpan.FromSeconds(1));
 
-        time.Advance(TimeSpan.FromSeconds(2.9));
-        Assert.False(health.Snapshot().Single().Stalled);
+        time.Advance(TimeSpan.FromSeconds(59));
+        Assert.False(health.Snapshot().Single().Stalled); // 3 s would be 3 intervals; the 60 s floor applies
 
-        time.Advance(TimeSpan.FromSeconds(0.2));
+        time.Advance(TimeSpan.FromSeconds(2));
+        Assert.True(health.Snapshot().Single().Stalled);
+    }
+
+    [Fact]
+    public void Long_interval_worker_uses_three_intervals()
+    {
+        var (health, time) = Create();
+        health.Register("w", TimeSpan.FromHours(1));
+        time.Advance(TimeSpan.FromHours(2.9));
+        Assert.False(health.Snapshot().Single().Stalled);
+        time.Advance(TimeSpan.FromHours(0.2));
         Assert.True(health.Snapshot().Single().Stalled);
     }
 
@@ -30,7 +41,7 @@ public class WorkerHealthTests
     {
         var (health, time) = Create();
         health.Register("w", TimeSpan.FromSeconds(1));
-        time.Advance(TimeSpan.FromSeconds(5));
+        time.Advance(TimeSpan.FromSeconds(61));
         Assert.True(health.Snapshot().Single().Stalled);
 
         health.Tick("w");
@@ -38,7 +49,7 @@ public class WorkerHealthTests
         Assert.False(e.Stalled);
         Assert.Equal(time.GetUtcNow(), e.LastTickAt);
 
-        time.Advance(TimeSpan.FromSeconds(2.9));
+        time.Advance(TimeSpan.FromSeconds(59));
         Assert.False(health.Snapshot().Single().Stalled);
     }
 
@@ -50,7 +61,7 @@ public class WorkerHealthTests
         for (var i = 0; i < 5; i++) { time.Advance(TimeSpan.FromSeconds(1)); health.Tick("w"); }
         Assert.False(health.Snapshot().Single().Stalled);
 
-        time.Advance(TimeSpan.FromSeconds(3.5));
+        time.Advance(TimeSpan.FromSeconds(61));
         Assert.True(health.Snapshot().Single().Stalled);
     }
 

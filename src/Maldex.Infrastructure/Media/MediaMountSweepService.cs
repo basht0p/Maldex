@@ -24,6 +24,7 @@ public sealed class MediaMountSweepService(IServiceProvider services, TimeProvid
             do
             {
                 _health?.Tick("media-mount-sweep");
+                // Not behind the real-mode start gate (unlike MediaWorker): safe because the in-flight guard skips live inspections, and Maldex is a single host.
                 if (services.GetService<LoopMountMediaInspector>() is { } inspector)
                 {
                     try { await inspector.SweepAsync(stoppingToken).ConfigureAwait(false); }

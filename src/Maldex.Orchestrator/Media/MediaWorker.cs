@@ -9,7 +9,7 @@ namespace Maldex.Orchestrator.Media;
 
 /// <summary>
 /// Runs the media library's background work: recovers at start, then completes uploads from <see cref="MediaUploadState.Queue"/> one at a time and runs URL fetches
-/// one at a time on a consumer of their own, and sweeps abandoned uploads (and, in Real mode, stale loop mounts) hourly.
+/// one at a time on a consumer of their own, and sweeps abandoned uploads hourly (stale loop mounts are swept by <c>MediaMountSweepService</c>).
 /// </summary>
 public sealed class MediaWorker(IServiceScopeFactory scopes, MediaUploadState state, TimeProvider time, ILogger<MediaWorker> logger, WorkerHealth? health = null) : BackgroundService
 {

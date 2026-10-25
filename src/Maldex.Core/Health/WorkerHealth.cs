@@ -6,11 +6,14 @@ public sealed record WorkerHealthEntry(string Name, DateTimeOffset RegisteredAt,
 
 /// <summary>
 /// Liveness of the background workers: each registers with the interval it normally ticks at and ticks once per loop iteration.
-/// A worker is stalled once <c>now - (lastTick ?? registeredAt)</c> exceeds <see cref="StallFactor"/> intervals.
+/// A worker is stalled once <c>now - (lastTick ?? registeredAt)</c> exceeds <see cref="StallFactor"/> intervals, but never under <see cref="MinStallThreshold"/>.
 /// </summary>
 public sealed class WorkerHealth(TimeProvider time)
 {
     public const int StallFactor = 3;
+
+    /// <summary>Floor of the stall threshold: a fast poller whose single pass is long (a Suricata run) is not stalled for it.</summary>
+    public static readonly TimeSpan MinStallThreshold = TimeSpan.FromSeconds(60);
 
     private sealed class State(DateTimeOffset registeredAt, TimeSpan interval)
     {
@@ -38,6 +41,8 @@ public sealed class WorkerHealth(TimeProvider time)
         if (_workers.TryGetValue(name, out var s)) Interlocked.Exchange(ref s.LastTickTicks, time.GetUtcNow().UtcTicks);
     }
 
+    private static TimeSpan Max(TimeSpan a, TimeSpan b) => a > b ? a : b;
+
     public IReadOnlyList<WorkerHealthEntry> Snapshot()
     {
         var now = time.GetUtcNow();
@@ -45,7 +50,7 @@ public sealed class WorkerHealth(TimeProvider time)
         {
             var last = Interlocked.Read(ref w.Value.LastTickTicks);
             DateTimeOffset? lastTick = last == 0 ? null : new DateTimeOffset(last, TimeSpan.Zero);
-            var stalled = now - (lastTick ?? w.Value.RegisteredAt) > w.Value.Interval * StallFactor;
+            var stalled = now - (lastTick ?? w.Value.RegisteredAt) > Max(w.Value.Interval * StallFactor, MinStallThreshold);
             return new WorkerHealthEntry(w.Key, w.Value.RegisteredAt, lastTick, w.Value.Interval, stalled);
         })];
     }

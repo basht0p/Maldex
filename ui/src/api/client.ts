@@ -16,6 +16,7 @@ import type {
   TaskDto,
   TaskListDto,
   TaskListQuery,
+  SystemStatusDto,
   TaskReportDto,
   TemplateJobDto,
   TemplateJobNetwork,
@@ -176,4 +177,4 @@ export const screenshotUrl = (artifactId: string) => `/api/artifacts/${encodeURI
 export const httpBodyUrl = (taskId: string, txId: number) => `/api/tasks/${encodeURIComponent(taskId)}/http/${txId}/body`
 export const resubmitTask = (id: string, req: ResubmitRequest) => post<TaskDto>(`/api/tasks/${encodeURIComponent(id)}/resubmit`, req)
 
-export const getSystemStatus = () => get<import('./types').SystemStatusDto>('/api/admin/status')
+export const getSystemStatus = () => get<SystemStatusDto>('/api/admin/status')

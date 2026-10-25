@@ -70,7 +70,7 @@ public sealed class LoopMountMediaInspector(
 
     /// <summary>
     /// Unmounts and removes every leftover <c>{Root}/mnt/*</c>. A mount that completed after its caller timed out (ProcessRunner kills sudo
-    /// but not the root-owned mount child) can only be found this way. Run once at startup and by the media worker.
+    /// but not the root-owned mount child) can only be found this way. Run at startup and hourly by <c>MediaMountSweepService</c>.
     /// </summary>
     public async Task SweepAsync(CancellationToken ct)
     {

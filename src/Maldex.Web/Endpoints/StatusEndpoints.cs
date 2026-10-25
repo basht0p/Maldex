@@ -34,7 +34,7 @@ public static class StatusEndpoints
         {
             var now = time.GetUtcNow();
 
-            // Same predicates as VmSlots.BusyAsync, so the holders always add up to Busy.
+            // Same predicates as VmSlots.BusyAsync.
             var taskHolders = await db.Tasks.AsNoTracking().Where(t => VmSlots.TaskStates.Contains(t.Status))
                 .Select(t => new { t.Id, t.OriginalFileName, t.Url, t.StartedAt, t.CreatedAt }).ToListAsync(ct);
             var jobHolders = await db.TemplateJobs.AsNoTracking().Where(j => j.SlotHeldAt != null && !VmSlots.Terminal.Contains(j.State))
@@ -46,7 +46,7 @@ public static class StatusEndpoints
             var queueDepth = await db.Tasks.AsNoTracking().CountAsync(t => t.Status == RunStatus.Queued, ct);
             var runningTasks = taskHolders.Count;
             var activeJobs = await db.TemplateJobs.AsNoTracking().CountAsync(j => !VmSlots.Terminal.Contains(j.State), ct);
-            var busy = await VmSlots.BusyAsync(db, ct);
+            var busy = holders.Count; // same predicates as VmSlots.BusyAsync, read in one go so the two always agree
 
             var failedTasks = await db.Tasks.AsNoTracking().Where(t => t.Status == RunStatus.Failed)
                 .OrderByDescending(t => t.EndedAt ?? t.CompletedAt ?? t.CreatedAt).Take(RecentFailureCount)
