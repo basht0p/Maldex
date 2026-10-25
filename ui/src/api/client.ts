@@ -83,7 +83,7 @@ export const updateOrg = (id: string, req: OrgRequest) => request<OrgDto>('PUT',
 /** `form` is multipart: orgId, one of file/url, and optionally networkMode, durationSec, interactive, exitCountry, image. */
 export const submitTask = (form: FormData) => request<TaskDto>('POST', '/api/tasks', form)
 export const listTasks = (q: TaskListQuery = {}) =>
-  get<TaskListDto>(`/api/tasks${query({ orgId: q.orgId, status: q.status, skip: q.skip, take: q.take })}`)
+  get<TaskListDto>(`/api/tasks${query({ orgId: q.orgId, status: q.status, q: q.q, verdict: q.verdict, mine: q.mine ? 'true' : undefined, from: q.from, to: q.to, sort: q.sort, dir: q.dir, skip: q.skip, take: q.take })}`)
 export const getTask = (id: string) => get<TaskDto>(`/api/tasks/${encodeURIComponent(id)}`)
 export const cancelTask = (id: string) => post<void>(`/api/tasks/${encodeURIComponent(id)}/cancel`)
 export const extendTask = (id: string, seconds: number) => post<TaskDto>(`/api/tasks/${encodeURIComponent(id)}/extend`, { seconds })

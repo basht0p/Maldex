@@ -46,6 +46,9 @@ export interface TaskDto {
   processingWarnings: string[]
   /** The template version the run used; absent for tasks created before templates (show `image` instead). */
   template?: TaskTemplateDto | null
+  submittedByName?: string | null
+  /** Seconds from start to end of the run; null when it has not both started and ended. */
+  ranSec?: number | null
 }
 
 export type TemplateVersionOrigin = 'IsoBuild' | 'Edit' | 'Refresh' | 'Imported'
@@ -226,6 +229,13 @@ export interface OrgRequest {
 export interface TaskListQuery {
   orgId?: string
   status?: RunStatus
+  q?: string
+  verdict?: Verdict
+  mine?: boolean
+  from?: string
+  to?: string
+  sort?: 'created' | 'verdict' | 'duration'
+  dir?: 'asc' | 'desc'
   skip?: number
   take?: number
 }
