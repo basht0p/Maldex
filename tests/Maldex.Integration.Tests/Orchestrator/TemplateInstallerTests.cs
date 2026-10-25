@@ -42,7 +42,9 @@ public class TemplateInstallerTests
             return this;
         }
 
-        public TemplateInstaller Installer(IHypervisor? hv = null) => new(hv ?? Kit.Hypervisor, Kit.ChannelFactory,
+        public IAgentChannelFactory? Channels { get; set; }
+
+        public TemplateInstaller Installer(IHypervisor? hv = null) => new(hv ?? Kit.Hypervisor, Channels ?? Kit.ChannelFactory,
             Microsoft.Extensions.Options.Options.Create(Kit.Options), Microsoft.Extensions.Options.Options.Create(Build), Time,
             NullLogger<TemplateInstaller>.Instance);
 
@@ -203,6 +205,7 @@ public class TemplateInstallerTests
         var ex = await FailsAsync(rig, rig.InstallAsync(), Minute);
 
         Assert.Equal("provisioning did not finish within 2 h", ex.Message);
+        Assert.True(File.Exists(rig.LogPath), "the provisioning log was not kept");
         Assert.InRange(rig.Time.GetUtcNow() - started, TimeSpan.FromHours(2), TimeSpan.FromHours(2) + TimeSpan.FromMinutes(5));
         // Polled about every 15 s, not in a tight loop.
         var polls = rig.Sent.OfType<CollectFileCommand>().Count(c => c.Path == BuildOptions.ProvisionResultGuestPath);
@@ -236,6 +239,7 @@ public class TemplateInstallerTests
         var ex = await FailsAsync(rig, run, Second);
 
         Assert.Equal("the guest stopped before provisioning finished", ex.Message);
+        Assert.True(File.Exists(rig.LogPath), "the provisioning log was not kept"); // the fake guest still serves it
         Assert.True(rig.Time.GetUtcNow() - stopped < Minute, "it waited instead of failing at once");
     }
 
@@ -250,6 +254,7 @@ public class TemplateInstallerTests
         """{"ok":false,"failedSteps":[1]}""",
         """{"ok":false,"failedSteps":[""" + string.Join(",", Enumerable.Range(0, 21).Select(i => $"\"step {i}\"")) + "]}",
         """{"ok":true,"failedSteps":[]} trailing""",
+        """{"ok":true,"failedSteps":["office"]}""", // a success that names a failed step contradicts itself
         new string(' ', 5000) + """{"ok":true,"failedSteps":[]}""", // over the 4096-byte limit
     };
 
@@ -263,6 +268,7 @@ public class TemplateInstallerTests
         var ex = await FailsAsync(rig, rig.InstallAsync(), Second);
 
         Assert.Equal("the provisioning result could not be read", ex.Message);
+        Assert.True(File.Exists(rig.LogPath), "the provisioning log was not kept");
         Assert.Empty(rig.Sent.OfType<PowerOffCommand>());
     }
 
@@ -323,6 +329,87 @@ public class TemplateInstallerTests
 
         Assert.Equal("the guest did not power off after provisioning", ex.Message);
         Assert.Single(rig.Sent.OfType<PowerOffCommand>());
+    }
+
+    /// <summary>The kit's channels, noting when (on the fake clock) each collect_file was sent.</summary>
+    private sealed class TimedCollects(Rig rig) : IAgentChannelFactory
+    {
+        public List<(string Path, DateTimeOffset At)> Collects { get; } = [];
+
+        public async Task<IAgentChannel> ConnectAsync(VmHandle vm, CancellationToken ct) =>
+            new Timed(await rig.Kit.ChannelFactory.ConnectAsync(vm, ct), this);
+
+        private sealed class Timed(IAgentChannel inner, TimedCollects owner) : IAgentChannel
+        {
+            public int Violations => inner.Violations;
+            public IAsyncEnumerable<AgentMessage> ReadAsync(CancellationToken ct) => inner.ReadAsync(ct);
+            public ValueTask DisposeAsync() => inner.DisposeAsync();
+
+            public Task SendAsync(AgentCommand command, CancellationToken ct)
+            {
+                if (command is CollectFileCommand c) lock (owner.Collects) owner.Collects.Add((c.Path, owner._time.GetUtcNow()));
+                return inner.SendAsync(command, ct);
+            }
+        }
+
+        private readonly TimeProvider _time = rig.Time;
+    }
+
+    [Fact]
+    public async Task Provision_LogIsReadOneIntervalAfterTheMarker_AndRetriedOnce()
+    {
+        await using var rig = await new Rig().StartAsync();
+        var timed = new TimedCollects(rig);
+        rig.Channels = timed;
+        rig.Kit.Guest.RemoveFile(FakeGuest.ProvisionLogPath); // the transcript is not readable yet
+        int LogReads() { lock (timed.Collects) return timed.Collects.Count(c => c.Path == BuildOptions.ProvisionLogGuestPath); }
+        var run = rig.InstallAsync();
+        await AdvanceUntilAsync(rig, () => LogReads() == 1);
+        var log = "**********************\nWindows PowerShell transcript end\n"u8.ToArray();
+        rig.Kit.Guest.AddFile(FakeGuest.ProvisionLogPath, log);
+
+        await rig.Kit.PumpAsync(run);
+
+        var marker = timed.Collects.Last(c => c.Path == BuildOptions.ProvisionResultGuestPath).At;
+        var reads = timed.Collects.Where(c => c.Path == BuildOptions.ProvisionLogGuestPath).Select(c => c.At).ToList();
+        Assert.Equal(2, reads.Count); // the first found nothing, the one retry found the log
+        Assert.True(reads[0] - marker >= rig.Build.ProvisionPollInterval, $"log read {reads[0] - marker} after the marker: Provision.ps1 may still be writing it");
+        Assert.True(reads[1] - reads[0] >= rig.Build.ProvisionPollInterval, $"retried after {reads[1] - reads[0]}");
+        Assert.Equal(log, await File.ReadAllBytesAsync(rig.LogPath, Ct));
+    }
+
+    /// <summary>IsRunningAsync (or the agent connection) failing with a cancellation nobody asked for: an internal timeout.</summary>
+    private sealed class InternalTimeoutHypervisor(IHypervisor inner, Func<bool> failWhen) : IHypervisor
+    {
+        public Task<VmHandle> StartAsync(VmSpec spec, CancellationToken ct) => inner.StartAsync(spec, ct);
+        public Task DestroyAsync(VmHandle vm, CancellationToken ct) => inner.DestroyAsync(vm, ct);
+        public Task<IReadOnlyList<VmHandle>> ListAsync(CancellationToken ct) => inner.ListAsync(ct);
+        public Task SendKeyAsync(VmHandle vm, string key, CancellationToken ct) => inner.SendKeyAsync(vm, key, ct);
+        public Task<bool> IsRunningAsync(VmHandle vm, CancellationToken ct) =>
+            failWhen() ? throw new OperationCanceledException() : inner.IsRunningAsync(vm, ct);
+    }
+
+    private sealed class TimesOutFactory : IAgentChannelFactory
+    {
+        public Task<IAgentChannel> ConnectAsync(VmHandle vm, CancellationToken ct) => throw new TaskCanceledException();
+    }
+
+    [Theory]
+    [InlineData("connect", "could not connect to the guest agent (it timed out)")]
+    [InlineData("install", "could not check whether the guest is running: it timed out")]
+    [InlineData("provision", "could not check whether the guest is running: it timed out")]
+    public async Task Install_InternalTimeout_IsABuildFailure_NotACancellation(string where, string expected)
+    {
+        await using var rig = await new Rig().StartAsync();
+        rig.Kit.VerifyAgentReady = where != "install";
+        rig.Kit.Guest.SetProvisionResult(null);
+        if (where == "connect") rig.Channels = new TimesOutFactory();
+        var hv = new InternalTimeoutHypervisor(rig.Kit.Hypervisor, () => where == "install" || (where == "provision" && rig.Phases.Count > 0));
+
+        var ex = await FailsAsync(rig, rig.InstallAsync(hv: hv), Second);
+
+        Assert.Equal(expected, ex.Message);
+        Assert.DoesNotContain("operation was canceled", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>IsRunningAsync that, once <paramref name="blockWhen"/> holds, waits for its token and then fails with a non-cancellation error (as SqlClient or virsh do).</summary>

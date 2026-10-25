@@ -52,6 +52,11 @@ public sealed class TemplateInstaller(
             // Cancellation is decided by the token, never by the exception's type.
             throw new OperationCanceledException("the build was cancelled", ex, ct);
         }
+        catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+        {
+            // Not a cancel: some step's own timeout ran out. Never surfaces as a bare "The operation was canceled."
+            throw new TemplateBuildException("a step of the build timed out unexpectedly", ex);
+        }
     }
 
     private async Task<ProvisionReport> RunAsync(VmHandle vm, Guid jobId, bool officeSelected, Func<TemplateJobState, string, Task> enterPhase, CancellationToken ct)
@@ -66,8 +71,23 @@ public sealed class TemplateInstaller(
         await AskProvenanceAsync(session, o, ct).ConfigureAwait(false);
 
         await enterPhase(TemplateJobState.Provisioning, ProvisioningNote).ConfigureAwait(false);
-        var marker = await AwaitResultAsync(vm, session, o, b, ct).ConfigureAwait(false);
-        await KeepLogAsync(session, b, jobId, ct).ConfigureAwait(false);
+        // From here on the provisioning log is kept on every outcome: it is the only thing a failed Build leaves behind.
+        byte[] marker;
+        try
+        {
+            marker = await AwaitResultAsync(vm, session, b, ct).ConfigureAwait(false);
+        }
+        catch (UnreadableMarkerException ex) when (!ct.IsCancellationRequested)
+        {
+            await KeepLogAsync(session, b, jobId, settle: true, ct).ConfigureAwait(false);
+            throw new TemplateBuildException(UnreadableResult, ex.InnerException);
+        }
+        catch (TemplateBuildException) when (!ct.IsCancellationRequested)
+        {
+            await KeepLogAsync(session, b, jobId, settle: false, ct).ConfigureAwait(false);
+            throw;
+        }
+        await KeepLogAsync(session, b, jobId, settle: true, ct).ConfigureAwait(false);
 
         var failedSteps = ParseResult(marker);
         if (failedSteps is not null)
@@ -89,9 +109,9 @@ public sealed class TemplateInstaller(
         {
             return await channels.ConnectAsync(vm, ct).ConfigureAwait(false);
         }
-        catch (Exception ex) when (!ct.IsCancellationRequested && ex is not OperationCanceledException)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            throw new TemplateBuildException($"could not connect to the guest agent ({GuestText.Clean(ex.Message, 200)})", ex);
+            throw new TemplateBuildException($"could not connect to the guest agent ({Reason(ex)})", ex);
         }
     }
 
@@ -186,7 +206,8 @@ public sealed class TemplateInstaller(
     /// <see cref="BuildOptions.ProvisionTimeout"/>; fails at once when the VM stops. A poll the agent does not answer (it may be
     /// restarting with the guest) is simply repeated.
     /// </summary>
-    private async Task<byte[]> AwaitResultAsync(VmHandle vm, GuestSession session, TemplateJobOptions o, BuildOptions b, CancellationToken ct)
+    /// <exception cref="UnreadableMarkerException">The marker is there but over the size limit or does not reassemble.</exception>
+    private async Task<byte[]> AwaitResultAsync(VmHandle vm, GuestSession session, BuildOptions b, CancellationToken ct)
     {
         using var deadline = new CancellationTokenSource(b.ProvisionTimeout, time);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, deadline.Token);
@@ -212,7 +233,7 @@ public sealed class TemplateInstaller(
                 catch (InvalidOperationException ex) when (!linked.IsCancellationRequested)
                 {
                     logger.LogWarning("The provisioning result was rejected: {Problem}", GuestText.Clean(ex.Message, 300));
-                    throw new TemplateBuildException(UnreadableResult, ex);
+                    throw new UnreadableMarkerException(ex);
                 }
                 if (marker is not null) return marker;
                 await Task.Delay(b.ProvisionPollInterval, time, linked.Token).ConfigureAwait(false);
@@ -226,26 +247,21 @@ public sealed class TemplateInstaller(
 
     /// <summary>
     /// Copies provision.log (its last <see cref="BuildOptions.ProvisionLogMaxBytes"/> when longer) to
-    /// <c>&lt;JobLogDir&gt;/&lt;jobId:N&gt;/provision.log</c>, readable by the service account only. Best effort: a log that cannot be
-    /// fetched or written is logged, never a failure of its own.
+    /// <c>&lt;JobLogDir&gt;/&lt;jobId:N&gt;/provision.log</c>, readable by the service account only. With <paramref name="settle"/>
+    /// (the result marker has appeared) it first waits one <see cref="BuildOptions.ProvisionPollInterval"/>, so Provision.ps1 has
+    /// stopped its transcript; a read that fails is tried once more an interval later. Best effort: a log that cannot be fetched or
+    /// written is logged, never a failure of its own.
     /// </summary>
-    private async Task KeepLogAsync(GuestSession session, BuildOptions b, Guid jobId, CancellationToken ct)
+    private async Task KeepLogAsync(GuestSession session, BuildOptions b, Guid jobId, bool settle, CancellationToken ct)
     {
-        byte[]? log;
-        try
-        {
-            log = await session.CollectFileAsync(BuildOptions.ProvisionLogGuestPath, AgentLimits.MaxDroppedFileBytes, CollectTimeout, ct).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (!ct.IsCancellationRequested)
-        {
-            logger.LogWarning(ex, "The provisioning log of build {JobId} could not be collected.", jobId);
-            return;
-        }
+        if (settle) await Task.Delay(b.ProvisionPollInterval, time, ct).ConfigureAwait(false);
+        var log = await TryCollectLogAsync(session, jobId, ct).ConfigureAwait(false);
         if (log is null)
         {
-            logger.LogWarning("The guest has no provisioning log for build {JobId}.", jobId);
-            return;
+            await Task.Delay(b.ProvisionPollInterval, time, ct).ConfigureAwait(false);
+            log = await TryCollectLogAsync(session, jobId, ct).ConfigureAwait(false);
         }
+        if (log is null) return;
 
         var keep = log.Length > b.ProvisionLogMaxBytes ? log.AsMemory(log.Length - b.ProvisionLogMaxBytes) : log.AsMemory();
         var dir = Path.Combine(b.JobLogDir, jobId.ToString("N"));
@@ -265,9 +281,24 @@ public sealed class TemplateInstaller(
         }
     }
 
+    private async Task<byte[]?> TryCollectLogAsync(GuestSession session, Guid jobId, CancellationToken ct)
+    {
+        try
+        {
+            var log = await session.CollectFileAsync(BuildOptions.ProvisionLogGuestPath, AgentLimits.MaxDroppedFileBytes, CollectTimeout, ct).ConfigureAwait(false);
+            if (log is null) logger.LogWarning("The guest has no provisioning log for build {JobId}.", jobId);
+            return log;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            logger.LogWarning(ex, "The provisioning log of build {JobId} could not be collected.", jobId);
+            return null;
+        }
+    }
+
     /// <summary>
     /// Null when provisioning succeeded; otherwise the failed steps (cleaned). The marker must be exactly an object with a bool
-    /// <c>ok</c> and a <c>failedSteps</c> array of at most <see cref="MaxFailedSteps"/> strings.
+    /// <c>ok</c> and a <c>failedSteps</c> array of at most <see cref="MaxFailedSteps"/> strings, empty exactly when <c>ok</c> is true.
     /// </summary>
     /// <exception cref="TemplateBuildException">The marker has any other shape.</exception>
     private static IReadOnlyList<string>? ParseResult(byte[] marker)
@@ -280,7 +311,8 @@ public sealed class TemplateInstaller(
                 || !root.TryGetProperty("ok", out var ok) || ok.ValueKind is not (JsonValueKind.True or JsonValueKind.False)
                 || !root.TryGetProperty("failedSteps", out var steps) || steps.ValueKind != JsonValueKind.Array
                 || steps.GetArrayLength() > MaxFailedSteps
-                || steps.EnumerateArray().Any(s => s.ValueKind != JsonValueKind.String))
+                || steps.EnumerateArray().Any(s => s.ValueKind != JsonValueKind.String)
+                || (ok.GetBoolean() && steps.GetArrayLength() > 0)) // a success that names failed steps contradicts itself
                 throw new TemplateBuildException(UnreadableResult);
             return ok.GetBoolean() ? null : steps.EnumerateArray().Select(s => GuestText.Clean(s.GetString(), 100)).ToList();
         }
@@ -296,11 +328,17 @@ public sealed class TemplateInstaller(
         {
             return await hypervisor.IsRunningAsync(vm, ct).ConfigureAwait(false);
         }
-        catch (Exception ex) when (!ct.IsCancellationRequested && ex is not OperationCanceledException)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            throw new TemplateBuildException($"could not check whether the guest is running: {GuestText.Clean(ex.Message, 200)}", ex);
+            throw new TemplateBuildException($"could not check whether the guest is running: {Reason(ex)}", ex);
         }
     }
+
+    /// <summary>The failure in words; an internal timeout (a cancellation nobody asked for) says so instead of "The operation was canceled."</summary>
+    private static string Reason(Exception ex) => ex is OperationCanceledException ? "it timed out" : GuestText.Clean(ex.Message, 200);
+
+    /// <summary>The result marker arrived but cannot be used (over the size limit, or its chunks do not reassemble).</summary>
+    private sealed class UnreadableMarkerException(Exception inner) : Exception(inner.Message, inner);
 
     private static string Duration(TimeSpan t) =>
         t.TotalHours >= 1 && t.TotalHours % 1 == 0 ? $"{t.TotalHours:0} h"
