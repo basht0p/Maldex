@@ -624,8 +624,7 @@ public sealed class MediaIntakeTests : IAsyncLifetime
         Assert.Empty(await NewDb().MediaFiles.ToListAsync(Ct));
     }
 
-    [Fact]
-    public async Task Worker_CompletesQueuedUploads_AndRunsFetches()
+    private ServiceProvider WorkerProvider()
     {
         var services = new ServiceCollection();
         services.AddSingleton<TimeProvider>(_time);
@@ -640,7 +639,13 @@ public sealed class MediaIntakeTests : IAsyncLifetime
         services.AddScoped<MediaIntake>();
         services.AddLogging();
         services.AddSingleton<MediaWorker>();
-        await using var provider = services.BuildServiceProvider();
+        return services.BuildServiceProvider();
+    }
+
+    [Fact]
+    public async Task Worker_CompletesQueuedUploads_AndRunsFetches()
+    {
+        await using var provider = WorkerProvider();
         var worker = provider.GetRequiredService<MediaWorker>();
         await worker.StartAsync(Ct);
         try
@@ -652,6 +657,46 @@ public sealed class MediaIntakeTests : IAsyncLifetime
 
             var row = await WaitForAsync(media.Id, MediaStatus.Ready);
             Assert.Equal(Hex(data), row.Sha256);
+        }
+        finally
+        {
+            await worker.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task Worker_CompletesAnUpload_WhileAFetchIsStillRunning()
+    {
+        var started = new TaskCompletionSource();
+        var port = await ServeAsync(app => app.MapGet("/slow", async (HttpContext c) =>
+        {
+            c.Response.ContentLength = 10_000_000;
+            await c.Response.Body.WriteAsync(new byte[1000], c.RequestAborted);
+            await c.Response.Body.FlushAsync(c.RequestAborted);
+            started.TrySetResult();
+            await Task.Delay(Timeout.Infinite, c.RequestAborted);
+        }));
+        await using var provider = WorkerProvider();
+        var worker = provider.GetRequiredService<MediaWorker>();
+        await worker.StartAsync(Ct);
+        try
+        {
+            // Recovery fails any fetch it finds: wait until the worker is past it (a warm-up upload completes) before starting ours.
+            var warm = Bytes(100);
+            var warmMedia = await StartAsync(NewIntake(), warm, "warm.iso");
+            await Send(NewIntake(), warmMedia.Id, warm, 0, 100);
+            Assert.Equal(MediaStatus.Ready, (await WaitForAsync(warmMedia.Id, MediaStatus.Ready)).Status);
+
+            var fetch = await NewIntake().StartFetchAsync(new Uri($"http://127.0.0.1:{port}/slow"), MediaKind.OsInstaller, null, _userId, Ct);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct);
+
+            var data = Bytes(3000);
+            var intake = NewIntake();
+            var media = await StartAsync(intake, data);
+            await Send(intake, media.Id, data, 0, 3000);
+
+            Assert.Equal(Hex(data), (await WaitForAsync(media.Id, MediaStatus.Ready)).Sha256);
+            Assert.Equal(MediaStatus.Receiving, (await RowAsync(fetch.Id)).Status);
         }
         finally
         {

@@ -341,6 +341,67 @@ public sealed class LoopMountMediaInspectorTests : IDisposable
         Assert.Empty(runner.Calls);
     }
 
+    /// <summary>Delegates to the fake runner but parks the first call to <c>blockOn</c> until released.</summary>
+    private sealed class GatedRunner(FakeRunner inner, string blockOn) : IProcessRunner
+    {
+        public TaskCompletionSource Reached { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<ProcessResult> RunAsync(string file, IReadOnlyList<string> args, CancellationToken ct, string? stdin = null, TimeSpan? timeout = null)
+        {
+            if (file == blockOn || args.Contains(blockOn))
+            {
+                Reached.TrySetResult();
+                await Release.Task;
+            }
+            return await inner.RunAsync(file, args, ct, stdin, timeout);
+        }
+    }
+
+    [Fact]
+    public async Task Sweep_LeavesAMountedInspectionAlone_WhileWiminfoRuns()
+    {
+        var runner = Installer("sources/install.wim");
+        var gate = new GatedRunner(runner, "wiminfo");
+        string? info = null;
+        var inspector = new LoopMountMediaInspector(gate, Options.Create(new MediaOptions { Root = _root }),
+            NullLogger<LoopMountMediaInspector>.Instance, () => info ?? "");
+
+        var inspecting = inspector.InspectAsync(Iso, MediaKind.OsInstaller, Ct);
+        await gate.Reached.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct);
+        var mnt = runner.Calls.Single(c => c.Args.Contains("mount")).Args[^1];
+        info = $"36 35 7:0 / {mnt} ro,nosuid,nodev,noexec - iso9660 /dev/loop0 ro\n";
+
+        await inspector.SweepAsync(Ct);
+
+        Assert.DoesNotContain(runner.Calls, c => c.Args.Contains("umount"));
+        Assert.True(Directory.Exists(mnt));
+        gate.Release.SetResult();
+        var result = await inspecting;
+        Assert.Null(result.Error);
+        Assert.False(Directory.Exists(mnt));
+    }
+
+    [Fact]
+    public async Task Sweep_LeavesTheMountPointAlone_BeforeTheMountRan()
+    {
+        var runner = Installer("sources/install.wim");
+        var gate = new GatedRunner(runner, "mount");
+        var inspector = new LoopMountMediaInspector(gate, Options.Create(new MediaOptions { Root = _root }),
+            NullLogger<LoopMountMediaInspector>.Instance, () => "");
+
+        var inspecting = inspector.InspectAsync(Iso, MediaKind.OsInstaller, Ct);
+        await gate.Reached.Task.WaitAsync(TimeSpan.FromSeconds(30), Ct);
+        var dir = Assert.Single(Directory.GetDirectories(Path.Combine(_root, "mnt")));
+
+        await inspector.SweepAsync(Ct);
+
+        Assert.True(Directory.Exists(dir));
+        gate.Release.SetResult();
+        Assert.Null((await inspecting).Error);
+        Assert.False(Directory.Exists(dir));
+    }
+
     /// <summary>Records the call and reports success (the sweep's lazy umount of a stale mount).</summary>
     private sealed class SweepRunner(FakeRunner recorder) : IProcessRunner
     {
