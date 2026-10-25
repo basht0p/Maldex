@@ -37,7 +37,7 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
         public Task<VncEndpoint?> GetAsync(VmHandle vm, CancellationToken ct) => Task.FromResult(endpoint);
     }
 
-    private sealed class TunnelFactory(SqlServerFixture sql, int guacdPort, VncEndpoint? endpoint, string authMode = "Dev", FakeTimeProvider? clock = null, string keepAlive = "00:01:00", Maldex.Orchestrator.Templates.ITemplateJobPublisher? publisher = null)
+    private sealed class TunnelFactory(SqlServerFixture sql, int guacdPort, VncEndpoint? endpoint, string authMode = "Dev", FakeTimeProvider? clock = null, string keepAlive = "00:01:00", Maldex.Orchestrator.Templates.ITemplateJobPublisher? publisher = null, Action<IServiceCollection>? configure = null)
         : MaldexAppFactory(sql, authMode: authMode, settings: new Dictionary<string, string?>
         {
             ["Maldex:Guacamole:GuacdPort"] = guacdPort.ToString(),
@@ -57,6 +57,7 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
                 s.AddSingleton<IVmConsoleLocator>(new StubLocator(endpoint));
                 if (clock is not null) s.Replace(ServiceDescriptor.Singleton<TimeProvider>(clock));
                 if (publisher is not null) s.Replace(ServiceDescriptor.Singleton(publisher));
+                configure?.Invoke(s);
             });
         }
     }
@@ -149,7 +150,10 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
         public TaskCompletionSource<NetworkStream> Connected { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public Task Run { get; private set; } = Task.CompletedTask;
 
-        public FakeGuacd()
+        /// <summary>Set once guacd has read the <c>select</c> of a stalled handshake.</summary>
+        public TaskCompletionSource Selected { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public FakeGuacd(bool stallHandshake = false)
         {
             _listener.Start();
             Run = Task.Run(async () =>
@@ -160,6 +164,11 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
                 async Task Send(params string[] e) => await stream.WriteAsync(Encoding.UTF8.GetBytes(GuacamoleProtocol.Encode(e)), Ct);
 
                 Record((await reader.ReadAsync(Ct))!); // select
+                if (stallHandshake)
+                {
+                    Selected.SetResult();
+                    await Task.Delay(Timeout.Infinite, Ct); // never answers
+                }
                 await Send("args", "hostname", "port", "password", "read-only", "VERSION_1_5_0");
                 for (var i = 0; i < 5; i++) Record((await reader.ReadAsync(Ct))!); // size, audio, video, image, connect
                 await Send("ready", "guacd-conn-1");
@@ -819,5 +828,111 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
         await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "bye", Ct);
 
         await WaitForAsync(async () => await LastConsoleAtAsync(f, id) == closedAt, "the disconnect touch");
+    }
+
+    /// <summary>Publishes nothing but throws a bare (not request-bound) cancellation for the calls <paramref name="failing"/> selects.</summary>
+    private sealed class FlakyPublisher(Func<int, bool> failing) : Maldex.Orchestrator.Templates.ITemplateJobPublisher
+    {
+        private int _calls;
+        public int Calls => Volatile.Read(ref _calls);
+        public Task PublishAsync(Maldex.Orchestrator.Templates.TemplateJobDto job, CancellationToken ct)
+        {
+            var n = Interlocked.Increment(ref _calls);
+            return failing(n) ? throw new OperationCanceledException("publisher timed out") : Task.CompletedTask;
+        }
+    }
+
+    /// <summary>Fails the console-touch UPDATE while <see cref="Fail"/> is set.</summary>
+    private sealed class TouchFailureInterceptor : Microsoft.EntityFrameworkCore.Diagnostics.DbCommandInterceptor
+    {
+        public volatile bool Fail;
+        public override ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int>> NonQueryExecutingAsync(
+            System.Data.Common.DbCommand command, Microsoft.EntityFrameworkCore.Diagnostics.CommandEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<int> result, CancellationToken cancellationToken)
+        {
+            if (Fail && command.CommandText.Contains("LastConsoleAt", StringComparison.Ordinal)) throw new InvalidOperationException("database unavailable");
+            return base.NonQueryExecutingAsync(command, eventData, result, cancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task JobTunnel_KeepAlive_SurvivesACancellationFromThePublisher()
+    {
+        using var guacd = new FakeGuacd();
+        var clock = new FakeTimeProvider(new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        var publisher = new FlakyPublisher(n => n is 2 or 3); // the connect push works; the next two keep-alive pushes are cancelled
+        var f = new TunnelFactory(sql, guacd.Port, new VncEndpoint("127.0.0.1", 5901, VncPassword), clock: clock, publisher: publisher);
+        _disposables.Add(f);
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring, clock.GetUtcNow());
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        using var ws = await ConnectJobAsync(f, id, await GetJobTokenAsync(admin, id));
+        await ReceiveTextAsync(ws);
+        await ReceiveTextAsync(ws);
+        await WaitForAsync(() => Task.FromResult(publisher.Calls >= 1), "the push for the connect");
+
+        for (var i = 0; i < 100 && publisher.Calls < 4; i++)
+        {
+            clock.Advance(TimeSpan.FromSeconds(61));
+            await Task.Delay(30, Ct);
+        }
+
+        Assert.True(publisher.Calls >= 4, $"the keep-alive stopped after the publisher's cancellation (publisher calls: {publisher.Calls})");
+        Assert.Equal(WebSocketState.Open, ws.State);
+    }
+
+    [Fact]
+    public async Task JobTunnel_KeepAlive_ClosesTheTunnel_WhenTouchesKeepFailingForHalfTheIdleTimeout()
+    {
+        using var guacd = new FakeGuacd();
+        var clock = new FakeTimeProvider(new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        var interceptor = new TouchFailureInterceptor();
+        var f = new TunnelFactory(sql, guacd.Port, new VncEndpoint("127.0.0.1", 5901, VncPassword), clock: clock,
+            configure: s => s.ConfigureDbContext<MaldexDbContext>(o => o.AddInterceptors(interceptor)));
+        _disposables.Add(f);
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring, clock.GetUtcNow());
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        using var ws = await ConnectJobAsync(f, id, await GetJobTokenAsync(admin, id));
+        await ReceiveTextAsync(ws);
+        await ReceiveTextAsync(ws);
+
+        interceptor.Fail = true;
+        var next = ReceiveTextAsync(ws);
+        // Half of the 2 h idle timeout is 1 h: a short outage is ridden out, a long one is not.
+        for (var i = 0; i < 40 && !next.IsCompleted; i++)
+        {
+            clock.Advance(TimeSpan.FromSeconds(61));
+            await Task.Delay(30, Ct);
+        }
+        Assert.False(next.IsCompleted, "the tunnel closed after only about 40 minutes of failing touches");
+
+        for (var i = 0; i < 40 && !next.IsCompleted; i++)
+        {
+            clock.Advance(TimeSpan.FromSeconds(61));
+            await Task.Delay(30, Ct);
+        }
+        Assert.True(next.IsCompleted, "the tunnel stayed open after more than half the idle timeout of failing touches");
+        Assert.Equal("<close:InternalServerError>", await next);
+    }
+
+    [Fact]
+    public async Task JobTunnel_ClosedDuringTheHandshake_IsANormalClose_AndTouchesOnTheWayOut()
+    {
+        using var guacd = new FakeGuacd(stallHandshake: true);
+        var clock = new FakeTimeProvider(new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        var f = new TunnelFactory(sql, guacd.Port, new VncEndpoint("127.0.0.1", 5901, VncPassword), clock: clock, keepAlive: "1.00:00:00");
+        _disposables.Add(f);
+        var since = clock.GetUtcNow();
+        var id = await CreateJobAsync(f, TemplateJobState.Configuring, since);
+        using var admin = f.CreateClient(UserRole.Admin, "admin");
+        using var ws = await ConnectJobAsync(f, id, await GetJobTokenAsync(admin, id));
+        await guacd.Selected.Task.WaitAsync(TimeSpan.FromSeconds(20), Ct);
+
+        clock.Advance(TimeSpan.FromMinutes(5));
+        var closedAt = clock.GetUtcNow();
+        var registry = f.Services.GetRequiredService<Maldex.Orchestrator.Templates.JobConsoleRegistry>();
+        Assert.True(await registry.CloseAsync(id, TimeSpan.FromSeconds(10), Ct));
+
+        Assert.Equal("<close:NormalClosure>", await ReceiveTextAsync(ws));
+        Assert.Equal(closedAt, await LastConsoleAtAsync(f, id));
     }
 }
