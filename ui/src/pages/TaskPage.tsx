@@ -6,6 +6,11 @@ import { EventTable } from '../components/EventTable'
 import { ProcessTree } from '../components/ProcessTree'
 import { SessionPane } from '../components/SessionPane'
 import { StatusBadge, VerdictBadge } from '../components/StatusBadge'
+import { useConfirm } from '../kit/Confirm'
+import { CopyButton } from '../kit/CopyButton'
+import { ErrorBanner } from '../kit/ErrorBanner'
+import { Skeleton } from '../kit/Skeleton'
+import { useToast } from '../kit/Toaster'
 import { useTaskLive } from '../live/useTaskLive'
 import { safeText } from '../util/safeText'
 import forms from './forms.module.css'
@@ -32,11 +37,13 @@ export default function TaskPage() {
 
 function LiveTask({ taskId }: { taskId: string }) {
   const live = useTaskLive(taskId)
+  const toast = useToast()
+  const confirm = useConfirm()
+  const [reload, setReload] = useState(0)
   // `basis` is the pushed status that was current when the fetch was issued: only a *different* (newer) push beats it.
   const [fetched, setFetched] = useState<{ task: TaskDto; basis: TaskStatusUpdate | null } | null>(null)
   const task = fetched?.task ?? null
   const [loadError, setLoadError] = useState<string | null>(null)
-  const [actionError, setActionError] = useState<string | null>(null)
   // Set by Extend; valid only until the next pushed deadline (`basis`) replaces it.
   const [extended, setExtended] = useState<{ value: string; basis: string | null } | null>(null)
   const [artifacts, setArtifacts] = useState<ArtifactDto[]>([])
@@ -68,7 +75,7 @@ function LiveTask({ taskId }: { taskId: string }) {
     return () => {
       cancelled = true
     }
-  }, [taskId, connected, leftQueue])
+  }, [taskId, connected, leftQueue, reload])
 
   // A pushed status carries the authoritative deadline (also after someone else extends the run).
   const liveNow = live.status !== fetched?.basis ? live.status : null // a push older than the last fetch is stale
@@ -103,29 +110,35 @@ function LiveTask({ taskId }: { taskId: string }) {
     return () => clearInterval(timer)
   }, [counting])
 
-  const act = useCallback(async (fn: () => Promise<unknown>) => {
+  const act = useCallback(async (fn: () => Promise<unknown>, done: string) => {
     setBusy(true)
-    setActionError(null)
     try {
       await fn()
+      toast.success(done)
     } catch (e) {
-      setActionError(errorMessage(e))
+      toast.error(errorMessage(e))
     } finally {
       setBusy(false)
     }
-  }, [])
+  }, [toast])
 
   const extend = (seconds: number) =>
     act(async () => {
       const t = await extendTask(taskId, seconds)
       if (t.deadlineAt) setExtended({ value: t.deadlineAt, basis: pushedDeadline })
-    })
+    }, `Extended by ${seconds} s`)
+
+  async function stop() {
+    if (!(await confirm({ title: 'Stop this task?', body: 'The run ends now.', confirmLabel: 'Stop task', danger: true }))) return
+    await act(() => stopTask(taskId), 'Task stopped')
+  }
 
   const running = status === 'Running'
   const stoppable = status === 'Preparing' || status === 'Running'
   const target = task?.originalFileName ?? task?.url ?? null
 
-  if (loadError && !task) return <p className={styles.error} role="alert">{loadError}</p>
+  if (loadError && !task) return <ErrorBanner message={loadError} onRetry={() => { setLoadError(null); setReload((n) => n + 1) }} />
+  if (!task && !status) return <Skeleton rows={4} />
 
   return (
     <section>
@@ -138,16 +151,27 @@ function LiveTask({ taskId }: { taskId: string }) {
         <span className={styles.spacer} />
         <button type="button" className={forms.secondary} disabled={!running || busy} onClick={() => extend(60)}>Extend +60 s</button>
         <button type="button" className={forms.secondary} disabled={!running || busy} onClick={() => extend(300)}>Extend +300 s</button>
-        <button type="button" className={forms.secondary} disabled={!stoppable || busy} onClick={() => act(() => stopTask(taskId))}>Stop</button>
+        <button type="button" className={forms.secondary} disabled={!stoppable || busy} onClick={() => void stop()}>Stop</button>
       </div>
-      {target && <p className={styles.mono}>{safeText(target)}</p>}
+      {target && (
+        <p className={styles.mono}>
+          {safeText(target)}
+          {task?.url && !task.originalFileName && <CopyButton value={task.url} label="Copy URL" />}
+        </p>
+      )}
+      {task?.sampleSha256 && (
+        <p className={styles.meta}>
+          <span className={styles.metaLabel}>SHA-256</span>
+          <span className={styles.mono}>{task.sampleSha256}</span>
+          <CopyButton value={task.sampleSha256} label="Copy SHA-256" />
+        </p>
+      )}
       {task && (
         <p className={styles.meta}>
           <span className={styles.metaLabel}>{task.template ? 'Template' : 'Image'}</span>
           <span className={styles.mono}>{safeText(task.template ? task.template.summary : task.image)}</span>
         </p>
       )}
-      {actionError && <p className={styles.error} role="alert">{actionError}</p>}
       {(liveNow?.reason ?? task?.failureReason) && <p className={styles.error}>{safeText(liveNow?.reason ?? task?.failureReason)}</p>}
 
       {completed && (
