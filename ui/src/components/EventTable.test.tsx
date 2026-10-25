@@ -1,6 +1,6 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { EventType, LiveEventDto } from '../api/types'
 import { EventTable } from './EventTable'
 
@@ -52,5 +52,18 @@ describe('EventTable', () => {
     render(<EventTable events={many} />)
     expect(screen.getAllByRole('row').length).toBeLessThan(200)
     expect(screen.getByText(/5000 events/)).toBeInTheDocument()
+  })
+})
+
+describe('EventTable copy', () => {
+  it('copies a summary with the hover button and reports it', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    const onCopy = vi.fn()
+    render(<EventTable events={[ev(1, 'File', 'write a.dll')]} onCopy={onCopy} controls={false} />)
+    await userEvent.click(screen.getByRole('button', { name: 'Copy summary' }))
+    expect(writeText).toHaveBeenCalledWith('write a.dll')
+    await waitFor(() => expect(onCopy).toHaveBeenCalledWith('write a.dll'))
+    expect(screen.queryByRole('searchbox')).toBeNull()
   })
 })

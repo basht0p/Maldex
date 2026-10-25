@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { ApiError, extendTask, getTask, getTaskReport, listArtifacts, stopTask } from '../api/client'
 import type { ArtifactDto, NetworkMode, RunStatus, TaskDto, TaskReportDto, TaskStatusUpdate } from '../api/types'
-import { EventTable } from '../components/EventTable'
 import { ProcessTree } from '../components/ProcessTree'
 import { SessionPane } from '../components/SessionPane'
 import { StatusBadge, VerdictBadge } from '../components/StatusBadge'
@@ -15,6 +14,7 @@ import { useToast } from '../kit/Toaster'
 import { useTaskLive } from '../live/useTaskLive'
 import { safeText } from '../util/safeText'
 import forms from './forms.module.css'
+import { LiveEventsPanel } from './report/EventsTab'
 import { TaskReport } from './report/TaskReport'
 import styles from './TaskPage.module.css'
 
@@ -293,7 +293,7 @@ function LiveTask({ taskId }: { taskId: string }) {
           </div>
           <div className={styles.panel}>
             <h2>Events</h2>
-            <EventTable events={live.events} />
+            <LiveEventsPanel events={live.events} processes={live.processes} />
           </div>
         </>
       )}
