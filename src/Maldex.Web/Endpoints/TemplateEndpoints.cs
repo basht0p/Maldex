@@ -137,14 +137,32 @@ public static class TemplateEndpoints
             await StartBuildAsync(req, db, user, store, disk, libvirt, jobs, build, time, ct));
 
         // Only a template that never produced a version (a Build that failed, say); the audit rows keep its history.
-        admin.MapDelete("{id}", async (string id, MaldexDbContext db, TemplateCatalog catalog, CurrentUser user, CancellationToken ct) =>
+        admin.MapDelete("{id}", async (string id, MaldexDbContext db, TemplateCatalog catalog, CurrentUser user, IOptions<BuildOptions> build,
+            ILogger<TemplateCatalog> logger, CancellationToken ct) =>
         {
             if (await CanonicalIdAsync(db, id, ct) is not { } templateId) return Results.NotFound();
-            return await ConflictOr(async () =>
+            // The jobs go with the template; read their ids first, to remove their provisioning logs once the delete is committed.
+            var jobIds = await db.TemplateJobs.AsNoTracking().Where(j => j.TemplateId == templateId).Select(j => j.Id).ToListAsync(ct);
+            var deleted = false;
+            IResult? refused;
+            try
             {
-                await catalog.DeleteEmptyAsync(templateId, ct, new TemplateAudit(ActorOf(user), "template.delete"));
-                return Results.NoContent();
-            });
+                refused = await ConflictOr(async () =>
+                {
+                    await catalog.DeleteEmptyAsync(templateId, ct, new TemplateAudit(ActorOf(user), "template.delete"));
+                    deleted = true;
+                    return null;
+                });
+            }
+            catch (InvalidOperationException)
+            {
+                // Another admin may have deleted it between the lookup and the lock; anything else is a real fault.
+                if (await db.Templates.AsNoTracking().AnyAsync(t => t.Id == templateId, ct)) throw;
+                return Results.NotFound();
+            }
+            if (!deleted) return refused!;
+            foreach (var jobId in jobIds) DeleteLogDirectory(build.Value, jobId, logger);
+            return Results.NoContent();
         });
 
         admin.MapGet("{id}/jobs", async (string id, MaldexDbContext db, IOptions<TemplateJobOptions> jobs, IOptions<BuildOptions> build, CancellationToken ct) =>
@@ -168,17 +186,23 @@ public static class TemplateEndpoints
         {
             if (!await db.TemplateJobs.AsNoTracking().AnyAsync(j => j.Id == jobId, ct)) return Results.NotFound();
             var path = build.Value.ProvisionLogPathOf(jobId);
-            FileStream stream;
+            // At most the last ProvisionLogMaxBytes (the installer keeps no more; a bigger file is something else's doing).
+            byte[] tail;
             try
             {
-                stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                var max = Math.Max(build.Value.ProvisionLogMaxBytes, 0);
+                if (stream.Length > max) stream.Seek(-max, SeekOrigin.End);
+                var buffer = new byte[(int)Math.Min(stream.Length - stream.Position, max)];
+                await stream.ReadExactlyAsync(buffer, ct);
+                tail = buffer;
             }
             catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException)
             {
                 return Results.NotFound();
             }
             http.Response.Headers["X-Content-Type-Options"] = "nosniff";
-            return Results.File(stream, "text/plain; charset=utf-8", $"provision-{jobId:N}.log");
+            return Results.File(tail, "text/plain; charset=utf-8", $"provision-{jobId:N}.log");
         });
 
         // Both requests are single-column conditional updates (no row-version check): the coordinator writes the same row, and
@@ -254,6 +278,20 @@ public static class TemplateEndpoints
 
     private const int RecentJobs = 20, MaxNoteLength = 1000;
 
+    /// <summary>Removes a deleted job's provisioning log directory. Best effort: the template is already gone.</summary>
+    private static void DeleteLogDirectory(BuildOptions build, Guid jobId, ILogger logger)
+    {
+        var dir = Path.GetDirectoryName(build.ProvisionLogPathOf(jobId))!;
+        try
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogWarning(ex, "The provisioning log directory {Dir} of deleted job {JobId} could not be removed.", dir, jobId);
+        }
+    }
+
     private static readonly IReadOnlyList<TemplateJobState> ActiveStates = TemplateJobStateMachine.ActiveStates;
 
 
@@ -328,6 +366,7 @@ public static class TemplateEndpoints
         if (description is { Length: > MaxDescription }) return Bad($"description may be at most {MaxDescription} characters");
         var publish = req.PublishOnSuccess ?? true;
         var applicationIds = (req.ApplicationMediaIds ?? []).Distinct().ToList();
+        if (applicationIds.Count > 1) return Bad("only Office media can be installed by a build"); // before any lock or query: a huge list never reaches the IN clause
         var mediaIds = new List<Guid> { req.OsMediaId };
         mediaIds.AddRange(applicationIds.Where(a => a != req.OsMediaId));
 

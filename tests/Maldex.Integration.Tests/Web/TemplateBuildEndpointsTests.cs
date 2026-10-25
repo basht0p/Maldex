@@ -41,27 +41,51 @@ public sealed class TemplateBuildEndpointsTests(SqlServerFixture sql) : IDisposa
         public required MaldexAppFactory Factory { get; init; }
         public required SettableDisk Disk { get; init; }
         public required string LogRoot { get; init; }
+        public required BeforeTemplateLock Interceptor { get; init; }
         public HttpClient Admin(string user = "builder") => Factory.CreateClient(UserRole.Admin, user);
     }
 
-    private sealed class BuildFactory(SqlServerFixture sql, SettableDisk disk, string logRoot) : MaldexAppFactory(sql, settings: new Dictionary<string, string?>
+    /// <summary>Runs the armed action once, just before the first row-locking read of a template (the delete's second step).</summary>
+    private sealed class BeforeTemplateLock : Microsoft.EntityFrameworkCore.Diagnostics.DbCommandInterceptor
     {
-        ["Maldex:Templates:Build:JobLogDir"] = logRoot,
-    })
+        private Func<Task>? _before;
+
+        public void Arm(Func<Task> before) => _before = before;
+
+        public override async ValueTask<Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<System.Data.Common.DbDataReader>> ReaderExecutingAsync(
+            System.Data.Common.DbCommand command, Microsoft.EntityFrameworkCore.Diagnostics.CommandEventData eventData,
+            Microsoft.EntityFrameworkCore.Diagnostics.InterceptionResult<System.Data.Common.DbDataReader> result, CancellationToken cancellationToken = default)
+        {
+            if (command.CommandText.Contains("FROM Templates WITH (UPDLOCK", StringComparison.Ordinal) && Interlocked.Exchange(ref _before, null) is { } before)
+                await before();
+            return result;
+        }
+    }
+
+    private sealed class BuildFactory(SqlServerFixture sql, SettableDisk disk, string logRoot, BeforeTemplateLock interceptor, Dictionary<string, string?>? extra = null)
+        : MaldexAppFactory(sql, settings: new Dictionary<string, string?>(extra ?? [])
+        {
+            ["Maldex:Templates:Build:JobLogDir"] = logRoot,
+        })
     {
         protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
         {
             base.ConfigureWebHost(builder);
-            builder.ConfigureServices(s => s.Replace(ServiceDescriptor.Singleton<IDiskSpaceProbe>(disk)));
+            builder.ConfigureServices(s =>
+            {
+                s.Replace(ServiceDescriptor.Singleton<IDiskSpaceProbe>(disk));
+                s.ConfigureDbContext<MaldexDbContext>(o => o.AddInterceptors(interceptor));
+            });
         }
     }
 
-    private Rig NewRig()
+    private Rig NewRig(Dictionary<string, string?>? settings = null)
     {
         var disk = new SettableDisk();
-        var f = new BuildFactory(sql, disk, _logRoot);
+        var interceptor = new BeforeTemplateLock();
+        var f = new BuildFactory(sql, disk, _logRoot, interceptor, settings);
         _disposables.Add(f);
-        return new Rig { Factory = f, Disk = disk, LogRoot = _logRoot };
+        return new Rig { Factory = f, Disk = disk, LogRoot = _logRoot, Interceptor = interceptor };
     }
 
     private static InstallerImage Image(int index, string name, string arch = "x86_64") => new(index, name, null, "26100", arch);
@@ -128,6 +152,18 @@ public sealed class TemplateBuildEndpointsTests(SqlServerFixture sql) : IDisposa
             await db.SaveChangesAsync(Ct);
             return job.Id;
         });
+    }
+
+    [Fact]
+    public async Task Build_MoreThanOneApplicationMedia_IsRefusedBeforeAnythingIsLookedUp()
+    {
+        var r = NewRig();
+        using var client = r.Admin();
+
+        // The installer media does not exist either: the list is refused first, so it never reaches the media lock's IN clause.
+        var resp = await BuildAsync(client, Guid.NewGuid(), apps: Enumerable.Range(0, 5000).Select(_ => Guid.NewGuid()).ToArray());
+
+        await AssertProblemAsync(resp, HttpStatusCode.BadRequest, "only Office media can be installed by a build");
     }
 
     // ---- build: happy paths ----
@@ -474,6 +510,22 @@ public sealed class TemplateBuildEndpointsTests(SqlServerFixture sql) : IDisposa
     }
 
     [Fact]
+    public async Task ProvisionLog_IsCappedToItsLastProvisionLogMaxBytes()
+    {
+        var r = NewRig(new() { ["Maldex:Templates:Build:ProvisionLogMaxBytes"] = "100" });
+        var id = await SeedJobAsync(r, Seeded, TemplateJobState.Failed);
+        Directory.CreateDirectory(Path.Combine(r.LogRoot, id.ToString("N")));
+        var log = string.Concat(Enumerable.Range(0, 100).Select(i => $"line {i:000}\n")); // 900 bytes
+        await File.WriteAllTextAsync(Path.Combine(r.LogRoot, id.ToString("N"), "provision.log"), log, Ct);
+        using var client = r.Admin();
+
+        var resp = await client.GetAsync($"/api/admin/template-jobs/{id}/provision-log", Ct);
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.Equal(log[^100..], await resp.Content.ReadAsStringAsync(Ct));
+    }
+
+    [Fact]
     public async Task ProvisionLog_Is404_WhenThereIsNoLogOrNoJob()
     {
         var r = NewRig();
@@ -524,6 +576,52 @@ public sealed class TemplateBuildEndpointsTests(SqlServerFixture sql) : IDisposa
         Assert.NotNull(audit.UserId);
         Assert.Single(await AuditsAsync(r, "template.create")); // the history stays
         Assert.Single(await AuditsAsync(r, "template.job.start"));
+    }
+
+    [Fact]
+    public async Task DeleteEmptyTemplate_RemovesTheJobsLogDirectories_AndOnlyThose()
+    {
+        var r = NewRig();
+        var os = await SeedMediaAsync(r);
+        using var client = r.Admin("deleter");
+        var id = (await ReadAsync(await BuildAsync(client, os))).GetProperty("id").GetGuid();
+        await InDbAsync(r, async db => await db.TemplateJobs.Where(j => j.Id == id)
+            .ExecuteUpdateAsync(s => s.SetProperty(j => j.State, TemplateJobState.Failed).SetProperty(j => j.EndedAt, DateTimeOffset.UtcNow), Ct));
+        var mine = Path.Combine(r.LogRoot, id.ToString("N"));
+        var other = Path.Combine(r.LogRoot, Guid.NewGuid().ToString("N"));
+        foreach (var dir in new[] { mine, other })
+        {
+            Directory.CreateDirectory(dir);
+            await File.WriteAllTextAsync(Path.Combine(dir, "provision.log"), "log", Ct);
+        }
+
+        Assert.Equal(HttpStatusCode.NoContent, (await client.DeleteAsync("/api/admin/templates/win11-pro", Ct)).StatusCode);
+
+        Assert.False(Directory.Exists(mine), "the deleted template's job log directory was left behind");
+        Assert.True(Directory.Exists(other));
+    }
+
+    [Fact]
+    public async Task DeleteEmptyTemplate_ThatVanishesBeforeTheLock_Is404()
+    {
+        var r = NewRig();
+        using var client = r.Admin();
+        await InDbAsync(r, async db =>
+        {
+            db.Templates.Add(new Template { Id = "vanishing", DisplayName = "Vanishing", CreatedAt = DateTimeOffset.UtcNow });
+            await db.SaveChangesAsync(Ct);
+            return 0;
+        });
+        // Another admin deletes it after the endpoint found it and before the catalog locks it.
+        r.Interceptor.Arm(async () =>
+        {
+            await using var scope = r.Factory.Services.CreateAsyncScope();
+            await scope.ServiceProvider.GetRequiredService<MaldexDbContext>().Templates.Where(t => t.Id == "vanishing").ExecuteDeleteAsync(Ct);
+        });
+
+        var resp = await client.DeleteAsync("/api/admin/templates/vanishing", Ct);
+
+        Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
     }
 
     [Fact]

@@ -79,15 +79,15 @@ public sealed class TemplateInstaller(
         }
         catch (UnreadableMarkerException ex) when (!ct.IsCancellationRequested)
         {
-            await KeepLogAsync(session, b, jobId, settle: true, ct).ConfigureAwait(false);
+            await KeepLogAsync(vm, session, b, jobId, settle: true, ct).ConfigureAwait(false);
             throw new TemplateBuildException(UnreadableResult, ex.InnerException);
         }
         catch (TemplateBuildException) when (!ct.IsCancellationRequested)
         {
-            await KeepLogAsync(session, b, jobId, settle: false, ct).ConfigureAwait(false);
+            await KeepLogAsync(vm, session, b, jobId, settle: false, ct).ConfigureAwait(false);
             throw;
         }
-        await KeepLogAsync(session, b, jobId, settle: true, ct).ConfigureAwait(false);
+        await KeepLogAsync(vm, session, b, jobId, settle: true, ct).ConfigureAwait(false);
 
         var failedSteps = ParseResult(marker);
         if (failedSteps is not null)
@@ -252,13 +252,16 @@ public sealed class TemplateInstaller(
     /// stopped its transcript; a read that fails is tried once more an interval later. Best effort: a log that cannot be fetched or
     /// written is logged, never a failure of its own.
     /// </summary>
-    private async Task KeepLogAsync(GuestSession session, BuildOptions b, Guid jobId, bool settle, CancellationToken ct)
+    private async Task KeepLogAsync(VmHandle vm, GuestSession session, BuildOptions b, Guid jobId, bool settle, CancellationToken ct)
     {
         if (settle) await Task.Delay(b.ProvisionPollInterval, time, ct).ConfigureAwait(false);
+        // A stopped guest has nothing to collect, and asking would only wait out the collect timeouts before the failure is reported.
+        if (!await StillRunningAsync(vm, jobId, ct).ConfigureAwait(false)) return;
         var log = await TryCollectLogAsync(session, jobId, ct).ConfigureAwait(false);
         if (log is null)
         {
             await Task.Delay(b.ProvisionPollInterval, time, ct).ConfigureAwait(false);
+            if (!await StillRunningAsync(vm, jobId, ct).ConfigureAwait(false)) return;
             log = await TryCollectLogAsync(session, jobId, ct).ConfigureAwait(false);
         }
         if (log is null) return;
@@ -278,6 +281,20 @@ public sealed class TemplateInstaller(
         catch (Exception ex) when (!ct.IsCancellationRequested && ex is IOException or UnauthorizedAccessException)
         {
             logger.LogWarning(ex, "The provisioning log of build {JobId} could not be written to {Path}.", jobId, path);
+        }
+    }
+
+    /// <summary>Whether the guest is still executing; a hypervisor that cannot say counts as not (the log is best effort).</summary>
+    private async Task<bool> StillRunningAsync(VmHandle vm, Guid jobId, CancellationToken ct)
+    {
+        try
+        {
+            return await hypervisor.IsRunningAsync(vm, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            logger.LogWarning(ex, "Could not check whether the guest of build {JobId} is running; its provisioning log is skipped.", jobId);
+            return false;
         }
     }
 

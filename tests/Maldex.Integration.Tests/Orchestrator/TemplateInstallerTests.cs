@@ -239,8 +239,27 @@ public class TemplateInstallerTests
         var ex = await FailsAsync(rig, run, Second);
 
         Assert.Equal("the guest stopped before provisioning finished", ex.Message);
-        Assert.True(File.Exists(rig.LogPath), "the provisioning log was not kept"); // the fake guest still serves it
-        Assert.True(rig.Time.GetUtcNow() - stopped < Minute, "it waited instead of failing at once");
+        // A stopped guest has no log to collect: asking would only wait out the collect timeouts (I-3).
+        Assert.DoesNotContain(rig.Sent.OfType<CollectFileCommand>(), c => c.Path == BuildOptions.ProvisionLogGuestPath);
+        Assert.False(File.Exists(rig.LogPath));
+        Assert.True(rig.Time.GetUtcNow() - stopped <= rig.Build.ProvisionPollInterval + Second, "it did not fail within one poll interval");
+    }
+
+    [Fact]
+    public async Task Provision_VmStopsWhileTheLogIsRead_DoesNotRetry()
+    {
+        await using var rig = await new Rig().StartAsync();
+        var timed = new TimedCollects(rig);
+        rig.Channels = timed;
+        rig.Kit.Guest.RemoveFile(FakeGuest.ProvisionLogPath); // the first read finds nothing ...
+        int LogReads() { lock (timed.Collects) return timed.Collects.Count(c => c.Path == BuildOptions.ProvisionLogGuestPath); }
+        var run = rig.InstallAsync();
+        await AdvanceUntilAsync(rig, () => LogReads() == 1);
+        await rig.Kit.Hypervisor.DestroyAsync(rig.Vm, Ct); // ... and then the guest stops: the retry is pointless
+
+        await rig.Kit.PumpAsync(run);
+
+        Assert.Equal(1, LogReads());
     }
 
     public static TheoryData<string> MalformedResults => new()
