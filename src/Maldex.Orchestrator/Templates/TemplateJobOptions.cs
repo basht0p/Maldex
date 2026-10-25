@@ -37,7 +37,27 @@ public sealed class TemplateJobOptions
     /// How many readings (on or off, not unreadable) "off" takes: with fewer, or none near the window's end, the state did not
     /// settle (R19). Not used when <see cref="DefenderSettleWindow"/> is zero (one reading decides).
     /// </summary>
-    public int DefenderSettleMinReadings { get; set; } = 10;
+    public int DefenderSettleMinReadings { get; set; } = 8;
+
+    /// <summary>
+    /// Why the Defender settle options cannot work, or null. A zero window (one reading) is allowed only in fake mode; otherwise
+    /// the window is at least 30 s, the interval positive, and the minimum at least 3 and no more than the window holds.
+    /// </summary>
+    public static string? DefenderSettleProblem(TemplateJobOptions o, bool fakeMode)
+    {
+        var key = SectionName + ":";
+        if (o.DefenderSettleWindow == TimeSpan.Zero && fakeMode) return null;
+        if (o.DefenderSettleWindow < TimeSpan.FromSeconds(30))
+            return $"{key}DefenderSettleWindow is {o.DefenderSettleWindow.TotalSeconds:0} s; it must be at least 30 s (0 only in fake mode)";
+        if (o.DefenderSettleInterval <= TimeSpan.Zero)
+            return $"{key}DefenderSettleInterval is {o.DefenderSettleInterval.TotalSeconds:0} s; it must be positive";
+        if (o.DefenderSettleMinReadings < 3) return $"{key}DefenderSettleMinReadings is {o.DefenderSettleMinReadings}; it must be at least 3";
+        var slots = (long)(o.DefenderSettleWindow / o.DefenderSettleInterval) + 1;
+        if (o.DefenderSettleMinReadings > slots)
+            return $"{key}DefenderSettleMinReadings is {o.DefenderSettleMinReadings}, but a {o.DefenderSettleWindow.TotalSeconds:0} s window read every "
+                + $"{o.DefenderSettleInterval.TotalSeconds:0} s holds at most {slots} readings";
+        return null;
+    }
     /// <summary>How long the coordinator waits for the open consoles of a job to close once a seal is requested, before sealing anyway.</summary>
     public TimeSpan ConsoleCloseTimeout { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan ConfigureIdleTimeout { get; set; } = TimeSpan.FromHours(2);

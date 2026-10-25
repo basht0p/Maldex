@@ -106,8 +106,9 @@ internal sealed class GuestSession : IAsyncDisposable
     /// <summary>
     /// Reads Defender's real-time protection until it has settled (right after a boot it briefly reads off before it turns on):
     /// a provenance reading (<see cref="AskProvenanceWithRetryAsync"/>, each bounded by <paramref name="timeout"/>) every
-    /// <see cref="TemplateJobOptions.DefenderSettleInterval"/> over <see cref="TemplateJobOptions.DefenderSettleWindow"/>, measured from
-    /// the first successful reading. A failed reading is skipped. The state (R19) is on as soon as any reading says on; off only with at
+    /// <see cref="TemplateJobOptions.DefenderSettleInterval"/> over <see cref="TemplateJobOptions.DefenderSettleWindow"/>, measured (by
+    /// timestamps) from the first successful reading's start, on a fixed cadence: reading k is due k intervals in, and one that
+    /// overruns its slot is followed at once. A failed reading is skipped. The state (R19) is on as soon as any reading says on; off only with at
     /// least <see cref="TemplateJobOptions.DefenderSettleMinReadings"/> off readings, the last of them at or after window - interval past
     /// the first; unreadable when no reading could read the state (R7); otherwise not settled. A zero window takes one reading, which decides.
     /// </summary>
@@ -116,27 +117,30 @@ internal sealed class GuestSession : IAsyncDisposable
     /// <exception cref="InvalidOperationException">No reading succeeded within the window, the last one was refused or the agent went away.</exception>
     public async Task<SettledProvenance> AskSettledProvenanceAsync(TemplateJobOptions o, TimeSpan timeout, TimeProvider time, CancellationToken ct)
     {
-        var start = time.GetUtcNow();
+        // Timestamps, not the wall clock: a clock step must not shorten the observation.
+        var anchor = time.GetTimestamp(); // the first successful reading's start (until then: the first request's)
+        long slot = 0; // the slot of the reading just taken; reading k is due k intervals after the anchor
         ProvenanceMessage? first = null;
-        DateTimeOffset firstAt = default, lastOffAt = default;
+        var lastOffAt = TimeSpan.Zero; // since the anchor, at the reading's start
         var offReadings = 0;
         Exception? lastFailure = null;
         while (true)
         {
+            var readingStart = time.GetTimestamp();
             try
             {
                 var p = await AskProvenanceWithRetryAsync(o.ProvenanceRetryInterval, timeout, time, ct).ConfigureAwait(false);
-                var now = time.GetUtcNow();
                 if (first is null)
                 {
                     first = p;
-                    firstAt = now;
+                    anchor = readingStart;
+                    slot = 0;
                 }
                 if (p.RealTimeProtectionEnabled == true) return new SettledProvenance(first, DefenderSettlement.On); // no later reading can change it
                 if (p.RealTimeProtectionEnabled == false)
                 {
                     offReadings++;
-                    lastOffAt = now;
+                    lastOffAt = time.GetElapsedTime(anchor, readingStart);
                 }
             }
             catch (Exception) when (ct.IsCancellationRequested)
@@ -148,15 +152,29 @@ internal sealed class GuestSession : IAsyncDisposable
                 lastFailure = ex; // skipped: the rules below decide whether the others are enough
             }
 
-            var from = first is null ? start : firstAt;
-            if (time.GetUtcNow() - from + o.DefenderSettleInterval > o.DefenderSettleWindow) break;
-            await Task.Delay(o.DefenderSettleInterval, time, ct).ConfigureAwait(false);
+            if (o.DefenderSettleWindow <= TimeSpan.Zero) break; // one reading
+            // A fixed cadence: a slow reading does not push the later ones back. One that overran its slot is followed at once.
+            var elapsed = time.GetElapsedTime(anchor);
+            var due = (slot + 1) * o.DefenderSettleInterval;
+            TimeSpan nextStart;
+            if (elapsed >= due)
+            {
+                slot = (long)(elapsed / o.DefenderSettleInterval);
+                nextStart = elapsed;
+            }
+            else
+            {
+                slot++;
+                nextStart = due;
+            }
+            if (nextStart > o.DefenderSettleWindow) break;
+            if (nextStart > elapsed) await Task.Delay(nextStart - elapsed, time, ct).ConfigureAwait(false);
         }
 
         if (first is null) ExceptionDispatchInfo.Throw(lastFailure!);
         if (offReadings == 0) return new SettledProvenance(first, DefenderSettlement.Unreadable);
         if (o.DefenderSettleWindow <= TimeSpan.Zero) return new SettledProvenance(first, DefenderSettlement.Off); // one reading decides
-        var settled = offReadings >= o.DefenderSettleMinReadings && lastOffAt - firstAt >= o.DefenderSettleWindow - o.DefenderSettleInterval;
+        var settled = offReadings >= o.DefenderSettleMinReadings && lastOffAt >= o.DefenderSettleWindow - o.DefenderSettleInterval;
         return new SettledProvenance(first, settled ? DefenderSettlement.Off : DefenderSettlement.NotSettled);
     }
 

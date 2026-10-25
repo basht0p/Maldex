@@ -48,7 +48,11 @@ public static class DependencyInjection
             o.JobLogDir = RealPaths.Resolve(root, o.JobLogDir);
         });
         var mode = configuration["Maldex:Mode"];
-        if (string.IsNullOrEmpty(mode) || mode == "Fake")
+        var fakeMode = string.IsNullOrEmpty(mode) || mode == "Fake";
+        // A settle window that cannot work would refuse every seal or pass Defender unchecked: fail at startup instead.
+        services.AddSingleton<IValidateOptions<TemplateJobOptions>>(new DefenderSettleValidation(fakeMode));
+        services.AddOptions<TemplateJobOptions>().ValidateOnStart();
+        if (fakeMode)
         {
             services.TryAddSingleton<IProvisioningMediaBuilder, FakeProvisioningMediaBuilder>();
             // The fake guest's Defender state never changes: one reading per check, not a minute of real time (unless configured).
@@ -93,5 +97,11 @@ public static class DependencyInjection
         {
             return null;
         }
+    }
+
+    private sealed class DefenderSettleValidation(bool fakeMode) : IValidateOptions<TemplateJobOptions>
+    {
+        public ValidateOptionsResult Validate(string? name, TemplateJobOptions options) =>
+            TemplateJobOptions.DefenderSettleProblem(options, fakeMode) is { } problem ? ValidateOptionsResult.Fail(problem) : ValidateOptionsResult.Success;
     }
 }

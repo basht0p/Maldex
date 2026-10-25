@@ -230,7 +230,7 @@ public class TemplateVerifierTests
     public async Task Verify_RealTimeProtectionOffThroughoutTheWindow_Passes_AfterReadingEveryFiveSecondsForAMinute()
     {
         var defaults = new TemplateJobOptions();
-        Assert.Equal((TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(5), 10), (defaults.DefenderSettleWindow, defaults.DefenderSettleInterval, defaults.DefenderSettleMinReadings));
+        Assert.Equal((TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(5), 8), (defaults.DefenderSettleWindow, defaults.DefenderSettleInterval, defaults.DefenderSettleMinReadings));
         var (kit, channels, run) = VerifyScripted(_ => DefenderReading.Off);
         await using var _ = kit;
 
