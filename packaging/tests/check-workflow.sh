@@ -45,6 +45,9 @@ if [ -f "$WF" ]; then
   # a branch push must not be mistaken for a release tag: the tag version needs the push event AND a v* ref name
   if grep -qF 'if [ "$EVENT" = push ] && [[ "$REF_NAME" == v* ]]; then' "$WF"; then ok "tag version needs push event and v* ref"; else fail "version derivation must require EVENT=push and [[ \"\$REF_NAME\" == v* ]]"; fi
   if grep -q 'if: always()' "$WF"; then ok "always() cleanup step"; else fail "missing if: always() cleanup step"; fi
+  # a top-level concurrency group keyed on the ref, never cancelling a run in progress (a re-pushed tag must not race a release)
+  conc=$(awk '/^concurrency:/{c=1;next} /^[^ #]/{c=0} c' "$WF")
+  if printf '%s\n' "$conc" | grep -qE '^  group: .*\$\{\{ github\.ref \}\}' && printf '%s\n' "$conc" | grep -qE '^  cancel-in-progress: false$'; then ok "concurrency group per ref, no cancel-in-progress"; else fail "release.yml needs a top-level concurrency: group keyed on github.ref with cancel-in-progress: false"; fi
 fi
 
 # CI scripts parse

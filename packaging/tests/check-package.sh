@@ -207,6 +207,26 @@ check "maldex.service: MALDEX_EXTRA_CONFIG" unit_has "Environment=MALDEX_EXTRA_C
 check "maldex.service: ExecStart=/opt/maldex/app/Maldex.Web" unit_has "ExecStart=/opt/maldex/app/Maldex.Web"
 check "maldex.service: WorkingDirectory=/var/lib/maldex" unit_has "WorkingDirectory=/var/lib/maldex"
 check "maldex.service: Requires=maldex-host-guard.service" unit_has "Requires=maldex-host-guard.service"
+# Without it the content root is the WorkingDirectory: no appsettings.json / appsettings.Real.json and no SPA.
+check "maldex.service: ASPNETCORE_CONTENTROOT=/opt/maldex/app" unit_has "Environment=ASPNETCORE_CONTENTROOT=/opt/maldex/app"
+# The app's configuration fail-fasts exit 78 (StartupChecks.ConfigErrorExitCode): no restart loop on a bad config.
+check "maldex.service: RestartPreventExitStatus=78" unit_has "RestartPreventExitStatus=78"
+exit_code_matches() {
+  grep -qE 'public const int ConfigErrorExitCode = 78;' "$REPO/src/Maldex.Web/StartupChecks.cs" \
+    || { OUT="src/Maldex.Web/StartupChecks.cs ConfigErrorExitCode is not 78 (the unit's RestartPreventExitStatus)"; return 1; }
+}
+check "StartupChecks.ConfigErrorExitCode matches RestartPreventExitStatus=78" exit_code_matches
+depends_on() { # $1: package; in the deb depends and the rpm overrides
+  local n; n="$(grep -cE "^ +- $1( |$)" "$NFPM")"
+  [ "$n" -ge 2 ] || { OUT="nfpm.yaml lists '$1' $n time(s); expected in the deb depends and the rpm overrides"; return 1; }
+}
+for dep in yara curl; do check "nfpm.yaml depends on $dep (deb and rpm)" depends_on "$dep"; done
+# RHEL's qemu-kvm ships only /usr/libexec/qemu-kvm; the domain XML names /usr/bin/qemu-system-x86_64.
+rpm_emulator_link() {
+  grep -qxF $'/usr/libexec/qemu-kvm\t/usr/bin/qemu-system-x86_64\tsymlink\trpm' <<<"$(nfpm_entries)" \
+    || { OUT="no rpm-only symlink /usr/bin/qemu-system-x86_64 -> /usr/libexec/qemu-kvm"; return 1; }
+}
+check "nfpm.yaml: rpm-only /usr/bin/qemu-system-x86_64 -> /usr/libexec/qemu-kvm" rpm_emulator_link
 
 config_group() { [ "$(grep -cE '^      group: maldex$' "$NFPM")" -ge 2 ] || { OUT="the /etc/maldex config entries lack file_info group: maldex"; return 1; }; }
 check "nfpm.yaml: appsettings.Production.json is group maldex (both formats)" config_group

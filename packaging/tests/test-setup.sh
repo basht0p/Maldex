@@ -11,7 +11,7 @@ SETUP_SRC="$PKG/bin/maldex-setup"
 LIB_SRC="$PKG/lib/maldex-common.sh"
 
 # Checks --check prints: db plus the verify list (the downloads' file presence is part of the verify list).
-EXPECTED_CHECKS=30
+EXPECTED_CHECKS=32
 
 PASS=0
 FAIL=0
@@ -52,7 +52,7 @@ setup_sandbox() {
   printf '1.0.0\n' > "$T/opt/agent/Maldex.Agent.version"
 
   # Recording no-ops for everything that would change the host.
-  for c in chown chgrp chmod useradd usermod udevadm nft setfacl virsh swtpm suricata inetsim wg wiminfo xorriso xmllint \
+  for c in chown chgrp chmod useradd usermod udevadm nft setfacl virsh swtpm suricata inetsim yara wg wiminfo xorriso xmllint \
            libguestfs-test-tool find; do
     stub "$c" 'exit 0'
   done
@@ -71,7 +71,7 @@ cp "$STUB_SRV/${url##*/}" "$out"'
   # For a non-root caller, sudo without -n would prompt for a password: the stub fails it, as a hang would.
   stub sudo '[ "$STUB_EUID" = 0 ] || [ "$1" = -n ] || exit 1; while [ $# -gt 0 ]; do case "$1" in -n) shift;; -u) shift 2;; --) shift; break;; *) break;; esac; done; exec "$@"'
   stub runuser 'while [ $# -gt 0 ]; do case "$1" in -u) shift 2;; --) shift; break;; *) break;; esac; done; exec "$@"'
-  stub systemctl 'exit 0'
+  stub systemctl 'case "$*" in is-active*maldex*) exit "${STUB_ACTIVE_RC:-0}";; esac; exit 0'
   stub dpkg-query 'echo "1.52.0-test"'
   stub libguestfs-make-fixed-appliance '[ ! -e "$STUB_SRV/guestfs-fail" ] || exit 1; mkdir -p "$1"; touch "$1/kernel" "$1/initrd" "$1/root"'
   printf '#!/usr/bin/env bash\necho "Maldex.Web $*" >> "$STUB_LOG"\nmkdir -p "$PLAYWRIGHT_BROWSERS_PATH/chromium-1"\n' > "$T/opt/app/Maldex.Web"
@@ -81,6 +81,8 @@ cp "$STUB_SRV/${url##*/}" "$out"'
   # Host paths the verify checks read, so a full run passes verify on any host (CI has no KVM).
   touch "$T/ovmf-secboot.fd" "$T/kvm"; echo 0 > "$T/bridge-nf-call-iptables"
   export MALDEX_OVMF_SECBOOT="$T/ovmf-secboot.fd" MALDEX_KVM_DEV="$T/kvm" MALDEX_BR_NF_CALL_IPTABLES="$T/bridge-nf-call-iptables"
+  printf '#!/bin/sh\n' > "$T/qemu-system-x86_64"; /bin/chmod +x "$T/qemu-system-x86_64"
+  export MALDEX_QEMU_EMULATOR="$T/qemu-system-x86_64" MALDEX_START_WAIT=0
   export PATH="$T/bin:/usr/bin:/bin"
 }
 
@@ -221,15 +223,100 @@ test_start_step() {
   setup_sandbox; write_config
   run_setup
   check "a full run passes verify" grep -q "^ok   verify\$" <<<"$OUT"
-  check "start enables maldex after verify" grep -q "^systemctl enable --now maldex" "$STUB_LOG"
+  check "start enables maldex after verify" grep -q "^systemctl enable maldex\$" "$STUB_LOG"
+  check "start restarts maldex (a re-run applies new configuration)" grep -q "^systemctl restart maldex\$" "$STUB_LOG"
+  check "start checks maldex stayed active" grep -q "^systemctl is-active --quiet maldex\$" "$STUB_LOG"
+  check "start prints ok start" grep -q "^ok   start\$" <<<"$OUT"
   check "start prints the URL and the next step" grep -q "http://127.0.0.1:5080.*" <<<"$OUT"
+  teardown
+
+  setup_sandbox; write_config
+  export STUB_ACTIVE_RC=3
+  run_setup
+  check "a service that does not stay active fails start" grep -q "^FAIL start -- maldex did not stay running" <<<"$OUT"
+  check "a failed start points at the journal" grep -q "journalctl -u maldex -n 50" <<<"$OUT"
+  check "a failed start exits nonzero" [ "$RC" != 0 ]
+  check "a failed start does not claim maldex is running" not_in_out "Maldex is running"
+  unset STUB_ACTIVE_RC
   teardown
 
   setup_sandbox; write_config
   echo 1 > "$T/bridge-nf-call-iptables"
   run_setup
   check "a failed verify check fails verify" grep -q "^FAIL verify -- " <<<"$OUT"
-  check "a failed verify stops before start" not_logged "^systemctl enable --now maldex"
+  check "a failed verify stops before start" not_logged "^systemctl (enable|restart) maldex"
+  teardown
+}
+
+test_verify_yara_and_emulator() {
+  setup_sandbox; write_config
+  stub yara 'exit 127'   # (the host may have a real yara on PATH)
+  rm -f "$T/qemu-system-x86_64"
+  run_setup --check
+  check "a missing yara fails its check" grep -q "^FAIL yara -- .*no YARA detections" <<<"$OUT"
+  check "a missing emulator fails its check" grep -q "^FAIL VM emulator $T/qemu-system-x86_64 -- .*qemu-kvm" <<<"$OUT"
+  teardown
+  setup_sandbox; write_config
+  run_setup --check
+  check "yara present: ok yara" grep -q "^ok   yara\$" <<<"$OUT"
+  check "an executable emulator: ok" grep -q "^ok   VM emulator $T/qemu-system-x86_64\$" <<<"$OUT"
+  check "the inetsim hint no longer sends RHEL to EPEL" not_in_out "inetsim.*from EPEL"
+  teardown
+}
+
+test_offline_browsers() {
+  setup_sandbox; write_config
+  run_setup --offline "$T/offline"
+  check "--offline with no Chromium seed: browsers passes" grep -q "^ok   browsers\$" <<<"$OUT"
+  check "--offline with no Chromium seed warns about PDF reports" grep -q "^warn browsers -- .*PDF reports" <<<"$OUT"
+  check "--offline never runs the Playwright download" not_logged "^(Maldex.Web|sudo -u maldex env PLAYWRIGHT)"
+  check "--offline never calls curl (whole run)" not_logged '^curl'
+  check "--offline with no Chromium: verify warns instead of failing" grep -q "^warn Playwright Chromium" <<<"$OUT"
+  check "--offline with no Chromium: verify and start pass" bash -c 'grep -q "^ok   verify$" <<<"$1" && grep -q "^ok   start$" <<<"$1"' _ "$OUT"
+  teardown
+
+  setup_sandbox; write_config
+  mkdir -p "$T/offline/ms-playwright/chromium-1234/chrome-linux" "$T/offline/ms-playwright/ffmpeg-1"
+  printf 'bin\n' > "$T/offline/ms-playwright/chromium-1234/chrome-linux/chrome"
+  run_setup --offline "$T/offline"
+  check "--offline with a seed: browsers passes" grep -q "^ok   browsers\$" <<<"$OUT"
+  check "--offline with a seed copies it to the browsers dir" cmp -s "$T/offline/ms-playwright/chromium-1234/chrome-linux/chrome" "$T/data/ms-playwright/chromium-1234/chrome-linux/chrome"
+  check "--offline with a seed copies every entry" [ -d "$T/data/ms-playwright/ffmpeg-1" ]
+  check "--offline with a seed gives it to maldex" grep -q "^chown -R -h maldex:maldex $T/data/ms-playwright\$" "$STUB_LOG"
+  check "--offline with a seed: no warning" not_in_out "^warn "
+  check "--offline with a seed: ok Chromium in verify" grep -q "^ok   Playwright Chromium" <<<"$OUT"
+  check "--offline with a seed never downloads" not_logged "^(curl|Maldex.Web)"
+  teardown
+}
+
+test_connection_string_parse() {
+  setup_sandbox
+  # A "}" in the password, full-line comments and a differently cased key: the JSON parse handles all three.
+  cat > "$T/etc/appsettings.Production.json" <<'JSON'
+{
+  // the admin's settings
+  "connectionStrings": {
+    // SQL Server
+    "maldex": "Server=sql2.example.internal,1500;Database=maldex;User Id=maldex;Password=a}b{c;TrustServerCertificate=True"
+  }
+}
+JSON
+  run_setup --check
+  check "JSON parse: ok db despite } in the password" grep -q '^ok   db$' <<<"$OUT"
+  check "JSON parse: probes the configured host and port" grep -q 'dev/tcp/$1/$2 _ sql2.example.internal 1500' "$STUB_LOG"
+  teardown
+
+  setup_sandbox; write_config
+  stub python3 'exit 1'
+  run_setup --check
+  check "sed fallback when python3 fails: ok db" grep -q '^ok   db$' <<<"$OUT"
+  check "sed fallback probes the configured host and port" grep -q 'sql.example.internal 14330' "$STUB_LOG"
+  teardown
+
+  setup_sandbox
+  printf '{ "Maldex": {} }\n' > "$T/etc/appsettings.Production.json"
+  run_setup --check
+  check "no connection string: the hint names the drop-in limit" grep -q '^FAIL db -- .*ConnectionStrings__Maldex.*drop-in' <<<"$OUT"
   teardown
 }
 
@@ -274,7 +361,8 @@ test_usage() {
 }
 
 for t in test_check_without_config test_check_lists_every_check test_downloads_skip_and_refetch test_offline \
-         test_rerun_after_guestfs_failure test_requires_root test_start_step test_check_never_prompts test_modes_and_symlinks test_usage; do
+         test_rerun_after_guestfs_failure test_requires_root test_start_step test_check_never_prompts test_modes_and_symlinks test_usage \
+         test_verify_yara_and_emulator test_offline_browsers test_connection_string_parse; do
   echo "# $t"
   OUT=""
   "$t"

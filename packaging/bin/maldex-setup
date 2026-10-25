@@ -3,7 +3,8 @@
 # safe to re-run, and each run starts from the first step and skips what is already done.
 #
 #   maldex-setup                    run every step, stop at the first failure
-#   maldex-setup --offline <dir>    take Sysmon.zip and virtio-win.iso from <dir> instead of downloading them (same hash checks)
+#   maldex-setup --offline <dir>    take Sysmon.zip and virtio-win.iso from <dir> instead of downloading them (same hash checks),
+#                                   and Chromium from <dir>/ms-playwright if present (else warn: PDF reports need it)
 #   maldex-setup --check            run only the read-only checks, print every result, change nothing (root not required);
 #                                   its guest disk editor check boots a throwaway libguestfs appliance (libguestfs-test-tool)
 #
@@ -13,7 +14,8 @@ set -uo pipefail
 
 HELP="usage: maldex-setup [--check] [--offline <dir>]
   (no flag)        run every step as root; stop at the first failure; safe to re-run
-  --offline <dir>  take Sysmon.zip and virtio-win.iso from <dir> (same SHA-256 checks)
+  --offline <dir>  take Sysmon.zip and virtio-win.iso from <dir> (same SHA-256 checks), and the
+                   Playwright Chromium from <dir>/ms-playwright if present (else warn; only PDF reports need it)
   --check          read-only checks only, as any user; prints every result and changes nothing.
                    The guest disk editor check boots a throwaway libguestfs appliance (libguestfs-test-tool,
                    about 30 s, needs KVM); it writes only libguestfs's own temp files."
@@ -59,6 +61,9 @@ APP_URL="http://127.0.0.1:5080"
 read -r -a OVMF_SECBOOT_CANDIDATES <<<"${MALDEX_OVMF_SECBOOT:-/usr/share/OVMF/OVMF_CODE_4M.secboot.fd /usr/share/edk2/ovmf/OVMF_CODE.secboot.fd}"
 BR_NF_CALL_IPTABLES="${MALDEX_BR_NF_CALL_IPTABLES:-/proc/sys/net/bridge/bridge-nf-call-iptables}"
 KVM_DEV="${MALDEX_KVM_DEV:-/dev/kvm}"
+# The emulator the domain XML names (DomainXmlBuilder); on RHEL the rpm links it to /usr/libexec/qemu-kvm.
+QEMU_EMULATOR="${MALDEX_QEMU_EMULATOR:-/usr/bin/qemu-system-x86_64}"
+START_WAIT="${MALDEX_START_WAIT:-5}"   # seconds the service must stay active after the restart
 SYSTEM_USERS=(maldex-mitm maldex-dns maldex-isroot maldex-isuser)
 
 HINT=""   # set by a failing step or check
@@ -66,9 +71,24 @@ fail() { HINT="$*"; return 1; }
 
 # ---- db ----
 
-# The string value of ConnectionStrings:Maldex in JSON file $1 (empty when missing). A sed parse, so no JSON tool is needed on a
-# minimal host; the value runs to the first unescaped quote.
+# The string value of ConnectionStrings:Maldex in JSON file $1 (empty when missing). python3 parses it as JSON (full-line //
+# comments stripped, keys matched case-insensitively, as .NET configuration does); without python3, or when that parse fails,
+# a sed parse runs instead: the value runs to the first unescaped quote, and a "}" anywhere in the ConnectionStrings object (for
+# example in the password) defeats it.
 connection_string() {
+  local cs
+  # shellcheck disable=SC2016  # a python program, not shell
+  if command -v python3 >/dev/null 2>&1 && cs="$(python3 -I -c '
+import json, re, sys
+d = json.loads(re.sub(r"(?m)^\s*//.*$", "", open(sys.argv[1], encoding="utf-8-sig").read()))
+def get(o, k):
+    return next((v for kk, v in o.items() if kk.lower() == k.lower()), None) if isinstance(o, dict) else None
+v = get(get(d, "ConnectionStrings"), "Maldex")
+print(v if isinstance(v, str) else "")
+' "$1" 2>/dev/null)"; then
+    printf '%s\n' "$cs"
+    return
+  fi
   tr '\n\r\t' '   ' < "$1" \
     | sed -nE 's/.*"ConnectionStrings"[[:space:]]*:[[:space:]]*\{([^}]*)\}.*/\1/p' \
     | sed -nE 's/.*"Maldex"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)".*/\1/p'
@@ -101,7 +121,7 @@ db_check() {
   [ -r "$CONFIG" ] || fail "$CONFIG is not readable; $how" || return 1
   local cs ep host port
   cs="$(connection_string "$CONFIG")"
-  [ -n "$cs" ] || fail "ConnectionStrings:Maldex is not set; $how" || return 1
+  [ -n "$cs" ] || fail "ConnectionStrings:Maldex is not set in $CONFIG (maldex-setup reads only that file, not a ConnectionStrings__Maldex variable set in a systemd drop-in); $how" || return 1
   ep="$(sql_endpoint "$cs")" || fail "ConnectionStrings:Maldex has no usable Server=host[,port]; $how" || return 1
   host="${ep% *}"; port="${ep#* }"
   # shellcheck disable=SC2016  # $1/$2 belong to the inner bash
@@ -186,8 +206,10 @@ step_mitm_ca() {
   done
 }
 
+INETSIM_HINT="install INetSim (Ubuntu: the inetsim package; RHEL: no package exists, install it by hand as the README describes)"
+
 step_inetsim() {
-  [ -d "$INETSIM_TEMPLATE_DIR" ] || fail "$INETSIM_TEMPLATE_DIR is missing; install the inetsim package" || return 1
+  [ -d "$INETSIM_TEMPLATE_DIR" ] || fail "$INETSIM_TEMPLATE_DIR is missing; $INETSIM_HINT" || return 1
   harden_inetsim_template || fail "cannot harden $INETSIM_TEMPLATE_DIR" || return 1
   inetsim_template_clean || fail "$INETSIM_TEMPLATE_DIR still has symlinks, non-root or group/world-writable entries; remove them and re-run" || return 1
 }
@@ -199,8 +221,24 @@ step_guestfs() {
 
 # ---- browsers ----
 
+BROWSERS_LATER="sudo -u $APP_USER env PLAYWRIGHT_BROWSERS_PATH=$BROWSERS_DIR $MALDEX_OPT/app/Maldex.Web --install-browsers --no-deps"
+
+# Chromium is only for PDF reports. Online it is installed from the Playwright CDN. With --offline it is copied from
+# <dir>/ms-playwright when that exists (a PLAYWRIGHT_BROWSERS_PATH tree installed by the same Maldex version); otherwise the step
+# warns and the run goes on without it.
 step_browsers() {
   app_dir "$BROWSERS_DIR" || fail "cannot create $BROWSERS_DIR" || return 1
+  if [ -n "$OFFLINE" ]; then
+    local seed="$OFFLINE/ms-playwright"
+    if [ -d "$seed" ] && [ ! -L "$seed" ] && compgen -G "$seed/chromium-*" >/dev/null; then
+      cp -R "$seed/." "$BROWSERS_DIR/" || fail "cannot copy $seed to $BROWSERS_DIR" || return 1
+      chown -R -h "$APP_USER:$APP_USER" "$BROWSERS_DIR" || fail "cannot set the owner of $BROWSERS_DIR" || return 1
+      chmod -R u+rwX,g+rX,g-w,o-rwx "$BROWSERS_DIR" || fail "cannot set the mode of $BROWSERS_DIR" || return 1
+      return 0
+    fi
+    echo "warn browsers -- --offline: no Playwright Chromium in $seed, so PDF reports will not work; put a ms-playwright tree there and re-run, or later run: $BROWSERS_LATER" >&2
+    return 0
+  fi
   sudo -u "$APP_USER" env "PLAYWRIGHT_BROWSERS_PATH=$BROWSERS_DIR" "$MALDEX_OPT/app/Maldex.Web" --install-browsers --no-deps \
     || fail "Playwright Chromium install failed (needs https access to the Playwright CDN); re-run when it is reachable" || return 1
 }
@@ -232,7 +270,10 @@ verify_checks() {
   real_check "suricata" "install suricata (RHEL: from EPEL)" suricata --build-info
   real_check "mitmdump $MITMPROXY_VERSION" "reinstall the maldex package (it ships mitmproxy)" \
     bash -c "mitmdump --version | grep -q -- '$MITMPROXY_VERSION'"
-  real_check "inetsim" "install inetsim (RHEL: from EPEL)" inetsim --version
+  real_check "inetsim" "$INETSIM_HINT" inetsim --version
+  real_check "yara" "install yara (Ubuntu: universe; RHEL: AppStream); without it analyses run with no YARA detections" yara --version
+  real_check "VM emulator $QEMU_EMULATOR" "install qemu-system-x86 (Ubuntu); RHEL: reinstall the maldex package (it links it to /usr/libexec/qemu-kvm from qemu-kvm)" \
+    test -x "$QEMU_EMULATOR"
   real_check "wireguard-tools" "install wireguard-tools" wg --version
   real_check "wiminfo" "install wimtools (Ubuntu) / wimlib-utils (RHEL, EPEL)" wiminfo --version
   real_check "xorriso" "install xorriso" xorriso -version
@@ -241,7 +282,12 @@ verify_checks() {
   real_check "virtio-win.iso" "maldex-setup (downloads step)" test -f "$ISO_DIR/virtio-win.iso"
   real_check "media library ($MEDIA_DIR)" "maldex-setup (downloads step)" test -d "$MEDIA_DIR"
   real_check "agent bundle ($AGENT_SRC)" "reinstall the maldex package (it ships the agent)" agent_present
-  real_check "Playwright Chromium ($BROWSERS_DIR)" "maldex-setup (browsers step)" chromium_present
+  if [ -n "$OFFLINE" ] && ! chromium_present; then
+    # Only PDF reports need it; the offline browsers step already warned.
+    echo "warn Playwright Chromium ($BROWSERS_DIR) -- missing (--offline); PDF reports will not work until: $BROWSERS_LATER" >&2
+  else
+    real_check "Playwright Chromium ($BROWSERS_DIR)" "maldex-setup (browsers step)" chromium_present
+  fi
   # shellcheck disable=SC2086  # MALDEX_SUDO is empty or "sudo -n"
   real_check "host guard table loaded" "systemctl restart maldex-host-guard" $MALDEX_SUDO nft list table inet maldex_guard
   real_check "host guard enabled at boot" "systemctl enable --now maldex-host-guard" systemctl is-enabled maldex-host-guard
@@ -264,8 +310,14 @@ step_verify() {
 
 # ---- start ----
 
+# restart, not start: a re-run applies changed configuration. The unit is Type=simple, so systemctl returns before the app has
+# loaded its configuration or migrated the database; it must still be active a few seconds later.
 step_start() {
-  systemctl enable --now maldex || fail "systemctl enable --now maldex failed; see journalctl -u maldex" || return 1
+  local logs="see journalctl -u maldex -n 50 (exit status 78 is a configuration error, named in the log)"
+  systemctl enable maldex || fail "systemctl enable maldex failed" || return 1
+  systemctl restart maldex || fail "systemctl restart maldex failed; $logs" || return 1
+  sleep "$START_WAIT"
+  systemctl is-active --quiet maldex || fail "maldex did not stay running; $logs" || return 1
 }
 
 # ---- runner ----

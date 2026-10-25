@@ -15,6 +15,7 @@ using Xunit;
 
 namespace Maldex.Integration.Tests.Web;
 
+[System.Runtime.Versioning.SupportedOSPlatform("linux")]
 public sealed class PackagingConfigTests
 {
     private static readonly string WebDll = Path.Combine(AppContext.BaseDirectory, "Maldex.Web.dll");
@@ -149,16 +150,116 @@ public sealed class PackagingConfigTests
     public async Task Production_without_connection_string_fails_fast_with_hint()
     {
         var (code, stdout, stderr) = await RunWeb([], new() { ["ASPNETCORE_ENVIRONMENT"] = "Production", ["ASPNETCORE_URLS"] = "http://127.0.0.1:0" });
-        Assert.NotEqual(0, code);
+        Assert.Equal(StartupChecks.ConfigErrorExitCode, code);
+        Assert.Equal(78, code);   // the packaged unit's RestartPreventExitStatus=78
         Assert.Contains("ConnectionStrings:Maldex is not set; edit /etc/maldex/appsettings.Production.json and restart maldex", stdout + stderr);
     }
 
-    private static async Task<(int Code, string Stdout, string Stderr)> RunWeb(string[] args, Dictionary<string, string> env)
+    // The packaged unit: WorkingDirectory=/var/lib/maldex plus these environment lines (packaging/systemd/maldex.service).
+    private static Dictionary<string, string> UnitEnvironment(string appDir) => new()
     {
-        var psi = new ProcessStartInfo("dotnet") { RedirectStandardOutput = true, RedirectStandardError = true, WorkingDirectory = AppContext.BaseDirectory };
+        ["ASPNETCORE_ENVIRONMENT"] = "Production",
+        ["ASPNETCORE_URLS"] = "http://127.0.0.1:0",
+        ["ASPNETCORE_CONTENTROOT"] = appDir,
+        ["MALDEX_EXTRA_CONFIG"] = Path.Combine(appDir, "appsettings.Package.json"),
+    };
+
+    private static string[] Lines(string stdout) =>
+        stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(l => l.TrimEnd(Path.DirectorySeparatorChar)).ToArray();
+
+    [Fact]
+    public async Task Unit_environment_roots_content_and_config_in_the_app_dir_whatever_the_cwd()
+    {
+        var appDir = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+        var cwd = Directory.CreateTempSubdirectory("maldex-cwd-").FullName;
+        // The SPA is in the publish output (build.sh package checks wwwroot/index.html); the test output has it only after ./build.sh build.
+        var wwwroot = Path.Combine(appDir, "wwwroot");
+        var index = Path.Combine(wwwroot, "index.html");
+        var createdDir = !Directory.Exists(wwwroot);
+        var createdIndex = !File.Exists(index);
+        if (createdIndex) { Directory.CreateDirectory(wwwroot); File.WriteAllText(index, "<!doctype html>"); }
+        try
+        {
+            var (code, stdout, stderr) = await RunWeb(["--print-paths"], UnitEnvironment(appDir), cwd);
+            Assert.True(code == 0, stderr);
+            var lines = Lines(stdout);
+            Assert.Contains($"ContentRoot={appDir}", lines);
+            Assert.Contains($"WebRoot={wwwroot}", lines);
+            Assert.Contains("IndexHtml=present", lines);
+            Assert.Contains($"Config={Path.Combine(appDir, "appsettings.json")}", lines);
+            Assert.Contains($"Config={Path.Combine(appDir, "appsettings.Real.json")}", lines);   // Package.json sets Mode=Real
+            Assert.Contains($"Config={Path.Combine(appDir, "appsettings.Package.json")}", lines);
+            Assert.DoesNotContain(lines, l => l.StartsWith("Config=" + cwd, StringComparison.Ordinal));
+
+            // Without ASPNETCORE_CONTENTROOT the content root is the cwd and the app's settings files and SPA are not found.
+            var env = UnitEnvironment(appDir);
+            env.Remove("ASPNETCORE_CONTENTROOT");
+            (code, stdout, stderr) = await RunWeb(["--print-paths"], env, cwd);
+            Assert.True(code == 0, stderr);
+            lines = Lines(stdout);
+            Assert.Contains($"ContentRoot={cwd}", lines);
+            Assert.Contains("IndexHtml=missing", lines);
+            Assert.DoesNotContain($"Config={Path.Combine(appDir, "appsettings.Real.json")}", lines);
+        }
+        finally
+        {
+            Directory.Delete(cwd, true);
+            if (createdDir) Directory.Delete(wwwroot, true);
+            else if (createdIndex) File.Delete(index);
+        }
+    }
+
+    [Fact]
+    public async Task Production_real_mode_with_an_unusable_root_fails_fast_with_EX_CONFIG()
+    {
+        var appDir = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+        var dir = Directory.CreateTempSubdirectory("maldex-root-").FullName;
+        try
+        {
+            var env = UnitEnvironment(appDir);
+            // A closed port: the process must exit on the Root check, before it ever connects.
+            env["ConnectionStrings__Maldex"] = "Server=127.0.0.1,1;Database=maldex;User Id=x;Password=x;TrustServerCertificate=True;Connect Timeout=1";
+            env["Maldex__Real__Root"] = Path.Combine(dir, "missing");
+            var (code, stdout, stderr) = await RunWeb([], env, dir);
+            Assert.Equal(StartupChecks.ConfigErrorExitCode, code);
+            Assert.Contains("Maldex:Real:Root", stdout + stderr);
+            Assert.Contains("does not exist", stdout + stderr);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Fact]
+    public void Real_root_problem_covers_unset_relative_missing_and_unwritable()
+    {
+        Assert.Contains("is not set", StartupChecks.RealRootProblem(null));
+        Assert.Contains("is not set", StartupChecks.RealRootProblem("  "));
+        Assert.Contains("absolute", StartupChecks.RealRootProblem("var/lib/maldex"));
+        var dir = Directory.CreateTempSubdirectory("maldex-root-").FullName;
+        try
+        {
+            Assert.Contains("does not exist", StartupChecks.RealRootProblem(Path.Combine(dir, "missing")));
+            Assert.Null(StartupChecks.RealRootProblem(dir));
+            Assert.Empty(Directory.EnumerateFileSystemEntries(dir));   // the write probe leaves nothing behind
+            if (Environment.UserName != "root")   // root writes through any mode
+            {
+                File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+                Assert.Contains("is not writable", StartupChecks.RealRootProblem(dir));
+            }
+        }
+        finally
+        {
+            File.SetUnixFileMode(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            Directory.Delete(dir, true);
+        }
+    }
+
+    private static async Task<(int Code, string Stdout, string Stderr)> RunWeb(string[] args, Dictionary<string, string> env, string? cwd = null)
+    {
+        var psi = new ProcessStartInfo("dotnet") { RedirectStandardOutput = true, RedirectStandardError = true, WorkingDirectory = cwd ?? AppContext.BaseDirectory };
         psi.ArgumentList.Add(WebDll);
         foreach (var a in args) psi.ArgumentList.Add(a);
-        foreach (var k in new[] { "ConnectionStrings__Maldex", "MALDEX_EXTRA_CONFIG", "Maldex__Mode", "DOTNET_ENVIRONMENT" }) psi.Environment.Remove(k);
+        foreach (var k in new[] { "ConnectionStrings__Maldex", "MALDEX_EXTRA_CONFIG", "Maldex__Mode", "DOTNET_ENVIRONMENT", "ASPNETCORE_CONTENTROOT", "Maldex__Real__Root" }) psi.Environment.Remove(k);
         foreach (var (k, v) in env) psi.Environment[k] = v;
         using var p = Process.Start(psi)!;
         var so = p.StandardOutput.ReadToEndAsync();

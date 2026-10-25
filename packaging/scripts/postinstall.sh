@@ -101,9 +101,14 @@ if command -v systemctl >/dev/null 2>&1; then
     else
       systemctl enable --now maldex-host-guard.service || warn "could not enable and start maldex-host-guard.service"
     fi
-    systemctl enable guacd.service || warn "could not enable guacd.service"
-    # Pick up the loopback-only drop-in when guacd is already running.
-    systemctl try-restart guacd.service || warn "could not restart guacd.service"
+    # guacd listens on 127.0.0.1 only (the drop-in). Start it: EPEL's guacd package does not, and maldex-setup checks it is
+    # active. When it is already running (Ubuntu's postinst starts it), restart it so it picks up the drop-in.
+    if systemctl is-active --quiet guacd.service; then
+      systemctl enable guacd.service || warn "could not enable guacd.service"
+      systemctl try-restart guacd.service || warn "could not restart guacd.service"
+    else
+      systemctl enable --now guacd.service || warn "could not enable and start guacd.service"
+    fi
   else
     systemctl enable maldex-host-guard.service guacd.service >/dev/null 2>&1 || warn "could not enable maldex-host-guard and guacd"
   fi
