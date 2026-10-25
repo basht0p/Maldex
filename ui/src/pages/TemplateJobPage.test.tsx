@@ -199,6 +199,13 @@ describe('TemplateJobPage', () => {
     await screen.findByRole('button', { name: 'Seal' })
     await userEvent.click(screen.getByRole('button', { name: 'Seal' }))
     expect(sealTemplateJob).toHaveBeenLastCalledWith('job-1', '')
+  })
+
+  it('Seal trims the note', async () => {
+    getTemplateJob.mockResolvedValue(job({ state: 'Configuring' }))
+    sealTemplateJob.mockResolvedValue(undefined)
+    renderJob()
+    await screen.findByRole('button', { name: 'Seal' })
     await userEvent.type(screen.getByLabelText('Seal note (optional)'), ' Installed 7-Zip ')
     await userEvent.click(screen.getByRole('button', { name: 'Seal' }))
     expect(sealTemplateJob).toHaveBeenLastCalledWith('job-1', 'Installed 7-Zip')
@@ -248,6 +255,28 @@ describe('TemplateJobPage', () => {
     renderJob()
     expect(await screen.findByText(/Sealed and held: this version is not published/)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull()
+  })
+
+  it('after Seal is accepted it says "Seal requested" and disables Seal and the note until the state changes', async () => {
+    getTemplateJob.mockResolvedValue(job({ state: 'Configuring' }))
+    sealTemplateJob.mockResolvedValue(undefined)
+    renderJob()
+    await userEvent.click(await screen.findByRole('button', { name: 'Seal' }))
+    expect(await screen.findByText('Seal requested')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Seal' })).toBeDisabled()
+    expect(screen.getByLabelText('Seal note (optional)')).toBeDisabled()
+    hub.push(job({ state: 'Sealing' }))
+    expect(screen.queryByText('Seal requested')).toBeNull()
+  })
+
+  it('a failed Seal does not mark the seal as requested', async () => {
+    getTemplateJob.mockResolvedValue(job({ state: 'Configuring' }))
+    sealTemplateJob.mockRejectedValue(new ApiError(409, { title: 'Nope.', status: 409 }))
+    renderJob()
+    await userEvent.click(await screen.findByRole('button', { name: 'Seal' }))
+    await screen.findByRole('alert')
+    expect(screen.queryByText('Seal requested')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Seal' })).toBeEnabled()
   })
 
   it('leaves the hub when it unmounts', async () => {

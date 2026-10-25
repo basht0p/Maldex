@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import {
   discardTemplateVersion,
@@ -37,6 +37,13 @@ function officeLabel(present: boolean | null | undefined): string {
 }
 
 const ACTIVE_JOB_STATES = ['Queued', 'Preparing', 'Configuring', 'Sealing', 'Verifying']
+/** While a job of the template is active, its job list is polled at this interval to notice the terminal state. */
+const JOB_POLL_MS = 5000
+
+function focusables(root: HTMLElement | null): HTMLElement[] {
+  if (!root) return []
+  return Array.from(root.querySelectorAll<HTMLElement>('input, button, select, textarea, a[href], [tabindex]:not([tabindex="-1"])')).filter((el) => !el.hasAttribute('disabled'))
+}
 
 /** Start dialog for an Edit (with the network choice) or a Refresh (confirm only). Errors, such as a 409 reason, show inside it. */
 function JobDialog({ kind, template, onClose, onStarted }: {
@@ -50,6 +57,27 @@ function JobDialog({ kind, template, onClose, onStarted }: {
   const [errors, setErrors] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const titleId = `job-dialog-${template.id}`
+  const dialogRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    focusables(dialogRef.current)[0]?.focus() // focus moves into the dialog on open
+  }, [])
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (e.key === 'Escape') {
+      e.stopPropagation()
+      if (!busy) onClose()
+      return
+    }
+    if (e.key !== 'Tab') return
+    const items = focusables(dialogRef.current)
+    if (items.length === 0) return
+    const first = items[0]
+    const last = items[items.length - 1]
+    const inside = dialogRef.current?.contains(document.activeElement) ?? false
+    if (e.shiftKey && (document.activeElement === first || !inside)) { e.preventDefault(); last.focus() }
+    else if (!e.shiftKey && (document.activeElement === last || !inside)) { e.preventDefault(); first.focus() }
+  }
 
   async function start() {
     setBusy(true)
@@ -62,7 +90,7 @@ function JobDialog({ kind, template, onClose, onStarted }: {
   }
 
   return (
-    <div role="dialog" aria-modal="true" aria-labelledby={titleId} className={page.dialog}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby={titleId} className={page.dialog} onKeyDown={onKeyDown}>
       <h3 id={titleId}>{kind === 'Edit' ? `Edit ${template.displayName}` : `Refresh components of ${template.displayName}`}</h3>
       {kind === 'Edit' ? (
         <fieldset className={page.fieldset}>
@@ -115,6 +143,7 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
   const navigate = useNavigate()
   const [jobs, setJobs] = useState<TemplateJobDto[]>([])
   const [dialog, setDialog] = useState<'Edit' | 'Refresh' | null>(null)
+  const opener = useRef<HTMLElement | null>(null)
   const activeJob = jobs.find((j) => ACTIVE_JOB_STATES.includes(j.state))
   const jobBlock = activeJob ? `A ${activeJob.kind} job is already ${activeJob.state.toLowerCase()} for this template.` : undefined
 
@@ -123,6 +152,31 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
     listTemplateJobs(t.id).then((list) => { if (!cancelled) setJobs(list) }, () => undefined) // best effort: the 409 on start is the guard
     return () => { cancelled = true }
   }, [t])
+
+  function openDialog(kind: 'Edit' | 'Refresh', trigger: HTMLElement) {
+    opener.current = trigger
+    setDialog(kind)
+  }
+
+  function closeDialog() {
+    setDialog(null)
+    opener.current?.focus() // focus returns to the trigger
+  }
+
+  const polling = !!activeJob
+  useEffect(() => {
+    if (!polling) return
+    let cancelled = false
+    const timer = setInterval(() => {
+      listTemplateJobs(t.id).then((list) => {
+        if (cancelled) return
+        setJobs(list)
+        // the job reached a terminal state: reload the template so its versions (and Edit/Refresh) are current
+        if (!list.some((j) => ACTIVE_JOB_STATES.includes(j.state))) void onChanged()
+      }, () => undefined)
+    }, JOB_POLL_MS)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [polling, t.id, onChanged])
 
   async function run(action: () => Promise<unknown>) {
     setBusy(true)
@@ -165,14 +219,14 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
           Enabled
         </label>
         <button type="button" className={styles.secondary} disabled={busy || t.isDefault} onClick={() => void run(() => setDefaultTemplate(t.id))}>Set as default</button>
-        <button type="button" className={styles.secondary} disabled={busy || !!activeJob} title={jobBlock} onClick={() => setDialog('Edit')}>Edit</button>
-        <button type="button" className={styles.secondary} disabled={busy || !!activeJob} title={jobBlock} onClick={() => setDialog('Refresh')}>Refresh components</button>
+        <button type="button" className={styles.secondary} disabled={busy || !!activeJob} title={jobBlock} onClick={(e) => openDialog('Edit', e.currentTarget)}>Edit</button>
+        <button type="button" className={styles.secondary} disabled={busy || !!activeJob} title={jobBlock} onClick={(e) => openDialog('Refresh', e.currentTarget)}>Refresh components</button>
         <button type="button" className={styles.secondary} disabled={busy || !previous || previousDiskMissing} title={previousDiskMissing ? `Cannot roll back: the disk is missing for v${previous.number}.` : undefined} onClick={rollBack}>Roll back</button>
       </div>
       {t.description && <p className={styles.hint}>{t.description}</p>}
       {errors.map((m, i) => <p key={i} className={styles.error} role="alert">{m}</p>)}
       {jobBlock && activeJob && <p className={page.summary}>{jobBlock} <Link to={`/admin/template-jobs/${activeJob.id}`}>Open the job</Link></p>}
-      {dialog && <JobDialog kind={dialog} template={t} onClose={() => setDialog(null)} onStarted={(job) => navigate(`/admin/template-jobs/${job.id}`)} />}
+      {dialog && <JobDialog kind={dialog} template={t} onClose={closeDialog} onStarted={(job) => navigate(`/admin/template-jobs/${job.id}`)} />}
       <p className={page.summary}>
         {t.current ? <>
             <span className={styles.mono}>{`Current: ${versionSummary(t.current)}`}</span>{' '}
