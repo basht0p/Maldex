@@ -1,0 +1,11 @@
+.backdrop { position: fixed; inset: 0; z-index: 1100; display: grid; place-items: center; background: rgb(0 0 0 / 0.55); padding: 1rem; }
+.dialog { display: grid; gap: 0.75rem; width: min(26rem, 100%); padding: 1.25rem; border: 1px solid var(--mx-border-strong); border-radius: var(--mx-radius-modal); background: var(--mx-overlay); color: var(--mx-text); box-sizing: border-box; }
+.dialog h3 { margin: 0; font-size: 1rem; }
+.body { margin: 0; color: var(--mx-muted); font-size: 0.9rem; }
+.actions { display: flex; gap: 0.75rem; justify-content: flex-end; }
+.cancel { padding: 0.5rem 1rem; border: 1px solid var(--mx-control); border-radius: var(--mx-radius-control); background: var(--mx-surface); color: var(--mx-text); font: inherit; }
+.cancel:hover { background: var(--mx-raised); }
+.confirm { padding: 0.5rem 1rem; border: 1px solid var(--mx-accent); border-radius: var(--mx-radius-control); background: var(--mx-accent); color: var(--mx-accent-ink); font: inherit; font-weight: 600; }
+.confirm:hover { background: var(--mx-accent-hover); border-color: var(--mx-accent-hover); }
+.danger { border-color: var(--mx-critical); background: var(--mx-critical); color: var(--mx-accent-ink); }
+.danger:hover { background: var(--mx-critical); border-color: var(--mx-critical); filter: brightness(1.1); }
