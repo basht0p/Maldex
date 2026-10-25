@@ -67,6 +67,11 @@ public class UrlFetchPolicyTests
     [InlineData("2002:c0a8:0101::1")]
     [InlineData("64:ff9b::c0a8:101")]
     [InlineData("::ffff:127.0.0.1")]
+    [InlineData("::192.168.1.1")]
+    [InlineData("::127.0.0.1")]
+    [InlineData("2001:0:4136:e378:8000:63bf:3fff:fdd2")]
+    [InlineData("fec0::1")]
+    [InlineData("64:ff9b:1::1")]
     public void Private_addresses_are_refused(string ip) =>
         Assert.True(UrlFetchPolicy.IsRefused(IPAddress.Parse(ip), false, NoHost));
 
@@ -78,6 +83,7 @@ public class UrlFetchPolicyTests
     [InlineData("::ffff:8.8.8.8")]
     [InlineData("2002:0808:0808::1")]
     [InlineData("64:ff9b::808:808")]
+    [InlineData("::8.8.8.8")]
     public void Public_addresses_are_allowed(string ip) =>
         Assert.False(UrlFetchPolicy.IsRefused(IPAddress.Parse(ip), false, NoHost));
 
@@ -93,6 +99,10 @@ public class UrlFetchPolicyTests
     [InlineData("fe80::1")]
     [InlineData("::ffff:192.168.1.1")]
     [InlineData("2002:c0a8:0101::1")]
+    [InlineData("::192.168.1.1")]
+    [InlineData("2001:0:4136:e378:8000:63bf:3fff:fdd2")]
+    [InlineData("fec0::1")]
+    [InlineData("64:ff9b:1::1")]
     public void Allow_private_lets_private_addresses_pass(string ip) =>
         Assert.False(UrlFetchPolicy.IsRefused(IPAddress.Parse(ip), true, NoHost));
 
@@ -108,6 +118,7 @@ public class UrlFetchPolicyTests
     [InlineData("::ffff:0.0.0.0")]
     [InlineData("::ffff:224.0.0.1")]
     [InlineData("2002:e000:0001::1")]
+    [InlineData("::224.0.0.1")]
     public void Unspecified_multicast_broadcast_and_reserved_stay_refused_even_when_private_is_allowed(string ip) =>
         Assert.True(UrlFetchPolicy.IsRefused(IPAddress.Parse(ip), true, NoHost));
 

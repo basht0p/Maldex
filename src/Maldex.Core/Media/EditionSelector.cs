@@ -29,7 +29,7 @@ public static class EditionSelector
         if (image.Name == Home)
             return "Windows 11 Home is not supported: it has no KMS client setup key and ignores the policies Maldex sets";
         if (!Supported.ContainsKey(image.Name))
-            return $"{image.Name} is not supported; choose Enterprise Evaluation, Enterprise, Pro or Education";
+            return $"{(image.Name.Length > 0 ? image.Name : $"image {image.Index}")} is not supported; choose Enterprise Evaluation, Enterprise, Pro or Education";
         if (!IsX64(image.Architecture)) return "only x64 images can be installed";
         return null;
     }

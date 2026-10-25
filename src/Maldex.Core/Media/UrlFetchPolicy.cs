@@ -39,6 +39,7 @@ public static class UrlFetchPolicy
         {
             var b = ip.GetAddressBytes();
             if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+            else if (b[..12].All(x => x == 0) && (b[12] != 0 || b[13] != 0 || b[14] != 0)) ip = new IPAddress(b[12..16]); // IPv4-compatible ::a.b.c.d
             else if (b[0] == 0x20 && b[1] == 0x02) ip = new IPAddress(b[2..6]);
             else if (b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b && b[4..12].All(x => x == 0)) ip = new IPAddress(b[12..16]);
             else break;
@@ -65,7 +66,10 @@ public static class UrlFetchPolicy
                 || (b[0] == 169 && b[1] == 254)
                 || (b[0] == 100 && (b[1] & 0xc0) == 64);
         return IPAddress.IsLoopback(ip)
-            || (b[0] == 0xfe && (b[1] & 0xc0) == 0x80)
-            || (b[0] & 0xfe) == 0xfc;
+            || (b[0] == 0xfe && (b[1] & 0xc0) == 0x80)  // link-local fe80::/10
+            || (b[0] == 0xfe && (b[1] & 0xc0) == 0xc0)  // site-local fec0::/10
+            || (b[0] & 0xfe) == 0xfc                    // ULA fc00::/7
+            || (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0 && b[3] == 0)  // Teredo 2001:0::/32
+            || (b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b && b[4] == 0 && b[5] == 0x01); // NAT64 local use 64:ff9b:1::/48
     }
 }

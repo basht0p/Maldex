@@ -78,6 +78,13 @@ public class EditionSelectorTests
     }
 
     [Fact]
+    public void An_image_without_a_name_is_described_by_its_index()
+    {
+        var ex = Assert.Throws<EditionNotSupportedException>(() => EditionSelector.Choose([new InstallerImage(3, "", null, null, "x86_64")], 3));
+        Assert.Equal("image 3 is not supported; choose Enterprise Evaluation, Enterprise, Pro or Education", ex.Message);
+    }
+
+    [Fact]
     public void Arm64_is_refused_even_for_a_supported_name()
     {
         var arm = new[] { Img(1, "Windows 11 Pro", "arm64") };
