@@ -2,6 +2,7 @@ using Maldex.Core.Abstractions;
 using Maldex.Infrastructure.Agent;
 using Maldex.Infrastructure.Execution;
 using Maldex.Infrastructure.Libvirt;
+using Maldex.Infrastructure.Media;
 using Maldex.Infrastructure.Real;
 using Maldex.Infrastructure.Fakes;
 using Maldex.Infrastructure.Guacamole;
@@ -35,6 +36,15 @@ public static class DependencyInjection
 
         if (!OperatingSystem.IsWindows()) services.AddSingleton<IArtifactStore, FileSystemArtifactStore>();
         services.AddSingleton<IDiskSpaceProbe, DiskSpaceProbe>();
+        services.Configure<MediaOptions>(configuration.GetSection(MediaOptions.SectionName));
+        // Resolved against the same base as real mode, in both modes (the media root must not depend on the working directory).
+        services.PostConfigure<MediaOptions>(o =>
+        {
+            var configuredRoot = configuration[$"{RealOptions.SectionName}:{nameof(RealOptions.Root)}"];
+            var root = string.IsNullOrWhiteSpace(configuredRoot) ? RealPaths.FindRoot(AppContext.BaseDirectory) : Path.GetFullPath(configuredRoot);
+            o.Root = RealPaths.Resolve(root, o.Root);
+        });
+        services.AddSingleton<MediaStore>();
         // YARA is real in every mode; the yara binary is a host dependency, not a fake.
         services.AddSingleton<IYaraScanner, YaraCliScanner>();
 
@@ -54,6 +64,7 @@ public static class DependencyInjection
                 services.AddSingleton<ISuricataRunner, NoopSuricataRunner>();
                 services.AddSingleton<IVmConsoleLocator, FakeConsoleLocator>();
                 services.AddSingleton<IWorkerStartGate, OpenWorkerStartGate>();
+                services.AddSingleton<IMediaInspector, FakeMediaInspector>();
                 break;
             case "Real":
                 AddReal(services, configuration);
@@ -124,5 +135,6 @@ public static class DependencyInjection
         services.AddSingleton<IExpectedEgress, WireGuardExpectedEgress>();
         services.AddSingleton<IHostGuardProbe, HostGuardProbe>();
         services.AddSingleton<IWorkerStartGate, GuardedWorkerStartGate>();
+        services.AddSingleton<IMediaInspector, LoopMountMediaInspector>();
     }
 }
