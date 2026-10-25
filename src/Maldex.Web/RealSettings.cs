@@ -17,6 +17,12 @@ public static class RealSettings
     public static void Insert(IList<IConfigurationSource> sources, IFileProvider contentRoot)
     {
         var at = sources.ToList().FindLastIndex(x => x is EnvironmentVariablesConfigurationSource { Prefix: null or "" });
-        sources.Insert(at < 0 ? sources.Count : at, new JsonConfigurationSource { Path = FileName, Optional = true, FileProvider = contentRoot });
+        InsertAt(sources, contentRoot, at < 0 ? sources.Count : at);
+    }
+
+    /// <summary>Inserts <c>appsettings.Real.json</c> at <paramref name="index"/> (used to place it under the MALDEX_EXTRA_CONFIG files).</summary>
+    public static void InsertAt(IList<IConfigurationSource> sources, IFileProvider contentRoot, int index)
+    {
+        sources.Insert(index, new JsonConfigurationSource { Path = FileName, Optional = true, FileProvider = contentRoot });
     }
 }

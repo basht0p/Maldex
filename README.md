@@ -180,6 +180,47 @@ MALDEX_MODE=Real ./build.sh run
 | `e2e-templates` | Real template-job E2E (Refresh, Edit, Roll back, Build from `MALDEX_WIN_ISO`); a green full run writes the validation stamp |
 | `e2e-build-acceptance` | Interactive Build from `MALDEX_WIN_ISO`: you turn off Defender in the job's console (localhost:5080 over an SSH forward) and press Seal |
 
+## Install on a server
+
+Release packages are built and signed by the release workflow: a `.deb` for Ubuntu 24.04 and an `.rpm` for RHEL 9 and its rebuilds (x86_64). Maldex assumes a **dedicated host**: the package creates five system users (`maldex`, `maldex-mitm`, `maldex-dns`, `maldex-isroot`, `maldex-isuser`) and a sudoers file that gives the `maldex` service user passwordless `sudo` for a fixed list of commands (`chmod chown cp find install ip iptables kill mount nft rm setsid sysctl umount`), because the app drives libvirt, nftables and network namespaces through `sudo -n`. Do not install it on a shared machine.
+
+1. **Download and verify.** Download the `.deb` or `.rpm`, `SHA256SUMS`, `SHA256SUMS.asc` and `maldex-signing-key.asc` from the GitHub release, then:
+
+   ```bash
+   gpg --show-keys --with-fingerprint maldex-signing-key.asc
+   gpg --import maldex-signing-key.asc
+   gpg --verify SHA256SUMS.asc SHA256SUMS
+   sha256sum -c SHA256SUMS --ignore-missing
+   ```
+
+   The checksums and signatures only prove the files match the key you imported, so compare the fingerprint printed by `--show-keys` with one you obtained out of band (ask basht0p) before trusting the key. Do not take the fingerprint from the same release page.
+
+2. **Install.**
+
+   ```bash
+   sudo apt install ./maldex_*.deb
+   ```
+
+   On RHEL, first `sudo dnf install epel-release` and enable the CRB repository (`sudo dnf config-manager --set-enabled crb`), then `sudo dnf install ./maldex-*.rpm`. For the rpm you can also `sudo rpm --import maldex-signing-key.asc` and check it with `rpm -K maldex-*.rpm`.
+
+   **RHEL: install INetSim by hand.** EL9 has no INetSim package (not in the base repositories, not in EPEL), so the rpm cannot depend on it. Install it from the [INetSim release tarball](https://www.inetsim.org/downloads.html) and its Perl dependencies so that `/usr/bin/inetsim` and its data directory `/var/lib/inetsim` exist, then create its system user: `sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin inetsim`. `maldex-setup` checks all three. The rpm also links `/usr/bin/qemu-system-x86_64` to RHEL's `/usr/libexec/qemu-kvm`, the emulator path the VMs use.
+
+3. **Configure.** Edit `/etc/maldex/appsettings.Production.json` (mode 0640, `root:maldex`): set the SQL Server connection string and the `AzureAd` section (tenant, client ID, audience).
+
+4. **Run the host setup.**
+
+   ```bash
+   sudo maldex-setup
+   ```
+
+   It installs and checks the rest of the host (libvirt/KVM, mitmproxy, guest tooling, Sysmon and the virtio drivers), then restarts maldex and checks that it stays up; if it does not, `journalctl -u maldex -n 50` names the problem. `maldex-setup --check` re-runs only the read-only checks.
+
+   **Offline.** On a host without internet access, copy `Sysmon.zip` and `virtio-win.iso` into a directory and run `sudo maldex-setup --offline <dir>`. Offline mode does not cover the OS packages (use a local mirror) or the Playwright Chromium that PDF reports need. To include Chromium, install it on a connected host with the same Maldex version (`PLAYWRIGHT_BROWSERS_PATH=$PWD/ms-playwright /opt/maldex/app/Maldex.Web --install-browsers --no-deps`) and copy that `ms-playwright` directory to `<dir>/ms-playwright`; maldex-setup copies it to `/var/lib/maldex/ms-playwright`. Without it, setup warns, finishes, and everything except PDF reports works; add Chromium later with `sudo maldex-setup` once the host can reach the Playwright CDN.
+
+5. **Open the app.** It listens on `http://127.0.0.1:5080` only; reach it through an SSH forward (`ssh -L 5080:127.0.0.1:5080 <host>`) or a reverse proxy you provide. Then build the first guest image under **Admin → Sandbox Templates → New template**.
+
+Restarting or upgrading the maldex package, restarting `maldex-host-guard`, or re-running `maldex-setup` (which restarts maldex) stops any running analysis VMs; let runs finish first.
+
 ## Development progress
 
 MALdex is delivered in sub-projects. **Sub-project 1, the core detonation slice, is code complete** and runs green end to end on a real Windows 11 guest.

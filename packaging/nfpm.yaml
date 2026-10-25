@@ -1,0 +1,242 @@
+# nfpm package definition for Maldex: one file for the .deb (Ubuntu 24.04) and the .rpm (RHEL 9 and rebuilds), x86_64 only.
+# Built by ./build.sh package, which stages packaging/stage/ and runs nfpm from the repository root (every src is relative to
+# it). MALDEX_VERSION and MALDEX_RELEASE come from build.sh. packaging/tests/check-package.sh parses the contents list: keep
+# each entry a "  - src:" block with dst / type / packager / file_info lines.
+name: maldex
+arch: amd64
+platform: linux
+version: ${MALDEX_VERSION}
+version_schema: none
+release: ${MALDEX_RELEASE}
+section: misc
+priority: optional
+maintainer: basht0p <60065396+basht0p@users.noreply.github.com>
+vendor: basht0p
+homepage: https://github.com/basht0p/Maldex
+license: Proprietary
+description: |-
+  Maldex: self-hosted, interactive malware-analysis sandbox.
+  Runs as the maldex service on 127.0.0.1:5080 with libvirt/KVM guests, per-run network namespaces, mitmproxy (bundled),
+  Suricata, INetSim and guacd. Needs an external SQL Server (ConnectionStrings:Maldex in
+  /etc/maldex/appsettings.Production.json); after installing, run: sudo maldex-setup.
+  The maldex user gets a root-equivalent sudo grant (/etc/sudoers.d/maldex): install only on a host dedicated to Maldex.
+  RHEL 9: enable EPEL (and CRB) first. From EPEL: suricata, guacd, libguac-client-vnc, genisoimage, wimlib-utils.
+  INetSim is not packaged for EL9 (neither in the base repositories nor in EPEL): install it separately so that
+  /usr/bin/inetsim and /var/lib/inetsim exist (maldex-setup checks both), and create its system user and group
+  `inetsim` (useradd --system --user-group --no-create-home --shell /usr/sbin/nologin inetsim), which Maldex maps into
+  the per-run INetSim user namespace.
+
+# Ubuntu 24.04
+depends:
+  - qemu-system-x86
+  - qemu-utils
+  - libvirt-daemon
+  - libvirt-clients
+  - ovmf
+  - swtpm
+  - swtpm-tools
+  - dnsmasq-base
+  - nftables
+  - tcpdump
+  - suricata
+  - inetsim
+  - wireguard-tools
+  - xorriso
+  - libxml2-utils
+  - socat
+  - genisoimage
+  - wimtools
+  - libguestfs-tools
+  - guacd
+  - libguac-client-vnc0t64
+  - sudo
+  - iproute2
+  - iptables
+  - curl
+  - yara
+  # Chromium for PDF reports (Playwright's ubuntu24.04 list), plus a font
+  - libasound2t64
+  - libatk-bridge2.0-0t64
+  - libatk1.0-0t64
+  - libatspi2.0-0t64
+  - libcairo2
+  - libcups2t64
+  - libdbus-1-3
+  - libdrm2
+  - libgbm1
+  - libglib2.0-0t64
+  - libnspr4
+  - libnss3
+  - libpango-1.0-0
+  - libx11-6
+  - libxcb1
+  - libxcomposite1
+  - libxdamage1
+  - libxext6
+  - libxfixes3
+  - libxkbcommon0
+  - libxrandr2
+  - fonts-liberation
+conflicts:
+  - mitmproxy
+
+overrides:
+  rpm:
+    # RHEL 9 (origin: AppStream/BaseOS unless marked EPEL). Substitutes for the Ubuntu names: qemu-kvm + qemu-img
+    # (qemu-system-x86, qemu-utils), libvirt + libvirt-client, edk2-ovmf (ovmf), dnsmasq (dnsmasq-base), libxml2 (xmllint,
+    # libxml2-utils), wimlib-utils (wimtools), libguestfs + libguestfs-appliance (libguestfs-tools; libguestfs ships guestfish,
+    # libguestfs-test-tool and libguestfs-make-fixed-appliance), iproute, iptables-nft. inetsim has no EL9 package (see the
+    # description). policycoreutils-python-utils provides semanage for the SELinux label in %post.
+    depends:
+      - qemu-kvm
+      - qemu-img
+      - libvirt
+      - libvirt-client
+      - edk2-ovmf
+      - swtpm
+      - swtpm-tools
+      - dnsmasq
+      - nftables
+      - tcpdump
+      - suricata                       # EPEL
+      - wireguard-tools
+      - xorriso
+      - libxml2
+      - socat
+      - genisoimage                    # EPEL
+      - wimlib-utils                   # EPEL
+      - libguestfs
+      - libguestfs-appliance
+      - guacd                          # EPEL
+      - libguac-client-vnc             # EPEL
+      - sudo
+      - iproute
+      - iptables-nft
+      - curl                           # maldex-setup downloads; the INetSim readiness probe
+      - yara                           # AppStream (RHEL 9.x / Rocky 9)
+      - policycoreutils-python-utils
+      # Chromium for PDF reports, plus a font
+      - alsa-lib
+      - at-spi2-atk
+      - at-spi2-core
+      - atk
+      - cairo
+      - cups-libs
+      - dbus-libs
+      - libdrm
+      - mesa-libgbm
+      - glib2
+      - nspr
+      - nss
+      - pango
+      - libX11
+      - libxcb
+      - libXcomposite
+      - libXdamage
+      - libXext
+      - libXfixes
+      - libxkbcommon
+      - libXrandr
+      - liberation-fonts
+
+contents:
+  # ---- /opt/maldex: read-only, root-owned ----
+  - src: packaging/stage/opt/maldex/app/
+    dst: /opt/maldex/app
+    type: tree
+  - src: packaging/stage/opt/maldex/agent/
+    dst: /opt/maldex/agent
+    type: tree
+  - src: packaging/stage/opt/maldex/mitmproxy/
+    dst: /opt/maldex/mitmproxy
+    type: tree
+  - src: packaging/stage/opt/maldex/deploy/
+    dst: /opt/maldex/deploy
+    type: tree
+  - src: packaging/stage/opt/maldex/rules/
+    dst: /opt/maldex/rules
+    type: tree
+  - src: packaging/stage/opt/maldex/bin/maldex-setup
+    dst: /opt/maldex/bin/maldex-setup
+    file_info:
+      mode: 0755
+  - src: packaging/stage/opt/maldex/lib/maldex-common.sh
+    dst: /opt/maldex/lib/maldex-common.sh
+    file_info:
+      mode: 0644
+  # The sudoers grant, per distro; postinstall copies it to /etc/sudoers.d/maldex only after visudo -c passes.
+  - src: packaging/sudoers/maldex.deb
+    dst: /opt/maldex/share/sudoers/maldex
+    packager: deb
+    file_info:
+      mode: 0440
+  - src: packaging/sudoers/maldex.rpm
+    dst: /opt/maldex/share/sudoers/maldex
+    packager: rpm
+    file_info:
+      mode: 0440
+
+  # ---- commands on PATH ----
+  - src: /opt/maldex/bin/maldex-setup
+    dst: /usr/sbin/maldex-setup
+    type: symlink
+  - src: /opt/maldex/mitmproxy/mitmdump
+    dst: /usr/bin/mitmdump
+    type: symlink
+  # RHEL 9 qemu-kvm installs only /usr/libexec/qemu-kvm, but the domain XML names /usr/bin/qemu-system-x86_64 (Ubuntu's path).
+  # An rpm-owned symlink (no RHEL 9 or EPEL package ships that path): rpm -qf and rpm -V see it, and erasing maldex removes it.
+  - src: /usr/libexec/qemu-kvm
+    dst: /usr/bin/qemu-system-x86_64
+    type: symlink
+    packager: rpm
+
+  # ---- /etc ----
+  - dst: /etc/maldex
+    type: dir
+    file_info:
+      mode: 0755
+  - src: packaging/etc/appsettings.Production.json
+    dst: /etc/maldex/appsettings.Production.json
+    type: config|noreplace
+    packager: deb
+    file_info:
+      mode: 0640
+      group: maldex
+  - src: packaging/stage/etc/appsettings.Production.rpm.json
+    dst: /etc/maldex/appsettings.Production.json
+    type: config|noreplace
+    packager: rpm
+    file_info:
+      mode: 0640
+      group: maldex
+  - src: deploy/host/maldex-host-guard.nft
+    dst: /etc/maldex/maldex-host-guard.nft
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - src: packaging/udev/99-maldex-kvm.rules
+    dst: /etc/udev/rules.d/99-maldex-kvm.rules
+    type: config|noreplace
+    file_info:
+      mode: 0644
+
+  # ---- systemd ----
+  - src: packaging/systemd/maldex.service
+    dst: /usr/lib/systemd/system/maldex.service
+    file_info:
+      mode: 0644
+  - src: packaging/systemd/maldex-host-guard.service
+    dst: /usr/lib/systemd/system/maldex-host-guard.service
+    file_info:
+      mode: 0644
+  - src: packaging/systemd/guacd-maldex.conf
+    dst: /usr/lib/systemd/system/guacd.service.d/maldex.conf
+    file_info:
+      mode: 0644
+
+scripts:
+  # preinstall creates the users before unpacking, so the config file above lands as root:maldex.
+  preinstall: packaging/scripts/preinstall.sh
+  postinstall: packaging/scripts/postinstall.sh
+  preremove: packaging/scripts/preremove.sh
+  postremove: packaging/scripts/postremove.sh

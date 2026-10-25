@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Text.Json.Serialization;
 using Maldex.Core.Abstractions;
 using Maldex.Data;
@@ -20,15 +21,62 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 
 // `dotnet run --project src/Maldex.Web -- --install-browsers` (./build.sh setup) installs the Chromium used for PDF reports.
+// `--no-deps` skips the OS-package step (RHEL: the package declares the libraries itself).
 if (args.Contains("--install-browsers"))
-    Environment.Exit(Microsoft.Playwright.Program.Main(["install", "--with-deps", "chromium"]));
+    Environment.Exit(Microsoft.Playwright.Program.Main(args.Contains("--no-deps")
+        ? ["install", "chromium"]
+        : ["install", "--with-deps", "chromium"]));
+
+// `Maldex.Web --version` prints the assembly informational version; it needs no configuration and no database.
+if (args.Contains("--version"))
+{
+    var version = typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+        ?? typeof(Program).Assembly.GetName().Version?.ToString() ?? "0.0.0";
+    Console.WriteLine(version);
+    return 0;
+}
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Real mode (Maldex__Mode=Real, as ./build.sh run sets it, or --Maldex:Mode=Real) layers appsettings.Real.json over
 // appsettings.json / appsettings.{Environment}.json but under the unprefixed environment variables and the command line.
+// MALDEX_EXTRA_CONFIG (colon-separated JSON files: the packaged defaults, then /etc/maldex/appsettings.Production.json) layers
+// over both, so a packaged install overrides appsettings.Real.json; they too sit under environment variables and the command line.
+var extraAt = ExtraConfig.Add(builder.Configuration.Sources, Environment.GetEnvironmentVariable(ExtraConfig.EnvironmentVariable));
 if (builder.Configuration["Maldex:Mode"] == "Real")
-    RealSettings.Insert(builder.Configuration.Sources, builder.Environment.ContentRootFileProvider);
+{
+    if (extraAt >= 0) RealSettings.InsertAt(builder.Configuration.Sources, builder.Environment.ContentRootFileProvider, extraAt);
+    else RealSettings.Insert(builder.Configuration.Sources, builder.Environment.ContentRootFileProvider);
+}
+
+// `Maldex.Web --print-paths` prints the content root, the web root and the JSON config files that were found, then exits 0
+// (a packaged install sets ASPNETCORE_CONTENTROOT=/opt/maldex/app in its unit; without it the content root is the cwd).
+if (args.Contains("--print-paths"))
+{
+    Console.WriteLine($"ContentRoot={builder.Environment.ContentRootPath}");
+    Console.WriteLine($"WebRoot={builder.Environment.WebRootPath}");
+    Console.WriteLine($"IndexHtml={(builder.Environment.WebRootFileProvider.GetFileInfo("index.html").Exists ? "present" : "missing")}");
+    foreach (var json in builder.Configuration.Sources.OfType<Microsoft.Extensions.Configuration.Json.JsonConfigurationSource>())
+    {
+        var file = json.Path is null ? null : json.FileProvider?.GetFileInfo(json.Path);
+        if (file is { Exists: true }) Console.WriteLine($"Config={file.PhysicalPath ?? json.Path}");
+    }
+    return 0;
+}
+
+// Fail fast on an unconfigured packaged install, with a hint instead of a stack trace, and with EX_CONFIG (78) so the unit's
+// RestartPreventExitStatus=78 stops systemd from restarting it until the admin fixes the configuration.
+if (builder.Environment.IsProduction() && string.IsNullOrWhiteSpace(builder.Configuration.GetConnectionString("Maldex")))
+{
+    Console.Error.WriteLine(StartupChecks.MissingConnectionMessage);
+    return StartupChecks.ConfigErrorExitCode;
+}
+if (builder.Environment.IsProduction() && builder.Configuration["Maldex:Mode"] == "Real"
+    && StartupChecks.RealRootProblem(builder.Configuration["Maldex:Real:Root"]) is { } rootProblem)
+{
+    Console.Error.WriteLine(rootProblem);
+    return StartupChecks.ConfigErrorExitCode;
+}
 
 builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddDbContext<MaldexDbContext>(o => o.UseSqlServer(
@@ -107,5 +155,6 @@ app.MapFallbackToFile("/", "index.html");
 app.MapFallbackToFile(@"{*path:nonfile:regex(^(?!(api|hubs)(/|$)).*$)}", "index.html");
 
 app.Run();
+return 0;
 
 public partial class Program;

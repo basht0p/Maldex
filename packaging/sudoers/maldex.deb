@@ -1,0 +1,27 @@
+# /etc/sudoers.d/maldex -- installed by the maldex package (Ubuntu 24.04 build). Do not edit; the package replaces it.
+#
+# WARNING: this grant is ROOT-EQUIVALENT BY DESIGN. The maldex service builds VM networks (ip, nft, iptables, sysctl), runs
+# per-run helpers as other users (setsid, ip netns exec), copies and owns files as root (install, cp, chown, chmod, rm, find),
+# mounts installer media (mount, umount) and stops its helpers (kill), all through "sudo -n" with arguments it constructs. Any
+# of these can be used to become root. It is meant for a host DEDICATED to Maldex; do not install the package on a shared one.
+#
+# The list is exactly the set of commands the app runs through sudo -n (packaging/tests/check-package.sh enforces it against
+# the source). Paths are this distro's; sudo matches a command found through another PATH entry (/sbin, /bin) by inode.
+Cmnd_Alias MALDEX_CMDS = \
+    /usr/bin/chmod, \
+    /usr/bin/chown, \
+    /usr/bin/cp, \
+    /usr/bin/find, \
+    /usr/bin/install, \
+    /usr/sbin/ip, \
+    /usr/sbin/iptables, \
+    /usr/bin/kill, \
+    /usr/bin/mount, \
+    /usr/sbin/nft, \
+    /usr/bin/rm, \
+    /usr/bin/setsid, \
+    /usr/sbin/sysctl, \
+    /usr/bin/umount
+
+Defaults:maldex !requiretty
+maldex ALL=(root) NOPASSWD: MALDEX_CMDS

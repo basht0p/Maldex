@@ -1,0 +1,35 @@
+[Unit]
+Description=Maldex malware-analysis sandbox
+Documentation=https://github.com/basht0p/Maldex
+After=network-online.target maldex-host-guard.service guacd.service
+Wants=network-online.target guacd.service
+# The host guard (nftables) must be loaded for guests to be isolated from the host; restarting it restarts maldex.
+Requires=maldex-host-guard.service
+
+[Service]
+Type=simple
+User=maldex
+Group=maldex
+SupplementaryGroups=kvm libvirt
+WorkingDirectory=/var/lib/maldex
+# qemu:///session keeps its state under the service user's home, which is the data dir.
+Environment=HOME=/var/lib/maldex
+Environment=ASPNETCORE_ENVIRONMENT=Production
+# The content root is the app dir (appsettings*.json, wwwroot); without this it would be the WorkingDirectory above.
+Environment=ASPNETCORE_CONTENTROOT=/opt/maldex/app
+Environment=ASPNETCORE_URLS=http://127.0.0.1:5080
+Environment=PLAYWRIGHT_BROWSERS_PATH=/var/lib/maldex/ms-playwright
+Environment=MALDEX_EXTRA_CONFIG=/opt/maldex/app/appsettings.Package.json:/etc/maldex/appsettings.Production.json
+Environment=DOTNET_NOLOGO=1
+ExecStart=/opt/maldex/app/Maldex.Web
+Restart=on-failure
+RestartSec=5
+# 78 (EX_CONFIG): the app found its configuration unusable (no connection string, bad Maldex:Real:Root); do not restart
+# until the admin fixes it and runs systemctl restart maldex (or sudo maldex-setup).
+RestartPreventExitStatus=78
+# KillMode stays the default (control-group): stopping, restarting or upgrading maldex, or restarting maldex-host-guard,
+# also stops every running analysis VM and its per-run helpers, which run in this unit's cgroup. Let runs finish first.
+# No NoNewPrivileges or other sandboxing: the app runs its privileged commands through sudo (/etc/sudoers.d/maldex).
+
+[Install]
+WantedBy=multi-user.target

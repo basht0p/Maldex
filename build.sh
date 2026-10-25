@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Pins and the host-setup helpers shared with packaging/bin/maldex-setup. Pure bash path math: the gate tests source this file with
+# an empty PATH.
+_mx_here="${BASH_SOURCE[0]%/*}"; [ "$_mx_here" != "${BASH_SOURCE[0]}" ] || _mx_here=.
+unset MALDEX_SUDO   # the library derives it (sudo, or empty as root); never inherit one from the environment
+# shellcheck source=packaging/lib/maldex-common.sh
+source "$_mx_here/packaging/lib/maldex-common.sh"
+unset _mx_here
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # Non-interactive shells may not have dotnet on PATH.
@@ -42,6 +49,11 @@ cmd_test() {
   if [ -f ui/package.json ]; then
     npm --prefix ui test -- --run
   fi
+  local t
+  for t in packaging/tests/*.sh; do
+    echo "== $t"
+    bash "$t"
+  done
 }
 
 # The dev backend needs the SA password that `setup` wrote to .env (appsettings.Development.json carries no secret).
@@ -158,12 +170,7 @@ cmd_smoke() {
 
 # ---- Real mode (Plan 1b) host toolchain ----
 
-MITMPROXY_VERSION="11.1.3"
-MITMPROXY_SHA256="f3f9aa0f719cfda9dac943891b6f3475bb869aa7a6115ee9e17c7e1c88bbc854"
 GUACD_IMAGE="guacamole/guacd:1.5.5"
-VIRTIO_WIN_VERSION="0.1.302-1"
-VIRTIO_WIN_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-$VIRTIO_WIN_VERSION/virtio-win.iso"
-VIRTIO_WIN_SHA256="303f7ae40dad495d6ae474fdc571df58958a4dbc5c37a522d80f9a203867949d"
 ALPINE_ISO_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-virt-3.20.3-x86_64.iso"
 ALPINE_ISO_SHA256="81df854fbd7327d293c726b1eeeb82061d3bc8f5a86a6f77eea720f6be372261"
 OVMF_CODE_SECBOOT="/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
@@ -176,27 +183,6 @@ GUARD_UNIT="/etc/systemd/system/maldex-host-guard.service"
 DOCKER_USER_SRC="deploy/host/maldex-docker-user.sh"
 DOCKER_USER_DST="/etc/maldex/maldex-docker-user.sh"
 DOCKER_USER_UNIT="/etc/systemd/system/maldex-docker-user.service"
-
-# Verify file $1 against SHA-256 $2; on mismatch delete it and fail loudly.
-verify_sha256() {
-  local file="$1" want="$2"
-  if ! echo "$want  $file" | sha256sum -c --status -; then
-    echo "SHA-256 mismatch for $file (expected $want, got $(sha256sum "$file" | cut -d' ' -f1)); deleting." >&2
-    rm -f "$file"
-    return 1
-  fi
-}
-
-# Download $1 to $2 unless it already exists (atomic via .part), then verify it against SHA-256 $3.
-fetch_cached() {
-  local url="$1" dest="$2" sha="$3"
-  if [ ! -s "$dest" ]; then
-    echo "Downloading $url"
-    curl -fsSL --retry 3 -o "$dest.part" "$url"
-    mv "$dest.part" "$dest"
-  fi
-  verify_sha256 "$dest" "$sha"
-}
 
 # Install the host guard persistently: copy to /etc/maldex, load now, and re-load at every boot via a oneshot unit.
 install_host_guard() {
@@ -268,77 +254,11 @@ direct_docker_exception_present() {
     && sudo -n iptables -C DOCKER-USER -i "$i" -o 'mxu+' -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment maldex-direct -j ACCEPT
 }
 
-# Dedicated, powerless account for the per-run mitmproxy: own group, no supplementary groups, no home, no shell, no sudoers.
-ensure_mitm_user() {
-  if ! id maldex-mitm >/dev/null 2>&1; then
-    sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin maldex-mitm
-  fi
-}
-
-# Dedicated, powerless account for the per-run dnsmasq: own group, no supplementary groups, no home, no shell, no sudoers.
-# It runs with no capability at all (see NetnsEgressRouter).
-ensure_dns_user() {
-  if ! id maldex-dns >/dev/null 2>&1; then
-    sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin maldex-dns
-  fi
-}
-
-# INetSim insists on root; it runs in a user namespace whose root is maldex-isroot and whose 'inetsim' is maldex-isuser.
-# Both are dedicated, powerless system accounts: own group only, no home, no shell, no sudoers, own nothing on the host.
-ensure_inetsim_userns_ids() {
-  local u
-  for u in maldex-isroot maldex-isuser; do
-    if ! id "$u" >/dev/null 2>&1; then
-      sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "$u"
-    fi
-  done
-}
-
 # mitmproxy's CA (the guest image trusts it); generated once, copied per run into a private confdir for maldex-mitm.
 MITM_CA_DIR=".data/mitm/ca"
-ensure_mitm_ca() {
-  mkdir -p "$MITM_CA_DIR"
-  chmod 0700 "$MITM_CA_DIR"
-  if [ ! -f "$MITM_CA_DIR/mitmproxy-ca.pem" ]; then
-    # mitmdump writes the CA at startup and then idles; stop it after a few seconds.
-    timeout 8 mitmdump --set "confdir=$MITM_CA_DIR" -n -q >/dev/null 2>&1 || true
-  fi
-  [ -f "$MITM_CA_DIR/mitmproxy-ca.pem" ] && [ -f "$MITM_CA_DIR/mitmproxy-ca-cert.pem" ]
-}
 
-# libguestfs's fixed appliance (LIBGUESTFS_PATH): the guest disk editor writes the current agent into a template working copy with
-# guestfish as the app's own user. Ubuntu's 0600 /boot/vmlinuz-* stops supermin from building an appliance for a non-root user, so
-# one is built once as root into a world-readable directory. The stamp records the libguestfs version it was built from.
+# libguestfs's fixed appliance for the guest disk editor (see ensure_guestfs_appliance in packaging/lib/maldex-common.sh).
 GUESTFS_APPLIANCE_DIR="/var/lib/maldex/guestfs-appliance"
-guestfs_version() { dpkg-query -W -f='${Version}' libguestfs-tools; }
-ensure_guestfs_appliance() {
-  local want; want="$(guestfs_version)"
-  if [ -f "$GUESTFS_APPLIANCE_DIR/maldex-libguestfs-version" ] && [ "$(cat "$GUESTFS_APPLIANCE_DIR/maldex-libguestfs-version")" = "$want" ] \
-     && [ -f "$GUESTFS_APPLIANCE_DIR/kernel" ] && [ -f "$GUESTFS_APPLIANCE_DIR/initrd" ] && [ -f "$GUESTFS_APPLIANCE_DIR/root" ]; then
-    return 0
-  fi
-  local fresh="$GUESTFS_APPLIANCE_DIR.new"
-  sudo rm -rf "$fresh"
-  sudo mkdir -p "$(dirname "$GUESTFS_APPLIANCE_DIR")"
-  sudo libguestfs-make-fixed-appliance "$fresh"
-  echo "$want" | sudo tee "$fresh/maldex-libguestfs-version" >/dev/null
-  sudo chown -R root:root "$fresh"
-  sudo chmod -R a+rX,go-w "$fresh"
-  sudo rm -rf "$GUESTFS_APPLIANCE_DIR"
-  sudo mv "$fresh" "$GUESTFS_APPLIANCE_DIR"
-}
-
-# INetSim's template data is only ever read (as root) and copied per run, so it must be root-owned, not writable by others
-# and free of symlinks; the guest-facing INetSim user gets only fresh per-run leaf directories.
-harden_inetsim_template() {
-  sudo chown -R root:root /var/lib/inetsim
-  sudo chmod -R go-w /var/lib/inetsim
-  sudo chmod 0755 /var/lib/inetsim
-}
-
-inetsim_template_clean() {
-  [ -z "$(sudo find /var/lib/inetsim \( -type l -o ! -user root -o -perm /022 \) -print -quit)" ]
-}
 
 # Stop and disable a system unit Maldex runs per run; tolerate only a missing unit, then verify it is inactive.
 disable_system_unit() {
@@ -403,28 +323,15 @@ cmd_real_setup() {
 
   install_host_guard
   install_direct_docker_exception
-  ensure_mitm_user
-  ensure_dns_user
-  ensure_inetsim_userns_ids
-  ensure_mitm_ca
+  local u
+  for u in maldex-mitm maldex-dns maldex-isroot maldex-isuser; do ensure_system_user "$u"; done
+  ensure_mitm_ca "$MITM_CA_DIR" "$(id -un)"
   harden_inetsim_template
-  ensure_guestfs_appliance
+  ensure_guestfs_appliance "$GUESTFS_APPLIANCE_DIR"
   mkdir -p .data/media
   ensure_sysmon_zip
 
   real_verify
-}
-
-# Run "$@" quietly; on failure print the hint and record the failure.
-REAL_FAILED=0
-real_check() {
-  local what="$1" hint="$2"; shift 2
-  if "$@" >/dev/null 2>&1; then
-    echo "ok   $what"
-  else
-    echo "FAIL $what -- install/fix: $hint" >&2
-    REAL_FAILED=1
-  fi
 }
 
 real_verify() {
@@ -523,21 +430,119 @@ cmd_real_smoke() {
   echo "real-smoke OK: OVMF + TPM 2.0 + KVM work under $LIBVIRT_URI"
 }
 
-# Unattended Windows 11 26H2 guest image (needs MALDEX_WIN_ISO; see deploy/guest/README.md).
-# Sysmon.zip is pinned by the SHA-256 of a download on 2026-10-20 (Sysinternals publishes no checksum file).
-SYSMON_URL="https://download.sysinternals.com/files/Sysmon.zip"
-SYSMON_SHA256="00ecf1b46aec99299d3ae0bca79dc621458bd014b20b509d7c5c8e8c8611aa54"
-
 # Publishes the guest agent (self-contained single-file win-x64) to .data/agent/Maldex.Agent.exe. Used by template sealing and the Build from ISO.
 cmd_agent() {
-  dotnet publish src/Maldex.Agent -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o "$PWD/.data/agent" --nologo -v q
-  [ -f .data/agent/Maldex.Agent.exe ] || { echo "Agent publish did not produce Maldex.Agent.exe" >&2; return 1; }
+  publish_agent "$PWD/.data/agent"
+}
+
+# The agent bundle into directory $1 (absolute): Maldex.Agent.exe plus Maldex.Agent.version.
+publish_agent() {
+  local out="$1"
+  dotnet publish src/Maldex.Agent -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o "$out" --nologo -v q
+  [ -f "$out/Maldex.Agent.exe" ] || { echo "Agent publish did not produce Maldex.Agent.exe" >&2; return 1; }
   # The agent reports "<version>+<12 hex of its exe>"; the hash half the host computes from the exe, the version half is
   # recorded here from the same project properties the exe was just compiled with (a Windows exe's file version is the .NET host's).
   local version
   version="$(dotnet msbuild src/Maldex.Agent -getProperty:Version -p:Configuration=Release -p:RuntimeIdentifier=win-x64 --nologo | head -n 1 | cut -d+ -f1 | tr -d '[:space:]')"
   [ -n "$version" ] || { echo "Could not read the agent version" >&2; return 1; }
-  printf '%s\n' "$version" > .data/agent/Maldex.Agent.version
+  printf '%s\n' "$version" > "$out/Maldex.Agent.version"
+}
+
+# nfpm builds the .deb and the .rpm (build time only), pinned by version and the SHA-256 of its release tarball
+# (github.com/goreleaser/nfpm, checksums.txt of the release), verified on every use.
+NFPM_VERSION="2.47.0"
+NFPM_SHA256="0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783"
+TOOLS_DIR=".data/tools"
+PKG_STAGE="packaging/stage"
+
+# Verifies the pinned nfpm tarball (downloading it once into $TOOLS_DIR) and extracts a fresh binary from it; prints its path.
+ensure_nfpm() {
+  local tarball="$TOOLS_DIR/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" dir="$TOOLS_DIR/nfpm-$NFPM_VERSION"
+  mkdir -p "$TOOLS_DIR"
+  fetch_cached "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+    "$tarball" "$NFPM_SHA256" >&2 || return 1
+  rm -rf "$dir"; mkdir -p "$dir"
+  tar -xzf "$tarball" -C "$dir" nfpm || return 1
+  echo "$PWD/$dir/nfpm"
+}
+
+# ./build.sh package [--stage-only] [version]: stage packaging/stage/ and build dist/maldex_<v>_amd64.deb and
+# dist/maldex-<v>-<release>.x86_64.rpm with nfpm. Without a version: 0.0.0~dev+<sha> (deb), 0.0.0 release 0.dev.<sha> (rpm).
+# --stage-only stops before nfpm (packaging/tests/check-package.sh --stage uses it).
+cmd_package() {
+  local stage_only=0 version="" arg sha deb_version rpm_version rpm_release
+  for arg in "$@"; do
+    case "$arg" in
+      --stage-only) stage_only=1 ;;
+      -*) echo "usage: $0 package [--stage-only] [version]" >&2; return 64 ;;
+      *) version="$arg" ;;
+    esac
+  done
+  if [ -z "$version" ]; then
+    sha="$(git rev-parse --short HEAD)"
+    deb_version="0.0.0~dev+$sha"; rpm_version="0.0.0"; rpm_release="0.dev.$sha"
+  else
+    # One string valid as a Debian upstream version and an rpm version: no '-', starts with a digit.
+    [[ "$version" =~ ^[0-9][A-Za-z0-9.+~]*$ ]] || { echo "package: version '$version' must match [0-9][A-Za-z0-9.+~]*" >&2; return 64; }
+    deb_version="$version"; rpm_version="$version"; rpm_release="1"
+  fi
+
+  local opt="$PKG_STAGE/opt/maldex"
+  rm -rf "$PKG_STAGE"
+  mkdir -p "$opt" "$PKG_STAGE/etc"
+
+  # 1-2. the SPA, then the self-contained web app (it hosts the SPA from wwwroot)
+  cmd_build_spa
+  # Stamped with the package version: Maldex.Web --version prints it (InformationalVersion, no +commit suffix appended);
+  # Version takes the numeric core (assembly and file versions accept only up to four numbers).
+  local core
+  core="$(grep -oE '^[0-9]+(\.[0-9]+){0,3}' <<<"$deb_version")"
+  dotnet publish src/Maldex.Web -c Release -r linux-x64 --self-contained -o "$PWD/$opt/app" --nologo -v q \
+    "-p:Version=$core" "-p:InformationalVersion=$deb_version" -p:IncludeSourceRevisionInInformationalVersion=false
+  [ -x "$opt/app/Maldex.Web" ] || { echo "package: the publish did not produce Maldex.Web" >&2; return 1; }
+  printf '%s\n' "$deb_version" > "$PKG_STAGE/VERSION"   # read by packaging/tests/check-package.sh
+  [ -f "$opt/app/appsettings.Package.json" ] || { echo "package: appsettings.Package.json is not in the publish output" >&2; return 1; }
+  [ -f "$opt/app/wwwroot/index.html" ] || { echo "package: the SPA is not in the publish output" >&2; return 1; }
+
+  # 3. the guest agent, as cmd_agent publishes it
+  publish_agent "$PWD/$opt/agent"
+
+  # 4. the pinned mitmproxy
+  local mitm_tgz="$TOOLS_DIR/mitmproxy-$MITMPROXY_VERSION-linux-x86_64.tar.gz"
+  mkdir -p "$TOOLS_DIR" "$opt/mitmproxy"
+  fetch_cached "https://downloads.mitmproxy.org/$MITMPROXY_VERSION/mitmproxy-$MITMPROXY_VERSION-linux-x86_64.tar.gz" \
+    "$mitm_tgz" "$MITMPROXY_SHA256"
+  # Only mitmdump: the app and maldex-setup run nothing else (mitmproxy and mitmweb would add about 100 MB).
+  tar -xzf "$mitm_tgz" -C "$opt/mitmproxy" --no-same-owner mitmdump
+  [ -x "$opt/mitmproxy/mitmdump" ] || { echo "package: the mitmproxy tarball has no mitmdump" >&2; return 1; }
+
+  # 5. bundled assets (tracked files only), the setup command and its library
+  git ls-files -z -- deploy rules | tar --null -T - -cf - | tar -xf - -C "$opt"
+  install -D -m 0755 packaging/bin/maldex-setup "$opt/bin/maldex-setup"
+  install -D -m 0644 packaging/lib/maldex-common.sh "$opt/lib/maldex-common.sh"
+  # The admin template, with RHEL 9's edk2-ovmf firmware paths for the .rpm.
+  sed -e 's#/usr/share/OVMF/OVMF_CODE_4M\.secboot\.fd#/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd#' \
+      -e 's#/usr/share/OVMF/OVMF_VARS_4M\.ms\.fd#/usr/share/edk2/ovmf/OVMF_VARS.secboot.fd#' \
+      packaging/etc/appsettings.Production.json > "$PKG_STAGE/etc/appsettings.Production.rpm.json"
+  if grep -q '/usr/share/OVMF/' "$PKG_STAGE/etc/appsettings.Production.rpm.json"; then
+    echo "package: the rpm config template still names an Ubuntu OVMF path" >&2; return 1
+  fi
+  # Packaged files are root-owned and not writable by group or others, whatever the build umask was.
+  chmod -R u+rwX,go+rX,go-w "$PKG_STAGE"
+
+  if [ "$stage_only" = 1 ]; then echo "Staged $PKG_STAGE (stage only)."; return 0; fi
+
+  # 6-7. nfpm
+  local nfpm deb rpm
+  nfpm="$(ensure_nfpm)"
+  mkdir -p dist
+  rm -f dist/maldex_*.deb dist/maldex-*.rpm
+  deb="dist/maldex_${deb_version}_amd64.deb"
+  rpm="dist/maldex-${rpm_version}-${rpm_release}.x86_64.rpm"
+  MALDEX_VERSION="$deb_version" MALDEX_RELEASE="" "$nfpm" package -f packaging/nfpm.yaml -p deb -t "$deb"
+  MALDEX_VERSION="$rpm_version" MALDEX_RELEASE="$rpm_release" "$nfpm" package -f packaging/nfpm.yaml -p rpm -t "$rpm"
+  [ -f "$deb" ] && [ -f "$rpm" ] || { echo "package: nfpm did not write $deb and $rpm" >&2; return 1; }
+  echo "Built $deb and $rpm"
 }
 
 # build-guest, prepare-guest, finalize-guest and discard-guest are retired: the app builds and edits templates.
@@ -727,10 +732,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     real-setup) cmd_real_setup ;;
     real-smoke) cmd_real_smoke ;;
     agent) cmd_agent ;;
+    package) shift; cmd_package "$@" ;;
     build-guest|prepare-guest|finalize-guest|discard-guest) cmd_retired ;;
     e2e)    cmd_e2e ;;
     e2e-templates) cmd_e2e_templates "${2:-}" ;;
     e2e-build-acceptance) cmd_e2e_build_acceptance ;;
-    *) echo "usage: $0 setup|dev-db|run|test|smoke|build|agent|real-setup|real-smoke|e2e|e2e-templates [test-filter]|e2e-build-acceptance" >&2; exit 64 ;;
+    *) echo "usage: $0 setup|dev-db|run|test|smoke|build|agent|package [--stage-only] [version]|real-setup|real-smoke|e2e|e2e-templates [test-filter]|e2e-build-acceptance" >&2; exit 64 ;;
   esac
 fi
