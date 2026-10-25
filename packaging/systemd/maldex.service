@@ -1,0 +1,26 @@
+[Unit]
+Description=Maldex malware-analysis sandbox
+Documentation=https://github.com/basht0p/Maldex
+After=network-online.target maldex-host-guard.service guacd.service
+Wants=network-online.target maldex-host-guard.service guacd.service
+
+[Service]
+Type=simple
+User=maldex
+Group=maldex
+SupplementaryGroups=kvm libvirt
+WorkingDirectory=/var/lib/maldex
+# qemu:///session keeps its state under the service user's home, which is the data dir.
+Environment=HOME=/var/lib/maldex
+Environment=ASPNETCORE_ENVIRONMENT=Production
+Environment=ASPNETCORE_URLS=http://127.0.0.1:5080
+Environment=PLAYWRIGHT_BROWSERS_PATH=/var/lib/maldex/ms-playwright
+Environment=MALDEX_EXTRA_CONFIG=/opt/maldex/app/appsettings.Package.json:/etc/maldex/appsettings.Production.json
+Environment=DOTNET_NOLOGO=1
+ExecStart=/opt/maldex/app/Maldex.Web
+Restart=on-failure
+RestartSec=5
+# No NoNewPrivileges or other sandboxing: the app runs its privileged commands through sudo (/etc/sudoers.d/maldex).
+
+[Install]
+WantedBy=multi-user.target

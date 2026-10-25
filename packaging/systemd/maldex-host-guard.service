@@ -1,0 +1,15 @@
+[Unit]
+Description=Maldex host guard (nftables)
+Documentation=file:///etc/maldex/maldex-host-guard.nft
+DefaultDependencies=no
+After=nftables.service network-pre.target
+Before=network.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/maldex/maldex-host-guard.nft
+
+[Install]
+WantedBy=multi-user.target
