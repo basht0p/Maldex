@@ -4,13 +4,20 @@
 #
 #   maldex-setup                    run every step, stop at the first failure
 #   maldex-setup --offline <dir>    take Sysmon.zip and virtio-win.iso from <dir> instead of downloading them (same hash checks)
-#   maldex-setup --check            run only the read-only checks, print every result, change nothing (root not required)
+#   maldex-setup --check            run only the read-only checks, print every result, change nothing (root not required);
+#                                   its guest disk editor check boots a throwaway libguestfs appliance (libguestfs-test-tool)
 #
 # Each step prints "ok   <step>" or "FAIL <step> -- <hint>". Paths can be moved for tests: MALDEX_ETC (default /etc/maldex),
 # MALDEX_DATA (default /var/lib/maldex, Maldex:Real:Root) and MALDEX_OPT (default /opt/maldex).
 set -uo pipefail
 
-usage() { echo "usage: maldex-setup [--check] [--offline <dir>]" >&2; exit 64; }
+HELP="usage: maldex-setup [--check] [--offline <dir>]
+  (no flag)        run every step as root; stop at the first failure; safe to re-run
+  --offline <dir>  take Sysmon.zip and virtio-win.iso from <dir> (same SHA-256 checks)
+  --check          read-only checks only, as any user; prints every result and changes nothing.
+                   The guest disk editor check boots a throwaway libguestfs appliance (libguestfs-test-tool,
+                   about 30 s, needs KVM); it writes only libguestfs's own temp files."
+usage() { echo "$HELP" >&2; exit 64; }
 
 CHECK=0
 OFFLINE=""
@@ -18,7 +25,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --check) CHECK=1; shift ;;
     --offline) if [ $# -lt 2 ] || [ -z "$2" ]; then usage; fi; OFFLINE="$2"; shift 2 ;;
-    -h|--help) echo "usage: maldex-setup [--check] [--offline <dir>]"; exit 0 ;;
+    -h|--help) echo "$HELP"; exit 0 ;;
     *) usage ;;
   esac
 done
@@ -43,12 +50,15 @@ CONFIG="$MALDEX_ETC/appsettings.Production.json"
 APP_USER="maldex"
 ISO_DIR="$MALDEX_DATA/.data/vm/iso"
 MITM_CA="$MALDEX_DATA/.data/mitm/ca"
-AGENT_DIR="$MALDEX_DATA/.data/agent"
+AGENT_SRC="$MALDEX_OPT/agent"   # the app reads the agent bundle from the package (controller ruling T2-1)
 MEDIA_DIR="$MALDEX_DATA/.data/media"
 GUESTFS_DIR="$MALDEX_DATA/guestfs-appliance"
 BROWSERS_DIR="$MALDEX_DATA/ms-playwright"
 APP_URL="http://127.0.0.1:5080"
-OVMF_SECBOOT_CANDIDATES=(/usr/share/OVMF/OVMF_CODE_4M.secboot.fd /usr/share/edk2/ovmf/OVMF_CODE.secboot.fd)
+# Host paths the verify checks read; overridable so the tests do not depend on the host.
+read -r -a OVMF_SECBOOT_CANDIDATES <<<"${MALDEX_OVMF_SECBOOT:-/usr/share/OVMF/OVMF_CODE_4M.secboot.fd /usr/share/edk2/ovmf/OVMF_CODE.secboot.fd}"
+BR_NF_CALL_IPTABLES="${MALDEX_BR_NF_CALL_IPTABLES:-/proc/sys/net/bridge/bridge-nf-call-iptables}"
+KVM_DEV="${MALDEX_KVM_DEV:-/dev/kvm}"
 SYSTEM_USERS=(maldex-mitm maldex-dns maldex-isroot maldex-isuser)
 
 HINT=""   # set by a failing step or check
@@ -102,18 +112,26 @@ db_check() {
 
 # ---- downloads ----
 
-# Directory $1 (and missing parents up to it) owned by the app user, mode 0750.
+# Set owner $1 and mode $2 on $3, refusing a symlink (root must not be steered to chown/chmod another path).
+own_mode() {
+  local owner="$1" mode="$2" p="$3"
+  [ ! -L "$p" ] || { echo "refusing to change $p: it is a symlink" >&2; return 1; }
+  chown -h "$owner" "$p" || return 1
+  chmod "$mode" "$p"
+}
+
+# Directory $1 owned by the app user, mode 0750; it must not be a symlink.
 app_dir() {
   local d="$1"
+  [ ! -L "$d" ] || { echo "refusing to use $d: it is a symlink" >&2; return 1; }
   mkdir -p "$d" || return 1
-  chown "$APP_USER:$APP_USER" "$d" || return 1
-  chmod 0750 "$d"
+  own_mode "$APP_USER:$APP_USER" 0750 "$d"
 }
 
 data_layout() {
   local d
   for d in "$MALDEX_DATA" "$MALDEX_DATA/.data" "$MALDEX_DATA/.data/vm" "$MALDEX_DATA/.data/vm/base" "$MALDEX_DATA/.data/vm/run" \
-           "$ISO_DIR" "$MEDIA_DIR" "$MALDEX_DATA/.data/artifacts" "$AGENT_DIR" "$MALDEX_DATA/.data/mitm"; do
+           "$ISO_DIR" "$MEDIA_DIR" "$MALDEX_DATA/.data/artifacts" "$MALDEX_DATA/.data/mitm"; do
     app_dir "$d" || return 1
   done
 }
@@ -121,8 +139,10 @@ data_layout() {
 # File $1 of the pinned set into $ISO_DIR: kept when it already verifies, else copied from --offline or downloaded, then verified.
 fetch_pinned() {
   local name="$1" url="$2" sha="$3" dest="$ISO_DIR/$1"
+  if [ -L "$dest" ] || [ -L "$dest.part" ]; then echo "refusing to use $dest: it is a symlink" >&2; return 1; fi
   if [ -s "$dest" ] && echo "$sha  $dest" | sha256sum -c --status - 2>/dev/null; then
-    return 0
+    own_mode "$APP_USER:$APP_USER" 0640 "$dest"
+    return
   fi
   rm -f "$dest" "$dest.part"
   if [ -n "$OFFLINE" ]; then
@@ -133,7 +153,7 @@ fetch_pinned() {
   else
     fetch_cached "$url" "$dest" "$sha" || return 1
   fi
-  chown "$APP_USER:$APP_USER" "$dest" && chmod 0640 "$dest"
+  own_mode "$APP_USER:$APP_USER" 0640 "$dest"
 }
 
 step_downloads() {
@@ -154,8 +174,14 @@ step_mitm_ca() {
   done
   ensure_mitm_ca "$MITM_CA" maldex-mitm || fail "mitmproxy CA not created in $MITM_CA; check that mitmdump runs (mitmdump --version)" || return 1
   # The app reads the cert (template sealing) and checks the key exists; it copies them per run as root.
-  chgrp "$APP_USER" "$MITM_CA" "$MITM_CA/mitmproxy-ca-cert.pem" || fail "cannot hand $MITM_CA to group $APP_USER" || return 1
-  chmod 0750 "$MITM_CA" && chmod 0640 "$MITM_CA/mitmproxy-ca-cert.pem" || fail "cannot set the modes in $MITM_CA" || return 1
+  # The private key files stay 0600 maldex-mitm.
+  local f
+  own_mode "maldex-mitm:$APP_USER" 0750 "$MITM_CA" || fail "cannot set the owner and mode of $MITM_CA" || return 1
+  own_mode "maldex-mitm:$APP_USER" 0640 "$MITM_CA/mitmproxy-ca-cert.pem" || fail "cannot set the mode of the CA cert" || return 1
+  for f in mitmproxy-ca.pem mitmproxy-ca.p12; do
+    [ -e "$MITM_CA/$f" ] || [ -L "$MITM_CA/$f" ] || continue
+    own_mode maldex-mitm:maldex-mitm 0600 "$MITM_CA/$f" || fail "cannot set the mode of $MITM_CA/$f" || return 1
+  done
 }
 
 step_inetsim() {
@@ -169,24 +195,12 @@ step_guestfs() {
     || fail "libguestfs-make-fixed-appliance failed; check libguestfs-test-tool, then re-run" || return 1
 }
 
-# ---- browsers, agent ----
+# ---- browsers ----
 
 step_browsers() {
   app_dir "$BROWSERS_DIR" || fail "cannot create $BROWSERS_DIR" || return 1
   sudo -u "$APP_USER" env "PLAYWRIGHT_BROWSERS_PATH=$BROWSERS_DIR" "$MALDEX_OPT/app/Maldex.Web" --install-browsers --no-deps \
     || fail "Playwright Chromium install failed (needs https access to the Playwright CDN); re-run when it is reachable" || return 1
-}
-
-step_agent() {
-  local f
-  for f in Maldex.Agent.exe Maldex.Agent.version; do
-    [ -f "$MALDEX_OPT/agent/$f" ] || fail "$MALDEX_OPT/agent/$f is missing; reinstall the maldex package" || return 1
-    if ! cmp -s "$MALDEX_OPT/agent/$f" "$AGENT_DIR/$f"; then
-      cp "$MALDEX_OPT/agent/$f" "$AGENT_DIR/$f.part" && mv "$AGENT_DIR/$f.part" "$AGENT_DIR/$f" \
-        || fail "cannot copy $f into $AGENT_DIR" || return 1
-    fi
-    chown "$APP_USER:$APP_USER" "$AGENT_DIR/$f" && chmod 0640 "$AGENT_DIR/$f" || fail "cannot set the owner of $AGENT_DIR/$f" || return 1
-  done
 }
 
 # ---- verify ----
@@ -196,11 +210,11 @@ not_in_sudoers() { ! $MALDEX_SUDO grep -rqs -- "$1" /etc/sudoers /etc/sudoers.d;
 powerless_user() { [ "$(id -nG "$1")" = "$1" ] && [ "$(id -u "$1")" != 0 ] && not_in_sudoers "$1"; }
 app_user_groups() { local g; g=" $(id -nG "$APP_USER") "; [[ "$g" == *" kvm "* ]] && [[ "$g" == *" libvirt "* ]]; }
 inetsim_ids_distinct() { [ "$(id -u maldex-isroot)" != "$(id -u maldex-isuser)" ] && [ "$(id -g maldex-isroot)" != "$(id -g maldex-isuser)" ]; }
-br_netfilter_off() { [ ! -e /proc/sys/net/bridge/bridge-nf-call-iptables ] || [ "$(cat /proc/sys/net/bridge/bridge-nf-call-iptables)" != 1 ]; }
+br_netfilter_off() { [ ! -e "$BR_NF_CALL_IPTABLES" ] || [ "$(cat "$BR_NF_CALL_IPTABLES")" != 1 ]; }
 mitm_ca_present() { $MALDEX_SUDO test -f "$MITM_CA/mitmproxy-ca.pem" && $MALDEX_SUDO test -f "$MITM_CA/mitmproxy-ca-cert.pem"; }
 chromium_present() { compgen -G "$BROWSERS_DIR/chromium-*" >/dev/null; }
-agent_present() { [ -f "$AGENT_DIR/Maldex.Agent.exe" ] && [ -f "$AGENT_DIR/Maldex.Agent.version" ]; }
-kvm_usable() { maldex_as_user "$APP_USER" test -r /dev/kvm -a -w /dev/kvm; }
+agent_present() { [ -f "$AGENT_SRC/Maldex.Agent.exe" ] && [ -f "$AGENT_SRC/Maldex.Agent.version" ]; }
+kvm_usable() { maldex_as_user "$APP_USER" test -r "$KVM_DEV" -a -w "$KVM_DEV"; }
 guestfs_works() { maldex_as_user "$APP_USER" env LIBGUESTFS_BACKEND=direct "LIBGUESTFS_PATH=$GUESTFS_DIR" libguestfs-test-tool; }
 
 # The real_verify checks for a packaged host: no dev-only ones (pwsh, the docker guacd image, the Docker exception), plus the
@@ -224,7 +238,7 @@ verify_checks() {
   real_check "Sysmon.zip" "maldex-setup (downloads step)" test -f "$ISO_DIR/Sysmon.zip"
   real_check "virtio-win.iso" "maldex-setup (downloads step)" test -f "$ISO_DIR/virtio-win.iso"
   real_check "media library ($MEDIA_DIR)" "maldex-setup (downloads step)" test -d "$MEDIA_DIR"
-  real_check "agent bundle ($AGENT_DIR)" "maldex-setup (agent step)" agent_present
+  real_check "agent bundle ($AGENT_SRC)" "reinstall the maldex package (it ships the agent)" agent_present
   real_check "Playwright Chromium ($BROWSERS_DIR)" "maldex-setup (browsers step)" chromium_present
   # shellcheck disable=SC2086  # MALDEX_SUDO is empty or "sudo -n"
   real_check "host guard table loaded" "systemctl restart maldex-host-guard" $MALDEX_SUDO nft list table inet maldex_guard
@@ -279,7 +293,6 @@ run_step mitm-ca step_mitm_ca
 run_step inetsim step_inetsim
 run_step guestfs step_guestfs
 run_step browsers step_browsers
-run_step agent step_agent
 run_step verify step_verify
 run_step start step_start
 echo

@@ -68,7 +68,8 @@ esac'
   stub curl 'out=""; while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; -*) shift;; *) url="$1"; shift;; esac; done
 cp "$STUB_SRV/${url##*/}" "$out"'
   stub timeout 'shift; case "$*" in *dev/tcp*) exit "${STUB_TCP_RC:-0}";; esac; exec "$@"'
-  stub sudo 'while [ $# -gt 0 ]; do case "$1" in -n) shift;; -u) shift 2;; --) shift; break;; *) break;; esac; done; exec "$@"'
+  # For a non-root caller, sudo without -n would prompt for a password: the stub fails it, as a hang would.
+  stub sudo '[ "$STUB_EUID" = 0 ] || [ "$1" = -n ] || exit 1; while [ $# -gt 0 ]; do case "$1" in -n) shift;; -u) shift 2;; --) shift; break;; *) break;; esac; done; exec "$@"'
   stub runuser 'while [ $# -gt 0 ]; do case "$1" in -u) shift 2;; --) shift; break;; *) break;; esac; done; exec "$@"'
   stub systemctl 'exit 0'
   stub dpkg-query 'echo "1.52.0-test"'
@@ -77,6 +78,9 @@ cp "$STUB_SRV/${url##*/}" "$out"'
   /bin/chmod +x "$T/opt/app/Maldex.Web"
 
   export MALDEX_ETC="$T/etc" MALDEX_DATA="$T/data" MALDEX_OPT="$T/opt" INETSIM_TEMPLATE_DIR="$T/inetsim"
+  # Host paths the verify checks read, so a full run passes verify on any host (CI has no KVM).
+  touch "$T/ovmf-secboot.fd" "$T/kvm"; echo 0 > "$T/bridge-nf-call-iptables"
+  export MALDEX_OVMF_SECBOOT="$T/ovmf-secboot.fd" MALDEX_KVM_DEV="$T/kvm" MALDEX_BR_NF_CALL_IPTABLES="$T/bridge-nf-call-iptables"
   export PATH="$T/bin:/usr/bin:/bin"
 }
 
@@ -179,14 +183,15 @@ test_rerun_after_guestfs_failure() {
   check "first run created the mitm CA" grep -q '^mitmdump --set' "$STUB_LOG"
   rm -f "$T/srv/guestfs-fail"; : > "$STUB_LOG"
   run_setup
-  for s in db downloads mitm-ca inetsim guestfs browsers agent; do check "re-run: ok $s" grep -q "^ok   $s\$" <<<"$OUT"; done
+  for s in db downloads mitm-ca inetsim guestfs browsers verify start; do check "re-run: ok $s" grep -q "^ok   $s\$" <<<"$OUT"; done
   check "re-run does not download again" not_logged '^curl'
   check "re-run does not regenerate the mitm CA" not_logged '^mitmdump --set'
   check "re-run does not create users again" not_logged '^useradd'
   check "re-run builds the appliance" [ -f "$T/data/guestfs-appliance/kernel" ]
   check "browsers step installs Chromium as maldex with the data dir's browser path" \
     grep -q "^sudo -u maldex env PLAYWRIGHT_BROWSERS_PATH=$T/data/ms-playwright $T/opt/app/Maldex.Web --install-browsers --no-deps" "$STUB_LOG"
-  check "agent step copies the agent bundle" cmp -s "$T/opt/agent/Maldex.Agent.exe" "$T/data/.data/agent/Maldex.Agent.exe"
+  check "verify finds the packaged agent bundle" grep -q "^ok   agent bundle ($T/opt/agent)" <<<"$OUT"
+  check "no agent copy into the data dir" [ ! -e "$T/data/.data/agent" ]
   teardown
 }
 
@@ -205,13 +210,48 @@ test_requires_root() {
 
 test_start_step() {
   setup_sandbox; write_config
-  # Every verify check must pass for start to run, so this only proves the order: start never runs after a failed verify.
   run_setup
-  if grep -q '^ok   verify' <<<"$OUT"; then
-    check "start enables maldex" grep -q '^systemctl enable --now maldex' "$STUB_LOG"
-  else
-    check "a failed verify stops before start" not_logged '^systemctl enable --now maldex'
-  fi
+  check "a full run passes verify" grep -q "^ok   verify\$" <<<"$OUT"
+  check "start enables maldex after verify" grep -q "^systemctl enable --now maldex" "$STUB_LOG"
+  check "start prints the URL and the next step" grep -q "http://127.0.0.1:5080.*" <<<"$OUT"
+  teardown
+
+  setup_sandbox; write_config
+  echo 1 > "$T/bridge-nf-call-iptables"
+  run_setup
+  check "a failed verify check fails verify" grep -q "^FAIL verify -- " <<<"$OUT"
+  check "a failed verify stops before start" not_logged "^systemctl enable --now maldex"
+  teardown
+}
+
+test_check_never_prompts() {
+  setup_sandbox; write_config; export STUB_EUID=1000
+  run_setup --check
+  check "non-root --check uses sudo for the root-only checks" grep -q "^sudo " "$STUB_LOG"
+  check "non-root --check passes -n to every sudo call" not_logged "^sudo (\$|[^-]|-[^n])"
+  check "non-root --check still lists every check" [ "$(grep -Ec "^(ok   |FAIL )" <<<"$OUT")" = "$EXPECTED_CHECKS" ]
+  teardown
+}
+
+test_modes_and_symlinks() {
+  setup_sandbox; write_config
+  mkdir -p "$T/data/.data/vm/iso"
+  cp "$T/srv/Sysmon.zip" "$T/data/.data/vm/iso/Sysmon.zip"
+  touch "$T/srv/guestfs-fail"
+  run_setup
+  check "a kept download gets its owner and mode again" grep -q "^chown -h maldex:maldex $T/data/.data/vm/iso/Sysmon.zip" "$STUB_LOG"
+  check "the CA key is 0600" grep -q "^chmod 0600 $T/data/.data/mitm/ca/mitmproxy-ca.pem" "$STUB_LOG"
+  check "the CA cert is 0640 for the app" grep -q "^chmod 0640 $T/data/.data/mitm/ca/mitmproxy-ca-cert.pem" "$STUB_LOG"
+  teardown
+
+  setup_sandbox; write_config
+  mkdir -p "$T/data/.data/vm" "$T/elsewhere"
+  ln -s "$T/elsewhere" "$T/data/.data/vm/iso"
+  run_setup
+  check "a symlinked data dir fails downloads" grep -q "^FAIL downloads -- " <<<"$OUT"
+  check "a symlinked data dir is refused by name" grep -q "refusing to use $T/data/.data/vm/iso: it is a symlink" <<<"$OUT"
+  check "nothing lands behind the symlink" [ -z "$(ls -A "$T/elsewhere")" ]
+  check "the symlink target is never chowned" not_logged "^chown .*elsewhere"
   teardown
 }
 
@@ -225,7 +265,7 @@ test_usage() {
 }
 
 for t in test_check_without_config test_check_lists_every_check test_downloads_skip_and_refetch test_offline \
-         test_rerun_after_guestfs_failure test_requires_root test_start_step test_usage; do
+         test_rerun_after_guestfs_failure test_requires_root test_start_step test_check_never_prompts test_modes_and_symlinks test_usage; do
   echo "# $t"
   OUT=""
   "$t"

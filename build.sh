@@ -3,6 +3,7 @@ set -euo pipefail
 # Pins and the host-setup helpers shared with packaging/bin/maldex-setup. Pure bash path math: the gate tests source this file with
 # an empty PATH.
 _mx_here="${BASH_SOURCE[0]%/*}"; [ "$_mx_here" != "${BASH_SOURCE[0]}" ] || _mx_here=.
+unset MALDEX_SUDO   # the library derives it (sudo, or empty as root); never inherit one from the environment
 # shellcheck source=packaging/lib/maldex-common.sh
 source "$_mx_here/packaging/lib/maldex-common.sh"
 unset _mx_here

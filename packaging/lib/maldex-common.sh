@@ -56,7 +56,8 @@ real_check() {
   fi
 }
 
-# Run "$@" as user $1: directly when that is us, through runuser as root, through sudo otherwise.
+# Run "$@" as user $1: directly when that is us, through runuser as root, otherwise through $MALDEX_SUDO (so "sudo -n" never
+# prompts).
 maldex_as_user() {
   local user="$1"; shift
   if [ "$(id -un)" = "$user" ]; then
@@ -64,7 +65,7 @@ maldex_as_user() {
   elif [ -z "$MALDEX_SUDO" ]; then
     runuser -u "$user" -- "$@"
   else
-    sudo -u "$user" -- "$@"
+    $MALDEX_SUDO -u "$user" -- "$@"
   fi
 }
 
@@ -93,6 +94,7 @@ ensure_mitm_ca() {
     [ -f "$confdir/mitmproxy-ca.pem" ] && [ -f "$confdir/mitmproxy-ca-cert.pem" ]
     return
   fi
+  if $MALDEX_SUDO test -L "$confdir"; then echo "refusing to use $confdir: it is a symlink" >&2; return 1; fi
   if ! { $MALDEX_SUDO test -f "$confdir/mitmproxy-ca.pem" && $MALDEX_SUDO test -f "$confdir/mitmproxy-ca-cert.pem"; }; then
     local tmp
     tmp="$($MALDEX_SUDO mktemp -d)" || return 1
@@ -109,7 +111,7 @@ ensure_mitm_ca() {
     done
     $MALDEX_SUDO rm -rf "$tmp"
   fi
-  $MALDEX_SUDO chown -R "$owner:$owner" "$confdir" || return 1
+  $MALDEX_SUDO chown -hR "$owner:$owner" "$confdir" || return 1
   $MALDEX_SUDO chmod 0700 "$confdir" || return 1
 }
 
