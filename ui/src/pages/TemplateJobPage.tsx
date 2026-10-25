@@ -47,22 +47,32 @@ function JobView({ job }: { job: TemplateJobDto }) {
   const [errors, setErrors] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const [note, setNote] = useState('')
+  const [sealedIn, setSealedIn] = useState<TemplateJobState | null>(null) // the state a Seal was accepted in
   const steps = stepsFor(job)
   const at = progressOf(job, steps)
   const active = ACTIVE.includes(job.state)
   const configuring = job.state === 'Configuring'
   const failed = job.state === 'Failed' || job.state === 'Cancelled'
 
-  async function run(action: () => Promise<unknown>) {
+  const sealRequested = sealedIn === job.state // the 202 is only a request: wait for the state to change
+
+  async function run(action: () => Promise<unknown>): Promise<boolean> {
     setBusy(true)
     try {
       await action()
       setErrors([])
+      return true
     } catch (e) {
       setErrors(messageOf(e))
+      return false
     } finally {
       setBusy(false)
     }
+  }
+
+  async function seal() {
+    const state = job.state
+    if (await run(() => sealTemplateJob(job.id, note.trim()))) setSealedIn(state)
   }
 
   function discard() {
@@ -110,9 +120,10 @@ function JobView({ job }: { job: TemplateJobDto }) {
           <div className={page.actions}>
             <div className={`${styles.field} ${page.note}`}>
               <label htmlFor="seal-note">Seal note (optional)</label>
-              <input id="seal-note" type="text" value={note} onChange={(e) => setNote(e.target.value)} />
+              <input id="seal-note" type="text" value={note} disabled={sealRequested} onChange={(e) => setNote(e.target.value)} />
             </div>
-            <button type="button" className={styles.primary} disabled={busy} onClick={() => void run(() => sealTemplateJob(job.id, note.trim()))}>Seal</button>
+            <button type="button" className={styles.primary} disabled={busy || sealRequested} onClick={() => void seal()}>Seal</button>
+            {sealRequested && <span className={styles.hint} role="status">Seal requested</span>}
             <button type="button" className={styles.secondary} disabled={busy} onClick={discard}>Discard</button>
           </div>
         </div>

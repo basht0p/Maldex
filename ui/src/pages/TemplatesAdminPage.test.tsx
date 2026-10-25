@@ -279,6 +279,50 @@ describe('TemplatesAdminPage', () => {
       expect(await screen.findByTestId('where')).toHaveTextContent('/admin/template-jobs/job-9')
     })
 
+    it('moves focus into the dialog, traps Tab, closes on Escape and returns focus to the trigger', async () => {
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      const trigger = within(g).getByRole('button', { name: 'Edit' })
+      await userEvent.click(trigger)
+      const dlg = within(g).getByRole('dialog')
+      await waitFor(() => expect(dlg).toContainElement(document.activeElement as HTMLElement))
+      for (let i = 0; i < 12; i++) {
+        await userEvent.tab()
+        expect(dlg).toContainElement(document.activeElement as HTMLElement)
+      }
+      for (let i = 0; i < 12; i++) {
+        await userEvent.tab({ shift: true })
+        expect(dlg).toContainElement(document.activeElement as HTMLElement)
+      }
+      await userEvent.keyboard('{Escape}')
+      expect(within(g).queryByRole('dialog')).toBeNull()
+      expect(trigger).toHaveFocus()
+    })
+
+    it('Cancel also returns focus to the trigger', async () => {
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      const trigger = within(g).getByRole('button', { name: 'Refresh components' })
+      await userEvent.click(trigger)
+      await userEvent.click(within(g).getByRole('button', { name: 'Cancel' }))
+      expect(trigger).toHaveFocus()
+    })
+
+    it('when the active job ends, the poll refreshes the versions and re-enables Edit and Refresh', async () => {
+      const pending = version({ id: 'p4', number: 4, origin: 'Edit', role: 'Pending' })
+      listTemplateJobs.mockResolvedValue([job({ state: 'Sealing' })])
+      renderPage()
+      const g = await region('Windows 11 Golden')
+      await waitFor(() => expect(within(g).getByRole('button', { name: 'Edit' })).toBeDisabled())
+      const loads = listAdminTemplates.mock.calls.length
+      listTemplateJobs.mockResolvedValue([job({ state: 'Sealed', resultVersionNumber: 4 })])
+      listAdminTemplates.mockResolvedValue([base(), golden({ versions: [pending, v3, v2, v1] })])
+      await waitFor(() => expect(within(g).getByRole('button', { name: 'Edit' })).toBeEnabled(), { timeout: 8000 })
+      expect(listAdminTemplates.mock.calls.length).toBeGreaterThan(loads)
+      expect(within(g).getByRole('button', { name: 'Publish v4' })).toBeInTheDocument()
+      expect(within(g).getByRole('button', { name: 'Refresh components' })).toBeEnabled()
+    }, 15000)
+
     it('Edit defaults to network None and publishing', async () => {
       startTemplateEdit.mockResolvedValue(job())
       renderPage()

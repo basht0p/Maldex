@@ -9,7 +9,8 @@ export interface TemplateJobLive {
   loadError: string | null
 }
 
-const RETRY_MS = 2000
+/** Backoff between attempts to connect, join or load; the last step repeats until success or unmount. */
+const RETRY_MS = [2000, 5000, 10000, 30000]
 
 /**
  * Live view of a template job: joins the job group on the hub (`JoinTemplateJob`), loads the current state over REST
@@ -26,6 +27,7 @@ export function useTemplateJobLive(jobId: string | null, createConnection: () =>
     let cancelled = false
     let retry: ReturnType<typeof setTimeout> | undefined
     let pushed = false
+    let failures = 0
     const conn = factory()
     conn.on('templateJob', (dto: TemplateJobDto) => {
       if (cancelled || dto.id !== jobId) return
@@ -33,6 +35,13 @@ export function useTemplateJobLive(jobId: string | null, createConnection: () =>
       setJob(dto)
       setLoadError(null)
     })
+
+    const later = (action: () => void) => {
+      if (cancelled) return
+      clearTimeout(retry)
+      retry = setTimeout(action, RETRY_MS[Math.min(failures, RETRY_MS.length - 1)])
+      failures++
+    }
 
     const sync = async () => {
       pushed = false
@@ -42,23 +51,22 @@ export function useTemplateJobLive(jobId: string | null, createConnection: () =>
         if (cancelled) return
         if (!pushed) setJob(dto)
         setLoadError(null)
+        failures = 0
       } catch (e) {
-        if (!cancelled) setLoadError(e instanceof Error ? e.message : 'Could not load the job.')
+        if (cancelled) return
+        setLoadError(e instanceof Error ? e.message : 'Could not load the job.')
+        later(() => void sync()) // a failed join or load on a live connection is retried, not left stuck
       }
     }
     const connect = () => {
       conn.start().then(
         () => (cancelled ? undefined : sync()),
-        () => {
-          if (!cancelled) retry = setTimeout(connect, RETRY_MS)
-        },
+        () => later(connect),
       )
     }
     conn.onreconnecting(() => undefined)
     conn.onreconnected(() => void sync())
-    conn.onclose(() => {
-      if (!cancelled) retry = setTimeout(connect, RETRY_MS)
-    })
+    conn.onclose(() => later(connect))
     connect()
 
     return () => {
