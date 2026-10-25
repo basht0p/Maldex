@@ -36,6 +36,23 @@ public static class ArtifactEndpoints
             return ZipResult(ctx, zip, a.Sha256);
         }).RequireAuthorization(AuthSetup.AnalystPolicy);
 
+        // Screenshots only, shown inline in the UI; not audited (a screenshot is not a payload). Sniffed, never trusted.
+        app.MapGet("/api/artifacts/{id:guid}/image", async (Guid id, HttpContext ctx, MaldexDbContext db, IArtifactStore store, CancellationToken ct) =>
+        {
+            var a = await db.Artifacts.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id && x.Kind == ArtifactKind.Screenshot, ct);
+            if (a is null || !store.Exists(a.BlobKey)) return Results.NotFound();
+            await using var source = await store.OpenReadAsync(a.BlobKey, ct);
+            using var buffer = new MemoryStream();
+            await source.CopyToAsync(buffer, ct);
+            var bytes = buffer.ToArray();
+            var type = bytes is [0x89, 0x50, 0x4E, 0x47, ..] ? "image/png" : bytes is [0xFF, 0xD8, ..] ? "image/jpeg" : null;
+            if (type is null) return Results.StatusCode(StatusCodes.Status415UnsupportedMediaType);
+            ctx.Response.Headers.ContentDisposition = "inline";
+            ctx.Response.Headers.XContentTypeOptions = "nosniff";
+            ctx.Response.Headers.CacheControl = "private, max-age=86400";
+            return Results.Bytes(bytes, type);
+        }).RequireAuthorization(AuthSetup.AnalystPolicy);
+
         app.MapGet("/api/tasks/{id:guid}/sample", async (Guid id, HttpContext ctx, MaldexDbContext db, IArtifactStore store, AuditWriter audit, CancellationToken ct) =>
         {
             var sample = await db.Tasks.AsNoTracking().Where(t => t.Id == id && t.Sample != null).Select(t => t.Sample).FirstOrDefaultAsync(ct);
@@ -52,7 +69,7 @@ public static class ArtifactEndpoints
     /// Builds the ZIP in memory: ZipOutputStream writes synchronously when it closes, and Kestrel forbids synchronous I/O on the
     /// response body. The entry name is the SHA-256 (a plain leaf, never a path from the guest).
     /// </summary>
-    private static async Task<byte[]> ZipAsync(IArtifactStore store, string blobKey, string sha256, CancellationToken ct)
+    internal static async Task<byte[]> ZipAsync(IArtifactStore store, string blobKey, string sha256, CancellationToken ct)
     {
         await using var source = await store.OpenReadAsync(blobKey, ct);
         using var buffer = new MemoryStream();
@@ -60,7 +77,7 @@ public static class ArtifactEndpoints
         return buffer.ToArray();
     }
 
-    private static IResult ZipResult(HttpContext ctx, byte[] zip, string sha256)
+    internal static IResult ZipResult(HttpContext ctx, byte[] zip, string sha256)
     {
         ctx.Response.Headers.ContentDisposition = $"attachment; filename=\"{sha256}.zip\"";
         return Results.Bytes(zip, "application/zip");
