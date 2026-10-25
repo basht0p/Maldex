@@ -269,6 +269,23 @@ describe('TemplateJobPage', () => {
     expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull()
   })
 
+  it('Sealed links to the template page, and the back link goes there too', async () => {
+    getTemplateJob.mockResolvedValue(job({ state: 'Sealed', resultVersionNumber: 4, endedAt: '2026-10-24T10:30:00Z' }))
+    renderJob()
+    expect(await screen.findByRole('link', { name: "the template's page" })).toHaveAttribute('href', '/admin/templates/win11-golden')
+    expect(screen.getByRole('link', { name: 'Back to the template' })).toHaveAttribute('href', '/admin/templates/win11-golden')
+  })
+
+  it('renders guest-controlled text (message, failure, edition, requester) through safeText', async () => {
+    getTemplateJob.mockResolvedValue(job({ state: 'Preparing', message: 'copy\u200Bing', edition: 'Pro\u202E', requestedByName: 'Ev\u202Eil' }))
+    renderJob()
+    expect(await screen.findByText('copy\\u200Bing')).toBeInTheDocument()
+    expect(screen.getByText('Pro\\u202E')).toBeInTheDocument()
+    expect(screen.getByText('Requested by Ev\\u202Eil')).toBeInTheDocument()
+    hub.push(job({ state: 'Failed', failureReason: 'bad\u202Ereason', endedAt: '2026-10-24T10:30:00Z' }))
+    expect(await screen.findByText('Failed: bad\\u202Ereason')).toBeInTheDocument()
+  })
+
   it('after Seal is accepted it says "Seal requested" and disables Seal and the note until the state changes', async () => {
     getTemplateJob.mockResolvedValue(job({ state: 'Configuring' }))
     sealTemplateJob.mockResolvedValue(undefined)

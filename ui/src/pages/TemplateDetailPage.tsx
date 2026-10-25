@@ -228,24 +228,36 @@ function TemplateDetail({ detail, onChanged }: { detail: TemplateDetailDto; onCh
 /** Admin-only detail of one template: actions, the version timeline and its jobs. */
 export default function TemplateDetailPage({ me }: { me: MeDto | null }) {
   const { id = '' } = useParams()
-  const [detail, setDetail] = useState<TemplateDetailDto | null>(null)
+  const [held, setHeld] = useState<{ id: string; detail: TemplateDetailDto } | null>(null)
+  const detail = held && held.id === id ? held.detail : null // another template's detail is never shown
   const [loadError, setLoadError] = useState<string | null>(null)
   const [notFound, setNotFound] = useState(false)
   const isAdmin = me?.role === 'Admin'
+  const seq = useRef(0) // the newest load wins: an older answer (a slow poll) never overwrites a newer one
+  const pending = useRef(0) // loads in flight
 
   const load = useCallback(async () => {
+    const mine = ++seq.current
+    pending.current++
     try {
-      setDetail(await getAdminTemplate(id))
+      const d = await getAdminTemplate(id)
+      if (mine !== seq.current) return
+      setHeld({ id, detail: d })
       setLoadError(null)
       setNotFound(false)
     } catch (e) {
+      if (mine !== seq.current) return
       if (e instanceof ApiError && e.status === 404) setNotFound(true)
       else setLoadError(messageOf(e)[0]) // the last loaded detail stays on screen
+    } finally {
+      pending.current--
     }
   }, [id])
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- a new id starts clean, then fetches
+    setLoadError(null)
+    setNotFound(false)
     if (isAdmin) void load()
   }, [isAdmin, load])
 
@@ -253,7 +265,10 @@ export default function TemplateDetailPage({ me }: { me: MeDto | null }) {
   const polling = !!detail?.jobs.some(isActiveJob)
   useEffect(() => {
     if (!polling) return
-    const timer = setInterval(() => void load(), JOB_POLL_MS)
+    const timer = setInterval(() => {
+      if (document.hidden || pending.current > 0) return // skip while the tab is hidden or a request is still running
+      void load()
+    }, JOB_POLL_MS)
     return () => clearInterval(timer)
   }, [polling, load])
 

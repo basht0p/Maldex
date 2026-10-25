@@ -67,7 +67,13 @@ export function useTemplateJobLive(jobId: string | null, createConnection: () =>
         await conn.invoke('JoinTemplateJob', jobId)
         const dto = await getTemplateJob(jobId)
         if (cancelled) return
-        setJob((held) => (pushed ? held : mergeJob(held, dto)))
+        setJob((held) => {
+          if (!pushed) return mergeJob(held, dto)
+          // A push won over the GET, but pushes lack the requester: still take the GET's name.
+          return held && held.id === dto.id && held.requestedByName == null && dto.requestedByName != null
+            ? { ...held, requestedByName: dto.requestedByName }
+            : held
+        })
         setLoadError(null)
         failures = 0
       } catch (e) {

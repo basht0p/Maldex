@@ -95,4 +95,19 @@ describe('useTemplateJobLive merge', () => {
     act(() => push({ id: 'job-1', state: 'Verifying', steps: [step('a', 1), step('b', 2), step('c', 3), step('d', 4)] } as TemplateJobDto))
     expect(result.current.job?.steps).toHaveLength(4)
   })
+
+  it('takes the requester from the GET when a push arrived first without one', async () => {
+    let push!: (d: TemplateJobDto) => void
+    class PushHub extends FlakyHub {
+      on(name: string, cb: (...args: never[]) => void) { if (name === 'templateJob') push = cb as unknown as typeof push }
+    }
+    getTemplateJob.mockImplementation(async () => {
+      push({ id: 'job-1', state: 'Sealing', requestedByName: null } as TemplateJobDto) // lands while the GET is in flight
+      return { id: 'job-1', state: 'Configuring', requestedByName: 'Ada' }
+    })
+    const { result } = renderHook(() => useTemplateJobLive('job-1', () => new PushHub()))
+    await settle()
+    expect(result.current.job?.state).toBe('Sealing') // the push still wins
+    expect(result.current.job?.requestedByName).toBe('Ada')
+  })
 })

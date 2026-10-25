@@ -2,7 +2,7 @@ import { Link } from 'react-router-dom'
 import { EmptyState } from '../kit/EmptyState'
 import { ErrorBanner } from '../kit/ErrorBanner'
 import { formatFileSize } from '../kit/format'
-import { RelativeTime } from '../kit/RelativeTime'
+import { Duration, RelativeTime } from '../kit/RelativeTime'
 import { Skeleton } from '../kit/Skeleton'
 import { useSystemStatus } from '../live/useSystemStatus'
 import { safeText } from '../util/safeText'
@@ -45,7 +45,17 @@ export default function StatusPage() {
           <div className={styles.panel}>
             <h2>Disks</h2>
             {status.disks.map((d) => {
-              const frac = d.totalBytes > 0 ? d.freeBytes / d.totalBytes : 0
+              if (d.totalBytes <= 0) {
+                return (
+                  <div key={d.name} className={styles.disk} data-level="ok">
+                    <div className={styles.diskHead}>
+                      <span><strong>{d.name}</strong> <span className={styles.path}>{safeText(d.path)}</span></span>
+                      <span>Unknown size</span>
+                    </div>
+                  </div>
+                )
+              }
+              const frac = d.freeBytes / d.totalBytes
               const level = frac < 0.05 ? 'red' : frac < 0.1 ? 'amber' : ''
               return (
                 <div key={d.name} className={styles.disk} data-level={level || 'ok'}>
@@ -74,7 +84,7 @@ export default function StatusPage() {
                     <tr key={w.name}>
                       <td>{w.name}</td>
                       <td>{w.lastTickAt ? <RelativeTime iso={w.lastTickAt} /> : 'Not yet'}</td>
-                      <td>{w.expectedIntervalSec} s</td>
+                      <td><Duration seconds={w.expectedIntervalSec} /></td>
                       <td>{w.stalled && <span className={styles.stalled}>Stalled</span>}</td>
                     </tr>
                   ))}
