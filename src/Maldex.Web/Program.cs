@@ -49,11 +49,33 @@ if (builder.Configuration["Maldex:Mode"] == "Real")
     else RealSettings.Insert(builder.Configuration.Sources, builder.Environment.ContentRootFileProvider);
 }
 
-// Fail fast on an unconfigured packaged install, with a hint instead of a stack trace.
+// `Maldex.Web --print-paths` prints the content root, the web root and the JSON config files that were found, then exits 0
+// (a packaged install sets ASPNETCORE_CONTENTROOT=/opt/maldex/app in its unit; without it the content root is the cwd).
+if (args.Contains("--print-paths"))
+{
+    Console.WriteLine($"ContentRoot={builder.Environment.ContentRootPath}");
+    Console.WriteLine($"WebRoot={builder.Environment.WebRootPath}");
+    Console.WriteLine($"IndexHtml={(builder.Environment.WebRootFileProvider.GetFileInfo("index.html").Exists ? "present" : "missing")}");
+    foreach (var json in builder.Configuration.Sources.OfType<Microsoft.Extensions.Configuration.Json.JsonConfigurationSource>())
+    {
+        var file = json.Path is null ? null : json.FileProvider?.GetFileInfo(json.Path);
+        if (file is { Exists: true }) Console.WriteLine($"Config={file.PhysicalPath ?? json.Path}");
+    }
+    return 0;
+}
+
+// Fail fast on an unconfigured packaged install, with a hint instead of a stack trace, and with EX_CONFIG (78) so the unit's
+// RestartPreventExitStatus=78 stops systemd from restarting it until the admin fixes the configuration.
 if (builder.Environment.IsProduction() && string.IsNullOrWhiteSpace(builder.Configuration.GetConnectionString("Maldex")))
 {
     Console.Error.WriteLine(StartupChecks.MissingConnectionMessage);
-    return 1;
+    return StartupChecks.ConfigErrorExitCode;
+}
+if (builder.Environment.IsProduction() && builder.Configuration["Maldex:Mode"] == "Real"
+    && StartupChecks.RealRootProblem(builder.Configuration["Maldex:Real:Root"]) is { } rootProblem)
+{
+    Console.Error.WriteLine(rootProblem);
+    return StartupChecks.ConfigErrorExitCode;
 }
 
 builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));

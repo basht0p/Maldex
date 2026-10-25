@@ -26,6 +26,23 @@ done
 # the app binary runs
 if /opt/maldex/app/Maldex.Web --version >/dev/null 2>&1; then pass "Maldex.Web --version"; else fail "/opt/maldex/app/Maldex.Web --version did not exit 0"; fi
 
+# Started the way the unit starts it (its Environment= lines, as maldex, from /var/lib/maldex): the content root, the SPA and
+# the settings files resolve under /opt/maldex/app, not the working directory.
+unit=/usr/lib/systemd/system/maldex.service; [ -f "$unit" ] || unit=/lib/systemd/system/maldex.service
+if [ -f "$unit" ]; then
+  mapfile -t unit_env < <(sed -n 's/^Environment=//p' "$unit")
+  paths="$(cd /var/lib/maldex && runuser -u maldex -- env "${unit_env[@]}" /opt/maldex/app/Maldex.Web --print-paths 2>&1)"
+  if printf '%s\n' "$paths" | grep -qE '^ContentRoot=/opt/maldex/app/?$' \
+     && printf '%s\n' "$paths" | grep -qx 'IndexHtml=present' \
+     && printf '%s\n' "$paths" | grep -qx 'Config=/opt/maldex/app/appsettings.json' \
+     && printf '%s\n' "$paths" | grep -qx 'Config=/opt/maldex/app/appsettings.Real.json' \
+     && printf '%s\n' "$paths" | grep -qx 'Config=/opt/maldex/app/appsettings.Package.json'; then
+    pass "unit environment: content root, SPA and settings under /opt/maldex/app"
+  else
+    fail "unit environment: content root, SPA or settings not under /opt/maldex/app"; printf '%s\n' "$paths" >&2
+  fi
+fi
+
 # maldex-setup --check runs without crashing and reports FAIL lines (no KVM in CI). FAIL lines go to stderr.
 if [ -x /usr/sbin/maldex-setup ]; then
   out="$(/usr/sbin/maldex-setup --check 2>&1)"; rc=$?
