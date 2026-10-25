@@ -8,7 +8,7 @@ vi.mock('../api/client', async (orig) => ({
   getSystemStatus: (...a: unknown[]) => getSystemStatus(...a),
 }))
 
-import { SystemStatusProvider } from '../live/useSystemStatus'
+import { SystemStatusProvider } from '../live/SystemStatusProvider'
 import { renderWithKit } from '../test/renderWithKit'
 import StatusPage from './StatusPage'
 

@@ -11,7 +11,8 @@ import { ThemeSwitch } from './kit/ThemeSwitch'
 import { ToastProvider } from './kit/Toaster'
 import { applyTheme, loadTheme } from './kit/theme'
 import { useShortcuts } from './kit/useShortcuts'
-import { SystemStatusProvider, useSystemStatus } from './live/useSystemStatus'
+import { SystemStatusProvider } from './live/SystemStatusProvider'
+import { useSystemStatus } from './live/useSystemStatus'
 import MediaPage from './pages/MediaPage'
 import OrgsAdminPage from './pages/OrgsAdminPage'
 import StatusPage from './pages/StatusPage'
@@ -53,14 +54,19 @@ function AdminLinks() {
       {ADMIN_LINKS.map((l) => (
         <NavLink key={l.label} to={l.to}>
           {l.label}
-          {l.label === 'Status' && attention && <span className={styles.attention} role="img" aria-label="needs attention" />}
+          {l.label === 'Status' && attention && <AttentionDot />}
         </NavLink>
       ))}
     </>
   )
 }
 
+function AttentionDot() {
+  return <span className={styles.attention} role="img" aria-label="needs attention" />
+}
+
 function AdminMenu({ narrow }: { narrow: boolean }) {
+  const { attention } = useSystemStatus()
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -77,7 +83,7 @@ function AdminMenu({ narrow }: { narrow: boolean }) {
   }
   return (
     <div ref={ref} className={styles.menu}>
-      <button type="button" className={styles.menuButton} aria-haspopup="true" aria-expanded={open} onClick={() => setOpen((o) => !o)}>Admin</button>
+      <button type="button" className={styles.menuButton} aria-haspopup="true" aria-expanded={open} onClick={() => setOpen((o) => !o)}>Admin{attention && <AttentionDot />}</button>
       {open && (
         <div className={styles.menuPanel} onClick={() => setOpen(false)}>
           <AdminLinks />

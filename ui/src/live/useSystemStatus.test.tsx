@@ -8,7 +8,8 @@ vi.mock('../api/client', async (orig) => ({
   getSystemStatus: (...a: unknown[]) => getSystemStatus(...a),
 }))
 
-import { SystemStatusProvider, useSystemStatus } from './useSystemStatus'
+import { SystemStatusProvider } from './SystemStatusProvider'
+import { useSystemStatus } from './useSystemStatus'
 
 const status = (over: Partial<SystemStatusDto> = {}): SystemStatusDto => ({
   vmSlot: { capacity: 1, busy: 0, holders: [] }, queueDepth: 0, runningTasks: 0, activeJobs: 0,
@@ -70,6 +71,37 @@ describe('SystemStatusProvider', () => {
     getSystemStatus.mockRejectedValueOnce(new Error('boom'))
     await tick(5000)
     expect(screen.getByText(/boom/)).toBeInTheDocument()
+  })
+
+  it('clears status and error when disabled', async () => {
+    getSystemStatus.mockResolvedValueOnce(status({ queueDepth: 7 }))
+    const { rerender } = render(<SystemStatusProvider enabled><Probe /></SystemStatusProvider>)
+    await flush()
+    expect(screen.getByText(/queued 7/)).toBeInTheDocument()
+    rerender(<SystemStatusProvider enabled={false}><Probe /></SystemStatusProvider>)
+    expect(screen.getByText('none|ok|calm')).toBeInTheDocument()
+
+    getSystemStatus.mockRejectedValueOnce(new Error('boom'))
+    rerender(<SystemStatusProvider enabled><Probe /></SystemStatusProvider>)
+    await flush()
+    expect(screen.getByText(/boom/)).toBeInTheDocument()
+    rerender(<SystemStatusProvider enabled={false}><Probe /></SystemStatusProvider>)
+    expect(screen.getByText('none|ok|calm')).toBeInTheDocument()
+  })
+
+  it('skips ticks while a request is in flight so a slow server still updates', async () => {
+    let resolve!: (s: SystemStatusDto) => void
+    getSystemStatus.mockReset()
+    getSystemStatus.mockReturnValueOnce(new Promise<SystemStatusDto>((r) => { resolve = r }))
+    render(<SystemStatusProvider enabled><Probe /></SystemStatusProvider>)
+    await flush()
+    await tick(12_000)
+    expect(getSystemStatus).toHaveBeenCalledTimes(1)
+    await act(async () => { resolve(status({ queueDepth: 4 })) })
+    expect(screen.getByText(/queued 4/)).toBeInTheDocument()
+    getSystemStatus.mockResolvedValue(status({ queueDepth: 5 }))
+    await tick(5000)
+    expect(getSystemStatus).toHaveBeenCalledTimes(2)
   })
 
   it('flags attention for a disk under 10% free but not at exactly 10%', async () => {
