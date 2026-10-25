@@ -67,3 +67,34 @@ it('collapses the nav into a menu button under 768 px', async () => {
   await userEvent.setup().click(screen.getByRole('button', { name: 'Menu' }))
   expect(screen.getByRole('link', { name: 'Submit' })).toBeInTheDocument()
 })
+
+const statusBody = (stalled: boolean) => ({
+  vmSlot: { capacity: 1, busy: 0, holders: [] }, queueDepth: 0, runningTasks: 0, activeJobs: 0,
+  disks: [{ name: 'data', path: '/d', freeBytes: 50, totalBytes: 100 }],
+  workers: [{ name: 'orchestrator', lastTickAt: null, expectedIntervalSec: 5, stalled }],
+  recentFailures: [], generatedAt: '2026-10-25T10:00:00Z',
+})
+
+it('shows the attention dot on the Status link when a worker is stalled', async () => {
+  server.use(me('Admin'), http.get('/api/admin/status', () => HttpResponse.json(statusBody(true))))
+  window.history.pushState({}, '', '/admin/status')
+  render(<App />)
+  await screen.findByRole('heading', { name: 'System status' })
+  await userEvent.setup().click(await screen.findByRole('button', { name: 'Admin' }))
+  expect(within(screen.getByRole('link', { name: /Status/ })).getByRole('img', { name: 'needs attention' })).toBeInTheDocument()
+})
+
+it('does not request status for analysts or on non-admin pages', async () => {
+  let calls = 0
+  const status = http.get('/api/admin/status', () => { calls++; return HttpResponse.json(statusBody(false)) })
+  server.use(me('Analyst'), status)
+  window.history.pushState({}, '', '/admin/status')
+  const { unmount } = render(<App />)
+  await screen.findByText('Pat (Analyst)')
+  unmount()
+  server.use(me('Admin'), status)
+  window.history.pushState({}, '', '/')
+  render(<App />)
+  await screen.findByText('Pat (Admin)')
+  expect(calls).toBe(0)
+})
