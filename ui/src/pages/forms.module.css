@@ -1,7 +1,7 @@
 .form { display: grid; gap: 1rem; max-width: 640px; }
 .field { display: grid; gap: 0.25rem; }
 .field label, .legend { font-weight: 600; font-size: 0.9rem; }
-.field input[type='text'], .field input[type='number'], .field input[type='file'], .field select, .field input[type='url'] {
+.field input[type='text'], .field input[type='date'], .field input[type='number'], .field input[type='file'], .field select, .field input[type='url'] {
   padding: 0.45rem 0.55rem;
   border: 1px solid var(--mx-control);
   border-radius: var(--mx-radius-control);
