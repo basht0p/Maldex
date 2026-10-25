@@ -48,9 +48,16 @@ public static class DependencyInjection
             o.JobLogDir = RealPaths.Resolve(root, o.JobLogDir);
         });
         var mode = configuration["Maldex:Mode"];
-        if (string.IsNullOrEmpty(mode) || mode == "Fake")
+        var fakeMode = string.IsNullOrEmpty(mode) || mode == "Fake";
+        // A settle window that cannot work would refuse every seal or pass Defender unchecked: fail at startup instead.
+        services.AddSingleton<IValidateOptions<TemplateJobOptions>>(new DefenderSettleValidation(fakeMode));
+        services.AddOptions<TemplateJobOptions>().ValidateOnStart();
+        if (fakeMode)
         {
             services.TryAddSingleton<IProvisioningMediaBuilder, FakeProvisioningMediaBuilder>();
+            // The fake guest's Defender state never changes: one reading per check, not a minute of real time (unless configured).
+            if (configuration[$"{TemplateJobOptions.SectionName}:{nameof(TemplateJobOptions.DefenderSettleWindow)}"] is null)
+                services.Configure<TemplateJobOptions>(o => o.DefenderSettleWindow = TimeSpan.Zero);
             // The fake guest "runs" the agent sealing installed, which is the one ./build.sh agent left on disk: so an Edit, Refresh or
             // Build passes the agent check. Before that agent exists it reports the fake build id (the bundle cannot load then anyway).
             services.Replace(ServiceDescriptor.Singleton(sp =>
@@ -90,5 +97,11 @@ public static class DependencyInjection
         {
             return null;
         }
+    }
+
+    private sealed class DefenderSettleValidation(bool fakeMode) : IValidateOptions<TemplateJobOptions>
+    {
+        public ValidateOptionsResult Validate(string? name, TemplateJobOptions options) =>
+            TemplateJobOptions.DefenderSettleProblem(options, fakeMode) is { } problem ? ValidateOptionsResult.Fail(problem) : ValidateOptionsResult.Success;
     }
 }

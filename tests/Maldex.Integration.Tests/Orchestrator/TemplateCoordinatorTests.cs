@@ -88,6 +88,9 @@ internal sealed class SilenceableChannels(IAgentChannelFactory inner, FakeGuest 
     public int DropOnConnections { get => _dropConnections; set => _dropConnections = value; }
     private int _dropConnections = int.MaxValue;
 
+    /// <summary>Wraps each channel opened from now on (say, to script the guest's Defender readings).</summary>
+    public Func<VmHandle, IAgentChannel, IAgentChannel>? Wrap { get; set; }
+
     private readonly List<(Guid TaskId, ReplayAgentChannel Channel)> _opened = [];
 
     /// <summary>The commands sent on every channel opened to the VM of <paramref name="taskId"/>.</summary>
@@ -102,7 +105,8 @@ internal sealed class SilenceableChannels(IAgentChannelFactory inner, FakeGuest 
         if (Silent?.Invoke(vm) == true) return new ReplayAgentChannel([], 1, holdOpen: true, time, guest, vm.TaskId);
         var channel = await inner.ConnectAsync(vm, ct);
         if (channel is ReplayAgentChannel replay) lock (_opened) _opened.Add((vm.TaskId, replay));
-        return DropProvenanceRequests > 0 && Interlocked.Decrement(ref _dropConnections) >= 0 ? new ReconnectGapChannel((ReplayAgentChannel)channel, DropProvenanceRequests) : channel;
+        var result = DropProvenanceRequests > 0 && Interlocked.Decrement(ref _dropConnections) >= 0 ? new ReconnectGapChannel((ReplayAgentChannel)channel, DropProvenanceRequests) : channel;
+        return Wrap is { } wrap ? wrap(vm, result) : result;
     }
 }
 
@@ -1430,6 +1434,131 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         await TemplateCoordinatorBuildTests.DefenderStillOnThenOffAsync(rig, publisher, id, run);
 
         Assert.Equal(2, (await rig.VersionsAsync()).Count);
+    }
+
+    /// <summary>
+    /// An Edit job on the default Defender settle window (60 s, a reading every 5 s, 10 readings), in Configuring. A hung reading
+    /// gives up after 10 s.
+    /// </summary>
+    private async Task<(TemplateJobRig Rig, Guid Id, Task Run)> ConfiguringWithSettleWindowAsync()
+    {
+        var defaults = new TemplateJobOptions();
+        var rig = await TemplateJobRig.CreateAsync(sql, new Dictionary<string, string?>
+        {
+            ["Maldex:Templates:Jobs:DefenderSettleWindow"] = defaults.DefenderSettleWindow.ToString(),
+            ["Maldex:Templates:Jobs:DefenderSettleInterval"] = defaults.DefenderSettleInterval.ToString(),
+            ["Maldex:Templates:Jobs:DefenderSettleMinReadings"] = defaults.DefenderSettleMinReadings.ToString(),
+            ["Maldex:Templates:Jobs:ProvenanceTimeout"] = "00:00:10",
+        });
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit);
+        var run = rig.Start(id);
+        await rig.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+        return (rig, id, run);
+    }
+
+    /// <summary>The next connection to the job's guest (the Defender check's) reads Defender as <paramref name="script"/> says.</summary>
+    private static Func<DefenderScriptChannel?> ScriptTheCheck(TemplateJobRig rig, Guid id, Func<TimeSpan, DefenderReading> script)
+    {
+        DefenderScriptChannel? check = null;
+        rig.Channels.Wrap = (vm, ch) => vm.TaskId == id && check is null ? check = new DefenderScriptChannel(ch, rig.H.Time, script) : ch;
+        return () => check;
+    }
+
+    /// <summary>Requests the seal and waits until it is refused: the job stays in Configuring with <paramref name="message"/>, nothing delivered or sealed.</summary>
+    private static async Task AssertSealRefusedAsync(TemplateJobRig rig, Guid id, Task run, string message)
+    {
+        await rig.RequestSealAsync(id);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while ((await rig.JobAsync(id)).SealRequestedAt is not null)
+        {
+            Assert.False(run.IsCompleted, $"the job ended ({(await rig.JobAsync(id)).State}) instead of refusing the seal");
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(60), "the seal request was never answered");
+            rig.H.Time.Advance(TimeSpan.FromMilliseconds(50));
+            await Task.Delay(1, Ct);
+        }
+
+        var job = await rig.JobAsync(id);
+        Assert.Equal((TemplateJobState.Configuring, message), (job.State, job.Message));
+        Assert.Empty(rig.Guest.AppliedComponentIds);
+        Assert.Empty(rig.Store.Sealed);
+        await rig.RequestCancelAsync(id);
+        await rig.PumpAsync(run);
+    }
+
+    [Fact]
+    public async Task Seal_DefenderTurningOnWithinTheSettleWindow_IsRefused()
+    {
+        var (rig, id, run) = await ConfiguringWithSettleWindowAsync();
+        await using var _ = rig;
+        // The check's guest reads off, off, then on (Defender settling after boot): one reading would seal it with Defender on.
+        ScriptTheCheck(rig, id, at => at < TimeSpan.FromSeconds(8) ? DefenderReading.Off : DefenderReading.On);
+
+        await AssertSealRefusedAsync(rig, id, run, TemplateCoordinator.DefenderStillOn);
+    }
+
+    [Fact]
+    public async Task Seal_OffThenEveryLaterReadingFails_IsRefused_AsUnconfirmed()
+    {
+        var (rig, id, run) = await ConfiguringWithSettleWindowAsync();
+        await using var _ = rig;
+        ScriptTheCheck(rig, id, at => at < TimeSpan.FromSeconds(4) ? DefenderReading.Off : DefenderReading.Refused);
+
+        await AssertSealRefusedAsync(rig, id, run, "Defender state could not be confirmed; wait a minute and press Seal again");
+    }
+
+    [Fact]
+    public async Task Seal_OffThenAHang_IsRefused_AsUnconfirmed()
+    {
+        var (rig, id, run) = await ConfiguringWithSettleWindowAsync();
+        await using var _ = rig;
+        ScriptTheCheck(rig, id, at => at < TimeSpan.FromSeconds(4) ? DefenderReading.Off : DefenderReading.Silent);
+
+        await AssertSealRefusedAsync(rig, id, run, TemplateCoordinator.DefenderUnconfirmed);
+    }
+
+    [Fact]
+    public async Task Seal_DefenderOffThroughoutTheWindow_DespiteAFailedReading_Seals()
+    {
+        var (rig, id, run) = await ConfiguringWithSettleWindowAsync();
+        await using var _ = rig;
+        var check = ScriptTheCheck(rig, id, at => at >= TimeSpan.FromSeconds(4) && at < TimeSpan.FromSeconds(8) ? DefenderReading.Refused : DefenderReading.Off);
+
+        await rig.RequestSealAsync(id);
+        await rig.PumpAsync(run);
+
+        Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
+        Assert.True(check()!.Readings.Count >= 10, $"the check took only {check()!.Readings.Count} readings");
+    }
+
+    [Fact]
+    public async Task Cancel_DuringTheDelayBetweenDefenderReadings_EndsCancelled()
+    {
+        var (rig, id, run) = await ConfiguringWithSettleWindowAsync();
+        await using var _ = rig;
+        var check = ScriptTheCheck(rig, id, _ => DefenderReading.Off);
+
+        await rig.RequestSealAsync(id);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while ((check()?.Readings.Count ?? 0) < 2) // the second reading is in: the check now waits 5 s for the third
+        {
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(60), "the Defender check never took two readings");
+            rig.H.Time.Advance(TimeSpan.FromMilliseconds(20));
+            await Task.Delay(1, Ct);
+        }
+        var readings = check()!.Readings.Count;
+        await rig.RequestCancelAsync(id);
+        while (!run.IsCompleted) // only as much fake time as the watcher needs to see the cancel, far less than the 5 s delay
+        {
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(60), "the job did not end");
+            rig.H.Time.Advance(TimeSpan.FromMilliseconds(20));
+            await Task.Delay(5, Ct);
+        }
+        await run;
+
+        var job = await rig.JobAsync(id);
+        Assert.Equal((TemplateJobState.Cancelled, (string?)null), (job.State, job.FailureReason));
+        Assert.Equal(readings, check()!.Readings.Count); // ended inside the delay, without another reading
+        Assert.Empty(rig.Store.Sealed);
     }
 
     [Fact]

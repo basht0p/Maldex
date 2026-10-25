@@ -64,6 +64,7 @@ public sealed class TemplateCoordinator(
     public const string DefenderGuidance = "Defender real-time protection is on. In the console open Windows Security, turn off Tamper Protection, then Real-time protection, then press Seal.";
     /// <summary>The message when a Seal was refused because the pre-seal check found real-time protection still on.</summary>
     public const string DefenderStillOn = "Defender real-time protection is still on; turn it off in the console, then press Seal again.";
+    public const string DefenderUnconfirmed = "Defender state could not be confirmed; wait a minute and press Seal again";
 
     private const int MaxSaveAttempts = 5;
     /// <summary>Tries to record a terminal state (the database may be briefly unreachable), waiting 1, 2, 4 … s in between.</summary>
@@ -562,7 +563,8 @@ public sealed class TemplateCoordinator(
 
     /// <summary>
     /// Waits for the admin's seal (<see cref="WaitForSealAsync"/>) and checks Defender before anything is installed or isolated
-    /// (decision 2, Build and Edit): real-time protection on refuses the seal — the request is cleared so the console opens again,
+    /// (decision 2, Build and Edit): real-time protection on, or a state that did not settle off (R19, <see cref="DefenderUnconfirmed"/>),
+    /// refuses the seal — the request is cleared so the console opens again,
     /// and the admin is told why, and the idle deadline restarts from the refusal (<see cref="TemplateJob.LastConsoleAt"/>), so the
     /// admin has the whole idle timeout to turn it off — and the wait goes on. An unreadable state does not block. A cancel request
     /// found by the refusal ends the job as a cancel does. Returns the discard (idle timeout or cancel), or null to seal.
@@ -572,7 +574,9 @@ public sealed class TemplateCoordinator(
         while (true)
         {
             if (await WaitForSealAsync(db, job.Id, ct).ConfigureAwait(false) is { } idle) return idle;
-            if (await DefenderCheckAsync(vm, job.Id, o, ct).ConfigureAwait(false) != true) return null;
+            var defender = await DefenderCheckAsync(vm, job.Id, o, ct).ConfigureAwait(false);
+            if (defender is DefenderSettlement.Off or DefenderSettlement.Unreadable) return null;
+            var why = defender == DefenderSettlement.On ? DefenderStillOn : DefenderUnconfirmed;
 
             var refused = false;
             await SaveJobAsync(db, job.Id, j =>
@@ -581,21 +585,23 @@ public sealed class TemplateCoordinator(
                 if (j.CancelRequestedAt is not null) return false; // the cancel wins
                 j.SealRequestedAt = null;
                 j.LastConsoleAt = time.GetUtcNow();
-                j.Message = DefenderStillOn;
+                j.Message = why;
                 return refused = true;
             }, [], ct, publish: true).ConfigureAwait(false);
             if (!refused) return new Discarded(CancelledByAdmin, job.RequestedByUserId);
-            logger.LogInformation("Template job {JobId}: seal refused, Defender real-time protection is still on.", job.Id);
+            logger.LogInformation("Template job {JobId}: seal refused, Defender real-time protection is {Defender}.", job.Id,
+                defender == DefenderSettlement.On ? "still on" : "not confirmed off");
         }
     }
 
     private const string DefenderCheckFailed = "the guest agent did not answer the Defender check; not sealing";
 
     /// <summary>
-    /// The pre-seal Defender check: one provenance round trip on a fresh channel (no ready wait, R25), closed again afterwards.
-    /// Returns the guest's real-time protection state (null: unreadable). No answer or a refusal fails the job.
+    /// The pre-seal Defender check: provenance readings over <see cref="TemplateJobOptions.DefenderSettleWindow"/> on a fresh channel
+    /// (no ready wait, R25), closed again afterwards. Returns the guest's settled real-time protection state
+    /// (<see cref="GuestSession.AskSettledProvenanceAsync"/>). No successful reading fails the job.
     /// </summary>
-    private async Task<bool?> DefenderCheckAsync(VmHandle vm, Guid jobId, TemplateJobOptions o, CancellationToken ct)
+    private async Task<DefenderSettlement> DefenderCheckAsync(VmHandle vm, Guid jobId, TemplateJobOptions o, CancellationToken ct)
     {
         IAgentChannel channel;
         try
@@ -617,8 +623,8 @@ public sealed class TemplateCoordinator(
             await using var session = new GuestSession(channel);
             try
             {
-                var answer = await session.AskProvenanceWithRetryAsync(o.ProvenanceRetryInterval, o.ProvenanceTimeout, time, ct).ConfigureAwait(false);
-                return answer.RealTimeProtectionEnabled;
+                var settled = await session.AskSettledProvenanceAsync(o, o.ProvenanceTimeout, time, ct).ConfigureAwait(false);
+                return settled.Defender;
             }
             catch (Exception) when (ct.IsCancellationRequested)
             {
