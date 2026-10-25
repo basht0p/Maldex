@@ -146,6 +146,15 @@ test_downloads_skip_and_refetch() {
   check "a file that already verifies is not downloaded again" not_logged '^curl .*Sysmon.zip'
   check "a corrupt file is fetched again" grep -q '^curl .*virtio-win.iso' "$STUB_LOG"
   check "the re-fetched file verifies" cmp -s "$T/srv/virtio-win.iso" "$T/data/.data/vm/iso/virtio-win.iso"
+  check "without SELinux, restorecon is not run" not_logged '^restorecon'
+  teardown
+
+  setup_sandbox; write_config
+  stub selinuxenabled 'exit 0'
+  stub restorecon 'exit 0'
+  touch "$T/srv/guestfs-fail"
+  run_setup
+  check "with SELinux enabled, the downloads step relabels the VM tree" grep -qx "restorecon -R $T/data/.data/vm" "$STUB_LOG"
   teardown
 }
 

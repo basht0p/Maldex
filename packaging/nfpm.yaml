@@ -22,7 +22,9 @@ description: |-
   The maldex user gets a root-equivalent sudo grant (/etc/sudoers.d/maldex): install only on a host dedicated to Maldex.
   RHEL 9: enable EPEL (and CRB) first. From EPEL: suricata, guacd, libguac-client-vnc, genisoimage, wimlib-utils.
   INetSim is not packaged for EL9 (neither in the base repositories nor in EPEL): install it separately so that
-  /usr/bin/inetsim and /var/lib/inetsim exist (maldex-setup checks both).
+  /usr/bin/inetsim and /var/lib/inetsim exist (maldex-setup checks both), and create its system user and group
+  `inetsim` (useradd --system --user-group --no-create-home --shell /usr/sbin/nologin inetsim), which Maldex maps into
+  the per-run INetSim user namespace.
 
 # Ubuntu 24.04
 depends:
@@ -189,12 +191,14 @@ contents:
     packager: deb
     file_info:
       mode: 0640
+      group: maldex
   - src: packaging/stage/etc/appsettings.Production.rpm.json
     dst: /etc/maldex/appsettings.Production.json
     type: config|noreplace
     packager: rpm
     file_info:
       mode: 0640
+      group: maldex
   - src: deploy/host/maldex-host-guard.nft
     dst: /etc/maldex/maldex-host-guard.nft
     type: config|noreplace
@@ -221,6 +225,8 @@ contents:
       mode: 0644
 
 scripts:
+  # preinstall creates the users before unpacking, so the config file above lands as root:maldex.
+  preinstall: packaging/scripts/preinstall.sh
   postinstall: packaging/scripts/postinstall.sh
   preremove: packaging/scripts/preremove.sh
   postremove: packaging/scripts/postremove.sh

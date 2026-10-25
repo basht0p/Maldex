@@ -493,8 +493,14 @@ cmd_package() {
 
   # 1-2. the SPA, then the self-contained web app (it hosts the SPA from wwwroot)
   cmd_build_spa
-  dotnet publish src/Maldex.Web -c Release -r linux-x64 --self-contained -o "$PWD/$opt/app" --nologo -v q
+  # Stamped with the package version: Maldex.Web --version prints it (InformationalVersion, no +commit suffix appended);
+  # Version takes the numeric core (assembly and file versions accept only up to four numbers).
+  local core
+  core="$(grep -oE '^[0-9]+(\.[0-9]+){0,3}' <<<"$deb_version")"
+  dotnet publish src/Maldex.Web -c Release -r linux-x64 --self-contained -o "$PWD/$opt/app" --nologo -v q \
+    "-p:Version=$core" "-p:InformationalVersion=$deb_version" -p:IncludeSourceRevisionInInformationalVersion=false
   [ -x "$opt/app/Maldex.Web" ] || { echo "package: the publish did not produce Maldex.Web" >&2; return 1; }
+  printf '%s\n' "$deb_version" > "$PKG_STAGE/VERSION"   # read by packaging/tests/check-package.sh
   [ -f "$opt/app/appsettings.Package.json" ] || { echo "package: appsettings.Package.json is not in the publish output" >&2; return 1; }
   [ -f "$opt/app/wwwroot/index.html" ] || { echo "package: the SPA is not in the publish output" >&2; return 1; }
 

@@ -99,7 +99,7 @@ scripts_parse() {
     [ -f "$f" ] || { OUT+="missing: $f"$'\n'; continue; }
     bash -n "$f" 2>>/dev/null || OUT+="bash -n failed: $f"$'\n'
   done
-  for f in postinstall preremove postremove; do [ -f "$PKG/scripts/$f.sh" ] || OUT+="missing: scripts/$f.sh"$'\n'; done
+  for f in preinstall postinstall preremove postremove; do [ -f "$PKG/scripts/$f.sh" ] || OUT+="missing: scripts/$f.sh"$'\n'; done
   # The install scripts run under /bin/sh (rpm scriptlets; the deb maintainer scripts' shebang), so they must be POSIX.
   if command -v dash >/dev/null 2>&1; then
     for f in "$PKG"/scripts/*.sh; do [ -f "$f" ] && { dash -n "$f" 2>/dev/null || OUT+="dash -n failed: $f"$'\n'; }; done
@@ -154,20 +154,45 @@ done
 # ---- systemd units ----
 if command -v systemd-analyze >/dev/null 2>&1; then
   units_verify() {
-    # verify checks that ExecStart binaries exist; the packaged ones are not on this host, so point them at stand-ins.
+    # verify checks that ExecStart binaries exist; the packaged app is not on this host, so it points at a stand-in.
     local tmp f out
     tmp="$(mktemp -d)"
     for f in "$PKG"/systemd/*.service; do
       sed -E 's#^ExecStart=/opt/maldex/app/Maldex.Web#ExecStart=/bin/true#' "$f" > "$tmp/$(basename "$f")"
     done
     out="$(cd "$tmp" && SYSTEMD_LOG_LEVEL=warning systemd-analyze verify --man=no ./*.service 2>&1)" || true
-    # Unknown users and units this host does not have are not defects of the unit files.
-    out="$(grep -vE "(Failed to resolve user|guacd\.service|maldex-host-guard\.service: (Unit|Failed)|network-online)" <<<"$out" || true)"
     rm -rf "$tmp"
     OUT="$out"
     [ -z "$out" ]
   }
   check "systemd-analyze verify packaging/systemd/*.service" units_verify
+
+  # The drop-in over stand-ins for both distro guacd units (Ubuntu: forking, /etc/default/guacd; EPEL: -f $OPTS from
+  # /etc/sysconfig/guacd). Each stand-in's own ExecStart names a binary that does not exist, so verify fails unless the drop-in
+  # resets it; the drop-in's guacd points at /bin/true because guacd is not installed here.
+  guacd_dropin_verify() {
+    local tmp flavour out all=""
+    for flavour in ubuntu epel; do
+      tmp="$(mktemp -d)"
+      mkdir -p "$tmp/guacd.service.d"
+      if [ "$flavour" = ubuntu ]; then
+        printf '%s\n' '[Unit]' 'Description=stand-in' '[Service]' 'Type=forking' 'PIDFile=/run/guacd/guacd.pid' \
+          'EnvironmentFile=-/etc/default/guacd' 'ExecStart=/nonexistent/guacd $DAEMON_ARGS -b $LISTEN_ADDRESS -l $LISTEN_PORT' \
+          '[Install]' 'WantedBy=multi-user.target' > "$tmp/guacd.service"
+      else
+        printf '%s\n' '[Unit]' 'Description=stand-in' '[Service]' 'EnvironmentFile=-/etc/sysconfig/guacd' \
+          'ExecStart=/nonexistent/guacd -f $OPTS' 'Restart=on-failure' '[Install]' 'WantedBy=multi-user.target' > "$tmp/guacd.service"
+      fi
+      sed -E 's#^ExecStart=/usr/sbin/guacd #ExecStart=/bin/true #' "$PKG/systemd/guacd-maldex.conf" > "$tmp/guacd.service.d/maldex.conf"
+      out="$(cd "$tmp" && SYSTEMD_UNIT_PATH="$tmp:" SYSTEMD_LOG_LEVEL=warning systemd-analyze verify --man=no guacd.service 2>&1)" \
+        || out+=$'\n'"(systemd-analyze exited non-zero)"
+      rm -rf "$tmp"
+      [ -z "$out" ] || all+="$flavour: $out"$'\n'
+    done
+    OUT="$all"
+    [ -z "$all" ]
+  }
+  check "systemd-analyze verify the guacd drop-in over the Ubuntu and EPEL units" guacd_dropin_verify
 else
   skip "systemd-analyze verify (systemd-analyze is not installed)"
 fi
@@ -181,6 +206,12 @@ check "maldex.service: PLAYWRIGHT_BROWSERS_PATH" unit_has "Environment=PLAYWRIGH
 check "maldex.service: MALDEX_EXTRA_CONFIG" unit_has "Environment=MALDEX_EXTRA_CONFIG=$EXTRA_CONFIG"
 check "maldex.service: ExecStart=/opt/maldex/app/Maldex.Web" unit_has "ExecStart=/opt/maldex/app/Maldex.Web"
 check "maldex.service: WorkingDirectory=/var/lib/maldex" unit_has "WorkingDirectory=/var/lib/maldex"
+check "maldex.service: Requires=maldex-host-guard.service" unit_has "Requires=maldex-host-guard.service"
+
+config_group() { [ "$(grep -cE '^      group: maldex$' "$NFPM")" -ge 2 ] || { OUT="the /etc/maldex config entries lack file_info group: maldex"; return 1; }; }
+check "nfpm.yaml: appsettings.Production.json is group maldex (both formats)" config_group
+preinstall_wired() { grep -qxF '  preinstall: packaging/scripts/preinstall.sh' "$NFPM"; }
+check "nfpm.yaml wires preinstall.sh (the users exist before unpacking)" preinstall_wired
 
 guard_unit() { local u="$PKG/systemd/maldex-host-guard.service"; grep -qxF "ExecStart=/usr/sbin/nft -f /etc/maldex/maldex-host-guard.nft" "$u" && grep -qxF "Type=oneshot" "$u"; }
 check "maldex-host-guard.service loads /etc/maldex/maldex-host-guard.nft" guard_unit
@@ -213,8 +244,16 @@ deb_template() {
 check "the deb template names Ubuntu's OVMF paths" deb_template
 if [ -d "$PKG/stage" ]; then
   check "the staged rpm template names RHEL 9's edk2-ovmf paths" rpm_template
+  staged_version() {
+    local want got
+    want="$(cat "$PKG/stage/VERSION" 2>/dev/null)" || { OUT="packaging/stage/VERSION is missing"; return 1; }
+    got="$("$PKG/stage/opt/maldex/app/Maldex.Web" --version 2>&1)" || { OUT="Maldex.Web --version failed: $got"; return 1; }
+    OUT="package version '$want', Maldex.Web --version '$got'"
+    [ -n "$want" ] && [[ "$got" == "$want"* ]]
+  }
+  check "the staged Maldex.Web --version starts with the package version" staged_version
 else
-  skip "the staged rpm template (packaging/stage/ is absent; run with --stage)"
+  skip "the staged rpm template and Maldex.Web --version (packaging/stage/ is absent; run with --stage)"
 fi
 
 # The install scripts: the version-dependent branches nfpm hands each format's arguments to.

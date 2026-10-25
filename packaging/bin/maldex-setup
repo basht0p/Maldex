@@ -134,6 +134,8 @@ data_layout() {
            "$ISO_DIR" "$MEDIA_DIR" "$MALDEX_DATA/.data/artifacts" "$MALDEX_DATA/.data/mitm"; do
     app_dir "$d" || return 1
   done
+  # SELinux (RHEL): label the VM tree with the virt_image_t rule the package's %post registered.
+  if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then restorecon -R "$MALDEX_DATA/.data/vm" || return 1; fi
 }
 
 # File $1 of the pinned set into $ISO_DIR: kept when it already verifies, else copied from --offline or downloaded, then verified.
