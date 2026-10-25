@@ -35,6 +35,8 @@ public static class DependencyInjection
 
         if (!OperatingSystem.IsWindows()) services.AddSingleton<IArtifactStore, FileSystemArtifactStore>();
         services.AddSingleton<IDiskSpaceProbe, DiskSpaceProbe>();
+        services.Configure<Maldex.Infrastructure.Media.MediaOptions>(configuration.GetSection(Maldex.Infrastructure.Media.MediaOptions.SectionName));
+        services.AddSingleton<Maldex.Infrastructure.Media.SafeHttpFetcher>();
         // YARA is real in every mode; the yara binary is a host dependency, not a fake.
         services.AddSingleton<IYaraScanner, YaraCliScanner>();
 
