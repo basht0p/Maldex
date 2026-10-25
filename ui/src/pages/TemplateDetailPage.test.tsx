@@ -1,6 +1,6 @@
-import { act, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { Route, Routes } from 'react-router-dom'
+import { Link, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AdminTemplateDto, MeDto, TemplateDetailDto, TemplateJobDto, TemplateVersionDto } from '../api/types'
 
@@ -245,6 +245,25 @@ describe('TemplateDetailPage', () => {
     expect(screen.getByRole('link', { name: 'Back to templates' })).toHaveAttribute('href', '/admin/templates')
   })
 
+  it('never shows the previous template after the id changes', async () => {
+    let resolveOther!: (d: TemplateDetailDto) => void
+    getAdminTemplate.mockImplementation((id: string) => (id === 'other' ? new Promise((r) => { resolveOther = r }) : Promise.resolve(detail())))
+    renderWithKit(
+      <>
+        <Link to="/admin/templates/other">go other</Link>
+        <Routes>
+          <Route path="/admin/templates/:id" element={<TemplateDetailPage me={admin} />} />
+        </Routes>
+      </>,
+      { route: '/admin/templates/win11-golden' },
+    )
+    expect(await screen.findByRole('heading', { level: 1, name: 'Windows 11 Golden' })).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('link', { name: 'go other' }))
+    expect(screen.queryByRole('heading', { level: 1, name: 'Windows 11 Golden' })).toBeNull()
+    await act(async () => { resolveOther(detail(golden({ id: 'other', displayName: 'Other' }))) })
+    expect(await screen.findByRole('heading', { level: 1, name: 'Other' })).toBeInTheDocument()
+  })
+
   it('shows a load error with Retry', async () => {
     getAdminTemplate.mockRejectedValueOnce(new Error('boom'))
     renderPage()
@@ -395,6 +414,67 @@ describe('TemplateDetailPage', () => {
       expect(getAdminTemplate).toHaveBeenCalledTimes(2)
       expect(screen.getByRole('button', { name: 'Edit' })).toBeEnabled()
       expect(screen.getByRole('button', { name: 'Refresh components' })).toBeEnabled()
+    })
+
+    const running = () => detail(golden({ activeJobId: 'j5' }), [job({ id: 'j5', state: 'Sealing', endedAt: null })])
+    const deferred = <T,>() => {
+      let resolve!: (v: T) => void
+      const promise = new Promise<T>((r) => { resolve = r })
+      return { promise, resolve }
+    }
+
+    it('skips a tick while the tab is hidden', async () => {
+      vi.useFakeTimers()
+      getAdminTemplate.mockResolvedValue(running())
+      renderPage()
+      await tick(0)
+      const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
+      await tick(15000)
+      expect(getAdminTemplate).toHaveBeenCalledTimes(1)
+      hidden.mockReturnValue(false)
+      await tick(5000)
+      expect(getAdminTemplate).toHaveBeenCalledTimes(2)
+    })
+
+    it('skips a tick while a load is still in flight', async () => {
+      vi.useFakeTimers()
+      const slow = deferred<TemplateDetailDto>()
+      getAdminTemplate.mockResolvedValueOnce(running())
+      getAdminTemplate.mockReturnValueOnce(slow.promise)
+      renderPage()
+      await tick(0)
+      await tick(5000)
+      expect(getAdminTemplate).toHaveBeenCalledTimes(2)
+      await tick(15000)
+      expect(getAdminTemplate).toHaveBeenCalledTimes(2)
+      slow.resolve(running())
+      await tick(0)
+      getAdminTemplate.mockResolvedValue(running())
+      await tick(5000)
+      expect(getAdminTemplate).toHaveBeenCalledTimes(3)
+    })
+
+    it('an older poll answer arriving after an action reload does not overwrite it', async () => {
+      vi.useFakeTimers()
+      const stale = deferred<TemplateDetailDto>()
+      const p4 = version({ id: 'p4', number: 4, origin: 'Edit', role: 'Pending' })
+      const before = detail(golden({ versions: [p4, v3, v2] }), [job({ id: 'j5', state: 'Sealing', endedAt: null })])
+      getAdminTemplate.mockResolvedValueOnce(before) // initial
+      getAdminTemplate.mockReturnValueOnce(stale.promise) // the poll, slow
+      getAdminTemplate.mockResolvedValue(detail(golden(), [job({ id: 'j5', state: 'Published' })])) // the action's reload
+      publishTemplateVersion.mockResolvedValue(undefined)
+      renderPage()
+      await tick(0)
+      await tick(5000) // the poll starts and hangs
+      fireEvent.click(within(screen.getByRole('listitem', { name: 'v4' })).getByRole('button', { name: 'Publish v4' }))
+      await tick(0)
+      fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Publish' }))
+      await tick(0)
+      await tick(0)
+      expect(screen.queryByRole('listitem', { name: 'v4' })).toBeNull()
+      stale.resolve(before) // the old answer lands last
+      await tick(0)
+      expect(screen.queryByRole('listitem', { name: 'v4' })).toBeNull()
     })
 
     it('keeps the last data and offers Retry when a reload fails', async () => {
