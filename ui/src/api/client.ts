@@ -92,7 +92,9 @@ export const stopTask = (id: string) => post<void>(`/api/tasks/${encodeURICompon
 
 export const getProcesses = (id: string) => get<ProcessNodeDto[]>(`/api/tasks/${encodeURIComponent(id)}/processes`)
 export const getEvents = (id: string, q: EventsQuery = {}) =>
-  get<LiveEventDto[]>(`/api/tasks/${encodeURIComponent(id)}/events${query({ afterId: q.afterId, type: q.type, take: q.take })}`)
+  get<LiveEventDto[]>(`/api/tasks/${encodeURIComponent(id)}/events${query({ afterId: q.afterId, type: q.type, take: q.take, pid: q.pid, processId: q.processId, q: q.q })}`)
+export const eventsExportUrl = (id: string, format: 'csv' | 'json', q: Omit<EventsQuery, 'afterId' | 'take'> = {}) =>
+  `/api/tasks/${encodeURIComponent(id)}/events/export${query({ format, type: q.type, pid: q.pid, processId: q.processId, q: q.q })}`
 export const listArtifacts = (id: string) => get<ArtifactDto[]>(`/api/tasks/${encodeURIComponent(id)}/artifacts`)
 export const getTunnelToken = (id: string) => get<{ token: string }>(`/api/tasks/${encodeURIComponent(id)}/tunnel-token`)
 
