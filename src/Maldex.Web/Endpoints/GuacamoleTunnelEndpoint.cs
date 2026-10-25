@@ -83,6 +83,9 @@ public static class GuacamoleTunnelEndpoint
             .ExecuteUpdateAsync(s => s.SetProperty(j => j.LastConsoleAt, now), ct),
     };
 
+    /// <summary>The keep-alive could not touch the job for longer than half the idle timeout: the tunnel is closed rather than left open unnoticed.</summary>
+    private sealed class KeepAliveFailedException(Exception inner) : Exception("The console keep-alive keeps failing.", inner);
+
     private sealed class PolicyViolationException(string opcode) : Exception($"Instruction '{opcode}' is not allowed from the browser.");
 
     private const int MaxClientMessageBytes = 1_048_576;
@@ -176,13 +179,22 @@ public static class GuacamoleTunnelEndpoint
                 }
                 var stream = tcp.GetStream();
                 reader = new GuacamoleInstructionReader(new StreamReader(stream, new UTF8Encoding(false), false, 8192, leaveOpen: true));
-                using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                // A seal/cancel asking the console to close ends the handshake too (a normal close, below).
+                using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(ct, registration?.Closing ?? CancellationToken.None);
                 handshakeCts.CancelAfter(HandshakeTimeout);
                 var ready = await HandshakeAsync(stream, reader, endpoint, Clamp(width, DefaultWidth), Clamp(height, DefaultHeight), handshakeCts.Token);
 
                 await AuditAsync(db, time, userId, target, target.JoinAction, null, ct);
                 await TouchAsync(scopes, target, time, ct);
-                await RunAsync(ws, stream, reader, ready, target, options.Value, scopes, time, ct, registration?.Closing ?? CancellationToken.None);
+                await RunAsync(ws, stream, reader, ready, target, options.Value, scopes, time, log, ct, registration?.Closing ?? CancellationToken.None);
+            }
+            catch (OperationCanceledException) when (registration?.Closing.IsCancellationRequested == true && !ct.IsCancellationRequested)
+            {
+                // Asked to close (R22) while connecting: not a failure.
+                log.LogInformation("Tunnel for {Kind} {Id} closed while connecting.", target.Kind, id);
+                try { await TouchAsync(scopes, target, time, CancellationToken.None); }
+                catch (Exception) { /* the idle clock then runs from the last touch */ }
+                await CloseAsync(ws, WebSocketCloseStatus.NormalClosure, target.EndedClose);
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
             {
@@ -241,7 +253,7 @@ public static class GuacamoleTunnelEndpoint
 
     private static async Task RunAsync(
         WebSocket ws, Stream guacd, GuacamoleInstructionReader reader, string[] ready, TunnelTarget target, GuacamoleOptions options,
-        IServiceScopeFactory scopes, TimeProvider time, CancellationToken requestAborted, CancellationToken closing)
+        IServiceScopeFactory scopes, TimeProvider time, ILogger<GuacamoleTunnelLog> log, CancellationToken requestAborted, CancellationToken closing)
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(requestAborted, closing);
         var ct = cts.Token;
@@ -303,17 +315,29 @@ public static class GuacamoleTunnelEndpoint
         }, ct);
 
         // While a job's console is open the job counts as in use, however long: the idle discard is measured from the last touch.
-        var keepAlive = target.Touch is null ? Task.CompletedTask : Task.Run(async () =>
+        // A failing touch (any exception, a stray cancellation included) is logged and retried on the next tick; if none succeeds
+        // for longer than half the idle timeout the job is about to be discarded under an open console, so the tunnel closes.
+        var keepAlive = target.Touch is null ? null : Task.Run(async () =>
         {
+            var failureLimit = ConfigureIdleTimeout(scopes) / 2;
+            var lastTouched = time.GetUtcNow();
             using var timer = new PeriodicTimer(options.ConsoleKeepAliveInterval, time);
             while (await timer.WaitForNextTickAsync(ct))
             {
-                try { await TouchAsync(scopes, target, time, ct); }
-                catch (Exception ex) when (ex is not OperationCanceledException) { /* transient database error: try again next tick */ }
+                try
+                {
+                    await TouchAsync(scopes, target, time, ct);
+                    lastTouched = time.GetUtcNow();
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    log.LogWarning(ex, "Keeping the console of {Kind} {Id} alive failed; trying again on the next tick.", target.Kind, target.Id);
+                    if (time.GetUtcNow() - lastTouched > failureLimit) throw new KeepAliveFailedException(ex);
+                }
             }
         }, ct);
 
-        var first = await Task.WhenAny(down, up, watch);
+        var first = await Task.WhenAny(keepAlive is null ? [down, up, watch] : [down, up, watch, keepAlive]);
         var status = WebSocketCloseStatus.NormalClosure;
         var description = first == watch ? target.EndedClose : "The live view ended.";
         if (first == up && up.IsFaulted && up.Exception!.GetBaseException() is PolicyViolationException)
@@ -321,13 +345,24 @@ public static class GuacamoleTunnelEndpoint
             status = WebSocketCloseStatus.PolicyViolation;
             description = "Instruction not allowed.";
         }
+        else if (first == keepAlive)
+        {
+            status = WebSocketCloseStatus.InternalServerError;
+            description = "The console could not be kept alive.";
+        }
         cts.Cancel();
-        try { await Task.WhenAll(down, up, watch, keepAlive); }
-        catch (Exception ex) when (ex is OperationCanceledException or WebSocketException or IOException or InvalidDataException or FormatException or PolicyViolationException) { }
+        try { await Task.WhenAll(keepAlive is null ? [down, up, watch] : [down, up, watch, keepAlive]); }
+        catch (Exception ex) when (ex is OperationCanceledException or WebSocketException or IOException or InvalidDataException or FormatException or PolicyViolationException or KeepAliveFailedException) { }
         // Once more on the way out, so the idle clock starts from the disconnect.
         try { await TouchAsync(scopes, target, time, CancellationToken.None); }
         catch (Exception) { /* the idle clock then runs from the last touch */ }
         await CloseAsync(ws, status, description);
+    }
+
+    private static TimeSpan ConfigureIdleTimeout(IServiceScopeFactory scopes)
+    {
+        using var scope = scopes.CreateScope();
+        return scope.ServiceProvider.GetRequiredService<IOptions<TemplateJobOptions>>().Value.ConfigureIdleTimeout;
     }
 
     private static async Task<bool> IsActiveAsync(IServiceScopeFactory scopes, TunnelTarget target, CancellationToken ct)
@@ -354,7 +389,7 @@ public static class GuacamoleTunnelEndpoint
             var dto = (await TemplateEndpoints.JobDtosAsync(db, [job], sp.GetRequiredService<IOptions<TemplateJobOptions>>().Value, ct)).Single();
             await publisher.PublishAsync(dto, ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (!ct.IsCancellationRequested)
         {
             sp.GetService<ILogger<GuacamoleTunnelLog>>()?.LogWarning(ex, "Publishing the console touch of job {JobId} failed.", target.Id);
         }

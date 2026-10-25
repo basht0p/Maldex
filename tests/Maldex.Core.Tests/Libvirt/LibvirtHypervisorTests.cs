@@ -90,6 +90,33 @@ public sealed class LibvirtHypervisorTests : IDisposable
 
     [Fact]
     [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public async Task Start_Writable_RefusesADiskThatIsNotOwnerWritable_ASealedVersion()
+    {
+        SeedBase();
+        // A sealed template version is 0444: QEMU running as root would otherwise write straight through the mode.
+        var disk = Path.Combine(_opts.BaseImageDir, "win11-26h2.qcow2");
+        File.SetUnixFileMode(disk, UnixFileMode.UserRead | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
+
+        var ex = await Assert.ThrowsAsync<VmStartException>(() => Hv().StartAsync(Spec() with { Writable = true }, CancellationToken.None));
+
+        Assert.Contains("win11-26h2", ex.Message);
+        Assert.Contains("sealed", ex.Message);
+        Assert.Empty(_runner.Calls);
+        Assert.False(Directory.Exists(RunDirOf(VmHandle.For(Id))));
+    }
+
+    [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public async Task Start_NotWritable_StillBootsASealedDisk_ThroughAnOverlay()
+    {
+        SeedBase();
+        File.SetUnixFileMode(Path.Combine(_opts.BaseImageDir, "win11-26h2.qcow2"), UnixFileMode.UserRead | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
+        await Hv().StartAsync(Spec(), CancellationToken.None);
+        Assert.Equal("qemu-img", _runner.Calls[0].File);
+    }
+
+    [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
     public async Task Start_NvramIsWritable_EvenThoughTheVarsTemplateIsReadOnly()
     {
         SeedBase();

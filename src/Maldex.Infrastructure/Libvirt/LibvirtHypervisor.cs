@@ -48,6 +48,10 @@ public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcess
             throw new VmStartException($"invalid disk stem '{spec.DiskStem}'");
         if (!File.Exists(basePath)) throw new VmStartException($"base image {basePath} not found");
         if (!File.Exists(varsPath)) throw new VmStartException($"UEFI vars template {varsPath} not found");
+        // A sealed version disk is 0444 and is never booted writable, even if QEMU runs as root and would ignore the mode.
+        // The same owner-write check the guestfish editor makes.
+        if (spec.Writable && !OperatingSystem.IsWindows() && (File.GetUnixFileMode(basePath) & UnixFileMode.UserWrite) == 0)
+            throw new VmStartException($"template disk '{spec.DiskStem}' is a sealed version, not a working copy: refusing to boot it writable");
 
         try
         {
