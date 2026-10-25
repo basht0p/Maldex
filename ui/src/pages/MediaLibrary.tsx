@@ -2,6 +2,13 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { deleteMedia, fetchMedia, listMedia } from '../api/client'
 import { uploadMedia } from '../api/mediaUpload'
 import type { MediaFileDto, MediaKind } from '../api/types'
+import { useConfirm } from '../kit/useConfirm'
+import { CopyButton } from '../kit/CopyButton'
+import { EmptyState } from '../kit/EmptyState'
+import { ErrorBanner } from '../kit/ErrorBanner'
+import { RelativeTime, FileSize } from '../kit/RelativeTime'
+import { Skeleton } from '../kit/Skeleton'
+import { useToast } from '../kit/useToast'
 import { messageOf } from '../util/apiMessage'
 import styles from './forms.module.css'
 import page from './MediaLibrary.module.css'
@@ -10,12 +17,6 @@ import page from './MediaLibrary.module.css'
 const POLL_MS = 2000
 
 const KIND_LABEL: Record<MediaKind, string> = { OsInstaller: 'OS installer', Application: 'Application' }
-
-function sizeText(bytes: number): string {
-  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GiB`
-  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`
-  return `${bytes} B`
-}
 
 function statusText(m: MediaFileDto): string {
   if (m.status === 'Failed') return `Failed${m.failureReason ? `: ${m.failureReason}` : ''}`
@@ -53,8 +54,10 @@ function KindSelect({ id, value, onChange }: { id: string; value: MediaKind; onC
 
 /** The media tab of the templates page: installers and application media that Builds use. */
 export default function MediaLibrary() {
+  const toast = useToast()
+  const confirm = useConfirm()
   const [rows, setRows] = useState<MediaFileDto[]>([])
-  const [errors, setErrors] = useState<string[]>([]) // the last action's failure
+  const [loaded, setLoaded] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [file, setFile] = useState<File | null>(null)
   const [uploadKind, setUploadKind] = useState<MediaKind>('OsInstaller')
@@ -78,6 +81,7 @@ export default function MediaLibrary() {
     } catch (e) {
       if (mounted.current) setLoadError(messageOf(e)[0])
     } finally {
+      if (mounted.current) setLoaded(true)
       inFlight.current = false
       if (again.current && mounted.current) { again.current = false; void refresh() }
     }
@@ -100,12 +104,15 @@ export default function MediaLibrary() {
   async function startUpload(f: File, kind: MediaKind, resumeId?: string) {
     const controller = new AbortController()
     abort.current = controller
-    setErrors([])
     setUpload({ name: f.name, received: 0, size: f.size })
     try {
       await uploadMedia(f, kind, (received, size) => { if (mounted.current) setUpload({ name: f.name, received, size }) }, controller.signal, resumeId)
+      if (mounted.current) toast.success(`${f.name} uploaded`)
     } catch (e) {
-      if (mounted.current) setErrors(e instanceof DOMException && e.name === 'AbortError' ? ['The upload was stopped. Resume it from the table.'] : messageOf(e))
+      if (mounted.current) {
+        if (e instanceof DOMException && e.name === 'AbortError') toast.error('The upload was stopped. Resume it from the table.')
+        else for (const m of messageOf(e)) toast.error(m)
+      }
     } finally {
       abort.current = null
       if (mounted.current) setUpload(null)
@@ -119,20 +126,26 @@ export default function MediaLibrary() {
     e.target.value = ''
     if (!f || !row) return
     if (f.name !== row.fileName || f.size !== row.size) {
-      setErrors([`Choose the same file: ${row.fileName} (${row.size} bytes). The name and size must match.`])
+      toast.error(`Choose the same file: ${row.fileName} (${row.size} bytes). The name and size must match.`)
       return
     }
     void startUpload(f, row.kind, row.id)
   }
 
   async function remove(m: MediaFileDto) {
-    if (!window.confirm(`Delete ${m.fileName}? Its file is removed from the library.`)) return
+    const ok = await confirm({
+      title: `Delete ${m.fileName}?`,
+      body: 'Its file is removed from the library.',
+      confirmLabel: 'Delete',
+      danger: true,
+    })
+    if (!ok) return
     try {
       await deleteMedia(m.id)
-      setErrors([])
+      toast.success(`${m.fileName} deleted`)
       await refresh()
     } catch (e) {
-      setErrors(messageOf(e))
+      for (const msg of messageOf(e)) toast.error(msg)
     }
   }
 
@@ -140,12 +153,12 @@ export default function MediaLibrary() {
     e.preventDefault()
     try {
       await fetchMedia(url.trim(), fetchKind, fetchName.trim() || undefined)
-      setErrors([])
+      toast.success('Fetch started')
       setUrl('')
       setFetchName('')
       await refresh()
     } catch (err) {
-      setErrors(messageOf(err))
+      for (const m of messageOf(err)) toast.error(m)
     }
   }
 
@@ -186,8 +199,9 @@ export default function MediaLibrary() {
         </fieldset>
       </div>
       <input ref={resumeInput} type="file" aria-label="Resume file" style={{ display: 'none' }} onChange={onResumeFile} />
-      {loadError && <p className={styles.error} role="alert">{loadError}</p>}
-      {errors.map((m, i) => <p key={i} className={styles.error} role="alert">{m}</p>)}
+      {loadError && <ErrorBanner message={loadError} onRetry={() => void refresh()} />}
+      {!loaded && !loadError && <Skeleton rows={3} />}
+      <div className={styles.tableScroll}>
       <table className={styles.table} aria-label="Media">
         <thead><tr><th>Kind</th><th>Name</th><th>Size</th><th>SHA-256</th><th>Status</th><th>Detected</th><th>Added</th><th>Used by</th><th>Actions</th></tr></thead>
         <tbody>
@@ -195,11 +209,11 @@ export default function MediaLibrary() {
             <tr key={m.id}>
               <td>{KIND_LABEL[m.kind]}</td>
               <td className={styles.mono}>{m.fileName}</td>
-              <td>{sizeText(m.size)}</td>
-              <td className={styles.mono}>{m.sha256 ? m.sha256.slice(0, 12) : ''}</td>
+              <td><FileSize bytes={m.size} /></td>
+              <td className={styles.mono}>{m.sha256 ? <>{m.sha256.slice(0, 12)}<CopyButton value={m.sha256} label="Copy SHA-256" /></> : ''}</td>
               <td>{statusText(m)}</td>
               <td>{detected(m).map((d) => <div key={d}>{d}</div>)}</td>
-              <td>{`${m.addedBy} ${m.addedAt.slice(0, 16).replace('T', ' ')}`}</td>
+              <td>{m.addedBy} <RelativeTime iso={m.addedAt} /></td>
               <td>{m.usedBy.join(', ')}</td>
               <td>
                 <span className={page.actions}>
@@ -213,7 +227,8 @@ export default function MediaLibrary() {
           ))}
         </tbody>
       </table>
-      {rows.length === 0 && <p className={styles.hint}>No media yet. Upload an ISO or fetch one from a URL.</p>}
+      </div>
+      {loaded && rows.length === 0 && <EmptyState title="No media yet." body="Upload an ISO or fetch one from a URL." />}
     </section>
   )
 }

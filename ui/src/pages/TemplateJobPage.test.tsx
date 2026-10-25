@@ -1,6 +1,6 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter, Route, Routes } from 'react-router-dom'
+import { Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { MeDto, TemplateJobDto } from '../api/types'
 
@@ -41,6 +41,7 @@ vi.mock('../api/client', async (orig) => ({
 
 import { ApiError } from '../api/client'
 import type { HubConnectionLike } from '../live/useTaskLive'
+import { renderWithKit } from '../test/renderWithKit'
 import TemplateJobPage from './TemplateJobPage'
 
 class MockHub implements HubConnectionLike {
@@ -57,7 +58,7 @@ class MockHub implements HubConnectionLike {
   push(dto: TemplateJobDto) { act(() => { (this.handlers.get('templateJob') as (p: unknown) => void)(dto) }) }
 }
 
-const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin' }
+const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin', maxUploadBytes: 268_435_456 }
 const job = (over: Partial<TemplateJobDto> = {}): TemplateJobDto => ({
   id: 'job-1', kind: 'Edit', templateId: 'win11-golden', baseVersionNumber: 3, resultVersionNumber: null, network: 'None', state: 'Queued',
   message: null, failureReason: null, createdAt: '2026-10-24T10:00:00Z', endedAt: null, idleDeadline: null, ...over,
@@ -65,12 +66,11 @@ const job = (over: Partial<TemplateJobDto> = {}): TemplateJobDto => ({
 
 let hub: MockHub
 function renderJob(me: MeDto | null = admin) {
-  return render(
-    <MemoryRouter initialEntries={['/admin/template-jobs/job-1']}>
-      <Routes>
-        <Route path="/admin/template-jobs/:id" element={<TemplateJobPage me={me} createConnection={() => hub} />} />
-      </Routes>
-    </MemoryRouter>,
+  return renderWithKit(
+    <Routes>
+      <Route path="/admin/template-jobs/:id" element={<TemplateJobPage me={me} createConnection={() => hub} />} />
+    </Routes>,
+    { route: '/admin/template-jobs/job-1' },
   )
 }
 const current = () => screen.getByRole('list', { name: 'Progress' }).querySelector('[aria-current="step"]')
@@ -84,7 +84,12 @@ beforeEach(() => {
   getTemplateJob.mockResolvedValue(job())
   getTemplateJobTunnelToken.mockResolvedValue({ token: 'tok-9' })
 })
-afterEach(() => vi.restoreAllMocks())
+let confirmSpy: ReturnType<typeof vi.spyOn>
+beforeEach(() => { confirmSpy = vi.spyOn(window, 'confirm') })
+afterEach(() => {
+  expect(confirmSpy).not.toHaveBeenCalled() // confirmations are in-app dialogs, never window.confirm
+  vi.restoreAllMocks()
+})
 
 describe('TemplateJobPage', () => {
   it('tells non-admins that administrator access is required, without opening the hub', async () => {
@@ -214,14 +219,17 @@ describe('TemplateJobPage', () => {
   it('Discard asks first and then cancels the job', async () => {
     getTemplateJob.mockResolvedValue(job({ state: 'Configuring' }))
     cancelTemplateJob.mockResolvedValue(undefined)
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true)
     renderJob()
     await screen.findByRole('button', { name: 'Discard' })
     await userEvent.click(screen.getByRole('button', { name: 'Discard' }))
+    const dlg = await screen.findByRole('dialog', { name: 'Discard this job?' })
+    expect(dlg).toHaveTextContent('The working copy is deleted and no version is created.')
+    await userEvent.click(within(dlg).getByRole('button', { name: 'Cancel' }))
     expect(cancelTemplateJob).not.toHaveBeenCalled()
     await userEvent.click(screen.getByRole('button', { name: 'Discard' }))
-    expect(confirm).toHaveBeenCalledTimes(2)
+    await userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Discard' }))
     expect(cancelTemplateJob).toHaveBeenCalledWith('job-1')
+    expect(await screen.findByText('Job discarded')).toBeInTheDocument()
   })
 
   it('shows a 409 reason from Seal inline and keeps the console', async () => {
@@ -229,7 +237,7 @@ describe('TemplateJobPage', () => {
     sealTemplateJob.mockRejectedValue(new ApiError(409, { title: 'The job is not in the Configuring state.', status: 409 }))
     renderJob()
     await userEvent.click(await screen.findByRole('button', { name: 'Seal' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('The job is not in the Configuring state.')
+    expect(await screen.findByText('The job is not in the Configuring state.')).toBeInTheDocument()
     expect(screen.getByTestId('guac-display')).toBeInTheDocument()
   })
 
@@ -238,7 +246,7 @@ describe('TemplateJobPage', () => {
     cancelTemplateJob.mockRejectedValue(new ApiError(409, { title: 'Too late to cancel.', status: 409 }))
     renderJob()
     await userEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent('Too late to cancel.')
+    expect(await screen.findByText('Too late to cancel.')).toBeInTheDocument()
   })
 
   it.each(['Failed', 'Cancelled'] as const)('%s shows the reason and no actions', async (state) => {
@@ -274,7 +282,7 @@ describe('TemplateJobPage', () => {
     sealTemplateJob.mockRejectedValue(new ApiError(409, { title: 'Nope.', status: 409 }))
     renderJob()
     await userEvent.click(await screen.findByRole('button', { name: 'Seal' }))
-    await screen.findByRole('alert')
+    await screen.findByText('Nope.')
     expect(screen.queryByText('Seal requested')).toBeNull()
     expect(screen.getByRole('button', { name: 'Seal' })).toBeEnabled()
   })

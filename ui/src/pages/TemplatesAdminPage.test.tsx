@@ -1,6 +1,6 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
+import { Route, Routes, useLocation } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AdminTemplateDto, MeDto, TemplateJobDto, TemplateVersionDto } from '../api/types'
 
@@ -33,9 +33,10 @@ vi.mock('../api/client', async (orig) => ({
 }))
 
 import { ApiError } from '../api/client'
+import { renderWithKit } from '../test/renderWithKit'
 import TemplatesAdminPage from './TemplatesAdminPage'
 
-const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin' }
+const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin', maxUploadBytes: 268_435_456 }
 
 const version = (over: Partial<TemplateVersionDto>): TemplateVersionDto => ({
   id: 'v-id', number: 1, origin: 'Imported', status: 'Ready', role: 'Pending', isCurrent: false, diskPresent: true,
@@ -67,14 +68,17 @@ function Where() {
   return <p data-testid="where">{useLocation().pathname}</p>
 }
 const renderPage = (me: MeDto | null = admin) =>
-  render(
-    <MemoryRouter initialEntries={['/admin/templates']}>
-      <Routes>
-        <Route path="/admin/templates" element={<TemplatesAdminPage me={me} />} />
-        <Route path="*" element={<Where />} />
-      </Routes>
-    </MemoryRouter>,
+  renderWithKit(
+    <Routes>
+      <Route path="/admin/templates" element={<TemplatesAdminPage me={me} />} />
+      <Route path="*" element={<Where />} />
+    </Routes>,
+    { route: '/admin/templates' },
   )
+/** The text of the open in-app confirmation (title and body). */
+const dialogText = async () => (await screen.findByRole('dialog')).textContent ?? ''
+const answer = async (label: string) => userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label }))
+let confirmSpy: ReturnType<typeof vi.spyOn>
 const region = (name: string) => screen.findByRole('region', { name })
 
 beforeEach(() => {
@@ -82,8 +86,12 @@ beforeEach(() => {
   listAdminTemplates.mockResolvedValue([base(), golden()])
   listTemplateJobs.mockResolvedValue([])
   listMedia.mockResolvedValue([])
+  confirmSpy = vi.spyOn(window, 'confirm')
 })
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => {
+  expect(confirmSpy).not.toHaveBeenCalled() // confirmations are in-app dialogs, never window.confirm
+  vi.restoreAllMocks()
+})
 
 describe('TemplatesAdminPage', () => {
   it('tells non-admins that administrator access is required', async () => {
@@ -109,6 +117,7 @@ describe('TemplatesAdminPage', () => {
     listAdminTemplates.mockResolvedValue([golden({ versions: [v3, version({ ...v2, diskPresent: false }), v1] })])
     renderPage()
     const g = await region('Windows 11 Golden')
+    expect(within(g).getByRole('table').parentElement?.className).toMatch(/tableScroll/)
     const rows = within(g).getAllByRole('row').slice(1)
     expect(rows).toHaveLength(3)
     expect(rows[0]).toHaveTextContent(/v3.*Edit.*Ready/)
@@ -139,7 +148,6 @@ describe('TemplatesAdminPage', () => {
   })
 
   it('names exactly the Ready previous version in the confirmation', async () => {
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     const v4 = version({ id: 'g4', number: 4, isCurrent: true, origin: 'Edit' })
     const v3r = version({ id: 'r3', number: 3, status: 'Retired', role: 'Retired' })
     const v2r = version({ id: 'g2', number: 2, status: 'Ready', role: 'RollbackTarget' })
@@ -148,25 +156,24 @@ describe('TemplatesAdminPage', () => {
     const g = await region('Windows 11 Golden')
     expect(within(g).getByText('Previous kept: v2')).toBeInTheDocument()
     await userEvent.click(within(g).getByRole('button', { name: 'Roll back' }))
-    expect(confirm).toHaveBeenCalledTimes(1)
-    const text = String(confirm.mock.calls[0][0])
+    const text = await dialogText()
     expect(text).toContain('v2')
     expect(text).not.toContain('v3')
+    await answer('Cancel')
   })
 
   it('says the version rolled back from is retired, never kept', async () => {
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     renderPage()
     const g = await region('Windows 11 Golden')
     await userEvent.click(within(g).getByRole('button', { name: 'Roll back' }))
-    const text = String(confirm.mock.calls[0][0])
+    const text = await dialogText()
     expect(text).toContain('New tasks will use v2.')
     expect(text).toContain('v3 will be retired')
     expect(text).not.toContain('stays available')
+    await answer('Cancel')
   })
 
   it('takes the rollback target from the server role, not from the highest number, and lists the other kept versions', async () => {
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     const c5 = version({ id: 'c5', number: 5, isCurrent: true, role: 'Current' })
     const t2 = version({ id: 't2', number: 2, role: 'RollbackTarget' })
     const p4 = version({ id: 'p4', number: 4, role: 'Previous' })
@@ -175,9 +182,10 @@ describe('TemplatesAdminPage', () => {
     const g = await region('Windows 11 Golden')
     expect(within(g).getByText('Previous kept: v2, v4')).toBeInTheDocument()
     await userEvent.click(within(g).getByRole('button', { name: 'Roll back' }))
-    const text = String(confirm.mock.calls[0][0])
+    const text = await dialogText()
     expect(text).toContain('New tasks will use v2.')
     expect(text).toContain('v5 will be retired')
+    await answer('Cancel')
   })
 
   it('shows a Ready previous version whose disk is missing as kept, with a warning, and disables Roll back', async () => {
@@ -210,21 +218,22 @@ describe('TemplatesAdminPage', () => {
   })
 
   it('rolls back only after the admin confirms', async () => {
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
     rollBackTemplate.mockResolvedValue(golden())
     renderPage()
     const g = await region('Windows 11 Golden')
     await userEvent.click(within(g).getByRole('button', { name: 'Roll back' }))
-    expect(confirm).toHaveBeenCalledTimes(1)
+    expect(await screen.findByRole('dialog', { name: 'Roll back Windows 11 Golden to v2?' })).toBeInTheDocument()
+    expect(rollBackTemplate).not.toHaveBeenCalled()
+    await answer('Roll back')
     expect(rollBackTemplate).toHaveBeenCalledWith('win11-golden')
     await waitFor(() => expect(listAdminTemplates).toHaveBeenCalledTimes(2))
   })
 
   it('does not roll back when the confirmation is declined', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(false)
     renderPage()
     const g = await region('Windows 11 Golden')
     await userEvent.click(within(g).getByRole('button', { name: 'Roll back' }))
+    await answer('Cancel')
     expect(rollBackTemplate).not.toHaveBeenCalled()
   })
 
@@ -240,7 +249,7 @@ describe('TemplatesAdminPage', () => {
     const def = await region('Windows 11 26H2')
     await userEvent.click(within(def).getByLabelText('Enabled'))
     expect(setTemplateEnabled).toHaveBeenCalledWith('win11-26h2', false)
-    expect(await within(def).findByRole('alert')).toHaveTextContent('The default template cannot be disabled.')
+    expect(await screen.findByText('The default template cannot be disabled.')).toBeInTheDocument()
     expect(within(def).getByLabelText('Enabled')).toBeChecked()
   })
 
@@ -268,6 +277,9 @@ describe('TemplatesAdminPage', () => {
     listAdminTemplates.mockRejectedValue(new ApiError(500, { title: 'Boom' }))
     renderPage()
     expect(await screen.findByRole('alert')).toHaveTextContent('Boom')
+    listAdminTemplates.mockResolvedValue([base(), golden()])
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(await region('Windows 11 Golden')).toBeInTheDocument()
   })
 
   describe('Edit, Refresh and jobs', () => {
@@ -413,14 +425,16 @@ describe('TemplatesAdminPage', () => {
       const pending = version({ id: 'p4', number: 4, role: 'Pending' })
       listAdminTemplates.mockResolvedValue([golden({ versions: [pending, v3] })])
       discardTemplateVersion.mockResolvedValue(undefined)
-      const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true)
       renderPage()
       const g = await region('Windows 11 Golden')
       await userEvent.click(within(g).getByRole('button', { name: 'Discard v4' }))
+      expect(await screen.findByRole('dialog', { name: 'Discard v4 of Windows 11 Golden?' })).toHaveTextContent('It is never published and its disk is deleted.')
+      await answer('Cancel')
       expect(discardTemplateVersion).not.toHaveBeenCalled()
       await userEvent.click(within(g).getByRole('button', { name: 'Discard v4' }))
-      expect(confirm).toHaveBeenCalledTimes(2)
+      await answer('Discard')
       expect(discardTemplateVersion).toHaveBeenCalledWith('win11-golden', 'p4')
+      expect(await screen.findByText('v4 discarded')).toBeInTheDocument()
     })
 
     it('shows a 409 from Publish inline', async () => {
@@ -430,7 +444,7 @@ describe('TemplatesAdminPage', () => {
       renderPage()
       const g = await region('Windows 11 Golden')
       await userEvent.click(within(g).getByRole('button', { name: 'Publish v4' }))
-      expect(await within(g).findByRole('alert')).toHaveTextContent('Only a held version can be published.')
+      expect(await screen.findByText('Only a held version can be published.')).toBeInTheDocument()
     })
 
     it('shows no Publish or Discard on versions that are not Pending', async () => {
@@ -527,14 +541,15 @@ describe('TemplatesAdminPage', () => {
     it('Delete asks first, then deletes and reloads', async () => {
       listAdminTemplates.mockResolvedValue([base(), empty()])
       deleteTemplate.mockResolvedValue(undefined)
-      const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true)
       renderPage()
       const e = await region('Windows 11 New')
       const del = await within(e).findByRole('button', { name: 'Delete' })
       await userEvent.click(del)
+      expect(await screen.findByRole('dialog', { name: 'Delete Windows 11 New?' })).toHaveTextContent('It has no versions; the template entry is removed.')
+      await answer('Cancel')
       expect(deleteTemplate).not.toHaveBeenCalled()
       await userEvent.click(del)
-      expect(confirm).toHaveBeenCalledTimes(2)
+      await answer('Delete')
       expect(deleteTemplate).toHaveBeenCalledWith('win11-new')
       await waitFor(() => expect(listAdminTemplates).toHaveBeenCalledTimes(2))
     })
@@ -542,11 +557,11 @@ describe('TemplatesAdminPage', () => {
     it('shows the 409 reason from Delete inline', async () => {
       listAdminTemplates.mockResolvedValue([base(), empty()])
       deleteTemplate.mockRejectedValue(new ApiError(409, { title: 'A job is active for this template.', status: 409 }))
-      vi.spyOn(window, 'confirm').mockReturnValue(true)
       renderPage()
       const e = await region('Windows 11 New')
       await userEvent.click(await within(e).findByRole('button', { name: 'Delete' }))
-      expect(await within(e).findByRole('alert')).toHaveTextContent('A job is active for this template.')
+      await answer('Delete')
+      expect(await screen.findByText('A job is active for this template.')).toBeInTheDocument()
     })
 
     it('the jobs table shows a Build as base "new"', async () => {

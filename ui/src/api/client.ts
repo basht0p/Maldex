@@ -10,11 +10,13 @@ import type {
   OrgDto,
   OrgRequest,
   ProcessNodeDto,
+  ResubmitRequest,
   StartBuildRequest,
   StartUploadResponse,
   TaskDto,
   TaskListDto,
   TaskListQuery,
+  TaskReportDto,
   TemplateJobDto,
   TemplateJobNetwork,
   TemplateSummaryDto,
@@ -64,7 +66,38 @@ async function request<T>(method: string, path: string, body?: BodyInit | null, 
   return parsed as T
 }
 
-function query(params: Record<string, string | number | undefined>): string {
+/**
+ * GET `path` as a Blob, with the same bearer token as every other call (Entra mode is bearer-only, so a plain
+ * `<img src>` or `<a href>` would get 401). Throws {@link ApiError} on a non-2xx response.
+ */
+export async function fetchBlob(path: string, signal?: AbortSignal): Promise<Blob> {
+  const headers: Record<string, string> = { Accept: '*/*' }
+  const token = await getAccessToken()
+  if (token) headers.Authorization = `Bearer ${token}`
+  const res = await fetch(path, { method: 'GET', headers, signal })
+  if (!res.ok) throw new ApiError(res.status, await parseBody(res))
+  return res.blob()
+}
+
+/** Downloads `path` (authenticated, see {@link fetchBlob}) and saves it as `fileName`. */
+export async function downloadFile(path: string, fileName: string): Promise<void> {
+  const blob = await fetchBlob(path)
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = fileName
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  try {
+    a.click()
+  } finally {
+    a.remove()
+    // Revoked on the next task: the click has started the download by then.
+    setTimeout(() => URL.revokeObjectURL(url), 0)
+  }
+}
+
+function query(params:Record<string, string | number | undefined>): string {
   const q = new URLSearchParams()
   for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== '') q.set(k, String(v))
   const s = q.toString()
@@ -83,7 +116,7 @@ export const updateOrg = (id: string, req: OrgRequest) => request<OrgDto>('PUT',
 /** `form` is multipart: orgId, one of file/url, and optionally networkMode, durationSec, interactive, exitCountry, image. */
 export const submitTask = (form: FormData) => request<TaskDto>('POST', '/api/tasks', form)
 export const listTasks = (q: TaskListQuery = {}) =>
-  get<TaskListDto>(`/api/tasks${query({ orgId: q.orgId, status: q.status, skip: q.skip, take: q.take })}`)
+  get<TaskListDto>(`/api/tasks${query({ orgId: q.orgId, status: q.status, q: q.q, verdict: q.verdict, mine: q.mine ? 'true' : undefined, from: q.from, to: q.to, sort: q.sort, dir: q.dir, skip: q.skip, take: q.take })}`)
 export const getTask = (id: string) => get<TaskDto>(`/api/tasks/${encodeURIComponent(id)}`)
 export const cancelTask = (id: string) => post<void>(`/api/tasks/${encodeURIComponent(id)}/cancel`)
 export const extendTask = (id: string, seconds: number) => post<TaskDto>(`/api/tasks/${encodeURIComponent(id)}/extend`, { seconds })
@@ -91,7 +124,9 @@ export const stopTask = (id: string) => post<void>(`/api/tasks/${encodeURICompon
 
 export const getProcesses = (id: string) => get<ProcessNodeDto[]>(`/api/tasks/${encodeURIComponent(id)}/processes`)
 export const getEvents = (id: string, q: EventsQuery = {}) =>
-  get<LiveEventDto[]>(`/api/tasks/${encodeURIComponent(id)}/events${query({ afterId: q.afterId, type: q.type, take: q.take })}`)
+  get<LiveEventDto[]>(`/api/tasks/${encodeURIComponent(id)}/events${query({ afterId: q.afterId, type: q.type, take: q.take, pid: q.pid, processId: q.processId, q: q.q })}`)
+export const eventsExportUrl = (id: string, format: 'csv' | 'json', q: Omit<EventsQuery, 'afterId' | 'take'> = {}) =>
+  `/api/tasks/${encodeURIComponent(id)}/events/export${query({ format, type: q.type, pid: q.pid, processId: q.processId, q: q.q })}`
 export const listArtifacts = (id: string) => get<ArtifactDto[]>(`/api/tasks/${encodeURIComponent(id)}/artifacts`)
 export const getTunnelToken = (id: string) => get<{ token: string }>(`/api/tasks/${encodeURIComponent(id)}/tunnel-token`)
 
@@ -135,3 +170,8 @@ export const putMediaChunk = (id: string, offset: number, chunk: Blob, signal?: 
 export const fetchMedia = (url: string, kind: MediaKind, fileName?: string) =>
   post<MediaFileDto>('/api/admin/media/fetch', { url, kind, fileName: fileName || null })
 export const deleteMedia = (id: string) => request<void>('DELETE', `/api/admin/media/${encodeURIComponent(id)}`)
+
+export const getTaskReport = (id: string) => get<TaskReportDto>(`/api/tasks/${encodeURIComponent(id)}/report`)
+export const screenshotUrl = (artifactId: string) => `/api/artifacts/${encodeURIComponent(artifactId)}/image`
+export const httpBodyUrl = (taskId: string, txId: number) => `/api/tasks/${encodeURIComponent(taskId)}/http/${txId}/body`
+export const resubmitTask = (id: string, req: ResubmitRequest) => post<TaskDto>(`/api/tasks/${encodeURIComponent(id)}/resubmit`, req)

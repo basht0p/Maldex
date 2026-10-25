@@ -13,4 +13,7 @@
 .table th:nth-child(3) { width: 4.5rem; }
 .table td { padding: 0 0.5rem; border-bottom: 1px solid var(--mx-border); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.6; }
 .time { color: var(--mx-muted); font-family: var(--mx-font-mono); font-size: 0.8rem; }
-.summary { font-family: var(--mx-font-mono); font-size: 0.8rem; }
+.summary { font-family: var(--mx-font-mono); font-size: 0.8rem; position: relative; padding-right: 1.8rem; }
+.value { position: relative; }
+.copy { position: absolute; right: 0.2rem; top: 50%; transform: translateY(-50%); opacity: 0; padding: 0 0.3rem; border: 1px solid var(--mx-control); border-radius: var(--mx-radius-control); background: var(--mx-surface); font-size: 0.75rem; line-height: 1.2; cursor: pointer; }
+tr:hover .copy, .copy:focus-visible { opacity: 1; }

@@ -15,6 +15,8 @@ export interface MeDto {
   id: string
   displayName: string
   role: UserRole
+  /** The effective submit cap in bytes; files over it are refused before upload. */
+  maxUploadBytes: number
 }
 
 export interface OrgDto {
@@ -46,6 +48,9 @@ export interface TaskDto {
   processingWarnings: string[]
   /** The template version the run used; absent for tasks created before templates (show `image` instead). */
   template?: TaskTemplateDto | null
+  submittedByName?: string | null
+  /** Seconds from start to end of the run; null when it has not both started and ended. */
+  ranSec?: number | null
 }
 
 export type TemplateVersionOrigin = 'IsoBuild' | 'Edit' | 'Refresh' | 'Imported'
@@ -226,6 +231,13 @@ export interface OrgRequest {
 export interface TaskListQuery {
   orgId?: string
   status?: RunStatus
+  q?: string
+  verdict?: Verdict
+  mine?: boolean
+  from?: string
+  to?: string
+  sort?: 'created' | 'verdict' | 'duration'
+  dir?: 'asc' | 'desc'
   skip?: number
   take?: number
 }
@@ -234,6 +246,9 @@ export interface EventsQuery {
   afterId?: number
   type?: EventType
   take?: number
+  pid?: number
+  processId?: number
+  q?: string
 }
 
 /** ASP.NET ValidationProblemDetails / ProblemDetails (the parts the UI reads). */
@@ -242,4 +257,124 @@ export interface ProblemDetails {
   status?: number
   detail?: string
   errors?: Record<string, string[]>
+}
+
+// --- In-app task report (GET /api/tasks/{id}/report) ---
+
+export type DetectionSource = 'Suricata' | 'Yara' | 'Heuristic'
+
+export interface StatusStepDto {
+  from?: RunStatus | null
+  to: RunStatus
+  at: string
+  reason: string
+}
+
+export interface DetectionDto {
+  source: DetectionSource
+  rule: string
+  severity: number
+  tags: string[]
+  target: string
+  details?: string | null
+}
+
+export interface ReportProcessDto {
+  id: number
+  parentId?: number | null
+  pid: number
+  imagePath: string
+  commandLine: string
+  user?: string | null
+  startedAt: string
+  endedAt?: string | null
+  depth: number
+}
+
+export interface NetworkFlowDto {
+  proto: string
+  src: string
+  dst: string
+  dstPort: number
+  bytes: number
+  startedAt: string
+}
+
+export interface DnsRowDto {
+  at: string
+  pid: number
+  query: string
+  answers: string[]
+}
+
+export interface HttpRowDto {
+  id: number
+  method: string
+  url: string
+  host: string
+  status?: number | null
+  reqHeaders: string
+  respHeaders: string
+  hasBody: boolean
+}
+
+export interface DroppedFileDto {
+  artifactId: string
+  guestPath?: string | null
+  sha256: string
+  size: number
+  createdAt: string
+}
+
+export interface ScreenshotRefDto {
+  artifactId: string
+  at: string
+}
+
+export interface SamePreviousLatestDto {
+  taskId: string
+  verdict: Verdict
+  createdAt: string
+}
+
+export interface SamePreviousDto {
+  count: number
+  latest?: SamePreviousLatestDto | null
+}
+
+export interface TruncatedDto {
+  processes: boolean
+  networkFlows: boolean
+  dns: boolean
+  http: boolean
+}
+
+export interface TaskReportDto {
+  task: TaskDto
+  submittedByName?: string | null
+  sha1?: string | null
+  md5?: string | null
+  sampleSize?: number | null
+  fileType?: string | null
+  mime?: string | null
+  templateSummary?: string | null
+  statusHistory: StatusStepDto[]
+  detections: DetectionDto[]
+  processes: ReportProcessDto[]
+  networkFlows: NetworkFlowDto[]
+  dns: DnsRowDto[]
+  http: HttpRowDto[]
+  droppedFiles: DroppedFileDto[]
+  screenshots: ScreenshotRefDto[]
+  samePrevious: SamePreviousDto
+  truncated: TruncatedDto
+}
+
+export interface ResubmitRequest {
+  orgId?: string | null
+  image?: string | null
+  networkMode?: string | null
+  exitCountry?: string | null
+  durationSec?: number | null
+  interactive?: boolean | null
 }

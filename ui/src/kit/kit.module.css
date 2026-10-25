@@ -1,0 +1,42 @@
+.copyWrap { display: inline-flex; align-items: center; gap: 0.35rem; }
+.copyButton {
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 0.2rem 0.3rem; border: 1px solid var(--mx-control); border-radius: var(--mx-radius-control);
+  background: var(--mx-surface); color: var(--mx-text); cursor: pointer;
+}
+.copyButton:hover { background: var(--mx-raised); }
+.copied { font-size: 0.8rem; color: var(--mx-muted); min-width: 3.2rem; }
+.copied:empty { min-width: 0; }
+
+.skeleton { display: grid; gap: 0.6rem; }
+.skeletonRow {
+  height: 1rem; border-radius: var(--mx-radius-control);
+  background: linear-gradient(90deg, var(--mx-raised) 25%, var(--mx-border) 50%, var(--mx-raised) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+}
+@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .skeletonRow { animation: none; background: var(--mx-raised); }
+}
+
+.empty { padding: 2rem 1rem; text-align: center; color: var(--mx-muted); }
+.emptyTitle { margin: 0 0 0.35rem; font-weight: 600; color: var(--mx-text); }
+.emptyBody { margin: 0; font-size: 0.9rem; }
+.emptyAction { margin-top: 1rem; }
+
+.errorBanner {
+  display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap;
+  padding: 0.6rem 0.8rem; border: 1px solid var(--mx-critical); border-radius: var(--mx-radius-control);
+  background: var(--mx-surface); color: var(--mx-critical);
+}
+.retry {
+  padding: 0.3rem 0.7rem; border: 1px solid var(--mx-control); border-radius: var(--mx-radius-control);
+  background: var(--mx-surface); color: var(--mx-text); cursor: pointer;
+}
+.retry:hover { background: var(--mx-raised); }
+
+.themeSelect { padding: 0.25rem 0.4rem; border: 1px solid var(--mx-control); border-radius: var(--mx-radius-control); background: var(--mx-surface); color: var(--mx-text); font: inherit; font-size: 0.85rem; }
+.shortcutList { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; font-size: 0.9rem; }
+.shortcutList li { display: grid; grid-template-columns: 5rem 1fr; align-items: center; gap: 0.75rem; color: var(--mx-muted); }
+.shortcutList kbd { display: inline-block; min-width: 1.4rem; margin-right: 0.25rem; padding: 0.1rem 0.4rem; border: 1px solid var(--mx-border-strong); border-radius: 4px; background: var(--mx-raised); color: var(--mx-text); font-family: var(--mx-font-mono); font-size: 0.8rem; text-align: center; }

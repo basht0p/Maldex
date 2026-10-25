@@ -1,0 +1,7 @@
+.stack { position: fixed; right: 1rem; bottom: 1rem; z-index: 1000; display: grid; gap: 0.5rem; max-width: min(24rem, calc(100vw - 2rem)); }
+.toast { display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem 0.9rem; border: 1px solid var(--mx-border-strong); border-left-width: 4px; border-radius: var(--mx-radius-panel); background: var(--mx-overlay); color: var(--mx-text); font-size: 0.9rem; }
+.success { border-left-color: var(--mx-success); }
+.error { border-left-color: var(--mx-critical); }
+.text { flex: 1; overflow-wrap: anywhere; }
+.dismiss { padding: 0.2rem 0.6rem; border: 1px solid var(--mx-control); border-radius: var(--mx-radius-control); background: var(--mx-surface); color: var(--mx-text); font: inherit; font-size: 0.8rem; }
+.dismiss:hover { background: var(--mx-raised); }

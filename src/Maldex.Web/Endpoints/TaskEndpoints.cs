@@ -17,11 +17,14 @@ using Microsoft.Net.Http.Headers;
 
 namespace Maldex.Web.Endpoints;
 
+public sealed record ResubmitRequest(Guid? OrgId, string? Image, string? NetworkMode, string? ExitCountry, int? DurationSec, bool? Interactive);
+
 public static class TaskEndpoints
 {
     private const int MaxFieldBytes = 4096;
     private const int MaxFileNameLength = 260;
     private const int MaxUrlLength = 2048;
+    private const int MaxSearchLength = 256;
     private const long MultipartOverheadBytes = 64 * 1024;
 
     public static IEndpointRouteBuilder MapTaskEndpoints(this IEndpointRouteBuilder app)
@@ -29,26 +32,80 @@ public static class TaskEndpoints
         var g = app.MapGroup("/api/tasks").RequireAuthorization(AuthSetup.AnalystPolicy);
 
         g.MapPost("", SubmitAsync);
+        g.MapPost("{id:guid}/resubmit", ResubmitAsync);
 
-        g.MapGet("", async (Guid? orgId, string? status, int? skip, int? take, MaldexDbContext db, CancellationToken ct) =>
+        g.MapGet("", async (Guid? orgId, string? status, string? q, string? verdict, bool? mine, string? from, string? to, string? sort, string? dir,
+            int? skip, int? take, MaldexDbContext db, CurrentUser user, CancellationToken ct) =>
         {
+            var errors = new Dictionary<string, string[]>();
             RunStatus? statusFilter = null;
             if (!string.IsNullOrWhiteSpace(status))
             {
-                if (!TryParseEnum<RunStatus>(status, out var s))
-                    return Results.ValidationProblem(new Dictionary<string, string[]> { ["status"] = ["Unknown status."] });
-                statusFilter = s;
+                if (TryParseEnum<RunStatus>(status, out var s)) statusFilter = s;
+                else errors["status"] = ["Unknown status."];
             }
-            if (skip is < 0)
-                return Results.ValidationProblem(new Dictionary<string, string[]> { ["skip"] = ["skip must be 0 or more."] });
+            Verdict? verdictFilter = null;
+            if (!string.IsNullOrWhiteSpace(verdict))
+            {
+                if (TryParseEnum<Verdict>(verdict, out var v)) verdictFilter = v;
+                else errors["verdict"] = ["Unknown verdict."];
+            }
+            var text = q?.Trim();
+            if (text is not null && (text.Length is 0 or > MaxSearchLength))
+                errors["q"] = [$"q must be 1 to {MaxSearchLength} characters."];
+            DateTimeOffset? fromAt = null, toBefore = null;
+            if (!string.IsNullOrWhiteSpace(from))
+            {
+                if (DateOnly.TryParseExact(from, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var d))
+                    fromAt = new DateTimeOffset(d.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
+                else errors["from"] = ["from must be yyyy-MM-dd."];
+            }
+            if (!string.IsNullOrWhiteSpace(to))
+            {
+                if (DateOnly.TryParseExact(to, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var d) && d < DateOnly.MaxValue)
+                    toBefore = new DateTimeOffset(d.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero).AddDays(1);
+                else errors["to"] = ["to must be yyyy-MM-dd."];
+            }
+            var sortKey = string.IsNullOrWhiteSpace(sort) ? "created" : sort.Trim().ToLowerInvariant();
+            if (sortKey is not ("created" or "verdict" or "duration")) errors["sort"] = ["sort must be created, verdict or duration."];
+            var dirKey = string.IsNullOrWhiteSpace(dir) ? "desc" : dir.Trim().ToLowerInvariant();
+            if (dirKey is not ("asc" or "desc")) errors["dir"] = ["dir must be asc or desc."];
+            if (skip is < 0) errors["skip"] = ["skip must be 0 or more."];
+            if (errors.Count > 0) return Results.ValidationProblem(errors);
             var takeN = Math.Clamp(take ?? 50, 1, 100);
+            var desc = dirKey == "desc";
 
             var query = db.Tasks.AsNoTracking().AsQueryable();
             if (orgId is not null) query = query.Where(t => t.OrgId == orgId);
             if (statusFilter is not null) query = query.Where(t => t.Status == statusFilter);
+            if (verdictFilter is not null) query = query.Where(t => t.Verdict == verdictFilter);
+            if (mine == true) { var me = user.UserId; query = query.Where(t => t.SubmittedByUserId == me); }
+            if (fromAt is { } f) query = query.Where(t => t.CreatedAt >= f);
+            if (toBefore is { } tb) query = query.Where(t => t.CreatedAt < tb);
+            if (text is not null)
+            {
+                var lower = text.ToLowerInvariant();
+                if (lower.Length == 64 && IsHex(lower)) query = query.Where(t => t.SampleSha256 == lower);
+                else if (lower.Length == 40 && IsHex(lower)) query = query.Where(t => t.Sample!.Sha1 == lower);
+                else if (lower.Length == 32 && IsHex(lower)) query = query.Where(t => t.Sample!.Md5 == lower);
+                else query = query.Where(t => (t.OriginalFileName != null && t.OriginalFileName.Contains(text)) || (t.Url != null && t.Url.Contains(text)));
+            }
 
             var total = await query.CountAsync(ct);
-            var page = await query.Include(t => t.Org).OrderByDescending(t => t.CreatedAt).ThenByDescending(t => t.Id)
+            IOrderedQueryable<AnalysisTask> ordered = sortKey switch
+            {
+                // Verdicts are stored as text, so rank them explicitly by enum value instead of sorting the names.
+                "verdict" => (desc ? query.OrderByDescending(VerdictRank) : query.OrderBy(VerdictRank))
+                    .ThenByDescending(t => t.CreatedAt),
+                // Rows without both ends sort last in both directions.
+                "duration" => desc
+                    ? query.OrderBy(t => EF.Functions.DateDiffSecond(t.StartedAt, t.EndedAt ?? t.CompletedAt) == null ? 1 : 0)
+                        .ThenByDescending(t => EF.Functions.DateDiffSecond(t.StartedAt, t.EndedAt ?? t.CompletedAt))
+                    : query.OrderBy(t => EF.Functions.DateDiffSecond(t.StartedAt, t.EndedAt ?? t.CompletedAt) == null ? 1 : 0)
+                        .ThenBy(t => EF.Functions.DateDiffSecond(t.StartedAt, t.EndedAt ?? t.CompletedAt)),
+                _ => desc ? query.OrderByDescending(t => t.CreatedAt) : query.OrderBy(t => t.CreatedAt),
+            };
+            var page = await ordered.ThenByDescending(t => t.Id).Include(t => t.Org).Include(t => t.SubmittedBy)
                 .Skip(skip ?? 0).Take(takeN).ToListAsync(ct);
             var queued = await QueuedAsync(db, ct);
             var templates = await TemplateProvenance.LoadAsync(db, page.Select(t => t.TemplateVersionId), ct); // one query for the whole page
@@ -84,6 +141,10 @@ public static class TaskEndpoints
 
         return app;
     }
+
+    private static IResult TooLarge(SubmissionOptions opts, string title) =>
+        Results.Problem(title: title, statusCode: StatusCodes.Status413PayloadTooLarge,
+            detail: $"Samples may be at most {opts.MaxUploadBytes} bytes" + (opts.IsReal ? " (the most a real-mode guest can receive)." : "."));
 
     private static IResult NotCancellable() =>
         Results.Problem(title: "Only queued tasks can be cancelled.", statusCode: StatusCodes.Status409Conflict);
@@ -152,19 +213,24 @@ public static class TaskEndpoints
         }
         catch (BlobTooLargeException)
         {
-            return Results.Problem(title: "The uploaded file is too large.", statusCode: StatusCodes.Status413PayloadTooLarge,
-                detail: $"Samples may be at most {opts.MaxUploadBytes} bytes" + (opts.IsReal ? " (the most a real-mode guest can receive)." : "."));
+            return TooLarge(opts, "The uploaded file is too large.");
         }
         catch (BadHttpRequestException ex) when (ex.StatusCode == StatusCodes.Status413PayloadTooLarge)
         {
-            return Results.Problem(title: "The request body is too large.", statusCode: StatusCodes.Status413PayloadTooLarge,
-                detail: $"Samples may be at most {opts.MaxUploadBytes} bytes" + (opts.IsReal ? " (the most a real-mode guest can receive)." : "."));
+            return TooLarge(opts, "The request body is too large.");
         }
         catch (Exception ex) when (ex is InvalidDataException or ArgumentException or FormatException)
         {
             return Results.ValidationProblem(new Dictionary<string, string[]> { ["file"] = ["Malformed multipart body."] });
         }
 
+        return await ValidateAndCreateAsync(fields, blob, fileName, null, errors, db, audit, user, time, vpnCountries, templates, ct);
+    }
+
+    private static async Task<IResult> ValidateAndCreateAsync(
+        Dictionary<string, string> fields, StoredBlob? blob, string? fileName, Guid? resubmittedFrom, Dictionary<string, string[]> errors,
+        MaldexDbContext db, AuditWriter audit, CurrentUser user, TimeProvider time, List<string> vpnCountries, TemplateCatalog templates, CancellationToken ct)
+    {
         // ---- validate (the blob, if any, is kept on failure: it is content-addressed and a concurrent valid upload may share it) ----
         Org? org = null;
         if (!fields.TryGetValue("orgId", out var orgRaw) || !Guid.TryParse(orgRaw, out var orgId) || orgId == Guid.Empty)
@@ -240,10 +306,46 @@ public static class TaskEndpoints
         task.StatusHistory.Add(new TaskStatusHistory { TaskId = task.Id, From = null, To = RunStatus.Queued, At = now, Reason = "submitted" });
         db.Tasks.Add(task);
         await audit.WriteAsync("task.submit", task.Id.ToString(),
-            $"org={org.Id}; mode={mode}; " + (blob is not null ? $"sha256={blob.Sha256}" : "url"), ct);
+            $"org={org.Id}; mode={mode}; " + (blob is not null ? $"sha256={blob.Sha256}" : "url")
+            + (resubmittedFrom is not null ? $"; resubmittedFrom={resubmittedFrom}" : ""), ct);
 
         var queued = await QueuedAsync(db, ct);
         return Results.Created($"/api/tasks/{task.Id}", TaskDto.From(task, org.Name, PositionOf(task, queued)));
+    }
+
+    private static async Task<IResult> ResubmitAsync(
+        Guid id, ResubmitRequest body, MaldexDbContext db, IArtifactStore store, AuditWriter audit, CurrentUser user, TimeProvider time,
+        IOptions<SubmissionOptions> submissionOptions, IOptions<EgressOptions> egressOptions, TemplateCatalog templates, CancellationToken ct)
+    {
+        var opts = submissionOptions.Value;
+        var source = await db.Tasks.AsNoTracking().FirstOrDefaultAsync(t => t.Id == id, ct);
+        if (source is null) return Results.NotFound();
+
+        StoredBlob? blob = null;
+        if (source.SampleSha256 is not null)
+        {
+            var sample = await db.Samples.AsNoTracking().FirstOrDefaultAsync(s => s.Sha256 == source.SampleSha256, ct);
+            if (sample is null || !store.Exists(sample.BlobKey))
+                return Results.Problem(title: "The sample has been deleted under the retention policy.", statusCode: StatusCodes.Status409Conflict,
+                    type: "sample-unavailable");
+            // The cap may have been lowered (or the mode changed to Real) since the sample was uploaded: enforce it as submit does.
+            if (sample.Size > opts.MaxUploadBytes) return TooLarge(opts, "The sample is too large.");
+            blob = new StoredBlob(sample.BlobKey, sample.Sha256, sample.Sha1, sample.Md5, sample.Size);
+        }
+
+        var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["orgId"] = (body.OrgId ?? source.OrgId).ToString(),
+        };
+        if (source.Url is not null) fields["url"] = source.Url;
+        if (body.Image is not null) fields["image"] = body.Image;
+        if (body.NetworkMode is not null) fields["networkMode"] = body.NetworkMode;
+        if (body.ExitCountry is not null) fields["exitCountry"] = body.ExitCountry;
+        if (body.DurationSec is { } d) fields["durationSec"] = d.ToString(CultureInfo.InvariantCulture);
+        if (body.Interactive is { } i) fields["interactive"] = i ? "true" : "false";
+
+        return await ValidateAndCreateAsync(fields, blob, source.OriginalFileName, source.Id, new Dictionary<string, string[]>(),
+            db, audit, user, time, egressOptions.Value.VpnCountries, templates, ct);
     }
 
     private static async Task EnsureSampleAsync(MaldexDbContext db, StoredBlob blob, string? fileName, TimeProvider time, CancellationToken ct)
@@ -307,6 +409,14 @@ public static class TaskEndpoints
                 break;
         }
     }
+
+    /// <summary>The verdict's enum value as a SQL expression (the column holds the name, which would sort alphabetically).</summary>
+    private static readonly System.Linq.Expressions.Expression<Func<AnalysisTask, int>> VerdictRank = t =>
+        t.Verdict == Verdict.Malicious ? (int)Verdict.Malicious
+        : t.Verdict == Verdict.Suspicious ? (int)Verdict.Suspicious
+        : t.Verdict == Verdict.NoThreats ? (int)Verdict.NoThreats : (int)Verdict.Unknown;
+
+    private static bool IsHex(string s) => s.All(Uri.IsHexDigit);
 
     internal static bool TryParseEnum<T>(string raw, out T value) where T : struct, Enum
     {

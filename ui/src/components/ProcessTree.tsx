@@ -1,4 +1,6 @@
 import type { ProcessNodeDto } from '../api/types'
+import { CopyButton } from '../kit/CopyButton'
+import { EmptyState } from '../kit/EmptyState'
 import { safeText } from '../util/safeText'
 import styles from './ProcessTree.module.css'
 
@@ -50,6 +52,7 @@ function Node({ node }: { node: TreeNode }) {
         <span className={styles.image}>{safeText(imageFileName(p.imagePath))}</span>
         <span className={styles.pid}>pid {p.pid}</span>
         <span className={styles.cmd}>{safeText(p.commandLine)}</span>
+        {p.commandLine && <CopyButton value={p.commandLine} label="Copy command line" />}
       </div>
       {node.children.length > 0 && (
         <ul className={styles.list}>
@@ -64,7 +67,7 @@ function Node({ node }: { node: TreeNode }) {
 
 /** Process tree. Every guest-derived string is a plain JSX text node (or an attribute), never HTML. */
 export function ProcessTree({ processes }: { processes: ProcessNodeDto[] }) {
-  if (processes.length === 0) return <p className={styles.empty}>No processes yet.</p>
+  if (processes.length === 0) return <EmptyState title="No processes yet." />
   return (
     <ul className={`${styles.list} ${styles.root}`}>
       {buildTree(processes).map((n) => (

@@ -1,8 +1,10 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { Route, Routes } from 'react-router-dom'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { ApiError } from '../api/client'
 import type { TaskDto } from '../api/types'
+import { reportFixture } from '../test/reportFixture'
 
 const live = vi.hoisted(() => ({ value: { status: null, processes: [], events: [], connected: true } as unknown }))
 vi.mock('../live/useTaskLive', () => ({ useTaskLive: () => live.value }))
@@ -10,14 +12,20 @@ const getTask = vi.fn()
 const extendTask = vi.fn()
 const stopTask = vi.fn()
 const listArtifacts = vi.fn()
+const getTaskReport = vi.fn()
+vi.mock('../auth/auth', () => ({ getAccessToken: vi.fn(async () => null) }))
+import { getAccessToken } from '../auth/auth'
 vi.mock('../api/client', async (orig) => ({
   ...(await orig<typeof import('../api/client')>()),
   getTask: (...a: unknown[]) => getTask(...a),
   extendTask: (...a: unknown[]) => extendTask(...a),
   stopTask: (...a: unknown[]) => stopTask(...a),
   listArtifacts: (...a: unknown[]) => listArtifacts(...a),
+  getTaskReport: (...a: unknown[]) => getTaskReport(...a),
+  getEvents: () => Promise.resolve([]),
 }))
 
+import { renderWithKit } from '../test/renderWithKit'
 import TaskPage from './TaskPage'
 
 const task = (over: Partial<TaskDto>): TaskDto => ({
@@ -26,17 +34,20 @@ const task = (over: Partial<TaskDto>): TaskDto => ({
   queuePosition: 0, createdAt: '2026-10-19T00:00:00Z', deadlineAt: new Date(Date.now() + 120_000).toISOString(), processingWarnings: [], ...over,
 })
 
-const renderPage = () =>
-  render(
-    <MemoryRouter initialEntries={['/tasks/t1']}>
-      <Routes><Route path="/tasks/:id" element={<TaskPage />} /></Routes>
-    </MemoryRouter>,
-  )
+const routes = () => <Routes><Route path="/tasks/:id" element={<TaskPage />} /></Routes>
+const renderPage = () => renderWithKit(routes(), { route: '/tasks/t1' })
 
+let confirmSpy: ReturnType<typeof vi.spyOn>
 beforeEach(() => {
   vi.clearAllMocks()
+  confirmSpy = vi.spyOn(window, 'confirm')
   live.value = { status: null, processes: [], events: [], connected: true }
   listArtifacts.mockResolvedValue([])
+  getTaskReport.mockResolvedValue(reportFixture())
+})
+afterEach(() => {
+  expect(confirmSpy).not.toHaveBeenCalled() // confirmations are in-app dialogs, never window.confirm
+  vi.restoreAllMocks()
 })
 
 describe('TaskPage', () => {
@@ -48,23 +59,91 @@ describe('TaskPage', () => {
     expect(screen.getByLabelText('Time remaining')).toHaveTextContent(/^[12]:\d\d$/)
     await userEvent.click(screen.getByRole('button', { name: 'Extend +60 s' }))
     expect(extendTask).toHaveBeenCalledWith('t1', 60)
+    expect(await screen.findByText('Extended by 60 s')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Extend +300 s' }))
     expect(extendTask).toHaveBeenCalledWith('t1', 300)
     stopTask.mockResolvedValue(undefined)
     await userEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    const dlg = await screen.findByRole('dialog', { name: 'Stop this task?' })
+    await userEvent.click(within(dlg).getByRole('button', { name: 'Cancel' }))
+    expect(stopTask).not.toHaveBeenCalled()
+    await userEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    await userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Stop task' }))
     expect(stopTask).toHaveBeenCalledWith('t1')
+    expect(await screen.findByText('Task stopped')).toBeInTheDocument()
     expect(screen.getByLabelText('Live view')).toBeInTheDocument()
   })
 
-  it('links the reports and downloads only once Completed', async () => {
+  it('shows an action failure as an error toast', async () => {
+    getTask.mockResolvedValue(task({}))
+    extendTask.mockRejectedValue(new Error('Too late to extend.'))
+    renderPage()
+    await screen.findByText('Running')
+    await userEvent.click(screen.getByRole('button', { name: 'Extend +60 s' }))
+    expect(await screen.findByText('Too late to extend.')).toBeInTheDocument()
+  })
+
+  it('offers a Copy SHA-256 button beside the sample hash', async () => {
+    getTask.mockResolvedValue(task({ sampleSha256: 'a'.repeat(64) }))
+    renderPage()
+    await screen.findByText('a'.repeat(64))
+    expect(screen.getByRole('button', { name: 'Copy SHA-256' })).toBeInTheDocument()
+  })
+
+  it('shows a load error with Retry', async () => {
+    getTask.mockRejectedValueOnce(new Error('Boom'))
+    renderPage()
+    expect(await screen.findByRole('alert')).toHaveTextContent('Boom')
+    getTask.mockResolvedValue(task({}))
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByText('Running')).toBeInTheDocument()
+  })
+
+  it('links the reports and downloads from the Reports menu once Completed', async () => {
     getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious' }))
     listArtifacts.mockResolvedValue([{ id: 'a1', kind: 'Pcap', sha256: 'abcdef0123', size: 5 }])
     renderPage()
-    expect(await screen.findByRole('link', { name: 'HTML report' })).toHaveAttribute('href', '/api/tasks/t1/report.html')
-    expect(screen.getByRole('link', { name: 'PDF report' })).toHaveAttribute('href', '/api/tasks/t1/report.pdf')
-    expect(screen.getByRole('link', { name: 'Sample (ZIP)' })).toHaveAttribute('href', '/api/tasks/t1/sample')
-    expect(await screen.findByRole('link', { name: /Pcap/ })).toHaveAttribute('href', '/api/artifacts/a1/download')
+    const menu = await screen.findByRole('button', { name: 'Reports' })
+    expect(menu).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('link', { name: 'HTML report' })).toBeNull()
+    await userEvent.click(menu)
+    expect(menu).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByRole('link', { name: 'HTML report' })).toHaveAttribute('href', '/api/tasks/t1/report.html')
+    expect(screen.getByRole('button', { name: 'PDF report' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Sample (ZIP)' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: /Pcap/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Stop' })).toBeDisabled()
+  })
+
+  it('downloads the PDF, sample and artifacts with the bearer token under their file names', async () => {
+    getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious', sampleSha256: 'f'.repeat(64) }))
+    listArtifacts.mockResolvedValue([{ id: 'a1', kind: 'Pcap', sha256: 'abcdef0123', size: 5 }])
+    vi.mocked(getAccessToken).mockResolvedValue('tok')
+    const calls: { url: string; auth: string | null }[] = []
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+      calls.push({ url: String(url), auth: new Headers(init?.headers).get('authorization') })
+      return new Response('x')
+    })
+    const saved: string[] = []
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) { saved.push(this.download) })
+    renderPage()
+    await userEvent.click(await screen.findByRole('button', { name: 'Reports' }))
+    await userEvent.click(screen.getByRole('button', { name: 'PDF report' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Sample (ZIP)' }))
+    await userEvent.click(await screen.findByRole('button', { name: /Pcap/ }))
+    await waitFor(() => expect(saved).toEqual(['maldex-t1.pdf', `${'f'.repeat(64)}.zip`, 'abcdef0123.zip']))
+    const downloads = calls.filter((c) => !c.url.endsWith('/image'))
+    expect(downloads.map((c) => c.url)).toEqual(['/api/tasks/t1/report.pdf', '/api/tasks/t1/sample', '/api/artifacts/a1/download'])
+    expect(downloads.every((c) => c.auth === 'Bearer tok')).toBe(true)
+  })
+
+  it('shows a failed download as an error toast', async () => {
+    getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious' }))
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => Response.json({ title: 'Report not found.' }, { status: 404 }))
+    renderPage()
+    await userEvent.click(await screen.findByRole('button', { name: 'Reports' }))
+    await userEvent.click(screen.getByRole('button', { name: 'PDF report' }))
+    expect(await screen.findByText('Report not found.')).toBeInTheDocument()
   })
 
   it('re-fetches the task after a reconnect so a status missed during the outage is reconciled', async () => {
@@ -77,22 +156,14 @@ describe('TaskPage', () => {
     // While disconnected the run completed; the hub reconnects but replays no status.
     getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious' }))
     live.value = { status: stale, processes: [], events: [], connected: true }
-    view.rerender(
-      <MemoryRouter initialEntries={['/tasks/t1']}>
-        <Routes><Route path="/tasks/:id" element={<TaskPage />} /></Routes>
-      </MemoryRouter>,
-    )
+    view.rerender(routes())
     expect(await screen.findByText('Completed')).toBeInTheDocument()
-    await waitFor(() => expect(screen.getByRole('link', { name: 'HTML report' })).toBeInTheDocument())
+    expect(await screen.findByRole('button', { name: 'Reports' })).toBeInTheDocument()
     expect(screen.queryByLabelText('Time remaining')).toBeNull()
 
     // A push newer than the fetch wins again.
     live.value = { status: { ...stale, status: 'Failed', reason: 'x' }, processes: [], events: [], connected: true }
-    view.rerender(
-      <MemoryRouter initialEntries={['/tasks/t1']}>
-        <Routes><Route path="/tasks/:id" element={<TaskPage />} /></Routes>
-      </MemoryRouter>,
-    )
+    view.rerender(routes())
     expect(await screen.findByText('Failed')).toBeInTheDocument()
   })
 
@@ -101,6 +172,89 @@ describe('TaskPage', () => {
     renderPage()
     await screen.findByText('Running')
     expect(screen.queryByRole('link', { name: 'HTML report' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Reports' })).toBeNull()
+    expect(getTaskReport).not.toHaveBeenCalled()
+  })
+
+  it('switches from the live layout to the report when the task completes', async () => {
+    getTask.mockResolvedValue(task({}))
+    const view = renderPage()
+    expect(await screen.findByLabelText('Live view')).toBeInTheDocument()
+
+    getTaskReport.mockRejectedValueOnce(new ApiError(409, { type: 'report-not-ready', title: 'The report is only available once the task has completed.', status: 409 }))
+    live.value = { status: { taskId: 't1', status: 'Completed', verdict: 'Malicious', deadlineAt: null }, processes: [], events: [], connected: true }
+    view.rerender(routes())
+    await waitFor(() => expect(getTaskReport).toHaveBeenCalledTimes(1))
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByRole('tab', { name: 'Overview' })).toBeNull()
+
+    // The next status push retries.
+    live.value = { status: { taskId: 't1', status: 'Completed', verdict: 'Malicious', deadlineAt: null }, processes: [], events: [], connected: true }
+    view.rerender(routes())
+    expect(await screen.findByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true')
+    expect(getTaskReport).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByLabelText('Live view')).toBeNull()
+  })
+
+  it('retries the report once 2 s after a 409 even without another push', async () => {
+    getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious' }))
+    getTaskReport.mockRejectedValueOnce(new ApiError(409, { type: 'report-not-ready', title: 'Not ready.', status: 409 }))
+    renderPage()
+    await waitFor(() => expect(getTaskReport).toHaveBeenCalledTimes(1))
+    expect(screen.queryByRole('tab', { name: 'Overview' })).toBeNull()
+    expect(await screen.findByRole('tab', { name: 'Overview' }, { timeout: 4000 })).toBeInTheDocument()
+    expect(getTaskReport).toHaveBeenCalledTimes(2)
+  })
+
+  it('clears the report retry timer on unmount', async () => {
+    getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious' }))
+    getTaskReport.mockRejectedValue(new ApiError(409, { type: 'report-not-ready', title: 'Not ready.', status: 409 }))
+    const view = renderPage()
+    await waitFor(() => expect(getTaskReport).toHaveBeenCalledTimes(1))
+    await new Promise((r) => setTimeout(r, 0))
+    view.unmount()
+    await new Promise((r) => setTimeout(r, 2300))
+    expect(getTaskReport).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows processing warnings on the running layout', async () => {
+    getTask.mockResolvedValue(task({ processingWarnings: ['Telemetry was cut short.'] }))
+    renderPage()
+    const panel = await screen.findByRole('region', { name: 'Processing warnings' })
+    expect(panel).toHaveTextContent('Telemetry was cut short.')
+  })
+
+  it('shows the started and completed times and the MIME type in the header', async () => {
+    getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious', startedAt: '2026-10-19T00:00:10Z', completedAt: '2026-10-19T00:05:10Z' }))
+    renderPage()
+    await screen.findByRole('tab', { name: 'Overview' })
+    const line = screen.getByLabelText('Task details')
+    expect(line).toHaveTextContent(/started .+ago/)
+    expect(line).toHaveTextContent(/completed .+ago/)
+    expect(line).toHaveTextContent('application/x-dosexec')
+    expect(line.querySelector('time[datetime="2026-10-19T00:00:10Z"]')).not.toBeNull()
+  })
+
+  it('shows a report load failure with Retry', async () => {
+    getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious' }))
+    getTaskReport.mockRejectedValueOnce(new ApiError(500, { title: 'The report could not be built.' }))
+    renderPage()
+    expect(await screen.findByRole('alert')).toHaveTextContent('The report could not be built.')
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByRole('tab', { name: 'Overview' })).toBeInTheDocument()
+  })
+
+  it('shows the header line and a Resubmit link', async () => {
+    getTask.mockResolvedValue(task({ submittedByName: 'Bob Analyst', ranSec: 125 }))
+    renderPage()
+    await screen.findByText('Running')
+    const line = screen.getByLabelText('Task details')
+    expect(line).toHaveTextContent('Acme')
+    expect(line).toHaveTextContent('submitted by Bob Analyst')
+    expect(line).toHaveTextContent('ran 2:05')
+    expect(line).toHaveTextContent('Simulated')
+    expect(screen.getByRole('link', { name: 'Resubmit…' })).toHaveAttribute('href', '/submit?from=t1')
   })
 
   it('shows the template provenance summary when the task has one', async () => {
@@ -130,11 +284,7 @@ describe('TaskPage', () => {
     expect(getTask).toHaveBeenCalledTimes(1)
 
     const rerender = () =>
-      view.rerender(
-        <MemoryRouter initialEntries={['/tasks/t1']}>
-          <Routes><Route path="/tasks/:id" element={<TaskPage />} /></Routes>
-        </MemoryRouter>,
-      )
+      view.rerender(routes())
     getTask.mockResolvedValue(bound)
     live.value = { status: { taskId: 't1', status: 'Preparing', verdict: 'Unknown', deadlineAt: null }, processes: [], events: [], connected: true }
     rerender()
