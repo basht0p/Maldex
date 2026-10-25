@@ -271,9 +271,9 @@ public static class TemplateEndpoints
 
     internal static async Task<List<TemplateJobDto>> JobDtosAsync(MaldexDbContext db, IReadOnlyList<TemplateJob> jobs, TemplateJobOptions options, CancellationToken ct)
     {
-        var versionIds = jobs.Select(j => j.BaseVersionId).Concat(jobs.Where(j => j.ResultVersionId != null).Select(j => j.ResultVersionId!.Value)).Distinct().ToList();
+        var versionIds = jobs.Where(j => j.BaseVersionId != null).Select(j => j.BaseVersionId!.Value).Concat(jobs.Where(j => j.ResultVersionId != null).Select(j => j.ResultVersionId!.Value)).Distinct().ToList();
         var numbers = await db.TemplateVersions.AsNoTracking().Where(v => versionIds.Contains(v.Id)).ToDictionaryAsync(v => v.Id, v => v.Number, ct);
-        return jobs.Select(j => TemplateJobDto.From(j, numbers.GetValueOrDefault(j.BaseVersionId),
+        return jobs.Select(j => TemplateJobDto.From(j, j.BaseVersionId is { } b ? numbers.GetValueOrDefault(b) : 0,
             j.ResultVersionId is { } r ? numbers.GetValueOrDefault(r) : null, options.ConfigureIdleTimeout)).ToList();
     }
 

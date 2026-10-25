@@ -53,13 +53,16 @@ public sealed class TemplateJobConfiguration : IEntityTypeConfiguration<Template
 {
     public void Configure(EntityTypeBuilder<TemplateJob> b)
     {
-        b.ToTable("TemplateJobs");
+        b.ToTable("TemplateJobs", t => t.HasCheckConstraint("CK_TemplateJobs_BuildHasNoBase",
+            "([Kind] = 'Build' AND [BaseVersionId] IS NULL) OR ([Kind] <> 'Build' AND [BaseVersionId] IS NOT NULL)"));
         b.HasKey(x => x.Id);
         b.Property(x => x.Id).ValueGeneratedNever();
         b.Property(x => x.TemplateId).HasMaxLength(64).IsRequired();
         b.Property(x => x.Message).HasMaxLength(500);
         b.Property(x => x.FailureReason).HasMaxLength(1000);
         b.Property(x => x.Note).HasMaxLength(1000);
+        b.Property(x => x.MediaIds).HasMaxLength(1000).IsRequired();
+        b.Property(x => x.EditionName).HasMaxLength(100);
         b.Property(x => x.RowVersion).IsRowVersion();
 
         b.HasOne<Template>().WithMany().HasForeignKey(x => x.TemplateId).OnDelete(DeleteBehavior.Restrict);

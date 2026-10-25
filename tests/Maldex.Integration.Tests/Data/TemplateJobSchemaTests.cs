@@ -1,6 +1,7 @@
 using Maldex.Core.Domain;
 using Maldex.Data;
 using Maldex.Integration.Tests.Fixtures;
+using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using Xunit;
 
@@ -81,7 +82,60 @@ public class TemplateJobSchemaTests(SqlServerFixture sql)
             db.TemplateJobs.Add(NewJob("t1", versionId, userId, TemplateJobState.Configuring));
             await db.SaveChangesAsync(Ct);
             db.TemplateJobs.Add(NewJob("t1", versionId, userId));
-            await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync(Ct));
+            var ex = await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync(Ct));
+            Assert.Contains(Assert.IsType<SqlException>(ex.InnerException).Number, new[] { 2601, 2627 });
+        }
+    }
+
+    [Fact]
+    public async Task BuildJob_WithBase_IsRejected()
+    {
+        var (db, versionId, userId) = await SeedAsync();
+        await using (db)
+        {
+            var job = NewJob("t1", versionId, userId);
+            job.Kind = TemplateJobKind.Build;
+            db.TemplateJobs.Add(job);
+            var ex = await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync(Ct));
+            Assert.Equal(547, Assert.IsType<SqlException>(ex.InnerException).Number);
+        }
+    }
+
+    [Fact]
+    public async Task EditJob_WithoutBase_IsRejected()
+    {
+        var (db, versionId, userId) = await SeedAsync();
+        await using (db)
+        {
+            var job = NewJob("t1", versionId, userId);
+            job.BaseVersionId = null;
+            db.TemplateJobs.Add(job);
+            var ex = await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync(Ct));
+            Assert.Equal(547, Assert.IsType<SqlException>(ex.InnerException).Number);
+        }
+    }
+
+    [Fact]
+    public async Task BuildJob_RoundTripsItsFields_AndNewStatesAreStoredAsStrings()
+    {
+        var (db, versionId, userId) = await SeedAsync();
+        await using (db)
+        {
+            var media = Guid.NewGuid();
+            var job = NewJob("t1", versionId, userId, TemplateJobState.Provisioning);
+            job.Kind = TemplateJobKind.Build;
+            job.BaseVersionId = null;
+            job.MediaIds = $"[\"{media}\"]";
+            job.EditionIndex = 3;
+            job.EditionName = "Windows 11 Pro";
+            job.ExpectedCurrentVersionId = versionId;
+            db.TemplateJobs.Add(job);
+            await db.SaveChangesAsync(Ct);
+            var rt = await db.TemplateJobs.AsNoTracking().SingleAsync(j => j.Id == job.Id, Ct);
+            Assert.Equal((TemplateJobKind.Build, (Guid?)null, job.MediaIds, 3, "Windows 11 Pro", (Guid?)versionId),
+                (rt.Kind, rt.BaseVersionId, rt.MediaIds, rt.EditionIndex, rt.EditionName, rt.ExpectedCurrentVersionId));
+            Assert.Equal("Provisioning", await db.Database.SqlQueryRaw<string>("SELECT State AS Value FROM TemplateJobs").SingleAsync(Ct));
+            Assert.Equal("Build", await db.Database.SqlQueryRaw<string>("SELECT Kind AS Value FROM TemplateJobs").SingleAsync(Ct));
         }
     }
 

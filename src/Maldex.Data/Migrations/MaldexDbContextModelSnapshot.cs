@@ -366,6 +366,81 @@ namespace Maldex.Data.Migrations
                     b.ToTable("HttpTransactions", (string)null);
                 });
 
+            modelBuilder.Entity("Maldex.Core.Domain.MediaFile", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<DateTimeOffset>("AddedAt")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<Guid>("AddedByUserId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<string>("Contents")
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<string>("FailureReason")
+                        .HasMaxLength(500)
+                        .HasColumnType("nvarchar(500)");
+
+                    b.Property<string>("FileName")
+                        .IsRequired()
+                        .HasMaxLength(255)
+                        .HasColumnType("nvarchar(255)");
+
+                    b.Property<string>("Kind")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("nvarchar(32)");
+
+                    b.Property<DateTimeOffset>("LastActivityAt")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<long>("ReceivedBytes")
+                        .HasColumnType("bigint");
+
+                    b.Property<byte[]>("RowVersion")
+                        .IsConcurrencyToken()
+                        .IsRequired()
+                        .ValueGeneratedOnAddOrUpdate()
+                        .HasColumnType("rowversion");
+
+                    b.Property<string>("Sha256")
+                        .HasMaxLength(64)
+                        .IsUnicode(false)
+                        .HasColumnType("char(64)")
+                        .IsFixedLength();
+
+                    b.Property<long>("Size")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("Source")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("nvarchar(32)");
+
+                    b.Property<string>("SourceUrl")
+                        .HasMaxLength(2048)
+                        .HasColumnType("nvarchar(2048)");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("nvarchar(32)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AddedByUserId");
+
+                    b.HasIndex("Sha256")
+                        .IsUnique()
+                        .HasDatabaseName("IX_MediaFiles_Sha256_Ready")
+                        .HasFilter("[Status] = 'Ready'");
+
+                    b.ToTable("MediaFiles", (string)null);
+                });
+
             modelBuilder.Entity("Maldex.Core.Domain.NetworkFlow", b =>
                 {
                     b.Property<long>("Id")
@@ -617,7 +692,7 @@ namespace Maldex.Data.Migrations
                     b.Property<Guid>("Id")
                         .HasColumnType("uniqueidentifier");
 
-                    b.Property<Guid>("BaseVersionId")
+                    b.Property<Guid?>("BaseVersionId")
                         .HasColumnType("uniqueidentifier");
 
                     b.Property<DateTimeOffset?>("CancelRequestedAt")
@@ -629,8 +704,18 @@ namespace Maldex.Data.Migrations
                     b.Property<DateTimeOffset>("CreatedAt")
                         .HasColumnType("datetimeoffset");
 
+                    b.Property<int?>("EditionIndex")
+                        .HasColumnType("int");
+
+                    b.Property<string>("EditionName")
+                        .HasMaxLength(100)
+                        .HasColumnType("nvarchar(100)");
+
                     b.Property<DateTimeOffset?>("EndedAt")
                         .HasColumnType("datetimeoffset");
+
+                    b.Property<Guid?>("ExpectedCurrentVersionId")
+                        .HasColumnType("uniqueidentifier");
 
                     b.Property<string>("FailureReason")
                         .HasMaxLength(1000)
@@ -643,6 +728,11 @@ namespace Maldex.Data.Migrations
 
                     b.Property<DateTimeOffset?>("LastConsoleAt")
                         .HasColumnType("datetimeoffset");
+
+                    b.Property<string>("MediaIds")
+                        .IsRequired()
+                        .HasMaxLength(1000)
+                        .HasColumnType("nvarchar(1000)");
 
                     b.Property<string>("Message")
                         .HasMaxLength(500)
@@ -704,7 +794,10 @@ namespace Maldex.Data.Migrations
                         .HasDatabaseName("IX_TemplateJobs_TemplateId_Active")
                         .HasFilter("[State] <> 'Published' AND [State] <> 'Sealed' AND [State] <> 'Failed' AND [State] <> 'Cancelled'");
 
-                    b.ToTable("TemplateJobs", (string)null);
+                    b.ToTable("TemplateJobs", null, t =>
+                        {
+                            t.HasCheckConstraint("CK_TemplateJobs_BuildHasNoBase", "([Kind] = 'Build' AND [BaseVersionId] IS NULL) OR ([Kind] <> 'Build' AND [BaseVersionId] IS NOT NULL)");
+                        });
                 });
 
             modelBuilder.Entity("Maldex.Core.Domain.TemplateVersion", b =>
@@ -881,6 +974,15 @@ namespace Maldex.Data.Migrations
                         .IsRequired();
                 });
 
+            modelBuilder.Entity("Maldex.Core.Domain.MediaFile", b =>
+                {
+                    b.HasOne("Maldex.Core.Domain.AppUser", null)
+                        .WithMany()
+                        .HasForeignKey("AddedByUserId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
             modelBuilder.Entity("Maldex.Core.Domain.NetworkFlow", b =>
                 {
                     b.HasOne("Maldex.Core.Domain.AnalysisTask", null)
@@ -926,8 +1028,7 @@ namespace Maldex.Data.Migrations
                     b.HasOne("Maldex.Core.Domain.TemplateVersion", null)
                         .WithMany()
                         .HasForeignKey("BaseVersionId")
-                        .OnDelete(DeleteBehavior.Restrict)
-                        .IsRequired();
+                        .OnDelete(DeleteBehavior.Restrict);
 
                     b.HasOne("Maldex.Core.Domain.AppUser", null)
                         .WithMany()

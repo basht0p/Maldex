@@ -113,7 +113,9 @@ public sealed class TemplateCoordinator(
             return;
         }
 
-        var baseVersion = await db.TemplateVersions.AsNoTracking().SingleOrDefaultAsync(v => v.Id == job.BaseVersionId, ct).ConfigureAwait(false);
+        TemplateVersion? baseVersion = null;
+        if (job.BaseVersionId is { } baseId)
+            baseVersion = await db.TemplateVersions.AsNoTracking().SingleOrDefaultAsync(v => v.Id == baseId, ct).ConfigureAwait(false);
         var refusal = await RefusalAsync(db, catalog, job, baseVersion, ct).ConfigureAwait(false);
         if (refusal is not null)
         {
@@ -177,6 +179,8 @@ public sealed class TemplateCoordinator(
     /// <summary>Why the job may not start, or null. The endpoint refuses these up front; this catches a race.</summary>
     private async Task<string?> RefusalAsync(MaldexDbContext db, TemplateCatalog catalog, TemplateJob job, TemplateVersion? baseVersion, CancellationToken ct)
     {
+        // Temporary guard: Task 10 replaces it with the Build path.
+        if (job.Kind == TemplateJobKind.Build) return "build jobs are not available yet";
         if (job.Kind == TemplateJobKind.Edit && job.Network is not (NetworkMode.None or NetworkMode.Direct))
             return $"network {job.Network} is not available for an edit";
         if (baseVersion is null || baseVersion.TemplateId != job.TemplateId) return "the base version does not belong to this template";
@@ -203,7 +207,7 @@ public sealed class TemplateCoordinator(
     {
         var copying = await (from j in db.TemplateJobs.AsNoTracking()
                              where j.State == TemplateJobState.Preparing && j.Id != jobId
-                             join v in db.TemplateVersions.AsNoTracking() on j.BaseVersionId equals v.Id
+                             join v in db.TemplateVersions.AsNoTracking() on j.BaseVersionId equals (Guid?)v.Id
                              select v.FileStem).ToListAsync(ct).ConfigureAwait(false);
         var bytes = SizeOrZero(store, baseVersion.FileStem) + copying.Sum(stem => SizeOrZero(store, stem));
         const long MiB = 1024 * 1024;
@@ -852,7 +856,7 @@ public sealed class TemplateCoordinator(
             var numbers = await db.TemplateVersions.AsNoTracking()
                 .Where(v => v.Id == job.BaseVersionId || (job.ResultVersionId != null && v.Id == job.ResultVersionId))
                 .Select(v => new { v.Id, v.Number }).ToListAsync(CancellationToken.None).ConfigureAwait(false);
-            var baseNumber = numbers.FirstOrDefault(n => n.Id == job.BaseVersionId)?.Number ?? 0;
+            var baseNumber = job.BaseVersionId is { } baseId ? numbers.FirstOrDefault(n => n.Id == baseId)?.Number ?? 0 : 0;
             int? resultNumber = numbers.FirstOrDefault(n => n.Id == job.ResultVersionId)?.Number;
             await publisher.PublishAsync(TemplateJobDto.From(job, baseNumber, resultNumber, options.Value.ConfigureIdleTimeout), CancellationToken.None).ConfigureAwait(false);
         }
