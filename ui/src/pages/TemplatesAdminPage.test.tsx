@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from '@testing-library/react'
+import { act, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Route, Routes, useLocation } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -66,6 +66,7 @@ const renderPage = (me: MeDto | null = admin, route = '/admin/templates') =>
     </Routes>,
     { route },
   )
+const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms) })
 const answer = async (label: string) => userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label }))
 const region = (name: string) => screen.findByRole('region', { name })
 let confirmSpy: ReturnType<typeof vi.spyOn>
@@ -281,6 +282,38 @@ describe('TemplatesAdminPage', () => {
       await userEvent.click(within(dlg).getByRole('button', { name: 'Start build' }))
       expect(startTemplateBuild).toHaveBeenCalledWith(expect.objectContaining({ templateId: 'win11-new', osMediaId: 'os1' }))
       expect(await screen.findByTestId('where')).toHaveTextContent('/admin/template-jobs/job-b')
+    })
+  })
+
+  describe('reload while a job runs', () => {
+    afterEach(() => {
+      vi.useRealTimers()
+      vi.restoreAllMocks()
+    })
+
+    it('reloads every 5 s, skipping ticks while the tab is hidden or a request is in flight', async () => {
+      vi.useFakeTimers()
+      listAdminTemplates.mockResolvedValue([golden({ activeJobId: 'job-7' })])
+      renderPage()
+      await tick(0)
+      expect(listAdminTemplates).toHaveBeenCalledTimes(1)
+      await tick(5000)
+      expect(listAdminTemplates).toHaveBeenCalledTimes(2)
+
+      const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
+      await tick(5000)
+      expect(listAdminTemplates).toHaveBeenCalledTimes(2)
+      hidden.mockReturnValue(false)
+
+      let release: (v: AdminTemplateDto[]) => void = () => undefined
+      listAdminTemplates.mockImplementation(() => new Promise<AdminTemplateDto[]>((r) => { release = r }))
+      await tick(5000)
+      expect(listAdminTemplates).toHaveBeenCalledTimes(3)
+      await tick(5000) // still in flight: skipped
+      expect(listAdminTemplates).toHaveBeenCalledTimes(3)
+      release([golden({ activeJobId: 'job-7' })])
+      await tick(5000)
+      expect(listAdminTemplates).toHaveBeenCalledTimes(4)
     })
   })
 })

@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from '@testing-library/react'
+import { act, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -70,6 +70,7 @@ const renderPage = (id = 'win11-golden') =>
     { route: `/admin/templates/${id}` },
   )
 
+const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms) })
 const answer = async (label: string) => userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label }))
 const versionItem = async (n: number) => screen.findByRole('listitem', { name: `v${n}` })
 
@@ -284,5 +285,128 @@ describe('TemplateDetailPage', () => {
     const del = await screen.findByRole('button', { name: 'Delete' })
     expect(del).toBeDisabled()
     expect(del).toHaveAccessibleDescription('Only a template with no versions can be deleted.')
+  })
+
+  it('shows no Publish or Discard on versions that are not Pending', async () => {
+    renderPage()
+    await versionItem(3)
+    expect(screen.queryByRole('button', { name: /^Publish v/ })).toBeNull()
+    expect(screen.queryByRole('button', { name: /^Discard v/ })).toBeNull()
+  })
+
+  it('shows a 409 from Publish as a toast', async () => {
+    const p4 = version({ id: 'p4', number: 4, role: 'Pending' })
+    getAdminTemplate.mockResolvedValue(detail(golden({ versions: [p4, v3, v2] })))
+    publishTemplateVersion.mockRejectedValue(new ApiError(409, { title: 'Only a held version can be published.', status: 409 }))
+    renderPage()
+    await userEvent.click(within(await versionItem(4)).getByRole('button', { name: 'Publish v4' }))
+    await answer('Publish')
+    expect(await screen.findByText('Only a held version can be published.')).toBeInTheDocument()
+  })
+
+  it('Retired-only and Pending-only histories leave Roll back disabled', async () => {
+    const retired = version({ id: 'r2', number: 2, status: 'Retired', role: 'Retired' })
+    getAdminTemplate.mockResolvedValue(detail(golden({ versions: [v3, retired] })))
+    const { unmount } = renderPage()
+    expect(await screen.findByRole('button', { name: 'Roll back' })).toBeDisabled()
+    unmount()
+    const pending = version({ id: 'p4', number: 4, origin: 'Edit', role: 'Pending' })
+    getAdminTemplate.mockResolvedValue(detail(golden({ versions: [pending, v3] })))
+    renderPage()
+    await versionItem(4)
+    expect(screen.getByRole('button', { name: 'Roll back' })).toBeDisabled()
+  })
+
+  it('takes the rollback target from the server role and names only it; the version rolled back from is retired', async () => {
+    const v4 = version({ id: 'g4', number: 4, isCurrent: true, role: 'Current', origin: 'Edit' })
+    const v3r = version({ id: 'r3', number: 3, status: 'Retired', role: 'Retired' })
+    const v2t = version({ id: 'g2', number: 2, role: 'RollbackTarget' })
+    getAdminTemplate.mockResolvedValue(detail(golden({ current: v4, versions: [v4, v3r, v2t] })))
+    renderPage()
+    await userEvent.click(await screen.findByRole('button', { name: 'Roll back' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Roll back Windows 11 Golden to v2?' })
+    expect(dialog).toHaveTextContent('New tasks will use v2.')
+    expect(dialog).toHaveTextContent('v4 will be retired')
+    expect(dialog.textContent).not.toContain('v3')
+    expect(dialog.textContent).not.toContain('stays available')
+    await answer('Cancel')
+    expect(rollBackTemplate).not.toHaveBeenCalled()
+  })
+
+  it('keeps Delete disabled with the default-template reason, and with the active-job reason', async () => {
+    getAdminTemplate.mockResolvedValue(detail(golden({ isDefault: true, current: null, versions: [] })))
+    const { unmount } = renderPage()
+    expect(await screen.findByRole('button', { name: 'Delete' })).toHaveAccessibleDescription('The default template cannot be deleted.')
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeDisabled()
+    unmount()
+    getAdminTemplate.mockResolvedValue(detail(golden({ current: null, versions: [], activeJobId: 'j5' }), [job({ id: 'j5', state: 'Configuring', endedAt: null })]))
+    renderPage()
+    const del = await screen.findByRole('button', { name: 'Delete' })
+    expect(del).toBeDisabled()
+    expect(del).toHaveAccessibleDescription('An Edit job is already configuring for this template.')
+  })
+
+  it('Delete Cancel makes no API call', async () => {
+    getAdminTemplate.mockResolvedValue(detail(golden({ current: null, versions: [] })))
+    renderPage()
+    await userEvent.click(await screen.findByRole('button', { name: 'Delete' }))
+    await answer('Cancel')
+    expect(deleteTemplate).not.toHaveBeenCalled()
+  })
+
+  it('a finished job does not block Edit and Refresh', async () => {
+    getAdminTemplate.mockResolvedValue(detail(golden(), [job({ id: 'j2', state: 'Failed', failureReason: 'Verify failed.' })]))
+    renderPage()
+    expect(await screen.findByRole('button', { name: 'Edit' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Refresh components' })).toBeEnabled()
+  })
+
+  it('Edit defaults to network None and publishing', async () => {
+    startTemplateEdit.mockResolvedValue(job({ id: 'job-e' }))
+    renderPage()
+    await userEvent.click(await screen.findByRole('button', { name: 'Edit' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Start edit' }))
+    expect(startTemplateEdit).toHaveBeenCalledWith('win11-golden', 'None', true)
+  })
+
+  it('shows an admin-entered name with control and bidi characters made visible', async () => {
+    getAdminTemplate.mockResolvedValue(detail(golden({ displayName: 'Evil\u202E\u200Bx' })))
+    renderPage()
+    expect(await screen.findByRole('heading', { level: 1, name: 'Evil\\u202E\\u200Bx' })).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Set as default' }))
+    expect(await screen.findByRole('dialog', { name: 'Make Evil\\u202E\\u200Bx the default?' })).toBeInTheDocument()
+    await answer('Cancel')
+    await userEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    expect(screen.getByRole('dialog', { name: 'Edit Evil\\u202E\\u200Bx' })).toBeInTheDocument()
+  })
+
+  describe('polling while a job runs', () => {
+    afterEach(() => vi.useRealTimers())
+
+    it('reloads when the job ends and re-enables Edit and Refresh', async () => {
+      vi.useFakeTimers()
+      getAdminTemplate.mockResolvedValueOnce(detail(golden({ activeJobId: 'j5' }), [job({ id: 'j5', state: 'Sealing', endedAt: null })]))
+      getAdminTemplate.mockResolvedValue(detail(golden(), [job({ id: 'j5', state: 'Published' })]))
+      renderPage()
+      await tick(0)
+      expect(screen.getByRole('button', { name: 'Edit' })).toBeDisabled()
+      expect(getAdminTemplate).toHaveBeenCalledTimes(1)
+      await tick(5000)
+      expect(getAdminTemplate).toHaveBeenCalledTimes(2)
+      expect(screen.getByRole('button', { name: 'Edit' })).toBeEnabled()
+      expect(screen.getByRole('button', { name: 'Refresh components' })).toBeEnabled()
+    })
+
+    it('keeps the last data and offers Retry when a reload fails', async () => {
+      vi.useFakeTimers()
+      getAdminTemplate.mockResolvedValueOnce(detail(golden({ activeJobId: 'j5' }), [job({ id: 'j5', state: 'Sealing', endedAt: null })]))
+      getAdminTemplate.mockRejectedValue(new Error('boom'))
+      renderPage()
+      await tick(0)
+      await tick(5000)
+      expect(screen.getByRole('alert')).toHaveTextContent('Could not refresh the template (boom). Showing the last loaded versions.')
+      expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+      expect(screen.getByRole('heading', { level: 1, name: 'Windows 11 Golden' })).toBeInTheDocument()
+    })
   })
 })

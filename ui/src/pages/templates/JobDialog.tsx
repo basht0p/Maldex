@@ -2,6 +2,7 @@ import { useRef, useState } from 'react'
 import { startTemplateEdit, startTemplateRefresh } from '../../api/client'
 import type { AdminTemplateDto, TemplateJobDto, TemplateJobNetwork } from '../../api/types'
 import { messageOf } from '../../util/apiMessage'
+import { safeText } from '../../util/safeText'
 import { useDialogFocus } from '../dialogFocus'
 import styles from '../forms.module.css'
 import page from './JobDialog.module.css'
@@ -34,7 +35,7 @@ export default function JobDialog({ kind, template, onClose, onStarted }: {
 
   return (
     <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby={titleId} className={page.dialog} onKeyDown={onKeyDown}>
-      <h3 id={titleId}>{kind === 'Edit' ? `Edit ${template.displayName}` : `Refresh components of ${template.displayName}`}</h3>
+      <h3 id={titleId}>{kind === 'Edit' ? `Edit ${safeText(template.displayName)}` : `Refresh components of ${safeText(template.displayName)}`}</h3>
       {kind === 'Edit' ? (
         <fieldset className={page.fieldset}>
           <legend className={styles.legend}>Network</legend>

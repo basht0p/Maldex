@@ -1,24 +1,8 @@
 import type { AdminTemplateDto, TemplateJobDto, TemplateJobState, TemplateVersionDto } from '../../api/types'
 
-/** e.g. `v3 (Windows 11 Pro 26300, agent 1.0.0, sealed 2026-10-24 by basht0p)`; mirrors the server's task provenance line. */
-export function versionSummary(v: TemplateVersionDto): string {
-  const parts: string[] = []
-  const windows = windowsLabel(v)
-  if (windows) parts.push(windows)
-  if (v.agentVersion) parts.push(`agent ${v.agentVersion}`)
-  parts.push(`sealed ${v.sealedAt.slice(0, 10)}${v.sealedBy ? ` by ${v.sealedBy}` : ''}`)
-  return `v${v.number} (${parts.join(', ')})`
-}
-
 /** Edition and build, e.g. `Windows 11 Pro 26300`; empty when neither is known. */
 export function windowsLabel(v: TemplateVersionDto): string {
   return [v.windowsEdition, v.windowsBuild].filter((s) => s && s.trim()).join(' ')
-}
-
-/** The versions the server keeps for rollback, rollback target first (its `role` decides; a disk may still be missing). */
-export function keptVersions(t: AdminTemplateDto): TemplateVersionDto[] {
-  const target = t.versions.filter((v) => v.role === 'RollbackTarget')
-  return [...target, ...t.versions.filter((v) => v.role === 'Previous')]
 }
 
 /** The version a rollback returns to, chosen by the server's role. */

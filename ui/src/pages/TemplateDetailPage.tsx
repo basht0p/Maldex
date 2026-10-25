@@ -189,7 +189,7 @@ function TemplateDetail({ detail, onChanged }: { detail: TemplateDetailDto; onCh
     <section aria-labelledby="template-title">
       <p className={page.crumb}><Link to="/admin/templates">Templates</Link></p>
       <div className={page.head}>
-        <h1 id="template-title">{t.displayName}</h1>
+        <h1 id="template-title">{safeText(t.displayName)}</h1>
         <code className={page.id}>{t.id}</code>
         {t.isDefault && <span className={page.badge}>Default</span>}
         {!t.enabled && <span className={page.badge}>Disabled</span>}

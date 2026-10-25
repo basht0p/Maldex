@@ -89,13 +89,16 @@ export default function TemplatesAdminPage({ me }: { me: MeDto | null }) {
   const isAdmin = me?.role === 'Admin'
   const legacyMedia = params.get('tab') === 'media'
 
+  const inFlight = useRef(false)
   const refresh = useCallback(async () => {
+    inFlight.current = true
     try {
       setTemplates(await listAdminTemplates())
       setLoadError(null)
     } catch (e) {
       setLoadError(messageOf(e)[0]) // the last loaded templates stay on screen
     } finally {
+      inFlight.current = false
       setLoaded(true)
     }
   }, [])
@@ -113,7 +116,10 @@ export default function TemplatesAdminPage({ me }: { me: MeDto | null }) {
   const polling = templates.some((t) => !!t.activeJobId)
   useEffect(() => {
     if (!polling) return
-    const timer = setInterval(() => void refresh(), JOB_POLL_MS)
+    const timer = setInterval(() => {
+      if (document.hidden || inFlight.current) return // skip while the tab is hidden or a request is still running
+      void refresh()
+    }, JOB_POLL_MS)
     return () => clearInterval(timer)
   }, [polling, refresh])
 
