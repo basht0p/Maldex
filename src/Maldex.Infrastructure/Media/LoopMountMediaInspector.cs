@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using Maldex.Core.Abstractions;
 using Maldex.Core.Domain;
@@ -19,6 +20,8 @@ public sealed class LoopMountMediaInspector(
 {
     private static readonly TimeSpan MountTimeout = TimeSpan.FromSeconds(30);
     private const UnixFileMode OwnerOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+    /// <summary>Mount points of inspections in progress: registered before the directory exists, dropped after it is gone. The sweep never touches them.</summary>
+    private readonly ConcurrentDictionary<string, byte> _inFlight = new(StringComparer.Ordinal);
     private readonly Func<string> _readMountInfo = readMountInfo ?? (() => File.ReadAllText("/proc/self/mountinfo"));
 
     public async Task<MediaInspection> InspectAsync(string isoPath, MediaKind kind, CancellationToken ct)
@@ -35,11 +38,12 @@ public sealed class LoopMountMediaInspector(
 
         var mountRoot = EnsureMountRoot(root);
         var mnt = Path.Combine(mountRoot, RandomNumberGenerator.GetHexString(16, lowercase: true));
-        Directory.CreateDirectory(mnt, OwnerOnly);
+        _inFlight[mnt] = 0;
 
         var mounted = false;
         try
         {
+            Directory.CreateDirectory(mnt, OwnerOnly);
             var (mountFile, mountArgs) = PrivilegedCommands.Sudo("mount", "-o", "loop,ro,nosuid,nodev,noexec", "-t", "udf,iso9660", "--", fullIso, mnt);
             ProcessResult mount;
             try { mount = await runner.RunAsync(mountFile, mountArgs, ct, timeout: MountTimeout); }
@@ -60,6 +64,7 @@ public sealed class LoopMountMediaInspector(
             if (mounted) await UnmountAsync(mnt);
             // rmdir (not recursive): it fails with EBUSY on a live mount and deletes nothing, so it is always safe to try.
             RemoveMountPoint(mnt);
+            _inFlight.TryRemove(mnt, out _);
         }
     }
 
@@ -76,6 +81,7 @@ public sealed class LoopMountMediaInspector(
         foreach (var dir in Directory.EnumerateDirectories(mountRoot))
         {
             ct.ThrowIfCancellationRequested();
+            if (_inFlight.ContainsKey(dir)) continue; // a live inspection owns it
             if (active.Contains(dir))
             {
                 try
