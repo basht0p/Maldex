@@ -4,7 +4,7 @@ import type { AdminTemplateDto, MediaFileDto, StartBuildRequest, TemplateJobDto 
 import { messageOf } from '../util/apiMessage'
 import { useDialogFocus } from './dialogFocus'
 import styles from './forms.module.css'
-import page from './TemplatesAdminPage.module.css'
+import page from './templates/JobDialog.module.css'
 
 const NEW = ''
 

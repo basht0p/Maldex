@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { ApiError, getAdminTemplate, setDefaultTemplate, setTemplateEnabled } from '../api/client'
+import { ApiError, getAdminTemplate } from '../api/client'
 import type { MeDto, TemplateDetailDto, TemplateJobDto, TemplateJobState, TemplateVersionDto, TemplateVersionRole } from '../api/types'
 import badge from '../components/StatusBadge.module.css'
 import { CopyButton } from '../kit/CopyButton'
@@ -12,9 +12,9 @@ import { messageOf } from '../util/apiMessage'
 import { safeText } from '../util/safeText'
 import styles from './forms.module.css'
 import page from './TemplateDetailPage.module.css'
-import { JobDialog } from './templates/JobDialog'
+import JobDialog from './templates/JobDialog'
 import { useTemplateActions } from './templates/useTemplateActions'
-import { isActiveJob, JOB_POLL_MS, jobBlockReason, NO_VERSION, officeLabel, rollbackDiskReason, rollbackTarget, windowsLabel } from './templates/versions'
+import { ALREADY_DEFAULT, isActiveJob, JOB_POLL_MS, jobBlockReason, NO_VERSION, officeLabel, rollbackDiskReason, rollbackTarget, windowsLabel } from './templates/versions'
 
 const ROLE_LABEL: Record<TemplateVersionRole, string> = {
   Current: 'Current',
@@ -26,7 +26,6 @@ const ROLE_LABEL: Record<TemplateVersionRole, string> = {
 }
 
 const NO_PREVIOUS = 'No previous version to roll back to.'
-const ALREADY_DEFAULT = 'Already the default.'
 const DEFAULT_NOT_DELETABLE = 'The default template cannot be deleted.'
 const HAS_VERSIONS = 'Only a template with no versions can be deleted.'
 
@@ -161,7 +160,7 @@ function ActionButton({ label, reason, describedBy, busy, onClick }: {
 function TemplateDetail({ detail, onChanged }: { detail: TemplateDetailDto; onChanged: () => Promise<void> }) {
   const { template: t, jobs } = detail
   const navigate = useNavigate()
-  const { busy, confirm, run, publish, discard, remove, rollBack } = useTemplateActions(t, onChanged, { onDeleted: () => navigate('/admin/templates') })
+  const { busy, publish, makeDefault, toggleEnabled, discard, remove, rollBack } = useTemplateActions(t, onChanged, { onDeleted: () => navigate('/admin/templates') })
   const [dialog, setDialog] = useState<'Edit' | 'Refresh' | null>(null)
   const opener = useRef<HTMLElement | null>(null)
 
@@ -186,29 +185,11 @@ function TemplateDetail({ detail, onChanged }: { detail: TemplateDetailDto; onCh
     opener.current?.focus() // focus returns to the trigger
   }
 
-  async function confirmPublish(v: TemplateVersionDto) {
-    const ok = await confirm({ title: `Publish v${v.number} of ${t.displayName}?`, body: `New tasks will use v${v.number}.`, confirmLabel: 'Publish' })
-    if (ok) await publish(v)
-  }
-
-  async function makeDefault() {
-    const ok = await confirm({ title: `Make ${t.displayName} the default?`, body: 'New tasks use it when no template is chosen.', confirmLabel: 'Set as default' })
-    if (ok) await run(() => setDefaultTemplate(t.id), `${t.displayName} is the default`)
-  }
-
-  async function toggleEnabled() {
-    const enable = !t.enabled
-    const ok = await confirm(enable
-      ? { title: `Enable ${t.displayName}?`, body: 'Analysts can pick it for new tasks again.', confirmLabel: 'Enable' }
-      : { title: `Disable ${t.displayName}?`, body: 'Analysts can no longer pick it for new tasks. Its versions are kept.', confirmLabel: 'Disable' })
-    if (ok) await run(() => setTemplateEnabled(t.id, enable), enable ? 'Template enabled' : 'Template disabled')
-  }
-
   return (
     <section aria-labelledby="template-title">
       <p className={page.crumb}><Link to="/admin/templates">Templates</Link></p>
       <div className={page.head}>
-        <h1 id="template-title">{t.displayName}</h1>
+        <h1 id="template-title">{safeText(t.displayName)}</h1>
         <code className={page.id}>{t.id}</code>
         {t.isDefault && <span className={page.badge}>Default</span>}
         {!t.enabled && <span className={page.badge}>Disabled</span>}
@@ -234,7 +215,7 @@ function TemplateDetail({ detail, onChanged }: { detail: TemplateDetailDto; onCh
       <h2 className={page.subhead}>Versions</h2>
       {versions.length === 0 ? <EmptyState title="No versions yet" /> : (
         <ol className={page.timeline} aria-label="Versions">
-          {versions.map((v) => <VersionItem key={v.id} v={v} busy={busy} onPublish={(x) => void confirmPublish(x)} onDiscard={(x) => void discard(x)} />)}
+          {versions.map((v) => <VersionItem key={v.id} v={v} busy={busy} onPublish={(x) => void publish(x)} onDiscard={(x) => void discard(x)} />)}
         </ol>
       )}
 
