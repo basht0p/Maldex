@@ -187,10 +187,13 @@ Release packages are built and signed by the release workflow: a `.deb` for Ubun
 1. **Download and verify.** Download the `.deb` or `.rpm`, `SHA256SUMS`, `SHA256SUMS.asc` and `maldex-signing-key.asc` from the GitHub release, then:
 
    ```bash
+   gpg --show-keys --with-fingerprint maldex-signing-key.asc
    gpg --import maldex-signing-key.asc
    gpg --verify SHA256SUMS.asc SHA256SUMS
    sha256sum -c SHA256SUMS --ignore-missing
    ```
+
+   The checksums and signatures only prove the files match the key you imported, so compare the fingerprint printed by `--show-keys` with one you obtained out of band (ask basht0p) before trusting the key. Do not take the fingerprint from the same release page.
 
 2. **Install.**
 

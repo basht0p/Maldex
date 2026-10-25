@@ -10,17 +10,18 @@ DIST="${1:?usage: sign.sh <dist-dir>}"
 : "${RPM_GPG_PASSPHRASE:?RPM_GPG_PASSPHRASE is not set}"
 DIST="$(cd "$DIST" && pwd)"
 
-GNUPGHOME="$(mktemp -d)"
-export GNUPGHOME
-chmod 700 "$GNUPGHOME"
+GNUPGHOME=""
 MACROS_BACKUP=""
-if [ -f "$HOME/.rpmmacros" ]; then MACROS_BACKUP="$GNUPGHOME/rpmmacros.orig"; cp "$HOME/.rpmmacros" "$MACROS_BACKUP"; fi
 cleanup() {
-  gpgconf --kill gpg-agent >/dev/null 2>&1 || true
-  if [ -n "$MACROS_BACKUP" ]; then cp "$MACROS_BACKUP" "$HOME/.rpmmacros"; else rm -f "$HOME/.rpmmacros"; fi
-  rm -rf "$GNUPGHOME"
+  if [ -n "$GNUPGHOME" ]; then gpgconf --kill gpg-agent >/dev/null 2>&1 || true; fi
+  if [ -n "$MACROS_BACKUP" ] && [ -f "$MACROS_BACKUP" ]; then cp "$MACROS_BACKUP" "$HOME/.rpmmacros"; else rm -f "$HOME/.rpmmacros"; fi
+  if [ -n "$GNUPGHOME" ]; then rm -rf "$GNUPGHOME"; fi
 }
 trap cleanup EXIT
+GNUPGHOME="$(mktemp -d -t maldex-gnupg.XXXXXX)"
+export GNUPGHOME
+chmod 700 "$GNUPGHOME"
+if [ -f "$HOME/.rpmmacros" ]; then MACROS_BACKUP="$GNUPGHOME/rpmmacros.orig"; cp "$HOME/.rpmmacros" "$MACROS_BACKUP"; fi
 
 PASSFILE="$GNUPGHOME/pass"
 ( umask 077; printf '%s' "$RPM_GPG_PASSPHRASE" > "$PASSFILE" )
@@ -34,6 +35,7 @@ echo "signing with key ${KEYID: -16}"
 
 cat > "$HOME/.rpmmacros" <<EOF
 %_gpg_name $KEYID
+%__gpg $(command -v gpg)
 %__gpg_sign_cmd %{__gpg} gpg --batch --no-verbose --no-armor --pinentry-mode loopback --passphrase-file $PASSFILE --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} --digest-algo sha256 %{__plaintext_filename}
 EOF
 

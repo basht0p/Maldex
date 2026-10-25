@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Set up .NET
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
@@ -28,11 +30,11 @@ jobs:
           sudo apt-get install -y rpm gnupg xorriso
       - name: Build packages
         env:
-          REF_TYPE: ${{ github.ref_type }}
+          EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
         run: |
-          if [ "$REF_TYPE" = tag ]; then
+          if [ "$EVENT" = push ]; then
             VERSION="${REF_NAME#v}"
           else
             VERSION="0.0.0~dryrun+${SHA:0:12}"
@@ -49,6 +51,12 @@ jobs:
           name: dist
           path: dist/
           if-no-files-found: error
+      - name: Remove leftover signing state
+        if: always()
+        run: |
+          rm -f "$HOME/.rpmmacros"
+          rm -rf /tmp/maldex-gnupg.*
+          gpgconf --kill gpg-agent || true
 
   smoke-deb:
     needs: build
@@ -57,6 +65,8 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Download dist
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -64,10 +74,11 @@ jobs:
           path: dist
       - name: Install the package
         run: |
+          export DEBIAN_FRONTEND=noninteractive
           apt-get update
           apt-get install -y ./dist/maldex_*.deb
       - name: Smoke
-        run: packaging/ci/smoke.sh deb
+        run: bash packaging/ci/smoke.sh deb
 
   smoke-rpm:
     needs: build
@@ -76,6 +87,8 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Download dist
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -86,13 +99,13 @@ jobs:
           dnf install -y epel-release dnf-plugins-core
           dnf config-manager --set-enabled crb
           rpm --import dist/maldex-signing-key.asc
-          rpm -K dist/maldex-*.rpm
+          rpm -K dist/maldex-*.rpm | tee /dev/stderr | grep -q 'signatures OK'
           dnf install -y ./dist/maldex-*.rpm
       - name: Smoke
-        run: packaging/ci/smoke.sh rpm
+        run: bash packaging/ci/smoke.sh rpm
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [smoke-deb, smoke-rpm]
     runs-on: ubuntu-24.04
     permissions:
@@ -121,7 +134,6 @@ jobs:
           The package grants the maldex service user passwordless sudo for a fixed list of commands and assumes a dedicated host.
           EOF
           gh release create "$TAG" \
-            "dist/maldex_${TAG#v}_amd64.deb" \
-            "dist/maldex-${TAG#v}-1.x86_64.rpm" \
+            dist/maldex_*.deb dist/maldex-*.rpm \
             dist/SHA256SUMS dist/SHA256SUMS.asc dist/maldex-signing-key.asc \
             --title "Maldex ${TAG#v}" --notes-file notes.md
