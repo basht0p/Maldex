@@ -105,7 +105,8 @@ public sealed partial class RealTemplateJobTests(SqlServerFixture sql, ITestOutp
         });
     }
 
-    [Fact(Timeout = 45 * 60 * 1000)]
+    // Its own waits: 20 (Configuring) + 5 (ready) + 2 (self-test) + 10 (cancel) min, plus up to 8 min of cleanup.
+    [Fact(Timeout = 60 * 60 * 1000)]
     public async Task Edit_Direct_ReachesInternet_NotLan()
     {
         RequireRealStack();
@@ -117,7 +118,7 @@ public sealed partial class RealTemplateJobTests(SqlServerFixture sql, ITestOutp
 
             var job = await StartAsync(admin, "edit", new { network = "Direct" });
             jobs.Add(job);
-            var configuring = await WaitForAsync(admin, job, s => s is "Configuring" || IsTerminal(s), JobTimeout);
+            var configuring = await WaitForAsync(admin, job, s => s is "Configuring" || IsTerminal(s), TimeSpan.FromMinutes(20));
             Assert.True(configuring.GetProperty("state").GetString() == "Configuring", $"edit job ended {Describe(configuring)}");
             Assert.Equal("Direct", configuring.GetProperty("network").GetString());
 
@@ -316,9 +317,6 @@ public sealed partial class RealTemplateJobTests(SqlServerFixture sql, ITestOutp
             failure = ex;
         }
 
-        foreach (var line in roundTrips.Describe(vm => jobs.Any(j => vm == VmHandle.For(j).Name) ? $"job {vm[7..15]}" : $"verification boot {vm[7..15]}"))
-            Progress("provenance: " + line);
-
         var problems = new List<string>();
         foreach (var job in jobs)
         {
@@ -372,11 +370,26 @@ public sealed partial class RealTemplateJobTests(SqlServerFixture sql, ITestOutp
         if (!after.SequenceEqual(before))
             problems.Add($"the base directory changed: before [{string.Join(", ", before)}], after [{string.Join(", ", after)}]");
 
+        // Diagnostics only, after the cleanup: never fails the test or hides its outcome.
+        try
+        {
+            foreach (var line in roundTrips.Describe(vm => (jobs.Any(j => vm == VmHandle.For(j).Name) ? "job " : "verification boot ") + ShortVm(vm)))
+                Progress("provenance: " + line);
+        }
+        catch (Exception ex)
+        {
+            try { Progress($"provenance: could not describe the round trips ({ex.Message})"); } catch (Exception) { /* output gone */ }
+        }
+
         var leak = problems.Count == 0 ? null : string.Join("; ", problems);
         if (failure is not null && leak is not null) throw new AggregateException($"template E2E failed AND cleanup reported problems: {leak}", failure, new InvalidOperationException(leak));
         if (leak is not null) throw new InvalidOperationException(leak);
         if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
     }
+
+    /// <summary><c>maldex-&lt;32 hex&gt;</c> → its first 8 hex; any other name as it is.</summary>
+    private static string ShortVm(string vm) =>
+        vm.StartsWith("maldex-", StringComparison.Ordinal) && vm.Length >= 15 ? vm[7..15] : vm;
 
     /// <summary>Asks a still-active job to cancel and waits up to 5 min for a terminal state.</summary>
     private static async Task CancelIfActiveAsync(MaldexAppFactory f, Guid job)

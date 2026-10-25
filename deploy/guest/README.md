@@ -47,7 +47,12 @@ Once an image is a template (the first start imports it as v1), change it in the
 the current agent, Sysmon configuration and interception CA without a console. Both verify the sealed copy (agent build,
 Defender real-time protection off) before publishing it as a new version, and **Roll back** returns to the previous one.
 No disk is ever replaced in place: every version is a new file `base/<version id>.qcow2`, so the hand-prepared base stays
-as it is. The agent that sealing installs is `.data/agent/Maldex.Agent.exe` with its `Maldex.Agent.version` (`./build.sh agent`).
+as it is.
+
+Before the first boot, each Edit and Refresh job writes the current agent into its own working copy offline with
+libguestfs (guestfish), so even an image with an older agent can be updated. This needs `libguestfs-tools` and the fixed
+appliance at `/var/lib/maldex/guestfs-appliance`, which root builds; `./build.sh real-setup` installs and builds both. The
+agent comes from `.data/agent/Maldex.Agent.exe` and its `Maldex.Agent.version`: run `./build.sh agent` first.
 
 `prepare-guest` / `finalize-guest` remain only for making the first image, until Build from ISO exists in the app (Plan 3).
 
