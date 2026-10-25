@@ -41,7 +41,7 @@ const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin', maxUploadByt
 const version = (over: Partial<TemplateVersionDto>): TemplateVersionDto => ({
   id: 'v-id', number: 1, origin: 'Imported', status: 'Ready', role: 'Pending', isCurrent: false, diskPresent: true,
   windowsEdition: null, windowsBuild: null, officePresent: null, agentVersion: null, sealedBy: null,
-  sealedAt: '2026-10-24T10:00:00Z', note: null, sizeBytes: null, ...over,
+  sealedAt: '2026-10-24T10:00:00Z', note: null, sizeBytes: null, sourceMedia: [], taskCount: 0, ...over,
 })
 
 const v3 = version({
@@ -52,11 +52,11 @@ const v1 = version({ id: 'g1', number: 1, origin: 'IsoBuild', status: 'Deleted',
 
 const golden = (over: Partial<AdminTemplateDto> = {}): AdminTemplateDto => ({
   id: 'win11-golden', displayName: 'Windows 11 Golden', description: null, isDefault: false, enabled: true,
-  current: v3, versions: [v3, v2, v1], ...over,
+  current: v3, versions: [v3, v2, v1], tasksLast30Days: 0, refreshDue: false, activeJobId: null, ...over,
 })
 const base = (over: Partial<AdminTemplateDto> = {}): AdminTemplateDto => {
   const cur = version({ id: 'b1', number: 1, isCurrent: true, role: 'Current' })
-  return { id: 'win11-26h2', displayName: 'Windows 11 26H2', description: null, isDefault: true, enabled: true, current: cur, versions: [cur], ...over }
+  return { id: 'win11-26h2', displayName: 'Windows 11 26H2', description: null, isDefault: true, enabled: true, current: cur, versions: [cur], tasksLast30Days: 0, refreshDue: false, activeJobId: null, ...over }
 }
 
 const job = (over: Partial<TemplateJobDto> = {}): TemplateJobDto => ({
@@ -457,7 +457,7 @@ describe('TemplatesAdminPage', () => {
 
   describe('Media, New template and Delete', () => {
     const empty = (over: Partial<AdminTemplateDto> = {}): AdminTemplateDto => ({
-      id: 'win11-new', displayName: 'Windows 11 New', description: null, isDefault: false, enabled: true, current: null, versions: [], ...over,
+      id: 'win11-new', displayName: 'Windows 11 New', description: null, isDefault: false, enabled: true, current: null, versions: [], tasksLast30Days: 0, refreshDue: false, activeJobId: null, ...over,
     })
     const iso = {
       id: 'os1', kind: 'OsInstaller', fileName: 'win11.iso', size: 10, receivedBytes: 10, sha256: 'ab', source: 'Upload', status: 'Ready',

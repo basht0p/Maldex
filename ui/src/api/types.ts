@@ -96,6 +96,18 @@ export interface TemplateVersionDto {
   sealedAt: string
   note?: string | null
   sizeBytes?: number | null
+  parentVersionId?: string | null
+  parentNumber?: number | null
+  sysmonConfigSha256?: string | null
+  mitmCaSha256?: string | null
+  /** The media the version was built from; a deleted file keeps its id with the name "(deleted)". */
+  sourceMedia: MediaRefDto[]
+  taskCount: number
+}
+
+export interface MediaRefDto {
+  id: string
+  name: string
 }
 
 export type TemplateJobKind = 'Edit' | 'Refresh' | 'Build'
@@ -200,6 +212,15 @@ export interface AdminTemplateDto {
   enabled: boolean
   current?: TemplateVersionDto | null
   versions: TemplateVersionDto[]
+  tasksLast30Days: number
+  refreshDue: boolean
+  activeJobId?: string | null
+}
+
+/** GET /api/admin/templates/{id}: the template with up to 100 jobs, newest first. */
+export interface TemplateDetailDto {
+  template: AdminTemplateDto
+  jobs: TemplateJobDto[]
 }
 
 export interface TaskListDto {

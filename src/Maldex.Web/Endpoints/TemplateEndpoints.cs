@@ -10,6 +10,7 @@ using Maldex.Infrastructure.Libvirt;
 using Maldex.Orchestrator.Templates;
 using Maldex.Orchestrator.Templates.Build;
 using Maldex.Web.Auth;
+using Maldex.Web.Templates;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
@@ -22,10 +23,17 @@ public sealed record TemplateSummaryDto(string Id, string DisplayName, bool IsDe
 
 public sealed record TemplateVersionDto(Guid Id, int Number, string Origin, string Status, bool IsCurrent, bool DiskPresent,
     string? WindowsEdition, string? WindowsBuild, bool? OfficePresent, string? AgentVersion, string? SealedBy, DateTimeOffset SealedAt,
-    string? Note, long? SizeBytes, string Role);
+    string? Note, long? SizeBytes, string Role,
+    Guid? ParentVersionId, int? ParentNumber, string? SysmonConfigSha256, string? MitmCaSha256, IReadOnlyList<MediaRefDto> SourceMedia, int TaskCount);
+
+/// <summary>A media file a version was built from; <c>Name</c> is "(deleted)" when the file is gone (the id is kept).</summary>
+public sealed record MediaRefDto(Guid Id, string Name);
+
+public sealed record TemplateDetailDto(AdminTemplateDto Template, IReadOnlyList<TemplateJobDto> Jobs);
 
 public sealed record AdminTemplateDto(string Id, string DisplayName, string? Description, bool IsDefault, bool Enabled,
-    TemplateVersionDto? Current, IReadOnlyList<TemplateVersionDto> Versions);
+    TemplateVersionDto? Current, IReadOnlyList<TemplateVersionDto> Versions,
+    int TasksLast30Days, bool RefreshDue, Guid? ActiveJobId);
 
 public sealed record SetEnabledRequest(bool Enabled);
 
@@ -55,8 +63,19 @@ public static class TemplateEndpoints
 
         var admin = app.MapGroup("/api/admin/templates").RequireAuthorization(AuthSetup.AdminPolicy);
 
-        admin.MapGet("", async (MaldexDbContext db, TemplateCatalog catalog, CancellationToken ct) =>
-            await LoadAsync(db, catalog, null, ct));
+        admin.MapGet("", async (MaldexDbContext db, TemplateCatalog catalog, IOptions<TemplateAdminOptions> adminOptions, TimeProvider time, CancellationToken ct) =>
+            await LoadAsync(db, catalog, null, adminOptions.Value, time, ct));
+
+        admin.MapGet("{id}", async (string id, MaldexDbContext db, TemplateCatalog catalog, IOptions<TemplateAdminOptions> adminOptions, TimeProvider time,
+            IOptions<TemplateJobOptions> jobs, IOptions<BuildOptions> build, CancellationToken ct) =>
+        {
+            if (await CanonicalIdAsync(db, id, ct) is not { } templateId) return Results.NotFound();
+            var template = (await LoadAsync(db, catalog, templateId, adminOptions.Value, time, ct)).SingleOrDefault();
+            if (template is null) return Results.NotFound();
+            var rows = await db.TemplateJobs.AsNoTracking().Where(j => j.TemplateId == templateId)
+                .OrderByDescending(j => j.CreatedAt).ThenByDescending(j => j.Id).Take(DetailJobs).ToListAsync(ct);
+            return Results.Ok(new TemplateDetailDto(template, await JobDtosAsync(db, rows, jobs.Value, build.Value, ct)));
+        });
 
         // Each change and its audit row are saved together by the catalog; a no-op change writes no row.
         admin.MapPost("{id}/default", async (string id, MaldexDbContext db, TemplateCatalog catalog, CurrentUser user, CancellationToken ct) =>
@@ -80,7 +99,7 @@ public static class TemplateEndpoints
             });
         });
 
-        admin.MapPost("{id}/rollback", async (string id, MaldexDbContext db, TemplateCatalog catalog, CurrentUser user, CancellationToken ct) =>
+        admin.MapPost("{id}/rollback", async (string id, MaldexDbContext db, TemplateCatalog catalog, IOptions<TemplateAdminOptions> adminOptions, TimeProvider time, CurrentUser user, CancellationToken ct) =>
         {
             if (await CanonicalIdAsync(db, id, ct) is not { } templateId) return Results.NotFound();
             var refused = await ConflictOr(async () =>
@@ -89,11 +108,11 @@ public static class TemplateEndpoints
                 return null;
             });
             // Outside ConflictOr: once the rollback is committed, a failure here is a 500, never a refusal.
-            return refused ?? Results.Ok((await LoadAsync(db, catalog, templateId, ct)).Single());
+            return refused ?? Results.Ok((await LoadAsync(db, catalog, templateId, adminOptions.Value, time, ct)).Single());
         });
 
         // Held versions (spec §2): sealed by a job that did not publish. Only a Pending version can be published or discarded.
-        admin.MapPost("{id}/versions/{versionId:guid}/publish", async (string id, Guid versionId, MaldexDbContext db, TemplateCatalog catalog, CurrentUser user, CancellationToken ct) =>
+        admin.MapPost("{id}/versions/{versionId:guid}/publish", async (string id, Guid versionId, MaldexDbContext db, TemplateCatalog catalog, IOptions<TemplateAdminOptions> adminOptions, TimeProvider time, CurrentUser user, CancellationToken ct) =>
         {
             if (await CanonicalIdAsync(db, id, ct) is not { } templateId) return Results.NotFound();
             if (await VersionNumberAsync(db, templateId, versionId, ct) is not { } number) return Results.NotFound();
@@ -102,10 +121,10 @@ public static class TemplateEndpoints
                 await catalog.PublishPendingAsync(templateId, versionId, ct, new TemplateAudit(ActorOf(user), "template.publish", $"to=v{number}"));
                 return null;
             });
-            return refused ?? Results.Ok((await LoadAsync(db, catalog, templateId, ct)).Single());
+            return refused ?? Results.Ok((await LoadAsync(db, catalog, templateId, adminOptions.Value, time, ct)).Single());
         });
 
-        admin.MapPost("{id}/versions/{versionId:guid}/discard", async (string id, Guid versionId, MaldexDbContext db, TemplateCatalog catalog, CurrentUser user, CancellationToken ct) =>
+        admin.MapPost("{id}/versions/{versionId:guid}/discard", async (string id, Guid versionId, MaldexDbContext db, TemplateCatalog catalog, IOptions<TemplateAdminOptions> adminOptions, TimeProvider time, CurrentUser user, CancellationToken ct) =>
         {
             if (await CanonicalIdAsync(db, id, ct) is not { } templateId) return Results.NotFound();
             if (await VersionNumberAsync(db, templateId, versionId, ct) is not { } number) return Results.NotFound();
@@ -114,7 +133,7 @@ public static class TemplateEndpoints
                 await catalog.DiscardPendingAsync(templateId, versionId, ct, new TemplateAudit(ActorOf(user), "template.version.discard", $"version=v{number}"));
                 return null;
             });
-            return refused ?? Results.Ok((await LoadAsync(db, catalog, templateId, ct)).Single());
+            return refused ?? Results.Ok((await LoadAsync(db, catalog, templateId, adminOptions.Value, time, ct)).Single());
         });
 
         // Edit and Refresh jobs. The endpoints only record the request; TemplateJobWorker starts the job and the coordinator runs it.
@@ -276,7 +295,7 @@ public static class TemplateEndpoints
         return app;
     }
 
-    private const int RecentJobs = 20, MaxNoteLength = 1000;
+    private const int RecentJobs = 20, DetailJobs = 100, MaxNoteLength = 1000;
 
     /// <summary>Removes a deleted job's provisioning log directory. Best effort: the template is already gone.</summary>
     private static void DeleteLogDirectory(BuildOptions build, Guid jobId, ILogger logger)
@@ -488,7 +507,14 @@ public static class TemplateEndpoints
     private static Task<string?> CanonicalIdAsync(MaldexDbContext db, string id, CancellationToken ct) =>
         db.Templates.AsNoTracking().Where(t => t.Id == id).Select(t => (string?)t.Id).SingleOrDefaultAsync(ct);
 
-    private static async Task<List<AdminTemplateDto>> LoadAsync(MaldexDbContext db, TemplateCatalog catalog, string? onlyId, CancellationToken ct)
+    private static List<Guid> IdsOf(string json)
+    {
+        try { return JsonSerializer.Deserialize<List<Guid>>(json) ?? []; }
+        catch (JsonException) { return []; }
+    }
+
+    private static async Task<List<AdminTemplateDto>> LoadAsync(MaldexDbContext db, TemplateCatalog catalog, string? onlyId,
+        TemplateAdminOptions options, TimeProvider time, CancellationToken ct)
     {
         var templates = await db.Templates.AsNoTracking().Where(t => onlyId == null || t.Id == onlyId)
             .OrderByDescending(t => t.IsDefault).ThenBy(t => t.DisplayName).ToListAsync(ct);
@@ -497,6 +523,26 @@ public static class TemplateEndpoints
             .OrderByDescending(v => v.Number).ToListAsync(ct);
         var userIds = versions.Where(v => v.SealedByUserId != null).Select(v => v.SealedByUserId!.Value).Distinct().ToList();
         var names = await db.Users.AsNoTracking().Where(u => userIds.Contains(u.Id)).ToDictionaryAsync(u => u.Id, u => u.DisplayName, ct);
+
+        var now = time.GetUtcNow();
+        var since = now.AddDays(-30);
+        var versionIds = versions.Select(v => v.Id).ToList();
+        // One grouped query: tasks per bound version, and how many of them are recent.
+        var usage = await db.Tasks.AsNoTracking().Where(k => k.TemplateVersionId != null && versionIds.Contains(k.TemplateVersionId.Value))
+            .GroupBy(k => k.TemplateVersionId!.Value)
+            .Select(g => new { VersionId = g.Key, Total = g.Count(), Recent = g.Count(k => k.CreatedAt >= since) })
+            .ToDictionaryAsync(x => x.VersionId, ct);
+        var activeStates = TemplateJobStateMachine.ActiveStates;
+        var activeJobs = (await db.TemplateJobs.AsNoTracking().Where(j => ids.Contains(j.TemplateId) && activeStates.Contains(j.State))
+            .Select(j => new { j.TemplateId, j.Id, j.CreatedAt }).ToListAsync(ct))
+            .GroupBy(j => j.TemplateId).ToDictionary(g => g.Key, g => g.OrderByDescending(j => j.CreatedAt).ThenByDescending(j => j.Id).First().Id);
+
+        var sources = versions.ToDictionary(v => v.Id, v => IdsOf(v.SourceMediaIds).Distinct().ToList());
+        var mediaIds = sources.Values.SelectMany(x => x).Distinct().ToList();
+        // A soft-deleted row (Status Deleted) is gone as far as the UI goes: it shows as "(deleted)".
+        var mediaNames = await db.MediaFiles.AsNoTracking().Where(m => mediaIds.Contains(m.Id) && m.Status != MediaStatus.Deleted)
+            .ToDictionaryAsync(m => m.Id, m => m.FileName, ct);
+        var numberOf = versions.ToDictionary(v => v.Id, v => v.Number);
 
         return templates.Select(t =>
         {
@@ -507,8 +553,16 @@ public static class TemplateEndpoints
                 v.Status != TemplateVersionStatus.Deleted && catalog.DiskPresent(v.FileStem),
                 v.WindowsEdition, v.WindowsBuild, v.OfficePresent, v.AgentVersion,
                 v.SealedByUserId is { } u && names.TryGetValue(u, out var name) ? name : null,
-                v.SealedAt, v.Note, v.SizeBytes, roles[v.Id])).ToList();
-            return new AdminTemplateDto(t.Id, t.DisplayName, t.Description, t.IsDefault, t.Enabled, dtos.FirstOrDefault(d => d.IsCurrent), dtos);
+                v.SealedAt, v.Note, v.SizeBytes, roles[v.Id],
+                v.ParentVersionId, v.ParentVersionId is { } p && numberOf.TryGetValue(p, out var pn) ? pn : null,
+                v.SysmonConfigSha256, v.MitmCaSha256,
+                sources[v.Id].Select(m => new MediaRefDto(m, mediaNames.GetValueOrDefault(m, "(deleted)"))).ToList(),
+                usage.TryGetValue(v.Id, out var us) ? us.Total : 0)).ToList();
+            var current = dtos.FirstOrDefault(d => d.IsCurrent);
+            var refreshDue = current is not null && current.SealedAt < now.AddDays(-options.RefreshDueDays);
+            return new AdminTemplateDto(t.Id, t.DisplayName, t.Description, t.IsDefault, t.Enabled, current, dtos,
+                mine.Sum(v => usage.TryGetValue(v.Id, out var us) ? us.Recent : 0), refreshDue,
+                activeJobs.TryGetValue(t.Id, out var job) ? job : null);
         }).ToList();
     }
 }
