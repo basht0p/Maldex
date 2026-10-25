@@ -1,3 +1,6 @@
+using System.Globalization;
+using System.Text;
+using System.Text.Json;
 using Maldex.Core.Domain;
 using Maldex.Core.Live;
 using Maldex.Data;
@@ -5,6 +8,7 @@ using Maldex.Web.Audit;
 using Maldex.Web.Auth;
 using Maldex.Web.Templates;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 
 namespace Maldex.Web.Endpoints;
 
@@ -19,7 +23,39 @@ public static class LiveControlEndpoints
     public const int MaxRunSeconds = 1800;
     public const int MaxEventsPerRequest = 1000;
 
+    public const int MaxExportRows = 100_000;
+
     private const int MaxSaveAttempts = 5;
+    private const int MaxQueryLength = 200;
+
+    private static EventType? ParseFilters(string? type, string? q, Dictionary<string, string[]> errors, out string? text)
+    {
+        EventType? typeFilter = null;
+        if (!string.IsNullOrWhiteSpace(type))
+        {
+            if (TaskEndpoints.TryParseEnum<EventType>(type, out var parsed)) typeFilter = parsed;
+            else errors["type"] = ["Unknown event type."];
+        }
+        text = null;
+        if (q is not null)
+        {
+            var trimmed = q.Trim();
+            if (trimmed.Length is < 1 or > MaxQueryLength) errors["q"] = [$"q must be 1 to {MaxQueryLength} characters."];
+            else text = trimmed;
+        }
+        return typeFilter;
+    }
+
+    // The default SQL collation is case-insensitive, so Contains needs no ToLower.
+    private static IQueryable<BehaviorEvent> Filtered(MaldexDbContext db, Guid taskId, EventType? type, int? pid, long? processId, string? text)
+    {
+        var query = db.BehaviorEvents.AsNoTracking().Where(e => e.TaskId == taskId);
+        if (type is not null) query = query.Where(e => e.Type == type);
+        if (pid is { } p) query = query.Where(e => e.Pid == p);
+        if (processId is { } n) query = query.Where(e => e.ProcessNodeId == n);
+        if (text is not null) query = query.Where(e => e.Summary.Contains(text) || e.Data.Contains(text));
+        return query;
+    }
 
     public static IEndpointRouteBuilder MapLiveControlEndpoints(this IEndpointRouteBuilder app)
     {
@@ -36,29 +72,72 @@ public static class LiveControlEndpoints
             return Results.Ok(nodes);
         });
 
-        g.MapGet("{id:guid}/events", async (Guid id, long? afterId, string? type, int? take, MaldexDbContext db, CancellationToken ct) =>
+        g.MapGet("{id:guid}/events", async (Guid id, long? afterId, string? type, int? take, int? pid, long? processId, string? q, MaldexDbContext db, CancellationToken ct) =>
         {
             var errors = new Dictionary<string, string[]>();
             if (afterId is < 0) errors["afterId"] = ["afterId must be 0 or more."];
-            EventType? typeFilter = null;
-            if (!string.IsNullOrWhiteSpace(type))
-            {
-                if (TaskEndpoints.TryParseEnum<EventType>(type, out var parsed)) typeFilter = parsed;
-                else errors["type"] = ["Unknown event type."];
-            }
+            var typeFilter = ParseFilters(type, q, errors, out var text);
             if (errors.Count > 0) return Results.ValidationProblem(errors);
 
             if (!await db.Tasks.AsNoTracking().AnyAsync(t => t.Id == id, ct)) return Results.NotFound();
 
             var after = afterId ?? 0;
-            var query = db.BehaviorEvents.AsNoTracking().Where(e => e.TaskId == id && e.Id > after);
-            if (typeFilter is not null) query = query.Where(e => e.Type == typeFilter);
-            var events = await query
+            var events = await Filtered(db, id, typeFilter, pid, processId, text)
+                .Where(e => e.Id > after)
                 .OrderBy(e => e.Id)
                 .Take(Math.Clamp(take ?? MaxEventsPerRequest, 1, MaxEventsPerRequest))
                 .Select(e => new LiveEventDto(e.Id, e.Type, e.At, e.Pid, e.ProcessNodeId, e.Summary, e.Data))
                 .ToListAsync(ct);
             return Results.Ok(events);
+        });
+
+        g.MapGet("{id:guid}/events/export", async (Guid id, string? format, string? type, int? pid, long? processId, string? q,
+            HttpContext ctx, MaldexDbContext db, AuditWriter audit, CancellationToken ct) =>
+        {
+            var errors = new Dictionary<string, string[]>();
+            var fmt = format?.Trim().ToLowerInvariant();
+            if (fmt is not ("csv" or "json")) errors["format"] = ["format must be csv or json."];
+            var typeFilter = ParseFilters(type, q, errors, out var text);
+            if (errors.Count > 0) return Results.ValidationProblem(errors);
+
+            if (!await db.Tasks.AsNoTracking().AnyAsync(t => t.Id == id, ct)) return Results.NotFound();
+
+            var json = fmt == "json";
+            ctx.Response.ContentType = json ? "application/json" : "text/csv; charset=utf-8";
+            ctx.Response.Headers.ContentDisposition = $"attachment; filename=\"task-{id}-events.{fmt}\"";
+            var options = ctx.RequestServices.GetRequiredService<IOptions<Microsoft.AspNetCore.Http.Json.JsonOptions>>().Value.SerializerOptions;
+
+            var rows = Filtered(db, id, typeFilter, pid, processId, text)
+                .OrderBy(e => e.Id)
+                .Take(MaxExportRows)
+                .Select(e => new LiveEventDto(e.Id, e.Type, e.At, e.Pid, e.ProcessNodeId, e.Summary, e.Data))
+                .AsAsyncEnumerable();
+
+            var count = 0;
+            await using (var writer = new StreamWriter(ctx.Response.Body, new UTF8Encoding(false), 16 * 1024, leaveOpen: true))
+            {
+                await writer.WriteAsync(json ? "[" : EventCsv.Header + "\r\n");
+                await foreach (var e in rows.WithCancellation(ct))
+                {
+                    if (json)
+                    {
+                        if (count > 0) await writer.WriteAsync(",");
+                        await writer.WriteAsync(JsonSerializer.Serialize(e, options));
+                    }
+                    else
+                    {
+                        await writer.WriteAsync(string.Join(',',
+                            e.Id.ToString(CultureInfo.InvariantCulture), EventCsv.Cell(e.Type.ToString()), e.At.ToString("O", CultureInfo.InvariantCulture),
+                            e.Pid.ToString(CultureInfo.InvariantCulture), e.ProcessId?.ToString(CultureInfo.InvariantCulture) ?? "",
+                            EventCsv.Cell(e.Summary), EventCsv.Cell(e.DataJson)) + "\r\n");
+                    }
+                    count++;
+                }
+                if (json) await writer.WriteAsync("]");
+                await writer.FlushAsync(ct);
+            }
+            await audit.WriteAsync("task.events.export", id.ToString(), $"format={fmt}; rows={count}", ct);
+            return Results.Empty;
         });
 
         g.MapPost("{id:guid}/extend", async (Guid id, ExtendRequest? req, MaldexDbContext db, AuditWriter audit, CancellationToken ct) =>

@@ -234,6 +234,9 @@ export interface EventsQuery {
   afterId?: number
   type?: EventType
   take?: number
+  pid?: number
+  processId?: number
+  q?: string
 }
 
 /** ASP.NET ValidationProblemDetails / ProblemDetails (the parts the UI reads). */
