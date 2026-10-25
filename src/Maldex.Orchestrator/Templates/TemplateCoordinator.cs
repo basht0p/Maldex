@@ -180,13 +180,43 @@ public sealed class TemplateCoordinator(
         if (others.Any(j => j.State != TemplateJobState.Queued || j.CreatedAt < job.CreatedAt || (j.CreatedAt == job.CreatedAt && j.Id.CompareTo(job.Id) < 0)))
             return AlreadyRunning;
 
-        return LowDiskSpace(disk.FreeMiB(Path.GetFullPath(libvirt.Value.BaseImageDir)), options.Value.MinFreeGiB);
+        return await DiskSpaceRefusalAsync(db, store, disk, libvirt.Value, options.Value.MinFreeGiB, baseVersion, job.Id, ct).ConfigureAwait(false);
     }
 
-    /// <summary>The refusal for a template copy that would not fit, or null. One wording for the endpoint's up-front check and the coordinator's.</summary>
-    public static string? LowDiskSpace(long freeMiB, int requiredGiB) =>
-        freeMiB < requiredGiB * 1024L
-            ? $"not enough disk space for a template copy: {freeMiB / 1024.0:0.#} GiB free, {requiredGiB} GiB required"
+    /// <summary>
+    /// The refusal for a template copy that would not fit, or null; the endpoint's up-front check and the coordinator's. Required
+    /// free space is the base version's size (unknown: 0) plus <paramref name="minFreeGiB"/>, plus the base sizes of the other
+    /// jobs still in Preparing, whose copies may be in flight (<paramref name="jobId"/>, the job being checked, is not one of them).
+    /// </summary>
+    public static async Task<string?> DiskSpaceRefusalAsync(MaldexDbContext db, ITemplateStore store, IDiskSpaceProbe disk, LibvirtOptions libvirt,
+        int minFreeGiB, TemplateVersion baseVersion, Guid jobId, CancellationToken ct)
+    {
+        var copying = await (from j in db.TemplateJobs.AsNoTracking()
+                             where j.State == TemplateJobState.Preparing && j.Id != jobId
+                             join v in db.TemplateVersions.AsNoTracking() on j.BaseVersionId equals v.Id
+                             select v.FileStem).ToListAsync(ct).ConfigureAwait(false);
+        var bytes = SizeOrZero(store, baseVersion.FileStem) + copying.Sum(stem => SizeOrZero(store, stem));
+        const long MiB = 1024 * 1024;
+        var requiredMiB = minFreeGiB * 1024L + (bytes + MiB - 1) / MiB;
+        return LowDiskSpace(disk.FreeMiB(Path.GetFullPath(libvirt.BaseImageDir)), requiredMiB);
+    }
+
+    private static long SizeOrZero(ITemplateStore store, string stem)
+    {
+        try
+        {
+            return store.SizeOf(stem) ?? 0;
+        }
+        catch (ArgumentException)
+        {
+            return 0; // a stem the store rejects has no disk
+        }
+    }
+
+    /// <summary>The refusal wording for a template copy that would not fit, or null.</summary>
+    public static string? LowDiskSpace(long freeMiB, long requiredMiB) =>
+        freeMiB < requiredMiB
+            ? $"not enough disk space for a template copy: {freeMiB / 1024.0:0.#} GiB free, {requiredMiB / 1024.0:0.#} GiB required"
             : null;
 
     /// <summary>Queued → Preparing. False when the job is no longer Queued (someone else got there first).</summary>

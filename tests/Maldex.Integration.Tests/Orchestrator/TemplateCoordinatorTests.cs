@@ -30,6 +30,17 @@ internal sealed class SettableDiskSpace : IDiskSpaceProbe
     }
 }
 
+/// <summary>The fake template store, with disk sizes a test sets (the fake itself knows no sizes).</summary>
+internal sealed class SizedTemplateStore(FakeTemplateStore inner) : ITemplateStore
+{
+    public System.Collections.Concurrent.ConcurrentDictionary<string, long> Sizes { get; } = new();
+    public bool Exists(string fileStem) => inner.Exists(fileStem);
+    public long? SizeOf(string fileStem) => Sizes.TryGetValue(fileStem, out var size) ? size : inner.SizeOf(fileStem);
+    public Task CreateWorkingCopyAsync(string fromStem, string toStem, CancellationToken ct) => inner.CreateWorkingCopyAsync(fromStem, toStem, ct);
+    public Task SealAsync(string fileStem, CancellationToken ct) => inner.SealAsync(fileStem, ct);
+    public Task DeleteAsync(string fileStem, CancellationToken ct) => inner.DeleteAsync(fileStem, ct);
+}
+
 /// <summary>The fake egress router, recording every call (and the job's state at the moment a lease is isolated).</summary>
 internal sealed class RecordingEgress(IEgressRouter inner) : IEgressRouter
 {
@@ -114,7 +125,9 @@ internal sealed class TemplateJobRig : IAsyncDisposable
 
     public FakeGuest Guest => H.Get<FakeGuest>();
     public FakeGuestDiskEditor DiskEditor => (FakeGuestDiskEditor)H.Get<IGuestDiskEditor>();
-    public FakeTemplateStore Store => (FakeTemplateStore)H.Get<ITemplateStore>();
+    public FakeTemplateStore Store => H.Get<FakeTemplateStore>();
+    /// <summary>Disk sizes in bytes, by stem (unset: unknown).</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, long> Sizes => ((SizedTemplateStore)H.Get<ITemplateStore>()).Sizes;
     public IHypervisor Hypervisor => H.Get<IHypervisor>();
     public RecordingEgress Egress => (RecordingEgress)H.Get<IEgressRouter>();
     public SilenceableChannels Channels => (SilenceableChannels)H.Get<IAgentChannelFactory>();
@@ -159,6 +172,8 @@ internal sealed class TemplateJobRig : IAsyncDisposable
         {
             configure?.Invoke(services);
             services.Replace(ServiceDescriptor.Singleton<IDiskSpaceProbe>(new SettableDiskSpace()));
+            services.AddSingleton<FakeTemplateStore>();
+            services.Replace(ServiceDescriptor.Singleton<ITemplateStore>(sp => new SizedTemplateStore(sp.GetRequiredService<FakeTemplateStore>())));
             services.Replace(ServiceDescriptor.Singleton<IEgressRouter>(sp =>
                 new RecordingEgress(new NoopEgressRouter(sp.GetRequiredService<IOptions<FakeEgressOptions>>(), sp.GetRequiredService<FakeGuest>()))));
             services.Replace(ServiceDescriptor.Singleton<IAgentChannelFactory>(sp =>
@@ -1033,6 +1048,56 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         Assert.Equal("not enough disk space for a template copy: 12 GiB free, 30 GiB required", job.FailureReason);
         Assert.Empty(rig.Store.WorkingCopies);
         Assert.Contains(rig.Disk.Paths, p => p == Path.GetFullPath(".data/vm/base")); // the template disks' filesystem
+    }
+
+    private const long GiB = 1024L * 1024 * 1024;
+
+    [Fact]
+    public async Task LowDisk_CountsTheBaseVersionsSize_OnTopOfTheMargin()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        rig.Disk.Free = 40 * 1024;
+        rig.Sizes[rig.V1.FileStem] = 15 * GiB;
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
+
+        await rig.PumpAsync(rig.Start(id));
+
+        var job = await rig.JobAsync(id);
+        Assert.Equal((TemplateJobState.Failed, "not enough disk space for a template copy: 40 GiB free, 45 GiB required"), (job.State, job.FailureReason));
+        Assert.Empty(rig.Store.WorkingCopies);
+    }
+
+    [Fact]
+    public async Task LowDisk_CountsTheCopiesOfOtherJobsStillPreparing()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        var win11 = await rig.H.SeedTemplateAsync("win11");
+        await rig.SeedJobAsync(TemplateJobKind.Refresh, state: TemplateJobState.Preparing, templateId: "win11", baseVersionId: win11.Id);
+        rig.Disk.Free = 40 * 1024;
+        rig.Sizes[rig.V1.FileStem] = 5 * GiB;
+        rig.Sizes[win11.FileStem] = 10 * GiB;
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh);
+
+        await rig.PumpAsync(rig.Start(id));
+
+        var job = await rig.JobAsync(id);
+        Assert.Equal((TemplateJobState.Failed, "not enough disk space for a template copy: 40 GiB free, 45 GiB required"), (job.State, job.FailureReason));
+    }
+
+    [Fact]
+    public async Task DiskCheck_OtherJobsPastPreparing_AreNotCounted()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        var win11 = await rig.H.SeedTemplateAsync("win11");
+        await rig.SeedJobAsync(TemplateJobKind.Edit, state: TemplateJobState.Configuring, templateId: "win11", baseVersionId: win11.Id); // its copy is done
+        rig.Disk.Free = 40 * 1024;
+        rig.Sizes[rig.V1.FileStem] = 5 * GiB;
+        rig.Sizes[win11.FileStem] = 10 * GiB;
+        var id = await rig.SeedJobAsync(TemplateJobKind.Refresh); // the seeded other job holds no VM slot: only the disk is under test
+
+        await rig.PumpAsync(rig.Start(id));
+
+        Assert.Equal(TemplateJobState.Published, (await rig.JobAsync(id)).State);
     }
 
     [Fact]

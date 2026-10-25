@@ -107,18 +107,18 @@ public static class TemplateEndpoints
 
         // Edit and Refresh jobs. The endpoints only record the request; TemplateJobWorker starts the job and the coordinator runs it.
         admin.MapPost("{id}/edit", async (string id, StartEditRequest? req, MaldexDbContext db, TemplateCatalog catalog, CurrentUser user,
-            IDiskSpaceProbe disk, IOptions<LibvirtOptions> libvirt, IOptions<TemplateJobOptions> jobs, TimeProvider time, CancellationToken ct) =>
+            ITemplateStore store, IDiskSpaceProbe disk, IOptions<LibvirtOptions> libvirt, IOptions<TemplateJobOptions> jobs, TimeProvider time, CancellationToken ct) =>
         {
             NetworkMode network;
             if (req?.Network is null) network = NetworkMode.None;
             else if (!Enum.TryParse(req.Network, ignoreCase: true, out network) || network is not (NetworkMode.None or NetworkMode.Direct))
                 return Results.Problem(title: "network must be None or Direct", statusCode: StatusCodes.Status400BadRequest);
-            return await StartJobAsync(id, TemplateJobKind.Edit, network, req?.PublishOnSuccess ?? true, db, catalog, user, disk, libvirt, jobs, time, ct);
+            return await StartJobAsync(id, TemplateJobKind.Edit, network, req?.PublishOnSuccess ?? true, db, catalog, user, store, disk, libvirt, jobs, time, ct);
         });
 
         admin.MapPost("{id}/refresh", async (string id, StartRefreshRequest? req, MaldexDbContext db, TemplateCatalog catalog, CurrentUser user,
-            IDiskSpaceProbe disk, IOptions<LibvirtOptions> libvirt, IOptions<TemplateJobOptions> jobs, TimeProvider time, CancellationToken ct) =>
-            await StartJobAsync(id, TemplateJobKind.Refresh, NetworkMode.None, req?.PublishOnSuccess ?? true, db, catalog, user, disk, libvirt, jobs, time, ct));
+            ITemplateStore store, IDiskSpaceProbe disk, IOptions<LibvirtOptions> libvirt, IOptions<TemplateJobOptions> jobs, TimeProvider time, CancellationToken ct) =>
+            await StartJobAsync(id, TemplateJobKind.Refresh, NetworkMode.None, req?.PublishOnSuccess ?? true, db, catalog, user, store, disk, libvirt, jobs, time, ct));
 
         admin.MapGet("{id}/jobs", async (string id, MaldexDbContext db, IOptions<TemplateJobOptions> jobs, CancellationToken ct) =>
         {
@@ -214,11 +214,11 @@ public static class TemplateEndpoints
 
     /// <summary>
     /// Records an Edit or Refresh job of the template's current version, or refuses (409 with the reason) when one is active,
-    /// the base disk is missing or free space is below <see cref="TemplateJobOptions.MinFreeGiB"/>. The coordinator re-checks all of
+    /// the base disk is missing or free space is short (<see cref="TemplateCoordinator.DiskSpaceRefusalAsync"/>). The coordinator re-checks all of
     /// it when it starts the job; the unique index <c>IX_TemplateJobs_TemplateId_Active</c> is the backstop for two racing requests.
     /// </summary>
     private static async Task<IResult> StartJobAsync(string id, TemplateJobKind kind, NetworkMode network, bool publishOnSuccess,
-        MaldexDbContext db, TemplateCatalog catalog, CurrentUser user, IDiskSpaceProbe disk, IOptions<LibvirtOptions> libvirt,
+        MaldexDbContext db, TemplateCatalog catalog, CurrentUser user, ITemplateStore store, IDiskSpaceProbe disk, IOptions<LibvirtOptions> libvirt,
         IOptions<TemplateJobOptions> jobs, TimeProvider time, CancellationToken ct)
     {
         if (await CanonicalIdAsync(db, id, ct) is not { } templateId) return Results.NotFound();
@@ -232,7 +232,7 @@ public static class TemplateEndpoints
         if (!catalog.DiskPresent(baseVersion.FileStem)) return Refuse(TemplateCoordinator.BaseDiskMissing);
         if (await db.TemplateJobs.AsNoTracking().AnyAsync(j => j.TemplateId == templateId && ActiveStates.Contains(j.State), ct))
             return Refuse(TemplateCoordinator.AlreadyRunning);
-        if (TemplateCoordinator.LowDiskSpace(disk.FreeMiB(Path.GetFullPath(libvirt.Value.BaseImageDir)), jobs.Value.MinFreeGiB) is { } lowSpace)
+        if (await TemplateCoordinator.DiskSpaceRefusalAsync(db, store, disk, libvirt.Value, jobs.Value.MinFreeGiB, baseVersion, Guid.Empty, ct) is { } lowSpace)
             return Refuse(lowSpace);
 
         var now = time.GetUtcNow();

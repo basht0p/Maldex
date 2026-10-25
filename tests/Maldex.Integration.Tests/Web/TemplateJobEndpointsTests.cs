@@ -48,6 +48,8 @@ public sealed class TemplateJobEndpointsTests(SqlServerFixture sql) : IDisposabl
         public required MaldexAppFactory Factory { get; init; }
         public required SettableDisk Disk { get; init; }
         public FakeTemplateStore Store => Factory.Services.GetRequiredService<FakeTemplateStore>();
+        public System.Collections.Concurrent.ConcurrentDictionary<string, long> Sizes =>
+            ((Maldex.Integration.Tests.Orchestrator.SizedTemplateStore)Factory.Services.GetRequiredService<ITemplateStore>()).Sizes;
     }
 
     private Rig NewRig()
@@ -68,7 +70,7 @@ public sealed class TemplateJobEndpointsTests(SqlServerFixture sql) : IDisposabl
                 s.Replace(ServiceDescriptor.Singleton<IDiskSpaceProbe>(disk));
                 // The store is read through its interface everywhere; expose the singleton so a test can make a disk go missing.
                 s.AddSingleton<FakeTemplateStore>();
-                s.Replace(ServiceDescriptor.Singleton<ITemplateStore>(sp => sp.GetRequiredService<FakeTemplateStore>()));
+                s.Replace(ServiceDescriptor.Singleton<ITemplateStore>(sp => new Maldex.Integration.Tests.Orchestrator.SizedTemplateStore(sp.GetRequiredService<FakeTemplateStore>())));
             });
         }
     }
@@ -281,8 +283,37 @@ public sealed class TemplateJobEndpointsTests(SqlServerFixture sql) : IDisposabl
         var resp = await client.PostAsJsonAsync($"/api/admin/templates/{Seeded}/{route}", new { }, Ct);
 
         Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
-        Assert.Equal(TemplateCoordinator.LowDiskSpace(10 * 1024, 30), (await ReadAsync(resp)).GetProperty("title").GetString());
+        Assert.Equal("not enough disk space for a template copy: 10 GiB free, 30 GiB required", (await ReadAsync(resp)).GetProperty("title").GetString());
         Assert.Equal(0, await InDbAsync(r, db => db.TemplateJobs.CountAsync(Ct)));
+    }
+
+    [Fact]
+    public async Task Start_RequiresTheBaseSizeAndTheCopiesInFlight_OnTopOfTheMargin()
+    {
+        var r = NewRig();
+        const long GiB = 1024L * 1024 * 1024;
+        var v1 = await InDbAsync(r, db => db.TemplateVersions.AsNoTracking().SingleAsync(v => v.TemplateId == Seeded && v.Number == 1, Ct));
+        r.Sizes[v1.FileStem] = 8 * GiB;
+        r.Disk.Mib = 40 * 1024;
+        using var client = Admin(r);
+
+        // 30 GiB margin + 8 GiB base fits in 40 GiB ...
+        var first = await client.PostAsJsonAsync($"/api/admin/templates/{Seeded}/refresh", new { }, Ct);
+        Assert.Equal(HttpStatusCode.Accepted, first.StatusCode);
+        var firstId = (await ReadAsync(first)).GetProperty("id").GetGuid();
+        // ... but not while that job is still copying the same base: 30 + 8 + 8. (It moves to another template, so that the
+        // one-active-job rule does not refuse first.)
+        await InDbAsync(r, async db =>
+        {
+            db.Templates.Add(new Template { Id = "other", DisplayName = "other", CreatedAt = DateTimeOffset.UtcNow });
+            return await db.SaveChangesAsync(Ct);
+        });
+        await InDbAsync(r, db => db.TemplateJobs.Where(j => j.Id == firstId)
+            .ExecuteUpdateAsync(s => s.SetProperty(j => j.State, TemplateJobState.Preparing).SetProperty(j => j.TemplateId, "other"), Ct));
+        var second = await client.PostAsJsonAsync($"/api/admin/templates/{Seeded}/refresh", new { }, Ct);
+
+        Assert.Equal(HttpStatusCode.Conflict, second.StatusCode);
+        Assert.Equal("not enough disk space for a template copy: 40 GiB free, 46 GiB required", (await ReadAsync(second)).GetProperty("title").GetString());
     }
 
     [Fact]
