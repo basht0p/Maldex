@@ -1,10 +1,8 @@
 using System.Collections.Concurrent;
+using System.Threading.Channels;
 using Maldex.Core.Abstractions;
 using Maldex.Core.Agent;
 using Maldex.Core.Text;
-
-// GuestSession is internal to the job pipeline; its unit tests (GuestSessionTests) live in the integration test project.
-[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("Maldex.Integration.Tests")]
 
 namespace Maldex.Orchestrator.Templates;
 
@@ -16,6 +14,7 @@ namespace Maldex.Orchestrator.Templates;
 internal sealed class GuestSession : IAsyncDisposable
 {
     private readonly IAgentChannel _channel;
+    private readonly TimeProvider _time;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _pump;
     private readonly TaskCompletionSource<ReadyMessage> _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -26,9 +25,11 @@ internal sealed class GuestSession : IAsyncDisposable
     /// <summary>Set once the pump has ended: a request registered after it can never be answered and fails at once.</summary>
     private volatile bool _ended;
 
-    public GuestSession(IAgentChannel channel)
+    /// <param name="time">Measures <see cref="CollectFileAsync"/>'s timeout (default: the system clock).</param>
+    public GuestSession(IAgentChannel channel, TimeProvider? time = null)
     {
         _channel = channel;
+        _time = time ?? TimeProvider.System;
         _pump = Task.Run(PumpAsync);
     }
 
@@ -99,6 +100,35 @@ internal sealed class GuestSession : IAsyncDisposable
                 _provenance.TryRemove(id, out _);
             }
         }
+    }
+
+    /// <summary>
+    /// Fetches one file from the guest with <c>collect_file</c> through the <see cref="Inbox"/> (which must not be open elsewhere),
+    /// reassembled and hash-checked as dropped files are.
+    /// </summary>
+    /// <returns>The file's bytes, or null when the agent answers that it could not serve it (the file is missing).</returns>
+    /// <exception cref="InvalidOperationException">The file is larger than <paramref name="maxBytes"/>, or its chunks do not reassemble.</exception>
+    /// <exception cref="TimeoutException">No complete answer within <paramref name="timeout"/>.</exception>
+    /// <exception cref="ChannelClosedException">The agent disconnected.</exception>
+    public async Task<byte[]?> CollectFileAsync(string guestPath, long maxBytes, TimeSpan timeout, CancellationToken ct)
+    {
+        var transfer = new FileTransfer(guestPath, maxBytes);
+        using var deadline = new CancellationTokenSource(timeout, _time);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, deadline.Token);
+        using var lease = Inbox.Open();
+        CommandResultMessage result;
+        try
+        {
+            result = await transfer.ReceiveAsync(_channel, lease.Reader, linked.Token).ConfigureAwait(false);
+        }
+        catch (Exception) when (deadline.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            throw new TimeoutException($"no answer to collect_file within {timeout.TotalSeconds:0} s");
+        }
+        if (!result.Success) return null;
+        var problem = transfer.Verify(out var content);
+        if (problem is not null) throw new InvalidOperationException($"the file {GuestText.Clean(guestPath, 256)} was rejected: {problem}");
+        return content;
     }
 
     /// <summary>

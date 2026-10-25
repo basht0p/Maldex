@@ -5,4 +5,8 @@
   <ItemGroup>
     <ProjectReference Include="..\Maldex.Infrastructure\Maldex.Infrastructure.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- The template job pipeline's internals (GuestSession, GuestPowerOff) are unit-tested from the integration test project. -->
+    <InternalsVisibleTo Include="Maldex.Integration.Tests" />
+  </ItemGroup>
 </Project>

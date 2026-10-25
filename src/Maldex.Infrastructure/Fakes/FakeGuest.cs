@@ -9,11 +9,34 @@ public sealed record FakeGuestFile(byte[] Data, string? ClaimedSha256 = null, lo
 
 /// <summary>
 /// What the replayed "guest" has on disk and how it behaves during bulk transfers, shared by every fake channel.
-/// Empty by default: sample chunks are accepted and every <c>collect_file</c> is answered "file not found".
+/// By default sample chunks are accepted and the only files on disk are a finished provisioning's result marker and log (so a
+/// fake Build completes); every other <c>collect_file</c> is answered "file not found".
 /// </summary>
 public sealed class FakeGuest
 {
+    /// <summary>Where Provision.ps1 writes its result marker and its log (the Build's guest paths).</summary>
+    public const string ProvisionResultPath = @"C:\ProgramData\Maldex\provision-result.json";
+    public const string ProvisionLogPath = @"C:\ProgramData\Maldex\provision.log";
+
+    /// <summary>The marker of a provisioning run in which every step succeeded, as Provision.ps1 writes it (UTF-8, no BOM).</summary>
+    public const string ProvisionSucceeded = """{"ok":true,"failedSteps":[]}""";
+
     private readonly ConcurrentDictionary<string, FakeGuestFile> _files = new(StringComparer.OrdinalIgnoreCase);
+
+    public FakeGuest()
+    {
+        SetProvisionResult(ProvisionSucceeded);
+        AddFile(ProvisionLogPath, "**********************\nWindows PowerShell transcript start\n[fake] provisioning finished\n"u8.ToArray());
+    }
+
+    /// <summary>Sets the provisioning result marker the guest holds (UTF-8, no BOM); null removes it (provisioning has not finished).</summary>
+    public void SetProvisionResult(string? json)
+    {
+        if (json is null) _files.TryRemove(ProvisionResultPath, out _);
+        else AddFile(ProvisionResultPath, System.Text.Encoding.UTF8.GetBytes(json));
+    }
+
+    public void RemoveFile(string path) => _files.TryRemove(path, out _);
 
     /// <summary>When set, the chunk with this index is answered with a failure (the agent "refusing" the delivery).</summary>
     public int? RejectSampleChunkIndex { get; set; }
