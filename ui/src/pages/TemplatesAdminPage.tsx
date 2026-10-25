@@ -1,104 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import {
-  deleteTemplate,
-  discardTemplateVersion,
-  listAdminTemplates,
-  listTemplateJobs,
-  publishTemplateVersion,
-  rollBackTemplate,
-  setDefaultTemplate,
-  setTemplateEnabled,
-  startTemplateEdit,
-  startTemplateRefresh,
-} from '../api/client'
-import type { AdminTemplateDto, MeDto, TemplateJobDto, TemplateJobNetwork, TemplateVersionDto } from '../api/types'
-import { useConfirm } from '../kit/useConfirm'
+import { listAdminTemplates, listTemplateJobs, setDefaultTemplate, setTemplateEnabled } from '../api/client'
+import type { AdminTemplateDto, MeDto, TemplateJobDto } from '../api/types'
 import { ErrorBanner } from '../kit/ErrorBanner'
 import { RelativeTime } from '../kit/RelativeTime'
 import { Skeleton } from '../kit/Skeleton'
-import { useToast } from '../kit/useToast'
 import { messageOf } from '../util/apiMessage'
-import { useDialogFocus } from './dialogFocus'
 import styles from './forms.module.css'
 import MediaLibrary from './MediaLibrary'
 import NewTemplateDialog from './NewTemplateDialog'
+import { JobDialog } from './templates/JobDialog'
+import { useTemplateActions } from './templates/useTemplateActions'
+import { isActiveJob, JOB_POLL_MS, jobBlockReason, keptVersions, NO_VERSION, officeLabel, rollbackDiskReason, rollbackTarget, versionSummary } from './templates/versions'
 import page from './TemplatesAdminPage.module.css'
-
-/** e.g. `v3 (Windows 11 Pro 26300, agent 1.0.0, sealed 2026-10-24 by basht0p)`; mirrors the server's task provenance line. */
-function versionSummary(v: TemplateVersionDto): string {
-  const parts: string[] = []
-  const windows = [v.windowsEdition, v.windowsBuild].filter((s) => s && s.trim()).join(' ')
-  if (windows) parts.push(windows)
-  if (v.agentVersion) parts.push(`agent ${v.agentVersion}`)
-  parts.push(`sealed ${v.sealedAt.slice(0, 10)}${v.sealedBy ? ` by ${v.sealedBy}` : ''}`)
-  return `v${v.number} (${parts.join(', ')})`
-}
-
-/** The versions the server keeps for rollback, rollback target first (its `role` decides; a disk may still be missing). */
-function keptVersions(t: AdminTemplateDto): TemplateVersionDto[] {
-  const target = t.versions.filter((v) => v.role === 'RollbackTarget')
-  return [...target, ...t.versions.filter((v) => v.role === 'Previous')]
-}
-
-function officeLabel(present: boolean | null | undefined): string {
-  return present == null ? 'Office unknown' : present ? 'Office ✓' : 'Office ✗'
-}
-
-/** Why Edit and Refresh are off for a template that has no current version. */
-const NO_VERSION = 'no version yet'
-const ACTIVE_JOB_STATES = ['Queued', 'Preparing', 'Installing', 'Provisioning', 'Configuring', 'Sealing', 'Verifying']
-/** While a job of the template is active, its job list is polled at this interval to notice the terminal state. */
-const JOB_POLL_MS = 5000
-
-/** Start dialog for an Edit (with the network choice) or a Refresh (confirm only). Errors, such as a 409 reason, show inside it. */
-function JobDialog({ kind, template, onClose, onStarted }: {
-  kind: 'Edit' | 'Refresh'
-  template: AdminTemplateDto
-  onClose: () => void
-  onStarted: (job: TemplateJobDto) => void
-}) {
-  const [network, setNetwork] = useState<TemplateJobNetwork>('None')
-  const [publish, setPublish] = useState(true)
-  const [errors, setErrors] = useState<string[]>([])
-  const [busy, setBusy] = useState(false)
-  const titleId = `job-dialog-${template.id}`
-  const dialogRef = useRef<HTMLDivElement>(null)
-
-  const onKeyDown = useDialogFocus(dialogRef, busy, onClose)
-
-  async function start() {
-    setBusy(true)
-    try {
-      onStarted(kind === 'Edit' ? await startTemplateEdit(template.id, network, publish) : await startTemplateRefresh(template.id, publish))
-    } catch (e) {
-      setErrors(messageOf(e))
-      setBusy(false)
-    }
-  }
-
-  return (
-    <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby={titleId} className={page.dialog} onKeyDown={onKeyDown}>
-      <h3 id={titleId}>{kind === 'Edit' ? `Edit ${template.displayName}` : `Refresh components of ${template.displayName}`}</h3>
-      {kind === 'Edit' ? (
-        <fieldset className={page.fieldset}>
-          <legend className={styles.legend}>Network</legend>
-          <label className={styles.inline}><input type="radio" name={`network-${template.id}`} checked={network === 'None'} onChange={() => setNetwork('None')} />None</label>
-          <label className={styles.inline}><input type="radio" name={`network-${template.id}`} checked={network === 'Direct'} onChange={() => setNetwork('Direct')} />Direct: internet on</label>
-          {network === 'Direct' && <p className={page.warn}>The working copy can reach the internet while you edit it.</p>}
-        </fieldset>
-      ) : (
-        <p>Starts the working copy, updates Windows and the Office components unattended, then seals and verifies the result. No one works in the guest.</p>
-      )}
-      <label className={styles.inline}><input type="checkbox" checked={publish} onChange={(e) => setPublish(e.target.checked)} />Publish when done</label>
-      {errors.map((m, i) => <p key={i} className={styles.error} role="alert">{m}</p>)}
-      <div className={page.dialogActions}>
-        <button type="button" className={styles.primary} disabled={busy} onClick={() => void start()}>{kind === 'Edit' ? 'Start edit' : 'Start refresh'}</button>
-        <button type="button" className={styles.secondary} disabled={busy} onClick={onClose}>Cancel</button>
-      </div>
-    </div>
-  )
-}
 
 function JobsList({ jobs }: { jobs: TemplateJobDto[] }) {
   if (jobs.length === 0) return <p className={styles.hint}>No jobs yet</p>
@@ -123,24 +37,22 @@ function JobsList({ jobs }: { jobs: TemplateJobDto[] }) {
 }
 
 function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; onChanged: () => Promise<void> }) {
-  const toast = useToast()
-  const confirm = useConfirm()
-  const [busy, setBusy] = useState(false)
+  const { busy, run, publish, discard, remove, rollBack } = useTemplateActions(t, onChanged)
   const kept = keptVersions(t)
-  const previous = kept.find((v) => v.role === 'RollbackTarget')
+  const previous = rollbackTarget(t)
   const pending = t.versions.filter((v) => v.role === 'Pending')
-  const previousDiskMissing = previous !== undefined && !previous.diskPresent
+  const previousDiskReason = rollbackDiskReason(previous)
   const headingId = `template-${t.id}`
   const navigate = useNavigate()
   const [jobs, setJobs] = useState<TemplateJobDto[]>([])
   const [jobsLoaded, setJobsLoaded] = useState(false) // Delete waits for it: an active Build must not look absent
   const [dialog, setDialog] = useState<'Edit' | 'Refresh' | null>(null)
   const opener = useRef<HTMLElement | null>(null)
-  const activeJob = jobs.find((j) => ACTIVE_JOB_STATES.includes(j.state))
+  const activeJob = jobs.find(isActiveJob)
   const canDelete = jobsLoaded && t.versions.length === 0 && !activeJob && !t.isDefault
   const noVersion = !t.current
   const noVersionId = `${headingId}-no-version`
-  const jobBlock = activeJob ? `A ${activeJob.kind} job is already ${activeJob.state.toLowerCase()} for this template.` : undefined
+  const jobBlock = jobBlockReason(activeJob)
 
   useEffect(() => {
     let cancelled = false
@@ -167,59 +79,11 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
         if (cancelled) return
         setJobs(list)
         // the job reached a terminal state: reload the template so its versions (and Edit/Refresh) are current
-        if (!list.some((j) => ACTIVE_JOB_STATES.includes(j.state))) void onChanged()
+        if (!list.some(isActiveJob)) void onChanged()
       }, () => undefined)
     }, JOB_POLL_MS)
     return () => { cancelled = true; clearInterval(timer) }
   }, [polling, t.id, onChanged])
-
-  async function run(action: () => Promise<unknown>, done: string) {
-    setBusy(true)
-    try {
-      await action()
-      toast.success(done)
-      await onChanged()
-    } catch (e) {
-      for (const m of messageOf(e)) toast.error(m)
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  function publish(v: TemplateVersionDto) {
-    void run(() => publishTemplateVersion(t.id, v.id), `v${v.number} published`)
-  }
-
-  async function discard(v: TemplateVersionDto) {
-    const ok = await confirm({
-      title: `Discard v${v.number} of ${t.displayName}?`,
-      body: 'It is never published and its disk is deleted.',
-      confirmLabel: 'Discard',
-      danger: true,
-    })
-    if (ok) await run(() => discardTemplateVersion(t.id, v.id), `v${v.number} discarded`)
-  }
-
-  async function remove() {
-    const ok = await confirm({
-      title: `Delete ${t.displayName}?`,
-      body: 'It has no versions; the template entry is removed.',
-      confirmLabel: 'Delete',
-      danger: true,
-    })
-    if (ok) await run(() => deleteTemplate(t.id), `${t.displayName} deleted`)
-  }
-
-  async function rollBack() {
-    if (!previous) return
-    const ok = await confirm({
-      title: `Roll back ${t.displayName} to v${previous.number}?`,
-      body: `New tasks will use v${previous.number}.${t.current ? ` v${t.current.number} will be retired: a rolled-back version is never kept.` : ''}`,
-      confirmLabel: 'Roll back',
-      danger: true,
-    })
-    if (ok) await run(() => rollBackTemplate(t.id), `Rolled back to v${previous.number}`)
-  }
 
   return (
     <section className={page.card} aria-labelledby={headingId}>
@@ -236,7 +100,7 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
         <button type="button" className={styles.secondary} disabled={busy || !!activeJob || noVersion} title={noVersion ? NO_VERSION : jobBlock} aria-describedby={noVersion ? noVersionId : undefined} onClick={(e) => openDialog('Edit', e.currentTarget)}>Edit</button>
         <button type="button" className={styles.secondary} disabled={busy || !!activeJob || noVersion} title={noVersion ? NO_VERSION : jobBlock} aria-describedby={noVersion ? noVersionId : undefined} onClick={(e) => openDialog('Refresh', e.currentTarget)}>Refresh components</button>
         {noVersion && <span id={noVersionId} hidden>{NO_VERSION}</span>}
-        <button type="button" className={styles.secondary} disabled={busy || !previous || previousDiskMissing} title={previousDiskMissing ? `Cannot roll back: the disk is missing for v${previous.number}.` : undefined} onClick={() => void rollBack()}>Roll back</button>
+        <button type="button" className={styles.secondary} disabled={busy || !previous || !!previousDiskReason} title={previousDiskReason} onClick={() => void rollBack()}>Roll back</button>
         {canDelete && <button type="button" className={styles.secondary} disabled={busy} onClick={() => void remove()}>Delete</button>}
       </div>
       {t.description && <p className={styles.hint}>{t.description}</p>}
@@ -269,7 +133,7 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
               <td>
                 {v.role === 'Pending' && (
                   <span className={page.rowActions}>
-                    <button type="button" className={styles.secondary} disabled={busy} onClick={() => publish(v)}>{`Publish v${v.number}`}</button>
+                    <button type="button" className={styles.secondary} disabled={busy} onClick={() => void publish(v)}>{`Publish v${v.number}`}</button>
                     <button type="button" className={styles.secondary} disabled={busy} onClick={() => void discard(v)}>{`Discard v${v.number}`}</button>
                   </span>
                 )}
