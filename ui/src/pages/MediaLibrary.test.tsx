@@ -189,6 +189,34 @@ describe('MediaLibrary', () => {
     })
   })
 
+  it('shows an unsupported edition once, with only the reason after the name', async () => {
+    const home = row({ id: 'h', fileName: 'h.iso', images: [{ index: 1, name: 'Windows 11 Home', build: '26300.1', supported: false, unsupportedReason: 'Windows 11 Home is not supported: Home cannot be used' }] })
+    listMedia.mockResolvedValue([home])
+    render(<MediaLibrary />)
+    await screen.findByText('h.iso')
+    const cell = rowOf('h.iso')
+    expect(cell).toHaveTextContent('1 · Windows 11 Home (26300.1): Home cannot be used')
+    expect(cell.textContent?.match(/Windows 11 Home/g)).toHaveLength(1)
+  })
+
+  it('a refresh requested while another is in flight runs once more when it ends', async () => {
+    let release!: (v: MediaFileDto[]) => void
+    deleteMedia.mockResolvedValue(undefined)
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    listMedia.mockResolvedValue([win, office])
+    render(<MediaLibrary />)
+    await screen.findByText('win11.iso')
+    listMedia.mockImplementationOnce(() => new Promise<MediaFileDto[]>((r) => { release = r })) // the refresh after the first delete
+    listMedia.mockResolvedValue([office])
+    await userEvent.click(within(rowOf('office.img')).getByRole('button', { name: 'Delete' }))
+    await waitFor(() => expect(listMedia).toHaveBeenCalledTimes(2))
+    await userEvent.click(within(rowOf('win11.iso')).getByRole('button', { name: 'Delete' }))
+    expect(listMedia).toHaveBeenCalledTimes(2) // dropped for now
+    await act(async () => release([win, office])) // the stale answer still lists the deleted row
+    await waitFor(() => expect(listMedia).toHaveBeenCalledTimes(3)) // the queued trailing refresh
+    await waitFor(() => expect(screen.queryByText('win11.iso')).toBeNull())
+  })
+
   it('shows a load error', async () => {
     listMedia.mockRejectedValue(new ApiError(500, { title: 'Boom' }))
     render(<MediaLibrary />)

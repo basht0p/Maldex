@@ -40,6 +40,8 @@ function officeLabel(present: boolean | null | undefined): string {
   return present == null ? 'Office unknown' : present ? 'Office ✓' : 'Office ✗'
 }
 
+/** Why Edit and Refresh are off for a template that has no current version. */
+const NO_VERSION = 'no version yet'
 const ACTIVE_JOB_STATES = ['Queued', 'Preparing', 'Installing', 'Provisioning', 'Configuring', 'Sealing', 'Verifying']
 /** While a job of the template is active, its job list is polled at this interval to notice the terminal state. */
 const JOB_POLL_MS = 5000
@@ -128,6 +130,8 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
   const opener = useRef<HTMLElement | null>(null)
   const activeJob = jobs.find((j) => ACTIVE_JOB_STATES.includes(j.state))
   const canDelete = jobsLoaded && t.versions.length === 0 && !activeJob && !t.isDefault
+  const noVersion = !t.current
+  const noVersionId = `${headingId}-no-version`
   const jobBlock = activeJob ? `A ${activeJob.kind} job is already ${activeJob.state.toLowerCase()} for this template.` : undefined
 
   useEffect(() => {
@@ -206,8 +210,9 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
           Enabled
         </label>
         <button type="button" className={styles.secondary} disabled={busy || t.isDefault} onClick={() => void run(() => setDefaultTemplate(t.id))}>Set as default</button>
-        <button type="button" className={styles.secondary} disabled={busy || !!activeJob} title={jobBlock} onClick={(e) => openDialog('Edit', e.currentTarget)}>Edit</button>
-        <button type="button" className={styles.secondary} disabled={busy || !!activeJob} title={jobBlock} onClick={(e) => openDialog('Refresh', e.currentTarget)}>Refresh components</button>
+        <button type="button" className={styles.secondary} disabled={busy || !!activeJob || noVersion} title={noVersion ? NO_VERSION : jobBlock} aria-describedby={noVersion ? noVersionId : undefined} onClick={(e) => openDialog('Edit', e.currentTarget)}>Edit</button>
+        <button type="button" className={styles.secondary} disabled={busy || !!activeJob || noVersion} title={noVersion ? NO_VERSION : jobBlock} aria-describedby={noVersion ? noVersionId : undefined} onClick={(e) => openDialog('Refresh', e.currentTarget)}>Refresh components</button>
+        {noVersion && <span id={noVersionId} hidden>{NO_VERSION}</span>}
         <button type="button" className={styles.secondary} disabled={busy || !previous || previousDiskMissing} title={previousDiskMissing ? `Cannot roll back: the disk is missing for v${previous.number}.` : undefined} onClick={rollBack}>Roll back</button>
         {canDelete && <button type="button" className={styles.secondary} disabled={busy} onClick={remove}>Delete</button>}
       </div>

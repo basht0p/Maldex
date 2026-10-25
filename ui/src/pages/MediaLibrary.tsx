@@ -24,9 +24,17 @@ function statusText(m: MediaFileDto): string {
   return `Receiving ${m.size > 0 ? Math.floor((m.receivedBytes * 100) / m.size) : 0}%`
 }
 
+/** The server's reason often restates the edition (`Windows 11 Home is not supported: …`); the name is shown once, so only the cause stays. */
+function reasonOf(i: MediaFileDto['images'][number]): string {
+  const reason = i.unsupportedReason?.trim()
+  if (!reason) return 'not supported'
+  const lead = `${i.name} is not supported`
+  return reason.startsWith(lead) ? reason.slice(lead.length).replace(/^[:\s]+/, '') || 'not supported' : reason
+}
+
 /** e.g. `6 · Windows 11 Pro (26300.1)`; an unsupported edition says why. */
 function detected(m: MediaFileDto): string[] {
-  const lines = m.images.map((i) => `${i.index} · ${i.name}${i.build ? ` (${i.build})` : ''}${i.supported ? '' : ` (not supported${i.unsupportedReason ? `: ${i.unsupportedReason}` : ''})`}`)
+  const lines = m.images.map((i) => `${i.index} · ${i.name}${i.build ? ` (${i.build})` : ''}${i.supported ? '' : `: ${reasonOf(i)}`}`)
   if (m.application) lines.push(m.application)
   return lines
 }
@@ -58,10 +66,11 @@ export default function MediaLibrary() {
   const [fetchKind, setFetchKind] = useState<MediaKind>('OsInstaller')
   const [fetchName, setFetchName] = useState('')
   const inFlight = useRef(false)
+  const again = useRef(false) // a refresh was requested while one was in flight: run one more when it ends
   const mounted = useRef(true)
 
-  const refresh = useCallback(async () => {
-    if (inFlight.current) return
+  const refresh = useCallback(async (poll = false) => {
+    if (inFlight.current) { if (!poll) again.current = true; return } // a dropped poll is not queued: the next tick comes anyway
     inFlight.current = true
     try {
       const list = await listMedia()
@@ -70,6 +79,7 @@ export default function MediaLibrary() {
       if (mounted.current) setLoadError(messageOf(e)[0])
     } finally {
       inFlight.current = false
+      if (again.current && mounted.current) { again.current = false; void refresh() }
     }
   }, [])
 
@@ -83,7 +93,7 @@ export default function MediaLibrary() {
   const receiving = rows.some((r) => r.status === 'Receiving')
   useEffect(() => {
     if (!receiving) return
-    const timer = setInterval(() => void refresh(), POLL_MS)
+    const timer = setInterval(() => void refresh(true), POLL_MS)
     return () => clearInterval(timer)
   }, [receiving, refresh])
 

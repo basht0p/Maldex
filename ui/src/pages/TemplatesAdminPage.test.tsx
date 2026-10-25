@@ -271,6 +271,18 @@ describe('TemplatesAdminPage', () => {
   })
 
   describe('Edit, Refresh and jobs', () => {
+    it('disables Edit and Refresh components on a template with no current version, saying why', async () => {
+      listAdminTemplates.mockResolvedValue([golden({ id: 'win11-new', displayName: 'Windows 11 New', current: null, versions: [] })])
+      renderPage()
+      const g = await region('Windows 11 New')
+      for (const name of ['Edit', 'Refresh components']) {
+        const b = within(g).getByRole('button', { name })
+        expect(b).toBeDisabled()
+        expect(b).toHaveAttribute('title', 'no version yet')
+        expect(b).toHaveAccessibleDescription('no version yet')
+      }
+    })
+
     it('Edit sends the chosen network and publish flag, then opens the job', async () => {
       startTemplateEdit.mockResolvedValue(job({ id: 'job-9' }))
       renderPage()
