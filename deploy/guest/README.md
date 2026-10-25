@@ -88,11 +88,30 @@ Once an image has been imported as template v1, running `build-guest` or `finali
 3. The test output records the time from `Preparing` to agent Ready for every run (measured, not asserted), and each run is followed by a check that no `maldex-*` libvirt domain and no `mx*` link or namespace survived.
 4. Calc-macro test: needs Office in the image (`MALDEX_OFFICE_ISO` at build time) and a macro-enabled document whose AutoOpen starts `calc.exe`, which is not stored in the repository. Opt in with `MALDEX_E2E_OFFICE=1 MALDEX_E2E_OFFICE_SAMPLE=/path/to/calc-macro.doc`; otherwise the test skips with a message.
 
-5. Template jobs (`RealTemplateJobTests`, same gate, also needs `./build.sh agent`): a Refresh of `win11-26h2` that must
-   publish v2 and then pass the three scenarios above on v2; an Edit with `Direct` network whose guest self-test must reach
-   a public address and not the LAN gateway, the host or the control plane, then a discard; and a Refresh followed by a
-   Roll back (v1 current, v2 retired). Each test deletes the disks its jobs created and checks that `.data/vm/base` holds
-   exactly the files it held before; nothing touches `win11-26h2.*`. They take up to about two hours in all:
-   `MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 dotnet test --project tests/Maldex.Integration.Tests --filter-class "*RealTemplateJobTests"`.
+5. Template jobs (`RealTemplateJobTests`, and `RealGuestDiskEditorTests` for the libguestfs disk editor): a Refresh of
+   `win11-26h2` that must publish v2 and then pass the three scenarios above on v2; an Edit with `Direct` network whose guest
+   self-test must reach a public address and not the LAN gateway, the host or the control plane, then a discard; and a Refresh
+   followed by a Roll back (v1 current, v2 retired). Each test deletes the disks its jobs created and checks that
+   `.data/vm/base` holds exactly the files it held before; nothing touches `win11-26h2.*`. They take up to about two hours in
+   all, so they are **not** part of `./build.sh e2e`: they also require `MALDEX_REAL_TEMPLATES=1` and skip with a pointer to
+   `./build.sh e2e-templates` without it. They also need the base image and the real-setup toolchain (the libguestfs appliance).
+
+### The template E2E gate
+
+`./build.sh e2e-templates [test-filter]` runs those two classes (`MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 MALDEX_REAL_TEMPLATES=1`).
+It checks the base image (exit 2 if missing) and runs `./build.sh agent` when `.data/agent/Maldex.Agent.exe` is missing. An
+optional argument runs only the tests whose method name contains it (for example `./build.sh e2e-templates Edit`); a filtered
+run never updates the stamp.
+
+A full run that is green, with no skipped test, writes `git rev-parse HEAD` to **`.data/e2e-templates.validated`** (the stamp;
+`.data/` is untracked), but only if the template-affecting paths have no uncommitted changes (otherwise it says why and leaves
+the stamp alone). The paths are the one `TEMPLATE_E2E_PATHS` list in `build.sh`: the template orchestrator code, agent,
+domain/lifecycle/data/infrastructure for templates, Libvirt/Agent/Net/Isolation, the template and tunnel endpoints,
+`deploy/guest/provision/sysmon-config.xml`, `deploy/host/` and the two E2E test files.
+
+At the end of `./build.sh e2e`, build.sh tells you when the template E2E is due: the stamp is missing, its commit is not an
+ancestor of HEAD, a watched path changed since it (`git diff --name-only <stamp> HEAD -- <paths>`), or a watched path has
+uncommitted changes. It prints the changed files and, on a terminal, asks `run ./build.sh e2e-templates now? [y/N]` (default
+No); with no terminal it only prints. Plain `e2e` still runs only `RealVmE2ETests`.
 
 The registry-write sample is a `.ps1`; the agent opens samples with ShellExecute, so `Provision.ps1` re-points the `.ps1` Open verb at PowerShell (Windows 11 otherwise opens it in Notepad).

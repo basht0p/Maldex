@@ -59,6 +59,8 @@ public sealed partial class RealTemplateJobTests(SqlServerFixture sql, ITestOutp
 
     private static void RequireRealStack()
     {
+        Assert.SkipUnless(Environment.GetEnvironmentVariable("MALDEX_REAL_TEMPLATES") == "1",
+            "Real template-job E2E skipped: it also needs MALDEX_REAL_TEMPLATES=1 (it takes up to about two hours). Run ./build.sh e2e-templates.");
         RealVmE2ETests.RequireRealStack();
         var missing = new[] { "Maldex.Agent.exe", "Maldex.Agent.version" }.Where(f => !File.Exists(Path.Combine(AgentDir, f))).ToList();
         Assert.SkipWhen(missing.Count > 0,

@@ -10,7 +10,7 @@ namespace Maldex.Integration.Tests.E2E;
 
 /// <summary>
 /// Real libguestfs against a throwaway qcow2 overlay of the win11-26h2 image. The image itself is only ever the overlay's read-only
-/// backing file: the test checks its size and mtime did not change. Skipped unless MALDEX_REAL_VM=1, the image exists
+/// backing file: the test checks its size and mtime did not change. Skipped unless MALDEX_REAL_TEMPLATES=1 (./build.sh e2e-templates), MALDEX_REAL_VM=1, the image exists
 /// (<c>MALDEX_REAL_BASE_IMAGE</c> overrides the repository's <c>.data/vm/base/win11-26h2.qcow2</c>) and the fixed appliance from
 /// <c>./build.sh real-setup</c> is installed.
 /// </summary>
@@ -34,6 +34,8 @@ public sealed class RealGuestDiskEditorTests : IDisposable
     [Fact]
     public async Task InstallAgent_WritesTheExeIntoAnOverlay_AndLeavesTheBaseImageUntouched()
     {
+        Assert.SkipUnless(Environment.GetEnvironmentVariable("MALDEX_REAL_TEMPLATES") == "1",
+            "Real guest disk editor test skipped: it also needs MALDEX_REAL_TEMPLATES=1. Run ./build.sh e2e-templates.");
         Assert.SkipUnless(Environment.GetEnvironmentVariable("MALDEX_REAL_VM") == "1" && File.Exists(BaseImage) && Directory.Exists(Appliance),
             $"Real guest disk editor test skipped: set MALDEX_REAL_VM=1, have the image ({BaseImage}) and the libguestfs appliance ({Appliance}; ./build.sh real-setup).");
 
