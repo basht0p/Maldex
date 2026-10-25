@@ -159,14 +159,10 @@ touch .data/vm/iso/virtio-win.iso
 ```
 
 ```bash
-MALDEX_WIN_ISO=/path/to/Win11.iso ./build.sh build-guest
-```
-
-```bash
 MALDEX_MODE=Real ./build.sh run
 ```
 
-`real-setup` installs libvirt/QEMU, OVMF, swtpm, WireGuard tools, a pinned mitmproxy, Suricata and INetSim. In real mode, `run` also starts guacd in Docker for the live view. `build-guest` builds the hardened base image unattended and offline (about 12 minutes). See [`deploy/guest/README.md`](deploy/guest/README.md) for media options, Office, and the `prepare-guest` / `finalize-guest` flow for changes that have to be made by hand in the Windows UI (such as turning off Tamper Protection). A real run budgets about 9 GB of RAM in total (4 GB / 2 vCPU for the guest).
+`real-setup` installs libvirt/QEMU, OVMF, swtpm, WireGuard tools, a pinned mitmproxy, Suricata, INetSim and the tools the template Build needs (`wimtools`, `xorriso`, libguestfs), and caches the virtio drivers and `Sysmon.zip`. In real mode, `run` also starts guacd in Docker for the live view. Then build the guest image in the app: upload or fetch a Windows 11 ISO under **Admin → Sandbox Templates → Media**, start **New template**, turn off Tamper Protection and Defender in the job's console, and press **Seal**. See [`deploy/guest/README.md`](deploy/guest/README.md) for the Build flow, media options and Office. A real run budgets about 9 GB of RAM in total (4 GB / 2 vCPU for the guest).
 
 ### `build.sh` targets
 
@@ -179,9 +175,8 @@ MALDEX_MODE=Real ./build.sh run
 | `smoke` | Playwright E2E against the hosted SPA and the fake backend |
 | `build` | Build the SPA into `wwwroot` and publish `Maldex.Web` |
 | `real-setup` / `real-smoke` | Install the real-mode toolchain / boot a throwaway KVM VM to check it |
-| `build-guest` | Build the Windows 11 26H2 base image |
-| `prepare-guest` / `finalize-guest` / `discard-guest` | Make manual changes to the base image, then keep or drop them |
-| `e2e` | Harmless real-VM end-to-end suite |
+| `agent` | Publish the guest agent that templates are built and refreshed with |
+| `e2e` | Harmless real-VM end-to-end suite (needs the default template `win11-26h2`) |
 | `e2e-templates` | Real template-job E2E (Refresh, Edit, Roll back, Build from `MALDEX_WIN_ISO`); a green full run writes the validation stamp |
 | `e2e-build-acceptance` | Interactive Build from `MALDEX_WIN_ISO`: you turn off Defender in the job's console (localhost:5080 over an SSH forward) and press Seal |
 

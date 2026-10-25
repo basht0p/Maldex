@@ -10,7 +10,7 @@ public sealed class TemplateJobOptions
     /// <summary>The agent's version, written next to the exe by <c>./build.sh agent</c> from the project properties the exe was compiled with.</summary>
     public string AgentVersionPath { get; set; } = ".data/agent/Maldex.Agent.version";
     public string SysmonConfigPath { get; set; } = "deploy/guest/provision/sysmon-config.xml";
-    /// <summary>The mitmproxy CA certificate as PEM (created by <c>./build.sh real-setup</c> / <c>build-guest</c>).</summary>
+    /// <summary>The mitmproxy CA certificate as PEM (created by <c>./build.sh real-setup</c>).</summary>
     public string MitmCaPemPath { get; set; } = ".data/mitm/ca/mitmproxy-ca-cert.pem";
 
     public TimeSpan AgentReadyTimeout { get; set; } = TimeSpan.FromMinutes(5);

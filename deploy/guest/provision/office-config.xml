@@ -1,5 +1,5 @@
 <!--
-  Optional Office Deployment Tool configuration, used by Provision.ps1 only when MALDEX_OFFICE_ISO was attached.
+  Optional Office Deployment Tool configuration, used by Provision.ps1 only when the Build selected Office media (it is then on the provisioning CD).
   Adjust Channel / Product ID to match the media you supply. Provision.ps1 replaces the placeholder
   @OFFICE_SOURCE@ with the drive root of the mounted Office media.
 -->

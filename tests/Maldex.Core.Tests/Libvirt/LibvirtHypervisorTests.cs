@@ -120,7 +120,7 @@ public sealed class LibvirtHypervisorTests : IDisposable
     public async Task Start_NvramIsWritable_EvenThoughTheVarsTemplateIsReadOnly()
     {
         SeedBase();
-        // build-guest finalises the template 0444; QEMU must still be able to write the run's copy (UEFI variable store).
+        // sealing finalises the template 0444; QEMU must still be able to write the run's copy (UEFI variable store).
         var template = Path.Combine(_opts.BaseImageDir, "win11-26h2.vars.fd");
         File.SetUnixFileMode(template, UnixFileMode.UserRead | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
         var dir = RunDirOf(await Hv().StartAsync(Spec(), CancellationToken.None));
