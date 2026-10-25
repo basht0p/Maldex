@@ -264,8 +264,8 @@ public sealed class TemplateInstaller(
         if (log is null) return;
 
         var keep = log.Length > b.ProvisionLogMaxBytes ? log.AsMemory(log.Length - b.ProvisionLogMaxBytes) : log.AsMemory();
-        var dir = Path.Combine(b.JobLogDir, jobId.ToString("N"));
-        var path = Path.Combine(dir, "provision.log");
+        var path = b.ProvisionLogPathOf(jobId);
+        var dir = Path.GetDirectoryName(path)!;
         try
         {
             Directory.CreateDirectory(dir);
