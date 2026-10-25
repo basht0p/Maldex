@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { useParams } from 'react-router-dom'
-import { ApiError, extendTask, getTask, listArtifacts, stopTask } from '../api/client'
-import type { ArtifactDto, RunStatus, TaskDto, TaskStatusUpdate } from '../api/types'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { Link, useParams } from 'react-router-dom'
+import { ApiError, extendTask, getTask, getTaskReport, listArtifacts, stopTask } from '../api/client'
+import type { ArtifactDto, NetworkMode, RunStatus, TaskDto, TaskReportDto, TaskStatusUpdate } from '../api/types'
 import { EventTable } from '../components/EventTable'
 import { ProcessTree } from '../components/ProcessTree'
 import { SessionPane } from '../components/SessionPane'
@@ -9,11 +9,13 @@ import { StatusBadge, VerdictBadge } from '../components/StatusBadge'
 import { useConfirm } from '../kit/Confirm'
 import { CopyButton } from '../kit/CopyButton'
 import { ErrorBanner } from '../kit/ErrorBanner'
+import { Duration, RelativeTime } from '../kit/RelativeTime'
 import { Skeleton } from '../kit/Skeleton'
 import { useToast } from '../kit/Toaster'
 import { useTaskLive } from '../live/useTaskLive'
 import { safeText } from '../util/safeText'
 import forms from './forms.module.css'
+import { TaskReport } from './report/TaskReport'
 import styles from './TaskPage.module.css'
 
 /** "m:ss" until the deadline, never negative. */
@@ -28,6 +30,79 @@ const COUNTING: readonly RunStatus[] = ['Preparing', 'Running']
 function errorMessage(e: unknown): string {
   if (e instanceof ApiError || e instanceof Error) return e.message
   return 'Request failed.'
+}
+
+/** The 409 the report endpoint returns while the server has not yet recorded the task as Completed. */
+function isReportNotReady(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 409 && typeof e.problem === 'object' && e.problem !== null
+    && (e.problem as { type?: unknown }).type === 'report-not-ready'
+}
+
+function networkLabel(mode: NetworkMode, exitCountry?: string | null): string {
+  switch (mode) {
+    case 'None': return 'No network'
+    case 'Simulated': return 'Simulated network'
+    case 'LiveVpn': return exitCountry ? `Live VPN (${safeText(exitCountry)})` : 'Live VPN'
+    case 'LiveTor': return 'Tor'
+  }
+}
+
+/** organization · submitted by · created · ran · template · network mode */
+function TaskDetails({ task }: { task: TaskDto }) {
+  const parts: ReactNode[] = [<span key="org">{safeText(task.orgName)}</span>]
+  if (task.submittedByName) parts.push(<span key="by">submitted by {safeText(task.submittedByName)}</span>)
+  parts.push(<RelativeTime key="created" iso={task.createdAt} />)
+  if (task.ranSec != null) parts.push(<span key="ran">ran <Duration seconds={task.ranSec} /></span>)
+  parts.push(
+    <span key="tpl">
+      <span className={styles.metaLabel}>{task.template ? 'Template' : 'Image'}</span>{' '}
+      <span className={styles.mono}>{safeText(task.template ? task.template.summary : task.image)}</span>
+    </span>,
+  )
+  parts.push(<span key="net">{networkLabel(task.networkMode, task.exitCountry)}</span>)
+  return (
+    <div className={styles.meta} role="group" aria-label="Task details">
+      {parts.flatMap((p, i) => (i === 0 ? [p] : [<span key={`sep${i}`} aria-hidden="true" className={styles.sep}>·</span>, p]))}
+    </div>
+  )
+}
+
+/** HTML/PDF report, the sample and the artifact ZIPs, behind one disclosure button. */
+function ReportsMenu({ taskId, artifacts }: { taskId: string; artifacts: ArtifactDto[] }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => {
+      if (!ref.current?.contains(e.target as Node)) setOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+  return (
+    <div className={styles.menu} ref={ref}>
+      <button type="button" className={forms.secondary} aria-expanded={open} aria-controls={`reports-${taskId}`} onClick={() => setOpen((o) => !o)}>
+        Reports
+      </button>
+      {open && (
+        <ul id={`reports-${taskId}`} className={styles.menuList}>
+          <li><a href={`/api/tasks/${taskId}/report.html`} target="_blank" rel="noreferrer">HTML report</a></li>
+          <li><a href={`/api/tasks/${taskId}/report.pdf`}>PDF report</a></li>
+          <li><a href={`/api/tasks/${taskId}/sample`}>Sample (ZIP)</a></li>
+          {artifacts.map((a) => (
+            <li key={a.id}><a href={`/api/artifacts/${a.id}/download`}>{a.kind} ({a.sha256.slice(0, 8)}) (ZIP)</a></li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
 }
 
 export default function TaskPage() {
@@ -89,6 +164,30 @@ function LiveTask({ taskId }: { taskId: string }) {
   const verdict = liveNow?.verdict ?? task?.verdict ?? 'Unknown'
   const completed = status === 'Completed'
 
+  // The report is fetched once the task is Completed (from a push or the fetch). A 409 report-not-ready means the
+  // server has not caught up with the push yet: it is not an error, and the next status push retries.
+  const [report, setReport] = useState<TaskReportDto | null>(null)
+  const [reportError, setReportError] = useState<string | null>(null)
+  const [reportReload, setReportReload] = useState(0)
+  const push = live.status
+  useEffect(() => {
+    if (!completed || report) return
+    let cancelled = false
+    getTaskReport(taskId).then(
+      (r) => {
+        if (cancelled) return
+        setReport(r)
+        setReportError(null)
+      },
+      (e: unknown) => {
+        if (!cancelled && !isReportNotReady(e)) setReportError(errorMessage(e))
+      },
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [taskId, completed, report, push, reportReload])
+
   useEffect(() => {
     if (!completed) return
     let cancelled = false
@@ -136,6 +235,7 @@ function LiveTask({ taskId }: { taskId: string }) {
   const running = status === 'Running'
   const stoppable = status === 'Preparing' || status === 'Running'
   const target = task?.originalFileName ?? task?.url ?? null
+  const details = report?.task ?? task
 
   if (loadError && !task) return <ErrorBanner message={loadError} onRetry={() => { setLoadError(null); setReload((n) => n + 1) }} />
   if (!task && !status) return <Skeleton rows={4} />
@@ -152,6 +252,8 @@ function LiveTask({ taskId }: { taskId: string }) {
         <button type="button" className={forms.secondary} disabled={!running || busy} onClick={() => extend(60)}>Extend +60 s</button>
         <button type="button" className={forms.secondary} disabled={!running || busy} onClick={() => extend(300)}>Extend +300 s</button>
         <button type="button" className={forms.secondary} disabled={!stoppable || busy} onClick={() => void stop()}>Stop</button>
+        {completed && <ReportsMenu taskId={taskId} artifacts={artifacts} />}
+        {task && <Link className={`${forms.secondary} ${styles.linkButton}`} to={`/submit?from=${encodeURIComponent(taskId)}`}>Resubmit…</Link>}
       </div>
       {target && (
         <p className={styles.mono}>
@@ -166,39 +268,35 @@ function LiveTask({ taskId }: { taskId: string }) {
           <CopyButton value={task.sampleSha256} label="Copy SHA-256" />
         </p>
       )}
-      {task && (
-        <p className={styles.meta}>
-          <span className={styles.metaLabel}>{task.template ? 'Template' : 'Image'}</span>
-          <span className={styles.mono}>{safeText(task.template ? task.template.summary : task.image)}</span>
-        </p>
-      )}
+      {details && <TaskDetails task={details} />}
       {(liveNow?.reason ?? task?.failureReason) && <p className={styles.error}>{safeText(liveNow?.reason ?? task?.failureReason)}</p>}
 
-      {completed && (
-        <nav className={styles.links} aria-label="Results">
-          <a href={`/api/tasks/${taskId}/report.html`} target="_blank" rel="noreferrer">HTML report</a>
-          <a href={`/api/tasks/${taskId}/report.pdf`}>PDF report</a>
-          <a href={`/api/tasks/${taskId}/sample`}>Sample (ZIP)</a>
-          {artifacts.map((a) => (
-            <a key={a.id} href={`/api/artifacts/${a.id}/download`}>{a.kind} ({a.sha256.slice(0, 8)}) (ZIP)</a>
-          ))}
-        </nav>
+      {completed ? (
+        report ? (
+          <TaskReport report={report} taskId={taskId} eventCount={live.events.length} />
+        ) : reportError ? (
+          <ErrorBanner message={reportError} onRetry={() => { setReportError(null); setReportReload((n) => n + 1) }} />
+        ) : (
+          <Skeleton rows={6} />
+        )
+      ) : (
+        <>
+          <div className={styles.grid}>
+            <div className={styles.panel}>
+              <h2>Session</h2>
+              <SessionPane taskId={taskId} status={status} />
+            </div>
+            <div className={styles.panel}>
+              <h2>Processes</h2>
+              <ProcessTree processes={live.processes} />
+            </div>
+          </div>
+          <div className={styles.panel}>
+            <h2>Events</h2>
+            <EventTable events={live.events} />
+          </div>
+        </>
       )}
-
-      <div className={styles.grid}>
-        <div className={styles.panel}>
-          <h2>Session</h2>
-          <SessionPane taskId={taskId} status={status} />
-        </div>
-        <div className={styles.panel}>
-          <h2>Processes</h2>
-          <ProcessTree processes={live.processes} />
-        </div>
-      </div>
-      <div className={styles.panel}>
-        <h2>Events</h2>
-        <EventTable events={live.events} />
-      </div>
     </section>
   )
 }
