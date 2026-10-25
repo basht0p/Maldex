@@ -387,3 +387,19 @@ export interface ResubmitRequest {
   durationSec?: number | null
   interactive?: boolean | null
 }
+
+export interface SlotHolderDto { kind: 'task' | 'job'; id: string; label: string; since: string }
+export interface VmSlotStatusDto { capacity: number; busy: number; holders: SlotHolderDto[] }
+export interface DiskStatusDto { name: 'data' | 'vm' | 'media'; path: string; freeBytes: number; totalBytes: number }
+export interface WorkerStatusDto { name: string; lastTickAt: string | null; expectedIntervalSec: number; stalled: boolean }
+export interface RecentFailureDto { kind: 'task' | 'job'; id: string; label: string; reason: string | null; at: string }
+export interface SystemStatusDto {
+  vmSlot: VmSlotStatusDto
+  queueDepth: number
+  runningTasks: number
+  activeJobs: number
+  disks: DiskStatusDto[]
+  workers: WorkerStatusDto[]
+  recentFailures: RecentFailureDto[]
+  generatedAt: string
+}
