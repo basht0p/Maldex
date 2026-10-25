@@ -340,7 +340,7 @@ public static class TemplateEndpoints
         {
             return Refuse(TemplateCoordinator.AlreadyRunning); // a racing request got its job in first
         }
-        var dto = TemplateJobDto.From(job, baseVersion.Number, null, jobs.Value.ConfigureIdleTimeout);
+        var dto = TemplateJobDto.From(job, baseVersion.Number, null, jobs.Value.ConfigureIdleTimeout, requestedByName: user.DisplayName);
         return Results.Accepted($"/api/admin/template-jobs/{job.Id}", dto);
     }
 
@@ -440,7 +440,7 @@ public static class TemplateEndpoints
         {
             return Refuse(TemplateCoordinator.AlreadyRunning); // a racing request got its job (or the new template) in first
         }
-        return Results.Accepted($"/api/admin/template-jobs/{job.Id}", TemplateJobDto.From(job, null, null, jobs.Value.ConfigureIdleTimeout));
+        return Results.Accepted($"/api/admin/template-jobs/{job.Id}", TemplateJobDto.From(job, null, null, jobs.Value.ConfigureIdleTimeout, requestedByName: user.DisplayName));
     }
 
     /// <summary>The audit row of a job action: the template's id as target, the job in the details.</summary>
@@ -455,9 +455,15 @@ public static class TemplateEndpoints
     {
         var versionIds = jobs.Where(j => j.BaseVersionId != null).Select(j => j.BaseVersionId!.Value).Concat(jobs.Where(j => j.ResultVersionId != null).Select(j => j.ResultVersionId!.Value)).Distinct().ToList();
         var numbers = await db.TemplateVersions.AsNoTracking().Where(v => versionIds.Contains(v.Id)).ToDictionaryAsync(v => v.Id, v => v.Number, ct);
+        var jobIds = jobs.Select(j => j.Id).Distinct().ToList();
+        var steps = (await db.TemplateJobSteps.AsNoTracking().Where(s => jobIds.Contains(s.JobId)).OrderBy(s => s.Id).ToListAsync(ct))
+            .ToLookup(s => s.JobId);
+        var userIds = jobs.Select(j => j.RequestedByUserId).Distinct().ToList();
+        var names = await db.Users.AsNoTracking().Where(u => userIds.Contains(u.Id)).ToDictionaryAsync(u => u.Id, u => u.DisplayName, ct);
         return jobs.Select(j => TemplateJobDto.From(j, j.BaseVersionId is { } b ? numbers.GetValueOrDefault(b) : null,
             j.ResultVersionId is { } r ? numbers.GetValueOrDefault(r) : null, options.ConfigureIdleTimeout,
-            j.Kind == TemplateJobKind.Build && File.Exists(build.ProvisionLogPathOf(j.Id)))).ToList();
+            j.Kind == TemplateJobKind.Build && File.Exists(build.ProvisionLogPathOf(j.Id)),
+            [.. steps[j.Id]], names.GetValueOrDefault(j.RequestedByUserId))).ToList();
     }
 
     private static Task<int?> VersionNumberAsync(MaldexDbContext db, string templateId, Guid versionId, CancellationToken ct) =>

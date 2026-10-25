@@ -122,6 +122,17 @@ export interface TemplateJobDto {
   hasProvisionLog?: boolean
   /** A Seal was accepted and has not been acted on yet; false again after a refusal (Defender). */
   sealRequested?: boolean
+  /** The job's transitions in order; empty for a job from before the step history. */
+  steps?: TemplateJobStepDto[]
+  /** The requester's display name; null in hub pushes. */
+  requestedByName?: string | null
+}
+
+/** One transition of a template job: the state it entered, when, and its message then. */
+export interface TemplateJobStepDto {
+  state: TemplateJobState
+  at: string
+  message?: string | null
 }
 
 export type MediaKind = 'OsInstaller' | 'Application'

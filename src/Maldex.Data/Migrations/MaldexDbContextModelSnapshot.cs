@@ -800,6 +800,36 @@ namespace Maldex.Data.Migrations
                         });
                 });
 
+            modelBuilder.Entity("Maldex.Core.Domain.TemplateJobStep", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTimeOffset>("At")
+                        .HasColumnType("datetimeoffset");
+
+                    b.Property<Guid>("JobId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<string>("Message")
+                        .HasMaxLength(500)
+                        .HasColumnType("nvarchar(500)");
+
+                    b.Property<string>("State")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("nvarchar(32)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("JobId", "Id");
+
+                    b.ToTable("TemplateJobSteps", (string)null);
+                });
+
             modelBuilder.Entity("Maldex.Core.Domain.TemplateVersion", b =>
                 {
                     b.Property<Guid>("Id")
@@ -1048,6 +1078,15 @@ namespace Maldex.Data.Migrations
                         .IsRequired();
                 });
 
+            modelBuilder.Entity("Maldex.Core.Domain.TemplateJobStep", b =>
+                {
+                    b.HasOne("Maldex.Core.Domain.TemplateJob", null)
+                        .WithMany("Steps")
+                        .HasForeignKey("JobId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
             modelBuilder.Entity("Maldex.Core.Domain.TemplateVersion", b =>
                 {
                     b.HasOne("Maldex.Core.Domain.TemplateVersion", null)
@@ -1070,6 +1109,11 @@ namespace Maldex.Data.Migrations
             modelBuilder.Entity("Maldex.Core.Domain.AnalysisTask", b =>
                 {
                     b.Navigation("StatusHistory");
+                });
+
+            modelBuilder.Entity("Maldex.Core.Domain.TemplateJob", b =>
+                {
+                    b.Navigation("Steps");
                 });
 #pragma warning restore 612, 618
         }

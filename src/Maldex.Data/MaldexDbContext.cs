@@ -20,6 +20,7 @@ public class MaldexDbContext(DbContextOptions<MaldexDbContext> options) : DbCont
     public DbSet<Template> Templates => Set<Template>();
     public DbSet<TemplateVersion> TemplateVersions => Set<TemplateVersion>();
     public DbSet<TemplateJob> TemplateJobs => Set<TemplateJob>();
+    public DbSet<TemplateJobStep> TemplateJobSteps => Set<TemplateJobStep>();
     public DbSet<MediaFile> MediaFiles => Set<MediaFile>();
 
     protected override void ConfigureConventions(ModelConfigurationBuilder configurationBuilder)
