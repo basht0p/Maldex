@@ -5,7 +5,7 @@ using Maldex.Infrastructure.Net;
 
 namespace Maldex.Infrastructure.Libvirt;
 
-public sealed record DomainPaths(string OverlayDiskPath, string NvramPath, string AgentSocketPath, int VncPort, string VncPassword);
+public sealed record DomainPaths(string DiskPath, string NvramPath, string AgentSocketPath, int VncPort, string VncPassword);
 
 /// <summary>Builds the libvirt domain XML for the Windows 11 guest (UEFI Secure Boot, managed TPM 2.0, tap-only NIC).</summary>
 public static partial class DomainXmlBuilder
@@ -20,17 +20,39 @@ public static partial class DomainXmlBuilder
         if (spec.NetworkId is null || !TapName().IsMatch(spec.NetworkId))
             throw new ArgumentException($"NetworkId must be a tap name (mxt + 12 hex), got '{spec.NetworkId}'.", nameof(spec));
 
+        var cdRoms = spec.CdRoms ?? [];
+        var installBoot = spec.BootFromCdRom && cdRoms.Count > 0;
+        // Install boot: first CD-ROM, then the disk; boot order lives on the devices and may not be mixed with <os><boot dev>.
+        var os = new XElement("os",
+            new XElement("type", new XAttribute("arch", "x86_64"), new XAttribute("machine", options.MachineType), "hvm"),
+            new XElement("loader",
+                new XAttribute("readonly", "yes"), new XAttribute("secure", "yes"), new XAttribute("type", "pflash"),
+                options.OvmfCodePath),
+            new XElement("nvram", paths.NvramPath));
+        if (!installBoot) os.Add(new XElement("boot", new XAttribute("dev", "hd")));
+
+        var mainDisk = new XElement("disk", new XAttribute("type", "file"), new XAttribute("device", "disk"),
+            new XElement("driver", new XAttribute("name", "qemu"), new XAttribute("type", "qcow2")),
+            new XElement("source", new XAttribute("file", paths.DiskPath)),
+            new XElement("target", new XAttribute("dev", "vda"), new XAttribute("bus", "virtio")));
+        if (installBoot) mainDisk.Add(new XElement("boot", new XAttribute("order", "2")));
+        var disks = new List<XElement> { mainDisk };
+        for (var i = 0; i < cdRoms.Count; i++)
+        {
+            var cd = new XElement("disk", new XAttribute("type", "file"), new XAttribute("device", "cdrom"),
+                new XElement("driver", new XAttribute("name", "qemu"), new XAttribute("type", "raw")),
+                new XElement("source", new XAttribute("file", cdRoms[i])),
+                new XElement("target", new XAttribute("dev", "sd" + (char)('a' + i)), new XAttribute("bus", "sata")),
+                new XElement("readonly"));
+            if (installBoot && i == 0) cd.Add(new XElement("boot", new XAttribute("order", "1")));
+            disks.Add(cd);
+        }
+
         var domain = new XElement("domain", new XAttribute("type", "kvm"),
             new XElement("name", VmHandle.For(spec.TaskId).Name),
             new XElement("memory", new XAttribute("unit", "MiB"), spec.MemoryMiB),
             new XElement("vcpu", new XAttribute("placement", "static"), spec.VCpus),
-            new XElement("os",
-                new XElement("type", new XAttribute("arch", "x86_64"), new XAttribute("machine", options.MachineType), "hvm"),
-                new XElement("loader",
-                    new XAttribute("readonly", "yes"), new XAttribute("secure", "yes"), new XAttribute("type", "pflash"),
-                    options.OvmfCodePath),
-                new XElement("nvram", paths.NvramPath),
-                new XElement("boot", new XAttribute("dev", "hd"))),
+            os,
             new XElement("features",
                 new XElement("acpi"),
                 new XElement("apic"),
@@ -51,10 +73,7 @@ public static partial class DomainXmlBuilder
             new XElement("on_crash", "destroy"),
             new XElement("devices",
                 new XElement("emulator", "/usr/bin/qemu-system-x86_64"),
-                new XElement("disk", new XAttribute("type", "file"), new XAttribute("device", "disk"),
-                    new XElement("driver", new XAttribute("name", "qemu"), new XAttribute("type", "qcow2")),
-                    new XElement("source", new XAttribute("file", paths.OverlayDiskPath)),
-                    new XElement("target", new XAttribute("dev", "vda"), new XAttribute("bus", "virtio"))),
+                disks,
                 new XElement("interface", new XAttribute("type", "ethernet"),
                     new XElement("mac", new XAttribute("address", RunNetNames.GuestMac(spec.TaskId))),
                     new XElement("target", new XAttribute("dev", spec.NetworkId), new XAttribute("managed", "no")),

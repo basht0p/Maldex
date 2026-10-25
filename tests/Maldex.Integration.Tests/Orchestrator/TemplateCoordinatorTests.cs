@@ -33,6 +33,7 @@ internal sealed class SettableDiskSpace : IDiskSpaceProbe
 /// <summary>The fake template store, with disk sizes a test sets (the fake itself knows no sizes).</summary>
 internal sealed class SizedTemplateStore(FakeTemplateStore inner) : ITemplateStore
 {
+    public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
     public System.Collections.Concurrent.ConcurrentDictionary<string, long> Sizes { get; } = new();
     public bool Exists(string fileStem) => inner.Exists(fileStem);
     public long? SizeOf(string fileStem) => Sizes.TryGetValue(fileStem, out var size) ? size : inner.SizeOf(fileStem);

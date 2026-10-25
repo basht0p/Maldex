@@ -10,6 +10,8 @@ public sealed class FakeHypervisor : IHypervisor
     private readonly ConcurrentDictionary<string, VmHandle> _running = new();
     private readonly ConcurrentDictionary<string, byte> _off = new();
     private readonly IOptions<FakeHypervisorOptions> options;
+    private readonly ConcurrentDictionary<string, VmSpec> _specs = new();
+    private readonly ConcurrentQueue<(VmHandle Vm, string Key)> _keys = new();
     private int _starts;
     private int _maxRunning;
 
@@ -23,6 +25,12 @@ public sealed class FakeHypervisor : IHypervisor
         if (guest is not null) guest.PoweredOff += taskId => _off[VmHandle.For(taskId).Name] = 0;
     }
 
+    /// <summary>The spec the VM was last started with (CD-ROMs, boot flag), or null when it was never started.</summary>
+    public VmSpec? LastSpec(VmHandle vm) => _specs.TryGetValue(vm.Name, out var s) ? s : null;
+
+    /// <summary>Every key pressed through <see cref="SendKeyAsync"/>, in order.</summary>
+    public IReadOnlyList<(VmHandle Vm, string Key)> KeysSent => _keys.ToArray();
+
     public Task<VmHandle> StartAsync(VmSpec spec, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
@@ -30,6 +38,7 @@ public sealed class FakeHypervisor : IHypervisor
             throw new VmStartException("Fake hypervisor configured to fail this start.");
         var handle = VmHandle.For(spec.TaskId);
         _off.TryRemove(handle.Name, out _);
+        _specs[handle.Name] = spec;
         _running[handle.Name] = handle;
         var running = _running.Keys.Count(name => !_off.ContainsKey(name));
         int seen;
@@ -49,4 +58,11 @@ public sealed class FakeHypervisor : IHypervisor
 
     public Task<IReadOnlyList<VmHandle>> ListAsync(CancellationToken ct) =>
         Task.FromResult<IReadOnlyList<VmHandle>>(_running.Values.ToArray());
+
+    public Task SendKeyAsync(VmHandle vm, string key, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        _keys.Enqueue((vm, key));
+        return Task.CompletedTask;
+    }
 }
