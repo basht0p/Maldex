@@ -19,7 +19,7 @@ test('submit a URL, watch live telemetry, stop, and read the report', async ({ p
 
   await page.getByRole('button', { name: 'Stop' }).click()
   await page.getByRole('dialog').getByRole('button', { name: 'Stop task' }).click()
-  await expect(page.getByText('Completed', { exact: true })).toBeVisible({ timeout: 30_000 })
+  await expect(page.getByText('Completed', { exact: true }).first()).toBeVisible({ timeout: 30_000 })
 
   // The in-app report: tabbed, Overview first.
   await expect(page.getByRole('tab', { name: /Overview/ })).toHaveAttribute('aria-selected', 'true', { timeout: 30_000 })
@@ -46,4 +46,23 @@ test('submit a URL, watch live telemetry, stop, and read the report', async ({ p
   // Theme switch.
   await page.getByLabel('Theme').selectOption({ label: 'Dark' })
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+
+  // Admin pages: Status, Templates -> detail, Media.
+  await page.getByRole('button', { name: 'Admin' }).click()
+  await page.getByRole('link', { name: 'Status' }).click()
+  await expect(page.getByRole('heading', { name: 'System status' })).toBeVisible()
+  await expect(page.getByText(/of \d+ in use/)).toBeVisible()
+  await expect(page.getByRole('cell', { name: 'orchestrator', exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: 'Admin' }).click()
+  await page.getByRole('link', { name: 'Templates' }).click()
+  await expect(page.getByRole('heading', { name: 'Sandbox Templates' })).toBeVisible()
+  await page.getByRole('link', { name: 'Details' }).first().click()
+  await expect(page).toHaveURL(/\/admin\/templates\/[\w-]+$/)
+  await expect(page.locator('#template-title')).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Versions' })).toBeVisible()
+
+  await page.getByRole('button', { name: 'Admin' }).click()
+  await page.getByRole('link', { name: 'Media' }).click()
+  await expect(page.getByRole('heading', { name: 'Media' })).toBeVisible()
 })
