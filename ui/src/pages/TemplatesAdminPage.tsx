@@ -13,6 +13,11 @@ import {
   startTemplateRefresh,
 } from '../api/client'
 import type { AdminTemplateDto, MeDto, TemplateJobDto, TemplateJobNetwork, TemplateVersionDto } from '../api/types'
+import { useConfirm } from '../kit/Confirm'
+import { ErrorBanner } from '../kit/ErrorBanner'
+import { RelativeTime } from '../kit/RelativeTime'
+import { Skeleton } from '../kit/Skeleton'
+import { useToast } from '../kit/Toaster'
 import { messageOf } from '../util/apiMessage'
 import { useDialogFocus } from './dialogFocus'
 import styles from './forms.module.css'
@@ -107,7 +112,7 @@ function JobsList({ jobs }: { jobs: TemplateJobDto[] }) {
             <td className={styles.mono}>{j.baseVersionNumber != null ? `v${j.baseVersionNumber}` : 'new'}</td>
             <td className={styles.mono}>{j.resultVersionNumber != null ? `v${j.resultVersionNumber}` : ''}</td>
             <td>{j.state}{j.state === 'Failed' && j.failureReason ? `: ${j.failureReason}` : ''}</td>
-            <td>{j.createdAt.slice(0, 16).replace('T', ' ')}</td>
+            <td><RelativeTime iso={j.createdAt} /></td>
           </tr>
         ))}
       </tbody>
@@ -116,7 +121,8 @@ function JobsList({ jobs }: { jobs: TemplateJobDto[] }) {
 }
 
 function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; onChanged: () => Promise<void> }) {
-  const [errors, setErrors] = useState<string[]>([])
+  const toast = useToast()
+  const confirm = useConfirm()
   const [busy, setBusy] = useState(false)
   const kept = keptVersions(t)
   const previous = kept.find((v) => v.role === 'RollbackTarget')
@@ -165,37 +171,52 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
     return () => { cancelled = true; clearInterval(timer) }
   }, [polling, t.id, onChanged])
 
-  async function run(action: () => Promise<unknown>) {
+  async function run(action: () => Promise<unknown>, done: string) {
     setBusy(true)
     try {
       await action()
-      setErrors([])
+      toast.success(done)
       await onChanged()
     } catch (e) {
-      setErrors(messageOf(e))
+      for (const m of messageOf(e)) toast.error(m)
     } finally {
       setBusy(false)
     }
   }
 
   function publish(v: TemplateVersionDto) {
-    void run(() => publishTemplateVersion(t.id, v.id))
+    void run(() => publishTemplateVersion(t.id, v.id), `v${v.number} published`)
   }
 
-  function discard(v: TemplateVersionDto) {
-    if (window.confirm(`Discard v${v.number} of ${t.displayName}? It is never published and its disk is deleted.`)) void run(() => discardTemplateVersion(t.id, v.id))
+  async function discard(v: TemplateVersionDto) {
+    const ok = await confirm({
+      title: `Discard v${v.number} of ${t.displayName}?`,
+      body: 'It is never published and its disk is deleted.',
+      confirmLabel: 'Discard',
+      danger: true,
+    })
+    if (ok) await run(() => discardTemplateVersion(t.id, v.id), `v${v.number} discarded`)
   }
 
-  function remove() {
-    if (window.confirm(`Delete ${t.displayName}? It has no versions; the template entry is removed.`)) void run(() => deleteTemplate(t.id))
+  async function remove() {
+    const ok = await confirm({
+      title: `Delete ${t.displayName}?`,
+      body: 'It has no versions; the template entry is removed.',
+      confirmLabel: 'Delete',
+      danger: true,
+    })
+    if (ok) await run(() => deleteTemplate(t.id), `${t.displayName} deleted`)
   }
 
-  function rollBack() {
+  async function rollBack() {
     if (!previous) return
-    const ok = window.confirm(
-      `Roll back ${t.displayName} to v${previous.number}? New tasks will use v${previous.number}.${t.current ? ` v${t.current.number} will be retired: a rolled-back version is never kept.` : ''}`,
-    )
-    if (ok) void run(() => rollBackTemplate(t.id))
+    const ok = await confirm({
+      title: `Roll back ${t.displayName} to v${previous.number}?`,
+      body: `New tasks will use v${previous.number}.${t.current ? ` v${t.current.number} will be retired: a rolled-back version is never kept.` : ''}`,
+      confirmLabel: 'Roll back',
+      danger: true,
+    })
+    if (ok) await run(() => rollBackTemplate(t.id), `Rolled back to v${previous.number}`)
   }
 
   return (
@@ -206,18 +227,17 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
         {t.isDefault && <span className={page.badge}>Default</span>}
         <span className={page.spacer} />
         <label className={page.toggle}>
-          <input type="checkbox" checked={t.enabled} disabled={busy} onChange={(e) => void run(() => setTemplateEnabled(t.id, e.target.checked))} />
+          <input type="checkbox" checked={t.enabled} disabled={busy} onChange={(e) => void run(() => setTemplateEnabled(t.id, e.target.checked), e.target.checked ? 'Template enabled' : 'Template disabled')} />
           Enabled
         </label>
-        <button type="button" className={styles.secondary} disabled={busy || t.isDefault} onClick={() => void run(() => setDefaultTemplate(t.id))}>Set as default</button>
+        <button type="button" className={styles.secondary} disabled={busy || t.isDefault} onClick={() => void run(() => setDefaultTemplate(t.id), 'Set as default')}>Set as default</button>
         <button type="button" className={styles.secondary} disabled={busy || !!activeJob || noVersion} title={noVersion ? NO_VERSION : jobBlock} aria-describedby={noVersion ? noVersionId : undefined} onClick={(e) => openDialog('Edit', e.currentTarget)}>Edit</button>
         <button type="button" className={styles.secondary} disabled={busy || !!activeJob || noVersion} title={noVersion ? NO_VERSION : jobBlock} aria-describedby={noVersion ? noVersionId : undefined} onClick={(e) => openDialog('Refresh', e.currentTarget)}>Refresh components</button>
         {noVersion && <span id={noVersionId} hidden>{NO_VERSION}</span>}
-        <button type="button" className={styles.secondary} disabled={busy || !previous || previousDiskMissing} title={previousDiskMissing ? `Cannot roll back: the disk is missing for v${previous.number}.` : undefined} onClick={rollBack}>Roll back</button>
-        {canDelete && <button type="button" className={styles.secondary} disabled={busy} onClick={remove}>Delete</button>}
+        <button type="button" className={styles.secondary} disabled={busy || !previous || previousDiskMissing} title={previousDiskMissing ? `Cannot roll back: the disk is missing for v${previous.number}.` : undefined} onClick={() => void rollBack()}>Roll back</button>
+        {canDelete && <button type="button" className={styles.secondary} disabled={busy} onClick={() => void remove()}>Delete</button>}
       </div>
       {t.description && <p className={styles.hint}>{t.description}</p>}
-      {errors.map((m, i) => <p key={i} className={styles.error} role="alert">{m}</p>)}
       {jobBlock && activeJob && <p className={page.summary}>{jobBlock} <Link to={`/admin/template-jobs/${activeJob.id}`}>Open the job</Link></p>}
       {dialog && <JobDialog kind={dialog} template={t} onClose={closeDialog} onStarted={(job) => navigate(`/admin/template-jobs/${job.id}`)} />}
       <p className={page.summary}>
@@ -247,7 +267,7 @@ function TemplateCard({ template: t, onChanged }: { template: AdminTemplateDto; 
                 {v.role === 'Pending' && (
                   <span className={page.rowActions}>
                     <button type="button" className={styles.secondary} disabled={busy} onClick={() => publish(v)}>{`Publish v${v.number}`}</button>
-                    <button type="button" className={styles.secondary} disabled={busy} onClick={() => discard(v)}>{`Discard v${v.number}`}</button>
+                    <button type="button" className={styles.secondary} disabled={busy} onClick={() => void discard(v)}>{`Discard v${v.number}`}</button>
                   </span>
                 )}
               </td>
@@ -267,6 +287,7 @@ type Tab = 'templates' | 'media'
 export default function TemplatesAdminPage({ me }: { me: MeDto | null }) {
   const [templates, setTemplates] = useState<AdminTemplateDto[]>([])
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [loaded, setLoaded] = useState(false)
   const [tab, setTab] = useState<Tab>('templates')
   const [mediaOpened, setMediaOpened] = useState(false) // the library stays mounted once opened, so an upload survives a tab switch
   const [building, setBuilding] = useState(false)
@@ -280,6 +301,8 @@ export default function TemplatesAdminPage({ me }: { me: MeDto | null }) {
       setLoadError(null)
     } catch (e) {
       setLoadError(messageOf(e)[0]) // the last loaded templates stay on screen
+    } finally {
+      setLoaded(true)
     }
   }, [])
 
@@ -314,11 +337,12 @@ export default function TemplatesAdminPage({ me }: { me: MeDto | null }) {
         </div>
         {building && <NewTemplateDialog templates={templates} onClose={closeBuild} onStarted={(job) => navigate(`/admin/template-jobs/${job.id}`)} />}
         {loadError && (
-          <p className={styles.error} role="alert">
-            {templates.length > 0 ? `Could not refresh the templates (${loadError}). Showing the last loaded versions. ` : `${loadError} `}
-            <button type="button" className={styles.secondary} onClick={() => void refresh()}>Retry</button>
-          </p>
+          <ErrorBanner
+            message={templates.length > 0 ? `Could not refresh the templates (${loadError}). Showing the last loaded versions.` : loadError}
+            onRetry={() => void refresh()}
+          />
         )}
+        {!loaded && !loadError && <Skeleton rows={4} />}
         {templates.map((t) => <TemplateCard key={t.id} template={t} onChanged={refresh} />)}
       </div>
       {mediaOpened && (

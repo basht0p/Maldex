@@ -5,6 +5,10 @@ import type { MeDto, TemplateJobDto, TemplateJobState } from '../api/types'
 import LiveConsole from '../components/LiveConsole'
 import type { HubConnectionLike } from '../live/useTaskLive'
 import { useTemplateJobLive } from '../live/useTemplateJobLive'
+import { useConfirm } from '../kit/Confirm'
+import { ErrorBanner } from '../kit/ErrorBanner'
+import { Skeleton } from '../kit/Skeleton'
+import { useToast } from '../kit/Toaster'
 import { messageOf } from '../util/apiMessage'
 import styles from './forms.module.css'
 import page from './TemplateJobPage.module.css'
@@ -50,7 +54,8 @@ function Elapsed({ job }: { job: TemplateJobDto }) {
 }
 
 function JobView({ job }: { job: TemplateJobDto }) {
-  const [errors, setErrors] = useState<string[]>([])
+  const toast = useToast()
+  const confirm = useConfirm()
   const [busy, setBusy] = useState(false)
   const [note, setNote] = useState('')
   const jobRef = useRef(job)
@@ -71,14 +76,14 @@ function JobView({ job }: { job: TemplateJobDto }) {
     if (wasRequested && configuring) setConsoleKey((k) => k + 1)
   }
 
-  async function run(action: () => Promise<unknown>): Promise<boolean> {
+  async function run(action: () => Promise<unknown>, done: string): Promise<boolean> {
     setBusy(true)
     try {
       await action()
-      setErrors([])
+      toast.success(done)
       return true
     } catch (e) {
-      setErrors(messageOf(e))
+      for (const m of messageOf(e)) toast.error(m)
       return false
     } finally {
       setBusy(false)
@@ -86,11 +91,17 @@ function JobView({ job }: { job: TemplateJobDto }) {
   }
 
   async function seal() {
-    if (await run(() => sealTemplateJob(job.id, note.trim()))) setAcceptedAt(jobRef.current)
+    if (await run(() => sealTemplateJob(job.id, note.trim()), 'Seal request sent')) setAcceptedAt(jobRef.current)
   }
 
-  function discard() {
-    if (window.confirm('Discard this job? The working copy is deleted and no version is created.')) void run(() => cancelTemplateJob(job.id))
+  async function discard() {
+    const ok = await confirm({
+      title: 'Discard this job?',
+      body: 'The working copy is deleted and no version is created.',
+      confirmLabel: 'Discard',
+      danger: true,
+    })
+    if (ok) await run(() => cancelTemplateJob(job.id), 'Job discarded')
   }
 
   return (
@@ -107,7 +118,7 @@ function JobView({ job }: { job: TemplateJobDto }) {
         <Link to="/admin/templates">Back to templates</Link>
         <span style={{ flex: 1 }} />
         {active && !configuring && (
-          <button type="button" className={styles.secondary} disabled={busy} onClick={() => void run(() => cancelTemplateJob(job.id))}>Cancel</button>
+          <button type="button" className={styles.secondary} disabled={busy} onClick={() => void run(() => cancelTemplateJob(job.id), 'Job cancelled')}>Cancel</button>
         )}
       </div>
 
@@ -123,7 +134,6 @@ function JobView({ job }: { job: TemplateJobDto }) {
         })}
       </ol>
 
-      {errors.map((m, i) => <p key={i} className={styles.error} role="alert">{m}</p>)}
       {job.message && !failed && <p className={page.message}>{job.message}</p>}
       {job.state === 'Sealed' && <p className={page.message}>Sealed and held: this version is not published. Publish it from the templates page.</p>}
       {failed && <p className={page.failure} role="status">{`${job.state}: ${job.failureReason ?? job.message ?? 'no reason recorded'}`}</p>}
@@ -142,7 +152,7 @@ function JobView({ job }: { job: TemplateJobDto }) {
             </div>
             <button type="button" className={styles.primary} disabled={busy || sealRequested} onClick={() => void seal()}>Seal</button>
             {sealRequested && <span className={styles.hint} role="status">Seal requested</span>}
-            <button type="button" className={styles.secondary} disabled={busy} onClick={discard}>Discard</button>
+            <button type="button" className={styles.secondary} disabled={busy} onClick={() => void discard()}>Discard</button>
           </div>
         </div>
       )}
@@ -158,7 +168,7 @@ export default function TemplateJobPage({ me, createConnection }: { me: MeDto | 
 
   if (!me) return <p>Loading…</p>
   if (!isAdmin) return <p role="alert">Administrator access is required to manage sandbox templates.</p>
-  if (loadError && !job) return <p className={styles.error} role="alert">{loadError}</p>
-  if (!job) return <p>Loading…</p>
+  if (loadError && !job) return <ErrorBanner message={loadError} onRetry={() => window.location.reload()} />
+  if (!job) return <Skeleton rows={4} />
   return <JobView job={job} />
 }

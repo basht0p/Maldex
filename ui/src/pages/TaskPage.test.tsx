@@ -1,7 +1,7 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { Route, Routes } from 'react-router-dom'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { TaskDto } from '../api/types'
 
 const live = vi.hoisted(() => ({ value: { status: null, processes: [], events: [], connected: true } as unknown }))
@@ -18,6 +18,7 @@ vi.mock('../api/client', async (orig) => ({
   listArtifacts: (...a: unknown[]) => listArtifacts(...a),
 }))
 
+import { renderWithKit } from '../test/renderWithKit'
 import TaskPage from './TaskPage'
 
 const task = (over: Partial<TaskDto>): TaskDto => ({
@@ -26,17 +27,19 @@ const task = (over: Partial<TaskDto>): TaskDto => ({
   queuePosition: 0, createdAt: '2026-10-19T00:00:00Z', deadlineAt: new Date(Date.now() + 120_000).toISOString(), processingWarnings: [], ...over,
 })
 
-const renderPage = () =>
-  render(
-    <MemoryRouter initialEntries={['/tasks/t1']}>
-      <Routes><Route path="/tasks/:id" element={<TaskPage />} /></Routes>
-    </MemoryRouter>,
-  )
+const routes = () => <Routes><Route path="/tasks/:id" element={<TaskPage />} /></Routes>
+const renderPage = () => renderWithKit(routes(), { route: '/tasks/t1' })
 
+let confirmSpy: ReturnType<typeof vi.spyOn>
 beforeEach(() => {
   vi.clearAllMocks()
+  confirmSpy = vi.spyOn(window, 'confirm')
   live.value = { status: null, processes: [], events: [], connected: true }
   listArtifacts.mockResolvedValue([])
+})
+afterEach(() => {
+  expect(confirmSpy).not.toHaveBeenCalled() // confirmations are in-app dialogs, never window.confirm
+  vi.restoreAllMocks()
 })
 
 describe('TaskPage', () => {
@@ -48,12 +51,44 @@ describe('TaskPage', () => {
     expect(screen.getByLabelText('Time remaining')).toHaveTextContent(/^[12]:\d\d$/)
     await userEvent.click(screen.getByRole('button', { name: 'Extend +60 s' }))
     expect(extendTask).toHaveBeenCalledWith('t1', 60)
+    expect(await screen.findByText('Extended by 60 s')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Extend +300 s' }))
     expect(extendTask).toHaveBeenCalledWith('t1', 300)
     stopTask.mockResolvedValue(undefined)
     await userEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    const dlg = await screen.findByRole('dialog', { name: 'Stop this task?' })
+    await userEvent.click(within(dlg).getByRole('button', { name: 'Cancel' }))
+    expect(stopTask).not.toHaveBeenCalled()
+    await userEvent.click(screen.getByRole('button', { name: 'Stop' }))
+    await userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Stop task' }))
     expect(stopTask).toHaveBeenCalledWith('t1')
+    expect(await screen.findByText('Task stopped')).toBeInTheDocument()
     expect(screen.getByLabelText('Live view')).toBeInTheDocument()
+  })
+
+  it('shows an action failure as an error toast', async () => {
+    getTask.mockResolvedValue(task({}))
+    extendTask.mockRejectedValue(new Error('Too late to extend.'))
+    renderPage()
+    await screen.findByText('Running')
+    await userEvent.click(screen.getByRole('button', { name: 'Extend +60 s' }))
+    expect(await screen.findByText('Too late to extend.')).toBeInTheDocument()
+  })
+
+  it('offers a Copy SHA-256 button beside the sample hash', async () => {
+    getTask.mockResolvedValue(task({ sampleSha256: 'a'.repeat(64) }))
+    renderPage()
+    await screen.findByText('a'.repeat(64))
+    expect(screen.getByRole('button', { name: 'Copy SHA-256' })).toBeInTheDocument()
+  })
+
+  it('shows a load error with Retry', async () => {
+    getTask.mockRejectedValueOnce(new Error('Boom'))
+    renderPage()
+    expect(await screen.findByRole('alert')).toHaveTextContent('Boom')
+    getTask.mockResolvedValue(task({}))
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByText('Running')).toBeInTheDocument()
   })
 
   it('links the reports and downloads only once Completed', async () => {
@@ -77,22 +112,14 @@ describe('TaskPage', () => {
     // While disconnected the run completed; the hub reconnects but replays no status.
     getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious' }))
     live.value = { status: stale, processes: [], events: [], connected: true }
-    view.rerender(
-      <MemoryRouter initialEntries={['/tasks/t1']}>
-        <Routes><Route path="/tasks/:id" element={<TaskPage />} /></Routes>
-      </MemoryRouter>,
-    )
+    view.rerender(routes())
     expect(await screen.findByText('Completed')).toBeInTheDocument()
     await waitFor(() => expect(screen.getByRole('link', { name: 'HTML report' })).toBeInTheDocument())
     expect(screen.queryByLabelText('Time remaining')).toBeNull()
 
     // A push newer than the fetch wins again.
     live.value = { status: { ...stale, status: 'Failed', reason: 'x' }, processes: [], events: [], connected: true }
-    view.rerender(
-      <MemoryRouter initialEntries={['/tasks/t1']}>
-        <Routes><Route path="/tasks/:id" element={<TaskPage />} /></Routes>
-      </MemoryRouter>,
-    )
+    view.rerender(routes())
     expect(await screen.findByText('Failed')).toBeInTheDocument()
   })
 
@@ -130,11 +157,7 @@ describe('TaskPage', () => {
     expect(getTask).toHaveBeenCalledTimes(1)
 
     const rerender = () =>
-      view.rerender(
-        <MemoryRouter initialEntries={['/tasks/t1']}>
-          <Routes><Route path="/tasks/:id" element={<TaskPage />} /></Routes>
-        </MemoryRouter>,
-      )
+      view.rerender(routes())
     getTask.mockResolvedValue(bound)
     live.value = { status: { taskId: 't1', status: 'Preparing', verdict: 'Unknown', deadlineAt: null }, processes: [], events: [], connected: true }
     rerender()

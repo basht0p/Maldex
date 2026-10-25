@@ -3,6 +3,13 @@ import { Link } from 'react-router-dom'
 import { ApiError, cancelTask, listOrgs, listTasks } from '../api/client'
 import { RUN_STATUSES, type OrgDto, type RunStatus, type TaskDto } from '../api/types'
 import { StatusBadge, VerdictBadge } from '../components/StatusBadge'
+import { useConfirm } from '../kit/Confirm'
+import { CopyButton } from '../kit/CopyButton'
+import { EmptyState } from '../kit/EmptyState'
+import { ErrorBanner } from '../kit/ErrorBanner'
+import { RelativeTime } from '../kit/RelativeTime'
+import { Skeleton } from '../kit/Skeleton'
+import { useToast } from '../kit/Toaster'
 import { safeText } from '../util/safeText'
 import styles from './forms.module.css'
 
@@ -16,6 +23,8 @@ function target(t: TaskDto): string {
 }
 
 export default function TasksPage() {
+  const toast = useToast()
+  const confirm = useConfirm()
   const [orgs, setOrgs] = useState<OrgDto[]>([])
   const [orgId, setOrgId] = useState('')
   const [status, setStatus] = useState<RunStatus | ''>('')
@@ -24,7 +33,6 @@ export default function TasksPage() {
   const [total, setTotal] = useState(0)
   const [loaded, setLoaded] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [actionError, setActionError] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
     try {
@@ -51,12 +59,13 @@ export default function TasksPage() {
   }, [refresh])
 
   async function onCancel(id: string) {
-    setActionError(null)
+    const ok = await confirm({ title: 'Cancel this queued task?', body: 'It leaves the queue and will not run.', confirmLabel: 'Cancel task', danger: true })
+    if (!ok) return
     try {
       await cancelTask(id)
-      setActionError(null)
+      toast.success('Task cancelled')
     } catch (e) {
-      setActionError(e instanceof ApiError && e.status === 409 ? 'Only queued tasks can be cancelled.' : e instanceof Error ? e.message : 'Cancel failed.')
+      toast.error(e instanceof ApiError && e.status === 409 ? 'Only queued tasks can be cancelled.' : e instanceof Error ? e.message : 'Cancel failed.')
     }
     await refresh()
   }
@@ -70,14 +79,14 @@ export default function TasksPage() {
       <div className={styles.filters}>
         <div className={styles.field}>
           <label htmlFor="filterOrg">Organization</label>
-          <select id="filterOrg" value={orgId} onChange={(e) => { setOrgId(e.target.value); setSkip(0); setActionError(null) }}>
+          <select id="filterOrg" value={orgId} onChange={(e) => { setOrgId(e.target.value); setSkip(0) }}>
             <option value="">All</option>
             {orgs.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
           </select>
         </div>
         <div className={styles.field}>
           <label htmlFor="filterStatus">Status</label>
-          <select id="filterStatus" value={status} onChange={(e) => { setStatus(e.target.value as RunStatus | ''); setSkip(0); setActionError(null) }}>
+          <select id="filterStatus" value={status} onChange={(e) => { setStatus(e.target.value as RunStatus | ''); setSkip(0) }}>
             <option value="">All</option>
             {RUN_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
           </select>
@@ -85,9 +94,17 @@ export default function TasksPage() {
         <Link to="/submit">Submit a sample</Link>
       </div>
 
-      {(actionError ?? error) && <p className={styles.error} role="alert">{actionError ?? error}</p>}
+      {error && <ErrorBanner message={error} onRetry={() => void refresh()} />}
+      {!loaded && !error && <Skeleton rows={5} />}
 
-      <table className={styles.table}>
+      {loaded && items.length === 0 && !error && (
+        orgId || status ? (
+          <EmptyState title="No tasks match these filters" />
+        ) : (
+          <EmptyState title="Submit your first sample" body="Tasks you submit appear here with their status and verdict." action={<Link to="/submit">Submit a sample</Link>} />
+        )
+      )}
+      {items.length > 0 && <table className={styles.table}>
         <thead>
           <tr>
             <th>Sample</th><th>Organization</th><th>Status</th><th>Verdict</th><th>Mode</th><th>Created</th><th />
@@ -96,7 +113,10 @@ export default function TasksPage() {
         <tbody>
           {items.map((t) => (
             <tr key={t.id}>
-              <td className={styles.mono}><Link to={`/tasks/${t.id}`}>{target(t)}</Link></td>
+              <td className={styles.mono}>
+                <Link to={`/tasks/${t.id}`}>{target(t)}</Link>
+                {(t.url || (!t.originalFileName && t.sampleSha256)) && <CopyButton value={t.url ?? t.sampleSha256 ?? ''} label={t.url ? 'Copy URL' : 'Copy SHA-256'} />}
+              </td>
               <td>{t.orgName}</td>
               <td>
                 <StatusBadge status={t.status} />
@@ -104,7 +124,7 @@ export default function TasksPage() {
               </td>
               <td><VerdictBadge verdict={t.verdict} /></td>
               <td>{t.networkMode}</td>
-              <td>{new Date(t.createdAt).toLocaleString()}</td>
+              <td><RelativeTime iso={t.createdAt} /></td>
               <td>
                 {t.status === 'Queued' && (
                   <button type="button" className={styles.secondary} onClick={() => void onCancel(t.id)}>Cancel</button>
@@ -112,16 +132,13 @@ export default function TasksPage() {
               </td>
             </tr>
           ))}
-          {loaded && items.length === 0 && (
-            <tr><td colSpan={7} className={styles.hint}>No tasks yet.</td></tr>
-          )}
         </tbody>
-      </table>
+      </table>}
 
       <div className={styles.pager}>
-        <button type="button" className={styles.secondary} disabled={skip === 0} onClick={() => { setSkip(Math.max(0, skip - PAGE_SIZE)); setActionError(null) }}>Previous</button>
+        <button type="button" className={styles.secondary} disabled={skip === 0} onClick={() => { setSkip(Math.max(0, skip - PAGE_SIZE)) }}>Previous</button>
         <span>{from}–{to} of {total}</span>
-        <button type="button" className={styles.secondary} disabled={skip + PAGE_SIZE >= total} onClick={() => { setSkip(skip + PAGE_SIZE); setActionError(null) }}>Next</button>
+        <button type="button" className={styles.secondary} disabled={skip + PAGE_SIZE >= total} onClick={() => { setSkip(skip + PAGE_SIZE) }}>Next</button>
       </div>
     </section>
   )

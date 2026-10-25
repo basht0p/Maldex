@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import type { EventType, LiveEventDto } from '../api/types'
+import { EmptyState } from '../kit/EmptyState'
 import { safeText } from '../util/safeText'
 import styles from './EventTable.module.css'
 
@@ -39,6 +40,8 @@ export function EventTable({ events, filter }: { events: LiveEventDto[]; filter?
   const first = virtual ? Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN) : 0
   const last = virtual ? Math.min(filtered.length, Math.ceil((scrollTop + VIEWPORT_HEIGHT) / ROW_HEIGHT) + OVERSCAN) : filtered.length
   const visible = filtered.slice(first, last)
+
+  if (events.length === 0) return <EmptyState title="No events yet." />
 
   return (
     <div>
