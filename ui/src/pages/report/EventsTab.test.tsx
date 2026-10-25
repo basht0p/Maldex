@@ -2,11 +2,12 @@ import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
-import { useLocation } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import type { EventType, LiveEventDto } from '../../api/types'
 import { renderWithKit } from '../../test/renderWithKit'
 import { reportFixture } from '../../test/reportFixture'
+import type { ProcessOption } from './eventFilters'
 import { EventsTab } from './EventsTab'
 
 const ev = (id: number, type: EventType = 'File', summary = `s${id}`, processId = 1): LiveEventDto => ({
@@ -15,11 +16,13 @@ const ev = (id: number, type: EventType = 'File', summary = `s${id}`, processId 
 const many = (from: number, n: number) => Array.from({ length: n }, (_, i) => ev(from + i))
 
 let requests: URL[] = []
+let gate: Promise<void> | null = null
 let respond: (u: URL) => LiveEventDto[] = () => []
 const server = setupServer(
-  http.get('/api/tasks/t1/events', ({ request }) => {
+  http.get('/api/tasks/t1/events', async ({ request }) => {
     const u = new URL(request.url)
     requests.push(u)
+    if (gate && u.searchParams.has('afterId')) await gate
     return HttpResponse.json(respond(u))
   }),
 )
@@ -27,6 +30,7 @@ beforeAll(() => server.listen({ onUnhandledFrame: 'error' }))
 afterEach(() => {
   server.resetHandlers()
   requests = []
+  gate = null
   respond = () => []
 })
 afterAll(() => server.close())
@@ -35,8 +39,12 @@ function Probe() {
   const loc = useLocation()
   return <output data-testid="location">{loc.pathname + loc.search}</output>
 }
-const renderTab = (route = '/tasks/t1', props: { live?: boolean; liveEvents?: LiveEventDto[] } = {}) =>
-  renderWithKit(<><EventsTab taskId="t1" report={reportFixture()} {...props} /><Probe /></>, { route })
+function Nav({ to }: { to: string }) {
+  const navigate = useNavigate()
+  return <button type="button" onClick={() => navigate(to)}>go</button>
+}
+const renderTab = (route = '/tasks/t1', props: { live?: boolean; liveEvents?: LiveEventDto[]; liveProcesses?: ProcessOption[] } = {}) =>
+  renderWithKit(<><EventsTab taskId="t1" report={reportFixture()} {...props} /><Probe /><Nav to="/tasks/t1?eq=other" /></>, { route })
 const last = () => requests[requests.length - 1]
 
 describe('EventsTab', () => {
@@ -94,5 +102,43 @@ describe('EventsTab', () => {
     await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Process' }), '')
     await waitFor(() => expect(last().searchParams.has('processId')).toBe(false))
     expect(screen.getByTestId('location').textContent).not.toContain('process=')
+  })
+  it('drops a Load more response that arrives after the filters changed', async () => {
+    respond = (u) => (u.searchParams.has('afterId') ? [ev(9001, 'File', 'STALE')] : u.searchParams.get('type') === 'Dns' ? [ev(1, 'Dns', 'fresh')] : many(1, 500))
+    let release!: () => void
+    gate = new Promise<void>((r) => { release = r })
+    renderTab()
+    await userEvent.click(await screen.findByRole('button', { name: 'Load more' }))
+    await waitFor(() => expect(requests.some((u) => u.searchParams.has('afterId'))).toBe(true))
+    await userEvent.click(screen.getByRole('button', { name: 'Dns' }))
+    await screen.findByText('fresh')
+    release()
+    await new Promise((r) => setTimeout(r, 50))
+    expect(screen.queryByText('STALE')).toBeNull()
+    expect(screen.getByText('fresh')).toBeInTheDocument()
+  })
+
+  it('takes an external eq change into the input and does not overwrite it', async () => {
+    respond = () => [ev(1)]
+    renderTab('/tasks/t1?eq=first')
+    const box = screen.getByRole('searchbox', { name: /search/i })
+    expect(box).toHaveValue('first')
+    await userEvent.click(screen.getByRole('button', { name: 'go' }))
+    await waitFor(() => expect(box).toHaveValue('other'))
+    await new Promise((r) => setTimeout(r, 400))
+    expect(screen.getByTestId('location').textContent).toContain('eq=other')
+    expect(box).toHaveValue('other')
+    expect(box).toHaveAttribute('data-search')
+  })
+
+  it('offers the live process tree in live mode', async () => {
+    renderTab('/tasks/t1', { live: true, liveEvents: [], liveProcesses: [{ id: 5, pid: 555, imagePath: 'C:\\x\\live.exe' }] })
+    expect(await screen.findByRole('option', { name: '555 live.exe' })).toBeInTheDocument()
+  })
+
+  it('says when the filters match nothing', async () => {
+    respond = () => []
+    renderTab('/tasks/t1?etype=Dns')
+    expect(await screen.findByText('No events match these filters')).toBeInTheDocument()
   })
 })

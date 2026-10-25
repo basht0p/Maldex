@@ -23,7 +23,7 @@ export interface EventFilter {
  * `controls={false}` hides the built-in chips and search (the Events tab and the running layout bring their own bar).
  * `onCopy` is called with the value after a hover copy button has copied it.
  */
-export function EventTable({ events, filter, controls = true, onCopy }: { events: LiveEventDto[]; filter?: EventFilter; controls?: boolean; onCopy?: (value: string) => void }) {
+export function EventTable({ events, filter, controls = true, onCopy, emptyTitle = 'No events yet.' }: { events: LiveEventDto[]; filter?: EventFilter; controls?: boolean; onCopy?: (value: string) => void; emptyTitle?: string }) {
   const [types, setTypes] = useState<ReadonlySet<EventType>>(() => new Set(filter?.types ?? []))
   const [text, setText] = useState(filter?.text ?? '')
   const [scrollTop, setScrollTop] = useState(0)
@@ -49,7 +49,7 @@ export function EventTable({ events, filter, controls = true, onCopy }: { events
     void navigator.clipboard?.writeText(value).then(() => onCopy?.(value), () => undefined)
   }
 
-  if (events.length === 0) return <EmptyState title="No events yet." />
+  if (events.length === 0) return <EmptyState title={emptyTitle} />
 
   return (
     <div>
