@@ -200,7 +200,7 @@ public static class TemplateEndpoints
             return job is null ? Results.NotFound() : Results.Ok((await JobDtosAsync(db, [job], jobs.Value, build.Value, ct)).Single());
         });
 
-        // The log is guest output: always a download, never rendered.
+        // The log is guest output: served as an attachment (a download); the UI shows it inline only as plain text.
         jobGroup.MapGet("{jobId:guid}/provision-log", async (Guid jobId, MaldexDbContext db, IOptions<BuildOptions> build, HttpContext http, CancellationToken ct) =>
         {
             if (!await db.TemplateJobs.AsNoTracking().AnyAsync(j => j.Id == jobId, ct)) return Results.NotFound();

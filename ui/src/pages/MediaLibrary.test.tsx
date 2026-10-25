@@ -242,6 +242,22 @@ describe('MediaLibrary', () => {
     await userEvent.click(within(dlg).getByRole('button', { name: 'Cancel' }))
   })
 
+  it('renders edition names, reasons and the delete-confirm users through safeText', async () => {
+    const evil = row({
+      id: 'ev', fileName: 'ev.iso', usedBy: ['job\u202Ex'],
+      images: [{ index: 1, name: 'Home\u200B', build: '1', supported: false, unsupportedReason: 'no\u202Ereason' }],
+    })
+    listMedia.mockResolvedValue([evil])
+    renderWithKit(<MediaLibrary />)
+    await screen.findByText('ev.iso')
+    const r = rowOf('ev.iso')
+    expect(r).toHaveTextContent('Home\\u200B')
+    expect(r).toHaveTextContent('no\\u202Ereason')
+    await userEvent.click(within(r).getByRole('button', { name: 'Delete' }))
+    expect(await screen.findByRole('dialog')).toHaveTextContent('job\\u202Ex')
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+  })
+
   it('shows upload speed and ETA when the upload reports them', async () => {
     uploadMedia.mockImplementation((_f: File, _k: string, onProgress: (r: number, s: number, rate: unknown) => void) => {
       onProgress(1024 * 1024, 4 * 1024 * 1024, { bytesPerSec: 1024 * 1024, etaSec: 3 })

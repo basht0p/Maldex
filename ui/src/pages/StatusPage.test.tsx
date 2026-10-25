@@ -8,6 +8,7 @@ vi.mock('../api/client', async (orig) => ({
   getSystemStatus: (...a: unknown[]) => getSystemStatus(...a),
 }))
 
+import { formatDuration } from '../kit/format'
 import { SystemStatusProvider } from '../live/SystemStatusProvider'
 import { renderWithKit } from '../test/renderWithKit'
 import StatusPage from './StatusPage'
@@ -65,6 +66,18 @@ describe('StatusPage', () => {
     expect(document.querySelector('img[onerror]')).toBeNull()
     expect(screen.getByText('bad\\u202Ereason')).toBeInTheDocument()
     expect(screen.getByText(/Last updated/)).toBeInTheDocument()
+  })
+
+  it('shows the expected interval as a duration and an unknown disk size without a bar', async () => {
+    getSystemStatus.mockResolvedValue(dto({ disks: [{ name: 'data', path: '/odd', freeBytes: 0, totalBytes: 0 }] }))
+    page()
+    await screen.findByText('2 of 2 in use')
+    expect(screen.queryByText('3600 s')).toBeNull()
+    expect(within(screen.getByRole('row', { name: /retention/ })).getByText(formatDuration(3600))).toBeInTheDocument()
+    expect(screen.getByText('Unknown size')).toBeInTheDocument()
+    expect(screen.getByText('/odd').closest('[data-level]')).toHaveAttribute('data-level', 'ok')
+    expect(screen.queryByRole('meter')).toBeNull()
+    expect(screen.queryByText('Critically low')).toBeNull()
   })
 
   it('shows an ErrorBanner with Retry when status fails', async () => {

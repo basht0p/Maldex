@@ -13,6 +13,7 @@ import { Duration, RelativeTime } from '../kit/RelativeTime'
 import { Skeleton } from '../kit/Skeleton'
 import { useToast } from '../kit/useToast'
 import { messageOf } from '../util/apiMessage'
+import { safeText } from '../util/safeText'
 import { safeLines } from './report/reportUtil'
 import styles from './forms.module.css'
 import page from './TemplateJobPage.module.css'
@@ -60,6 +61,7 @@ function Elapsed({ job }: { job: TemplateJobDto }) {
 /**
  * Messages of a refused Seal. Keep in step with TemplateCoordinator.DefenderStillOn and .DefenderUnconfirmed (C#);
  * the normal Configuring guidance (DefenderGuidance) is not a refusal and shows as the plain message.
+ * Pinned by TemplateRefusalMessageTests (tests/Maldex.Integration.Tests/Orchestrator).
  */
 const REFUSAL_PREFIXES = [
   'Defender real-time protection is still on',
@@ -132,7 +134,7 @@ function DefenderChecklist({ refusal }: { refusal: string | null }) {
         <h2 className={page.checkTitle}>Turn Defender off before sealing</h2>
         <ol>{DEFENDER_STEPS.map((t) => <li key={t}>{t}</li>)}</ol>
       </div>
-      {refusal && <p className={page.refusal} role="status">{refusal}</p>}
+      {refusal && <p className={page.refusal} role="status">{safeText(refusal)}</p>}
     </div>
   )
 }
@@ -255,11 +257,11 @@ function JobView({ job }: { job: TemplateJobDto }) {
         {(job.baseVersionNumber != null || job.resultVersionNumber != null) && (
           <span className={page.meta}>{[job.baseVersionNumber != null ? `from v${job.baseVersionNumber}` : '', job.resultVersionNumber != null ? `to v${job.resultVersionNumber}` : ''].filter(Boolean).join(' ')}</span>
         )}
-        {job.edition && <span className={page.meta}>{job.edition}</span>}
+        {job.edition && <span className={page.meta}>{safeText(job.edition)}</span>}
         <Elapsed job={job} />
         <span className={styles.hint}>{`State: ${job.state}`}</span>
-        {job.requestedByName && <span className={page.meta}>{`Requested by ${job.requestedByName}`}</span>}
-        <Link to="/admin/templates">Back to templates</Link>
+        {job.requestedByName && <span className={page.meta}>{`Requested by ${safeText(job.requestedByName)}`}</span>}
+        <Link to={`/admin/templates/${job.templateId}`}>Back to the template</Link>
         <span style={{ flex: 1 }} />
         {active && !configuring && (
           <button type="button" className={styles.secondary} disabled={busy} onClick={() => void run(() => cancelTemplateJob(job.id), 'Job cancelled')}>Cancel</button>
@@ -280,9 +282,9 @@ function JobView({ job }: { job: TemplateJobDto }) {
 
       <Timeline job={job} />
 
-      {job.message && !failed && !refusal && <p className={page.message}>{job.message}</p>}
-      {job.state === 'Sealed' && <p className={page.message}>Sealed and held: this version is not published. Publish it from the templates page.</p>}
-      {failed && <p className={page.failure} role="status">{`${job.state}: ${job.failureReason ?? job.message ?? 'no reason recorded'}`}</p>}
+      {job.message && !failed && !refusal && <p className={page.message}>{safeText(job.message)}</p>}
+      {job.state === 'Sealed' && <p className={page.message}>Sealed and held: this version is not published. Publish it from <Link to={`/admin/templates/${job.templateId}`}>the template&apos;s page</Link>.</p>}
+      {failed && <p className={page.failure} role="status">{`${job.state}: ${safeText(job.failureReason ?? job.message) || 'no reason recorded'}`}</p>}
 
       {configuring && (
         <div className={`${page.panel} ${expanded ? page.expanded : ''}`}>

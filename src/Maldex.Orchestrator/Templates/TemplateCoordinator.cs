@@ -62,7 +62,11 @@ public sealed class TemplateCoordinator(
     public const string AlreadyRunning = "a job is already running for this template";
     /// <summary>A Build's Configuring message when provisioning reported Defender real-time protection on (Pro media: Tamper Protection).</summary>
     public const string DefenderGuidance = "Defender real-time protection is on. In the console open Windows Security, turn off Tamper Protection, then Real-time protection, then press Seal.";
-    /// <summary>The message when a Seal was refused because the pre-seal check found real-time protection still on.</summary>
+    /// <summary>
+    /// The message when a Seal was refused because the pre-seal check found real-time protection still on.
+    /// The UI recognises this and <see cref="DefenderUnconfirmed"/> by prefix (REFUSAL_PREFIXES in ui/src/pages/TemplateJobPage.tsx);
+    /// TemplateRefusalMessageTests pins that. <see cref="DefenderGuidance"/> must start with neither.
+    /// </summary>
     public const string DefenderStillOn = "Defender real-time protection is still on; turn it off in the console, then press Seal again.";
     public const string DefenderUnconfirmed = "Defender state could not be confirmed; wait a minute and press Seal again";
 

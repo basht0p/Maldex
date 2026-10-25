@@ -12,6 +12,7 @@ import { Skeleton } from '../kit/Skeleton'
 import { formatFileSize } from '../kit/format'
 import { useToast } from '../kit/useToast'
 import { messageOf } from '../util/apiMessage'
+import { safeText } from '../util/safeText'
 import styles from './forms.module.css'
 import page from './MediaLibrary.module.css'
 
@@ -67,10 +68,10 @@ function Editions({ m }: { m: MediaFileDto }) {
           {m.images.map((i) => (
             <tr key={i.index}>
               <td>{i.index}</td>
-              <td>{i.name}{i.index === m.preferredImageIndex && <> <strong>Default</strong></>}</td>
+              <td>{safeText(i.name)}{i.index === m.preferredImageIndex && <> <strong>Default</strong></>}</td>
               <td>{i.architecture ?? ''}</td>
               <td>{i.build ?? ''}</td>
-              <td>{i.supported ? '' : reasonOf(i)}</td>
+              <td>{i.supported ? '' : safeText(reasonOf(i))}</td>
             </tr>
           ))}
         </tbody>
@@ -175,7 +176,7 @@ export default function MediaLibrary() {
     const ok = await confirm({
       title: `Delete ${m.fileName}?`,
       body: m.usedBy.length > 0
-        ? `Used by ${m.usedBy.join(', ')}. The server will refuse to delete it while it is in use.`
+        ? `Used by ${m.usedBy.map((u) => safeText(u)).join(', ')}. The server will refuse to delete it while it is in use.`
         : 'Its file is removed from the library.',
       confirmLabel: 'Delete',
       danger: true,
