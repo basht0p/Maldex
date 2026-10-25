@@ -1,4 +1,6 @@
+using Maldex.Core.Agent;
 using Maldex.Data.Templates;
+using Maldex.Infrastructure.Fakes;
 using Maldex.Orchestrator.Media;
 using Maldex.Infrastructure.Real;
 using Maldex.Orchestrator.Templates;
@@ -6,6 +8,7 @@ using Maldex.Orchestrator.Templates.Build;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Options;
 
 namespace Maldex.Orchestrator;
 
@@ -45,7 +48,17 @@ public static class DependencyInjection
             o.JobLogDir = RealPaths.Resolve(root, o.JobLogDir);
         });
         var mode = configuration["Maldex:Mode"];
-        if (string.IsNullOrEmpty(mode) || mode == "Fake") services.TryAddSingleton<IProvisioningMediaBuilder, FakeProvisioningMediaBuilder>();
+        if (string.IsNullOrEmpty(mode) || mode == "Fake")
+        {
+            services.TryAddSingleton<IProvisioningMediaBuilder, FakeProvisioningMediaBuilder>();
+            // The fake guest "runs" the agent sealing installed, which is the one ./build.sh agent left on disk: so an Edit, Refresh or
+            // Build passes the agent check. Before that agent exists it reports the fake build id (the bundle cannot load then anyway).
+            services.Replace(ServiceDescriptor.Singleton(sp =>
+            {
+                var jobs = sp.GetRequiredService<IOptions<TemplateJobOptions>>();
+                return new FakeGuest { InstalledAgentBuildId = () => InstalledAgentBuildId(jobs.Value) };
+            }));
+        }
         else services.TryAddSingleton<IProvisioningMediaBuilder, XorrisoProvisioningMediaBuilder>();
         services.AddSingleton<VmSlotGate>();
         services.AddSingleton<JobConsoleRegistry>();
@@ -64,5 +77,18 @@ public static class DependencyInjection
         services.AddSingleton<MediaWorker>();
         services.AddScoped<MediaIntake>();
         return services;
+    }
+
+    /// <summary>The build id of the agent on disk (resolved paths), or null when it has not been built.</summary>
+    private static string? InstalledAgentBuildId(TemplateJobOptions o)
+    {
+        try
+        {
+            return AgentIdentity.BuildIdOfFiles(o.AgentExePath, o.AgentVersionPath);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return null;
+        }
     }
 }
