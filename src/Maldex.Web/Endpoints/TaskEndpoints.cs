@@ -59,7 +59,7 @@ public static class TaskEndpoints
             }
             if (!string.IsNullOrWhiteSpace(to))
             {
-                if (DateOnly.TryParseExact(to, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var d))
+                if (DateOnly.TryParseExact(to, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var d) && d < DateOnly.MaxValue)
                     toBefore = new DateTimeOffset(d.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero).AddDays(1);
                 else errors["to"] = ["to must be yyyy-MM-dd."];
             }

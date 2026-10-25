@@ -180,7 +180,7 @@ public sealed class TaskListQueryTests(SqlServerFixture sql) : IDisposable
         var items = (await ListAsync(analyst, "")).GetProperty("items").EnumerateArray().ToDictionary(i => i.GetProperty("id").GetGuid());
         Assert.Equal(90, items[done].GetProperty("ranSec").GetInt32());
         Assert.Equal(JsonValueKind.Null, items[open].GetProperty("ranSec").ValueKind);
-        Assert.False(string.IsNullOrEmpty(items[done].GetProperty("submittedByName").GetString()));
+        Assert.Equal("analyst", items[done].GetProperty("submittedByName").GetString());
     }
 
     [Theory]
@@ -189,6 +189,7 @@ public sealed class TaskListQueryTests(SqlServerFixture sql) : IDisposable
     [InlineData("dir=up")]
     [InlineData("from=2026-13-01")]
     [InlineData("to=nope")]
+    [InlineData("to=9999-12-31")]
     [InlineData("q=%20%20")]
     public async Task Bad_parameters_are_400_problem_details(string qs)
     {
@@ -216,6 +217,10 @@ public sealed class TaskListQueryTests(SqlServerFixture sql) : IDisposable
         using var analyst = f.CreateClient(UserRole.Analyst, "analyst");
         var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
         await SubmitFileAsync(analyst, org, "a.exe", "a");
+        var wild = (await SubmitFileAsync(analyst, org, "100%_off.exe", "w")).GetProperty("id").GetGuid();
         Assert.Empty(Ids(await ListAsync(analyst, "q=" + Uri.EscapeDataString("%' OR 1=1 --"))));
+        // LIKE wildcards in the input are literal characters.
+        Assert.Equal([wild], Ids(await ListAsync(analyst, "q=" + Uri.EscapeDataString("%"))));
+        Assert.Equal([wild], Ids(await ListAsync(analyst, "q=" + Uri.EscapeDataString("_"))));
     }
 }
