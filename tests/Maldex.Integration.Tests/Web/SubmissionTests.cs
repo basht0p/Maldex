@@ -365,6 +365,7 @@ public sealed class SubmissionTests(SqlServerFixture sql) : IDisposable
 
     private sealed class MissingStemsStore(params string[] missing) : Maldex.Core.Abstractions.ITemplateStore
     {
+        public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
         public bool Exists(string fileStem) => !missing.Contains(fileStem);
         public long? SizeOf(string fileStem) => null;
         public Task DeleteAsync(string fileStem, CancellationToken ct) => Task.CompletedTask;

@@ -12,4 +12,12 @@ public sealed class QemuImageCli(IProcessRunner runner, string binary)
         if (r.ExitCode != 0)
             throw new InvalidOperationException($"qemu-img create failed ({r.ExitCode}): {r.Stderr.Trim()}");
     }
+
+    /// <summary>Creates an empty qcow2 disk of <paramref name="bytes"/> at <paramref name="path"/>.</summary>
+    public async Task CreateBlankAsync(string path, long bytes, CancellationToken ct)
+    {
+        var r = await runner.RunAsync(binary, ["create", "-f", "qcow2", path, bytes.ToString(System.Globalization.CultureInfo.InvariantCulture)], ct);
+        if (r.ExitCode != 0)
+            throw new InvalidOperationException($"qemu-img create failed ({r.ExitCode}): {r.Stderr.Trim()}");
+    }
 }

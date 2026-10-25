@@ -14,6 +14,8 @@ public sealed class FakeTemplateStore : ITemplateStore
     public List<string> Sealed { get; } = [];
     public List<string> Deleted { get; } = [];
 
+    public List<(string Stem, long DiskBytes, string VarsTemplatePath)> Blanks { get; } = [];
+
     public bool Exists(string fileStem)
     {
         lock (Missing) return !Missing.Contains(fileStem);
@@ -28,6 +30,17 @@ public sealed class FakeTemplateStore : ITemplateStore
     {
         OnCreateWorkingCopy?.Invoke();
         lock (WorkingCopies) WorkingCopies.Add((fromStem, toStem));
+        return Task.CompletedTask;
+    }
+
+    public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct)
+    {
+        lock (Blanks)
+        {
+            if (Blanks.Any(b => b.Stem == stem)) throw new InvalidOperationException($"Template file stem '{stem}' already exists.");
+            Blanks.Add((stem, diskBytes, varsTemplatePath));
+        }
+        lock (Missing) Missing.Remove(stem); // the stem now exists
         return Task.CompletedTask;
     }
 

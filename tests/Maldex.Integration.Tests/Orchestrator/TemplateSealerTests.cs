@@ -108,6 +108,7 @@ internal sealed class TemplateJobKit : IAsyncDisposable
 /// <summary>Records the seal calls and whether the guest was already gone when each happened.</summary>
 internal sealed class SpyTemplateStore(IHypervisor hypervisor) : ITemplateStore
 {
+    public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
     public List<(string Stem, int VmsListed)> Seals { get; } = [];
     public bool Exists(string fileStem) => true;
     public long? SizeOf(string fileStem) => null;
@@ -292,6 +293,7 @@ public class TemplateSealerTests
 
     private sealed class HypervisorWithIsRunning(IHypervisor inner, Func<VmHandle, CancellationToken, Task<bool>> isRunning, Func<VmHandle, Task>? destroy = null) : IHypervisor
     {
+        public Task SendKeyAsync(VmHandle vm, string key, CancellationToken ct) => throw new NotSupportedException();
         public Task<VmHandle> StartAsync(VmSpec spec, CancellationToken ct) => inner.StartAsync(spec, ct);
         public Task DestroyAsync(VmHandle vm, CancellationToken ct) => destroy is null ? inner.DestroyAsync(vm, ct) : destroy(vm);
         public Task<bool> IsRunningAsync(VmHandle vm, CancellationToken ct) => isRunning(vm, ct);

@@ -103,6 +103,7 @@ public class TemplateVerifierTests
 
     private sealed class FailingDestroy(IHypervisor inner) : IHypervisor
     {
+        public Task SendKeyAsync(VmHandle vm, string key, CancellationToken ct) => throw new NotSupportedException();
         public Task<VmHandle> StartAsync(VmSpec spec, CancellationToken ct) => inner.StartAsync(spec, ct);
         public Task DestroyAsync(VmHandle handle, CancellationToken ct) => throw new IOException("virsh destroy failed");
         public Task<bool> IsRunningAsync(VmHandle vm, CancellationToken ct) => inner.IsRunningAsync(vm, ct);

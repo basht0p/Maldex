@@ -18,6 +18,7 @@ public class TemplateImporterTests(SqlServerFixture sql)
 
     private sealed class FakeStore : ITemplateStore
     {
+        public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
         public Dictionary<string, long?> Present { get; } = new();
         public bool Exists(string fileStem) => Present.ContainsKey(fileStem);
         public long? SizeOf(string fileStem) => Present.GetValueOrDefault(fileStem);
@@ -103,6 +104,7 @@ public class TemplateImporterTests(SqlServerFixture sql)
 
     private sealed class AllPresentStore : ITemplateStore
     {
+        public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
         public bool Exists(string fileStem) => true;
         public long? SizeOf(string fileStem) => null;
         public Task DeleteAsync(string fileStem, CancellationToken ct) => Task.CompletedTask;
@@ -174,6 +176,7 @@ public class TemplateImporterTests(SqlServerFixture sql)
     /// <summary>Like <c>LibvirtTemplateStore</c>: a stem that is not a valid slug throws instead of answering.</summary>
     private sealed class InvalidStemStore(string invalid) : ITemplateStore
     {
+        public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
         public bool Exists(string fileStem) => fileStem == invalid ? throw new ArgumentException("Invalid template file stem.", nameof(fileStem)) : true;
         public long? SizeOf(string fileStem) => null;
         public Task DeleteAsync(string fileStem, CancellationToken ct) => Task.CompletedTask;
@@ -234,7 +237,8 @@ public class TemplateImporterTests(SqlServerFixture sql)
             File.WriteAllBytes(Path.Combine(dir, "win11-26h2.qcow2"), [1]);
             File.WriteAllBytes(Path.Combine(dir, "win11-26h2.vars.fd"), [1]);
             var store = new Maldex.Infrastructure.Libvirt.LibvirtTemplateStore(
-                Microsoft.Extensions.Options.Options.Create(new Maldex.Infrastructure.Libvirt.LibvirtOptions { BaseImageDir = dir }));
+                Microsoft.Extensions.Options.Options.Create(new Maldex.Infrastructure.Libvirt.LibvirtOptions { BaseImageDir = dir }),
+                new Maldex.Infrastructure.Execution.ProcessRunner());
             await using var db = await FreshAsync();
 
             var imported = await TemplateImporter.ImportAsync(db, store, ["Win_11", "win11-26h2"], new FixedTime(Now), NullLogger.Instance, Ct);

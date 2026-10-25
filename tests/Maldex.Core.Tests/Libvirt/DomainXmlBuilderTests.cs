@@ -75,7 +75,7 @@ public class DomainXmlBuilderTests
         Assert.Equal("file", disk.Attribute("type")!.Value);
         Assert.Equal("qemu", disk.Element("driver")!.Attribute("name")!.Value);
         Assert.Equal("qcow2", disk.Element("driver")!.Attribute("type")!.Value);
-        Assert.Equal(Paths.OverlayDiskPath, disk.Element("source")!.Attribute("file")!.Value);
+        Assert.Equal(Paths.DiskPath, disk.Element("source")!.Attribute("file")!.Value);
         Assert.Equal("virtio", disk.Element("target")!.Attribute("bus")!.Value);
     }
 
@@ -126,4 +126,53 @@ public class DomainXmlBuilderTests
     [InlineData("mxt0123456789abc")]
     public void Build_RejectsNetworkIdThatIsNotATap(string id) =>
         Assert.Throws<ArgumentException>(() => DomainXmlBuilder.Build(Spec with { NetworkId = id }, Paths, Options));
+
+    private static readonly string[] Isos = ["/m/a.iso", "/m/b.iso", "/m/c.iso", "/m/d.iso"];
+
+    [Fact]
+    public void InstallBoot_AttachesCdRomsReadOnlyOnSata_InOrder()
+    {
+        var d = Domain(Spec with { Writable = true, CdRoms = Isos, BootFromCdRom = true });
+        var cds = d.Element("devices")!.Elements("disk").Where(x => (string?)x.Attribute("device") == "cdrom").ToList();
+        Assert.Equal(Isos, cds.Select(c => c.Element("source")!.Attribute("file")!.Value));
+        Assert.Equal(["sda", "sdb", "sdc", "sdd"], cds.Select(c => c.Element("target")!.Attribute("dev")!.Value));
+        Assert.All(cds, c =>
+        {
+            Assert.Equal("file", c.Attribute("type")!.Value);
+            Assert.Equal("qemu", c.Element("driver")!.Attribute("name")!.Value);
+            Assert.Equal("raw", c.Element("driver")!.Attribute("type")!.Value);
+            Assert.Equal("sata", c.Element("target")!.Attribute("bus")!.Value);
+            Assert.NotNull(c.Element("readonly"));
+        });
+    }
+
+    [Fact]
+    public void InstallBoot_BootsFromTheFirstCdRomThenTheDisk_WithNoOsBootElement()
+    {
+        var d = Domain(Spec with { Writable = true, CdRoms = Isos, BootFromCdRom = true });
+        Assert.Null(d.Element("os")!.Element("boot"));
+        var disks = d.Element("devices")!.Elements("disk").ToList();
+        var cds = disks.Where(x => (string?)x.Attribute("device") == "cdrom").ToList();
+        Assert.Equal("1", cds[0].Element("boot")!.Attribute("order")!.Value);
+        Assert.All(cds.Skip(1), c => Assert.Null(c.Element("boot")));
+        var vda = disks.Single(x => (string?)x.Attribute("device") == "disk");
+        Assert.Equal("2", vda.Element("boot")!.Attribute("order")!.Value);
+    }
+
+    [Fact]
+    public void CdRomsWithoutBootFlag_KeepDiskFirst()
+    {
+        var d = Domain(Spec with { Writable = true, CdRoms = Isos[..1] });
+        Assert.Equal("hd", d.Element("os")!.Element("boot")!.Attribute("dev")!.Value);
+        Assert.DoesNotContain(d.Descendants("boot"), b => b.Attribute("order") is not null);
+        Assert.Single(d.Element("devices")!.Elements("disk"), x => (string?)x.Attribute("device") == "cdrom");
+    }
+
+    [Fact]
+    public void NormalBoot_HasNoCdRomAndBootsFromDisk()
+    {
+        var d = Domain();
+        Assert.DoesNotContain(d.Descendants("disk"), x => (string?)x.Attribute("device") == "cdrom");
+        Assert.Equal("hd", d.Element("os")!.Element("boot")!.Attribute("dev")!.Value);
+    }
 }

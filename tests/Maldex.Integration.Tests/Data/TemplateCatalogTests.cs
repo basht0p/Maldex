@@ -20,6 +20,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
 
     private sealed class RecordingStore : ITemplateStore
     {
+        public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
         public List<string> Deleted { get; } = [];
         public HashSet<string> Missing { get; } = [];
         public bool Exists(string fileStem) => !Missing.Contains(fileStem);
@@ -158,6 +159,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
     /// <summary>Like <c>LibvirtTemplateStore</c>: a stem that is not a valid slug throws instead of answering.</summary>
     private sealed class InvalidStemStore(string invalid) : ITemplateStore
     {
+        public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
         public bool Exists(string fileStem) => fileStem == invalid ? throw new ArgumentException("Invalid template file stem.", nameof(fileStem)) : true;
         public long? SizeOf(string fileStem) => fileStem == invalid ? throw new ArgumentException("Invalid template file stem.", nameof(fileStem)) : null;
         public Task DeleteAsync(string fileStem, CancellationToken ct) => Task.CompletedTask;

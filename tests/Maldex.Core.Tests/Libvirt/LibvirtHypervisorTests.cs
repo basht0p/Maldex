@@ -265,4 +265,107 @@ public sealed class LibvirtHypervisorTests : IDisposable
         _runner.Handler = (_, _) => new(1, "", "error: Domain not found");
         Assert.Null(await loc.GetAsync(h, CancellationToken.None));
     }
+
+    private string Iso(string name)
+    {
+        var p = Path.Combine(_root, name);
+        File.WriteAllText(p, "iso");
+        return p;
+    }
+
+    [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public async Task Start_InstallBoot_AttachesTheIsosReadOnly_NoOverlay()
+    {
+        SeedBase();
+        var isos = new[] { Iso("a.iso"), Iso("b.iso") };
+        var h = await Hv().StartAsync(Spec() with { Writable = true, CdRoms = isos, BootFromCdRom = true }, CancellationToken.None);
+        var call = Assert.Single(_runner.Calls);
+        Assert.Equal("virsh", call.File);
+        var xml = File.ReadAllText(Path.Combine(RunDirOf(h), "domain.xml"));
+        Assert.Contains(isos[0], xml);
+        Assert.Contains(isos[1], xml);
+        Assert.Contains("<readonly />", xml);
+        Assert.Contains("device=\"cdrom\"", xml);
+    }
+
+    [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public async Task Start_CdRomsOnOverlayBoot_Refused()
+    {
+        SeedBase();
+        var ex = await Assert.ThrowsAsync<VmStartException>(() => Hv().StartAsync(Spec() with { CdRoms = [Iso("a.iso")] }, CancellationToken.None));
+        Assert.Contains("CD-ROM", ex.Message);
+        Assert.Empty(_runner.Calls);
+        Assert.False(Directory.Exists(RunDirOf(VmHandle.For(Id))));
+    }
+
+    [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public async Task Start_CdRomMissingFile_Refused()
+    {
+        SeedBase();
+        var missing = Path.Combine(_root, "nope.iso");
+        var ex = await Assert.ThrowsAsync<VmStartException>(() => Hv().StartAsync(Spec() with { Writable = true, CdRoms = [Iso("a.iso"), missing] }, CancellationToken.None));
+        Assert.Contains(missing, ex.Message);
+        Assert.Empty(_runner.Calls);
+        Assert.False(Directory.Exists(RunDirOf(VmHandle.For(Id))));
+    }
+
+    [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public async Task Start_TooManyOrBadCdRoms_Refused()
+    {
+        SeedBase();
+        var five = Enumerable.Range(0, 5).Select(i => Iso($"{i}.iso")).ToArray();
+        await Assert.ThrowsAsync<VmStartException>(() => Hv().StartAsync(Spec() with { Writable = true, CdRoms = five }, CancellationToken.None));
+        await Assert.ThrowsAsync<VmStartException>(() => Hv().StartAsync(Spec() with { Writable = true, CdRoms = ["rel/a.iso"] }, CancellationToken.None));
+        var notIso = Path.Combine(_root, "a.img");
+        File.WriteAllText(notIso, "x");
+        await Assert.ThrowsAsync<VmStartException>(() => Hv().StartAsync(Spec() with { Writable = true, CdRoms = [notIso] }, CancellationToken.None));
+        await Assert.ThrowsAsync<VmStartException>(() => Hv().StartAsync(Spec() with { Writable = true, BootFromCdRom = true }, CancellationToken.None));
+        Assert.Empty(_runner.Calls);
+    }
+
+    [Fact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public async Task Start_SealedDiskGuard_StaysFirst_EvenWithBadCdRoms()
+    {
+        SeedBase();
+        File.SetUnixFileMode(Path.Combine(_opts.BaseImageDir, "win11-26h2.qcow2"), UnixFileMode.UserRead | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
+        var ex = await Assert.ThrowsAsync<VmStartException>(() =>
+            Hv().StartAsync(Spec() with { Writable = true, CdRoms = [Path.Combine(_root, "nope.iso")] }, CancellationToken.None));
+        Assert.Contains("sealed", ex.Message);
+    }
+
+    [Fact]
+    public async Task SendKey_RunsVirshSendKey()
+    {
+        var vm = VmHandle.For(Id);
+        await Hv().SendKeyAsync(vm, "KEY_ENTER", CancellationToken.None);
+        var call = Assert.Single(_runner.Calls);
+        Assert.Equal("virsh", call.File);
+        Assert.Equal(["-c", "qemu:///session", "send-key", vm.Name, "KEY_ENTER"], call.Args);
+    }
+
+    [Theory]
+    [InlineData("ENTER")]
+    [InlineData("key_enter")]
+    [InlineData("KEY_")]
+    [InlineData("KEY_ENTER\n")]
+    [InlineData("KEY_ENTER KEY_A")]
+    [InlineData("--codeset")]
+    [InlineData("KEY_AAAAAAAAAAAAAAAAAAAAA")]
+    public async Task SendKey_InvalidKey_Refused(string key)
+    {
+        await Assert.ThrowsAsync<ArgumentException>(() => Hv().SendKeyAsync(VmHandle.For(Id), key, CancellationToken.None));
+        Assert.Empty(_runner.Calls);
+    }
+
+    [Fact]
+    public async Task SendKey_VirshFailure_Throws()
+    {
+        _runner.Handler = (_, _) => new(1, "", "error: failed to get domain");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Hv().SendKeyAsync(VmHandle.For(Id), "KEY_ENTER", CancellationToken.None));
+    }
 }

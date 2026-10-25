@@ -32,8 +32,9 @@ internal static partial class LibvirtPaths
 }
 
 /// <summary>Session-libvirt (<c>qemu:///session</c>) hypervisor: transient domains over qcow2 overlays.</summary>
-public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcessRunner runner) : IHypervisor
+public sealed partial class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcessRunner runner) : IHypervisor
 {
+    private const int MaxCdRoms = 4;
     private const string VncAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     private static readonly SemaphoreSlim StartLock = new(1, 1);
     private readonly LibvirtOptions _o = options.Value;
@@ -52,6 +53,7 @@ public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcess
         // The same owner-write check the guestfish editor makes.
         if (spec.Writable && !OperatingSystem.IsWindows() && (File.GetUnixFileMode(basePath) & UnixFileMode.UserWrite) == 0)
             throw new VmStartException($"template disk '{spec.DiskStem}' is a sealed version, not a working copy: refusing to boot it writable");
+        ValidateCdRoms(spec);
 
         try
         {
@@ -170,6 +172,36 @@ public sealed class LibvirtHypervisor(IOptions<LibvirtOptions> options, IProcess
 
         return [.. found.Values];
     }
+
+    public async Task SendKeyAsync(VmHandle vm, string key, CancellationToken ct)
+    {
+        if (key is null || !KeyName().IsMatch(key)) throw new ArgumentException($"Invalid key name '{key}'.", nameof(key));
+        var r = await runner.RunAsync(_o.VirshBinary, ["-c", _o.Uri, "send-key", vm.Name, key], ct);
+        if (r.ExitCode != 0)
+            throw new InvalidOperationException($"virsh send-key {vm.Name} {key} failed ({r.ExitCode}): {r.Stderr.Trim()}");
+    }
+
+    /// <summary>Installer media only on an install boot, at most 4, each an absolute path to an existing .iso file.</summary>
+    private static void ValidateCdRoms(VmSpec spec)
+    {
+        var cdRoms = spec.CdRoms ?? [];
+        if (cdRoms.Count == 0)
+        {
+            if (spec.BootFromCdRom) throw new VmStartException("cannot boot from a CD-ROM: none attached");
+            return;
+        }
+        if (!spec.Writable) throw new VmStartException("CD-ROMs are only allowed on an install boot (a writable template boot); analysis boots refuse them");
+        if (cdRoms.Count > MaxCdRoms) throw new VmStartException($"at most {MaxCdRoms} CD-ROMs can be attached, got {cdRoms.Count}");
+        foreach (var iso in cdRoms)
+        {
+            if (string.IsNullOrEmpty(iso) || !Path.IsPathRooted(iso) || !iso.EndsWith(".iso", StringComparison.OrdinalIgnoreCase))
+                throw new VmStartException($"CD-ROM image '{iso}' must be an absolute path to an .iso file");
+            if (!File.Exists(iso)) throw new VmStartException($"CD-ROM image {iso} not found");
+        }
+    }
+
+    [GeneratedRegex(@"^KEY_[A-Z0-9_]{1,20}\z")] // \z, not $: $ also matches before a trailing newline
+    private static partial Regex KeyName();
 
     private static int FindFreeVncPort()
     {

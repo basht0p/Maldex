@@ -24,6 +24,7 @@ public sealed class TemplateAdminTests(SqlServerFixture sql) : IDisposable
 
     private sealed class MissingStemsStore : ITemplateStore
     {
+        public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
         public HashSet<string> Missing { get; } = [];
         public bool Exists(string fileStem) => !Missing.Contains(fileStem);
         public long? SizeOf(string fileStem) => null;
@@ -162,6 +163,7 @@ public sealed class TemplateAdminTests(SqlServerFixture sql) : IDisposable
 
     private sealed class InvalidStemStore : ITemplateStore
     {
+        public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
         public HashSet<string> Invalid { get; } = [];
         public bool Exists(string fileStem) => Invalid.Contains(fileStem) ? throw new ArgumentException("Invalid template file stem.", nameof(fileStem)) : true;
         public long? SizeOf(string fileStem) => null;
@@ -300,6 +302,7 @@ public sealed class TemplateAdminTests(SqlServerFixture sql) : IDisposable
     /// <summary>Answers normally until <see cref="Fail"/> is set, then throws an InvalidOperationException that is no rule refusal.</summary>
     private sealed class FailingAfterArmStore : ITemplateStore
     {
+        public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct) => throw new NotSupportedException();
         public volatile bool Fail;
         public bool Exists(string fileStem) => Fail ? throw new InvalidOperationException("store broke") : true;
         public long? SizeOf(string fileStem) => null;
