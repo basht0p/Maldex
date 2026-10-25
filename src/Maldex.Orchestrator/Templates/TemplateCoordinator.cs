@@ -5,7 +5,9 @@ using Maldex.Core.Lifecycle;
 using Maldex.Core.Text;
 using Maldex.Data;
 using Maldex.Data.Templates;
+using Maldex.Infrastructure.Isolation;
 using Maldex.Infrastructure.Libvirt;
+using Maldex.Infrastructure.Net;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -37,6 +39,9 @@ public sealed class TemplateCoordinator(
     IOptions<OrchestratorOptions> orchestrator,
     IOptions<TemplateJobOptions> options,
     IOptions<LibvirtOptions> libvirt,
+    IRunNetworkInfo networkInfo,
+    IOptions<NetOptions> net,
+    IOptions<SelfTestOptions> selfTest,
     TimeProvider time,
     ILogger<TemplateCoordinator> logger,
     ITemplateJobPublisher? publisher = null,
@@ -236,7 +241,7 @@ public sealed class TemplateCoordinator(
         held.Vm = await hypervisor.StartAsync(new VmSpec(job.Id, stem, vmOptions.VmMemoryMiB, vmOptions.VmVCpus, held.Lease.NetworkId, Writable: true), ct).ConfigureAwait(false);
 
         await SaveJobAsync(db, job.Id, j => { j.Message = "checking the guest agent"; return true; }, [], ct).ConfigureAwait(false);
-        await CheckAgentAsync(held.Vm!, bundle, o, ct).ConfigureAwait(false);
+        await CheckAgentAsync(db, job, held.Vm!, mode == NetworkMode.Direct ? held.Lease : null, bundle, o, ct).ConfigureAwait(false);
 
         if (job.Kind == TemplateJobKind.Edit)
         {
@@ -320,11 +325,11 @@ public sealed class TemplateCoordinator(
 
     /// <summary>
     /// Proves the booted working copy runs the agent that was written into it: waits for ready, asks <c>provenance</c> and compares the
-    /// build id. An agent that is older (refuses the command, never answers) or different fails the job. The channel is closed again
-    /// afterwards: the sealer connects its own and reads that connection's ready message (an agent whose host end is not connected
-    /// retries its connection and says ready again, which is how a long-idle Edit guest reaches the sealer too).
+    /// build id. An agent that is older (refuses the command, never answers) or different fails the job. A Direct session then runs
+    /// its isolation self-test on the same channel (<paramref name="directLease"/>). The channel is closed again afterwards: the
+    /// sealer connects its own and proves liveness with a provenance round trip, never by waiting for ready (R25).
     /// </summary>
-    private async Task CheckAgentAsync(VmHandle vm, ComponentBundle bundle, TemplateJobOptions o, CancellationToken ct)
+    private async Task CheckAgentAsync(MaldexDbContext db, TemplateJob job, VmHandle vm, NetworkLease? directLease, ComponentBundle bundle, TemplateJobOptions o, CancellationToken ct)
     {
         IAgentChannel channel;
         try
@@ -371,11 +376,42 @@ public sealed class TemplateCoordinator(
 
             if (answer.AgentVersion != bundle.AgentBuildId)
                 throw new JobFailedException($"the working copy still runs agent {GuestText.Clean(answer.AgentVersion, 100)}; the agent could not be updated");
+
+            if (directLease is not null) await DirectSelfTestAsync(db, job, directLease, channel, session.Inbox, ct).ConfigureAwait(false);
         }
         finally
         {
             await DisposeQuietlyAsync(channel, vm.TaskId).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// The isolation self-test of a Direct session (spec §4), before the admin gets the guest: LAN, host and control plane must be
+    /// unreachable and the internet reachable. Fails closed: any other verdict, or an error running it, fails the job.
+    /// </summary>
+    private async Task DirectSelfTestAsync(MaldexDbContext db, TemplateJob job, NetworkLease lease, IAgentChannel channel, TransferInbox inbox, CancellationToken ct)
+    {
+        await SaveJobAsync(db, job.Id, j => { j.Message = "checking the isolation of the Direct network"; return true; }, [], ct).ConfigureAwait(false);
+        IsolationVerdict verdict;
+        try
+        {
+            var info = await networkInfo.GetAsync(lease, ct).ConfigureAwait(false);
+            if (info is null) verdict = IsolationVerdict.Fail("the job's network addressing is unknown");
+            else if (info.Mode != NetworkMode.Direct) verdict = IsolationVerdict.Fail($"network mode mismatch: lease {info.Mode}, job Direct");
+            else
+            {
+                var plan = IsolationProbePlan.Build(net.Value, info);
+                verdict = selfTest.Value.RequireControlPlaneProbes && !plan.Targets.Any(t => t.Name.StartsWith("control_plane_", StringComparison.Ordinal))
+                    ? IsolationVerdict.Fail("no control-plane probe targets configured")
+                    : await new SelfTestGate(time, pollInterval: options.Value.PollInterval).RunAsync(channel, inbox, NetworkMode.Direct, null, plan, ct).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogError(ex, "The Direct isolation self-test of template job {JobId} failed unexpectedly.", job.Id);
+            verdict = IsolationVerdict.Fail($"self-test error: {GuestText.Clean(ex.Message, 200)}");
+        }
+        if (!verdict.Isolated) throw new JobFailedException($"isolation self-test failed: {GuestText.Clean(verdict.Reason, 500)}");
     }
 
     /// <summary>

@@ -76,11 +76,20 @@ internal sealed class SilenceableChannels(IAgentChannelFactory inner, FakeGuest 
     public int DropOnConnections { get => _dropConnections; set => _dropConnections = value; }
     private int _dropConnections = int.MaxValue;
 
+    private readonly List<(Guid TaskId, ReplayAgentChannel Channel)> _opened = [];
+
+    /// <summary>The commands sent on every channel opened to the VM of <paramref name="taskId"/>.</summary>
+    public IReadOnlyList<AgentCommand> SentTo(Guid taskId)
+    {
+        lock (_opened) return _opened.Where(o => o.TaskId == taskId).SelectMany(o => o.Channel.SentCommands).ToList();
+    }
+
     public async Task<IAgentChannel> ConnectAsync(VmHandle vm, CancellationToken ct)
     {
         if (Unreachable?.Invoke(vm) == true) throw new IOException("the agent socket is not there");
         if (Silent?.Invoke(vm) == true) return new ReplayAgentChannel([], 1, holdOpen: true, time, guest, vm.TaskId);
         var channel = await inner.ConnectAsync(vm, ct);
+        if (channel is ReplayAgentChannel replay) lock (_opened) _opened.Add((vm.TaskId, replay));
         return DropProvenanceRequests > 0 && Interlocked.Decrement(ref _dropConnections) >= 0 ? new ReconnectGapChannel((ReplayAgentChannel)channel, DropProvenanceRequests) : channel;
     }
 }
@@ -407,6 +416,55 @@ public class TemplateCoordinatorTests(SqlServerFixture sql)
         Assert.Equal(["template.egress.start", "template.egress.stop", "template.seal", "template.publish"], audits.Select(a => a.Action));
         Assert.All(audits.Take(2), a => Assert.Equal(rig.AdminId, a.UserId));
         Assert.All(audits.Take(2), a => Assert.Contains($"job={id}", a.Details));
+    }
+
+    [Fact]
+    public async Task Edit_Direct_RunsTheIsolationSelfTest_BeforeTheAdminGetsTheGuest()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit, NetworkMode.Direct);
+        var run = rig.Start(id);
+
+        await rig.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+
+        var selfTests = rig.Channels.SentTo(id).OfType<SelfTestCommand>().ToList();
+        var selfTest = Assert.Single(selfTests);
+        Assert.Equal(rig.H.Get<IOptions<Maldex.Infrastructure.Net.NetOptions>>().Value.DirectProbeUrl, selfTest.EchoUrl);
+        Assert.Contains(selfTest.Targets, t => t.Name == "gateway");
+        await rig.RequestCancelAsync(id);
+        await rig.PumpAsync(run);
+    }
+
+    [Fact]
+    public async Task Edit_None_RunsNoSelfTest()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit);
+        var run = rig.Start(id);
+
+        await rig.PumpUntilAsync(id, TemplateJobState.Configuring, run);
+
+        Assert.Empty(rig.Channels.SentTo(id).OfType<SelfTestCommand>());
+        await rig.RequestCancelAsync(id);
+        await rig.PumpAsync(run);
+    }
+
+    [Fact]
+    public async Task Edit_Direct_FailedSelfTest_FailsTheJob_AndDiscardsEverything()
+    {
+        await using var rig = await TemplateJobRig.CreateAsync(sql);
+        rig.Guest.SetReachable("gateway"); // the guest can reach the host side of its network
+        var id = await rig.SeedJobAsync(TemplateJobKind.Edit, NetworkMode.Direct);
+
+        await rig.PumpAsync(rig.Start(id));
+
+        var job = await rig.JobAsync(id);
+        Assert.Equal(TemplateJobState.Failed, job.State);
+        Assert.Equal("isolation self-test failed: gateway is reachable from the guest", job.FailureReason);
+        Assert.Null(job.ConfiguringSince); // the admin never got the guest
+        await rig.AssertDiscardedAsync(id);
+        Assert.Equal(["create Direct", "release"], rig.Egress.Calls);
+        Assert.Equal(["template.egress.start", "template.egress.stop", "template.job.fail"], (await rig.AuditsAsync()).Select(a => a.Action));
     }
 
     [Fact]
