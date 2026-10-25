@@ -42,6 +42,7 @@ public static class DependencyInjection
         {
             var configuredRoot = configuration[$"{RealOptions.SectionName}:{nameof(RealOptions.Root)}"];
             var root = string.IsNullOrWhiteSpace(configuredRoot) ? RealPaths.FindRoot(AppContext.BaseDirectory) : Path.GetFullPath(configuredRoot);
+            if (string.IsNullOrWhiteSpace(o.Root)) throw new InvalidOperationException("Maldex:Media:Root must not be empty.");
             o.Root = RealPaths.Resolve(root, o.Root);
         });
         services.AddSingleton<MediaStore>();
@@ -135,6 +136,8 @@ public static class DependencyInjection
         services.AddSingleton<IExpectedEgress, WireGuardExpectedEgress>();
         services.AddSingleton<IHostGuardProbe, HostGuardProbe>();
         services.AddSingleton<IWorkerStartGate, GuardedWorkerStartGate>();
-        services.AddSingleton<IMediaInspector, LoopMountMediaInspector>();
+        services.AddSingleton<LoopMountMediaInspector>();
+        services.AddSingleton<IMediaInspector>(sp => sp.GetRequiredService<LoopMountMediaInspector>());
+        services.AddHostedService<MediaMountSweepService>();
     }
 }

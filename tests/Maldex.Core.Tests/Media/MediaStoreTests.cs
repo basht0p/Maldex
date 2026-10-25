@@ -173,4 +173,27 @@ public sealed class MediaStoreTests : IDisposable
         Assert.Equal(777, store.FreeMiB());
         Assert.Equal(_root, disk.Path);
     }
+
+    [Fact]
+    public void Finalize_ManyConcurrentFinalizesOfTheSameContent_AllSucceedAndKeepOneFile()
+    {
+        var sha = Sha("race");
+        var ids = Enumerable.Range(0, 16).Select(_ => Guid.NewGuid()).ToList();
+        foreach (var id in ids) using (var s = _store.OpenStagingForAppend(id, 0)) s.Write("race"u8);
+
+        var paths = ids.AsParallel().Select(id => _store.Finalize(id, sha)).ToList();
+
+        Assert.All(paths, p => Assert.Equal(_store.FinalPath(sha), p));
+        Assert.Empty(_store.StagingIds());
+        Assert.Equal("race", File.ReadAllText(_store.FinalPath(sha)));
+    }
+
+    [Fact]
+    public void Staging_DirectoryIsOwnerOnly_AndTheRootKeepsItsDefaultMode()
+    {
+        using (_store.OpenStagingForAppend(Guid.NewGuid(), 0)) { }
+        const UnixFileMode ownerOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+        Assert.Equal(ownerOnly, File.GetUnixFileMode(Path.Combine(_root, "staging")));
+        Assert.NotEqual(ownerOnly, File.GetUnixFileMode(_root));
+    }
 }

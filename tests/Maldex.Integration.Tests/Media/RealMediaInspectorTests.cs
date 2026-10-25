@@ -30,6 +30,26 @@ public sealed class RealMediaInspectorTests : IDisposable
     }
 
     [Fact]
+    public async Task Inspect_AJunkFile_ReportsTheMountError_AndLeavesNothingBehind()
+    {
+        Assert.SkipUnless(Environment.GetEnvironmentVariable("MALDEX_REAL_VM") == "1",
+            "Real media inspector test skipped: set MALDEX_REAL_VM=1 (needs sudo mount/umount).");
+        var runner = new ProcessRunner();
+        var root = Path.Combine(_dir, "media");
+        Directory.CreateDirectory(root);
+        var junk = Path.Combine(root, "junk.iso");
+        await File.WriteAllBytesAsync(junk, new byte[64 * 1024], Ct);
+
+        var inspector = new LoopMountMediaInspector(runner, Options.Create(new MediaOptions { Root = root }), NullLogger<LoopMountMediaInspector>.Instance);
+        var result = await inspector.InspectAsync(junk, MediaKind.OsInstaller, Ct);
+
+        Assert.Equal("the file could not be mounted read-only as an ISO (udf/iso9660)", result.Error);
+        Assert.Empty(Directory.EnumerateFileSystemEntries(Path.Combine(root, "mnt")));
+        var findmnt = await runner.RunAsync("findmnt", ["-rn", "-o", "TARGET"], Ct);
+        Assert.DoesNotContain(root, findmnt.Stdout);
+    }
+
+    [Fact]
     public async Task Inspect_ATinyInstallerIso_FindsOneImage_AndLeavesNothingMounted()
     {
         Assert.SkipUnless(Environment.GetEnvironmentVariable("MALDEX_REAL_VM") == "1",
@@ -43,10 +63,11 @@ public sealed class RealMediaInspectorTests : IDisposable
         File.WriteAllText(Path.Combine(content, "hello.txt"), "hello");
         await Run(runner, "wimcapture", content, Path.Combine(tree, "sources", "install.wim"), "Windows 11 Pro", "--no-acls",
             "--image-property", "WINDOWS/ARCH=9"); // real Windows images carry an architecture; the parser requires it
-        var iso = Path.Combine(_dir, "tiny.iso");
+        var root = Path.Combine(_dir, "media");
+        Directory.CreateDirectory(root);
+        var iso = Path.Combine(root, "tiny.iso");
         await Run(runner, "xorriso", "-as", "mkisofs", "-iso-level", "4", "-J", "-o", iso, tree);
 
-        var root = Path.Combine(_dir, "media");
         var inspector = new LoopMountMediaInspector(runner, Options.Create(new MediaOptions { Root = root }), NullLogger<LoopMountMediaInspector>.Instance);
         var result = await inspector.InspectAsync(iso, MediaKind.OsInstaller, Ct);
 

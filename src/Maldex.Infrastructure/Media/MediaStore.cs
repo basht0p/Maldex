@@ -26,7 +26,9 @@ public sealed partial class MediaStore(IOptions<MediaOptions> options, IDiskSpac
     public FileStream OpenStagingForAppend(Guid id, long keepBytes)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(keepBytes);
-        Directory.CreateDirectory(StagingDir);
+        Directory.CreateDirectory(Root);
+        if (!OperatingSystem.IsWindows()) Directory.CreateDirectory(StagingDir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        else Directory.CreateDirectory(StagingDir);
         var open = new FileStreamOptions { Mode = FileMode.OpenOrCreate, Access = FileAccess.ReadWrite, Share = FileShare.Read };
         if (!OperatingSystem.IsWindows()) open.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
         var stream = new FileStream(StagingPath(id), open);
@@ -75,13 +77,16 @@ public sealed partial class MediaStore(IOptions<MediaOptions> options, IDiskSpac
     {
         var final = FinalPath(sha256);
         var staging = StagingPath(id);
-        if (File.Exists(final))
-        {
-            File.Delete(staging);
-            return final;
-        }
         if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(staging, UnixFileMode.UserRead | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
-        File.Move(staging, final);
+        try
+        {
+            File.Move(staging, final);
+        }
+        catch (IOException) when (File.Exists(final))
+        {
+            // Already there (earlier, or a concurrent finalize of the same content won): keep it, drop ours.
+            File.Delete(staging);
+        }
         return final;
     }
 
