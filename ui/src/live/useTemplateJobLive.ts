@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { getTemplateJob } from '../api/client'
 import type { TemplateJobDto } from '../api/types'
 import { createHubConnection, type HubConnectionLike } from './useTaskLive'
@@ -7,6 +7,23 @@ export interface TemplateJobLive {
   job: TemplateJobDto | null
   /** The job could not be loaded (not found, or the request failed). */
   loadError: string | null
+  /** Starts the connect, join and load over again (the Retry of a load error). */
+  retry: () => void
+}
+
+/**
+ * A newer DTO over the held one. The hub pushes can lack the history and the requester (`requestedByName` is null in
+ * coordinator pushes), so the held steps and name survive a DTO that has none or fewer steps.
+ */
+export function mergeJob(held: TemplateJobDto | null, next: TemplateJobDto): TemplateJobDto {
+  if (!held || held.id !== next.id) return next
+  const heldSteps = held.steps ?? []
+  const keepSteps = (next.steps?.length ?? 0) < heldSteps.length
+  return {
+    ...next,
+    steps: keepSteps ? held.steps : next.steps,
+    requestedByName: next.requestedByName ?? held.requestedByName,
+  }
 }
 
 /** Backoff between attempts to connect, join or load; the last step repeats until success or unmount. */
@@ -21,6 +38,7 @@ export function useTemplateJobLive(jobId: string | null, createConnection: () =>
   const [factory] = useState(() => createConnection) // fixed at mount: an inline factory must not tear the connection down
   const [job, setJob] = useState<TemplateJobDto | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [attempt, setAttempt] = useState(0)
 
   useEffect(() => {
     if (jobId === null) return
@@ -32,7 +50,7 @@ export function useTemplateJobLive(jobId: string | null, createConnection: () =>
     conn.on('templateJob', (dto: TemplateJobDto) => {
       if (cancelled || dto.id !== jobId) return
       pushed = true
-      setJob(dto)
+      setJob((held) => mergeJob(held, dto))
       setLoadError(null)
     })
 
@@ -49,7 +67,7 @@ export function useTemplateJobLive(jobId: string | null, createConnection: () =>
         await conn.invoke('JoinTemplateJob', jobId)
         const dto = await getTemplateJob(jobId)
         if (cancelled) return
-        if (!pushed) setJob(dto)
+        setJob((held) => (pushed ? held : mergeJob(held, dto)))
         setLoadError(null)
         failures = 0
       } catch (e) {
@@ -76,7 +94,8 @@ export function useTemplateJobLive(jobId: string | null, createConnection: () =>
       setLoadError(null)
       void conn.stop().catch(() => undefined)
     }
-  }, [jobId, factory])
+  }, [jobId, factory, attempt])
 
-  return { job, loadError }
+  const retry = useCallback(() => setAttempt((n) => n + 1), [])
+  return { job, loadError, retry }
 }

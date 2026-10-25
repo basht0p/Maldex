@@ -31,12 +31,16 @@ const getTemplateJob = vi.fn()
 const sealTemplateJob = vi.fn()
 const cancelTemplateJob = vi.fn()
 const getTemplateJobTunnelToken = vi.fn()
+const fetchBlob = vi.fn()
+const downloadFile = vi.fn()
 vi.mock('../api/client', async (orig) => ({
   ...(await orig<typeof import('../api/client')>()),
   getTemplateJob: (...a: unknown[]) => getTemplateJob(...a),
   sealTemplateJob: (...a: unknown[]) => sealTemplateJob(...a),
   cancelTemplateJob: (...a: unknown[]) => cancelTemplateJob(...a),
   getTemplateJobTunnelToken: (...a: unknown[]) => getTemplateJobTunnelToken(...a),
+  fetchBlob: (...a: unknown[]) => fetchBlob(...a),
+  downloadFile: (...a: unknown[]) => downloadFile(...a),
 }))
 
 import { ApiError } from '../api/client'
@@ -172,7 +176,7 @@ describe('TemplateJobPage', () => {
     expect(guac.state.tunnelUrls[0]).toMatch(/^wss?:\/\/[^/]+\/api\/admin\/template-jobs\/job-1\/tunnel$/)
     expect(guac.state.connects[0]).toContain('token=tok-9')
     expect(screen.getByText('None')).toBeInTheDocument()
-    expect(screen.getByText(/Discarded automatically if idle until/)).toBeInTheDocument()
+    expect(screen.getByText(/Discarded in .* if the console stays closed/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Seal' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Discard' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull()
@@ -300,6 +304,172 @@ describe('TemplateJobPage', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Not found')
   })
 
+  describe('Task 6', () => {
+    const t = (m: number, sec = 0) => new Date(Date.UTC(2026, 9, 24, 10, m, sec)).toISOString()
+    const withSteps = (over: Partial<TemplateJobDto> = {}) => job({
+      state: 'Configuring', createdAt: t(0),
+      steps: [{ state: 'Preparing', at: t(1), message: null }, { state: 'Configuring', at: t(3), message: null }], ...over,
+    })
+    const timeline = () => within(screen.getByRole('list', { name: 'Timeline' })).getAllByRole('listitem')
+
+    afterEach(() => vi.useRealTimers())
+
+    it('shows Queued then each step with durations and ticks the current one', async () => {
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'], now: new Date(t(5)) })
+      getTemplateJobTunnelToken.mockReturnValue(new Promise(() => undefined))
+      getTemplateJob.mockResolvedValue(withSteps())
+      renderJob()
+      await screen.findByRole('list', { name: 'Timeline' })
+      expect(timeline().map((li) => li.textContent)).toEqual([
+        expect.stringMatching(/^Queued.*1:00$/), expect.stringMatching(/^Preparing.*2:00$/), expect.stringMatching(/^Configuring.*2:00$/),
+      ])
+      act(() => { vi.advanceTimersByTime(5000) })
+      expect(timeline()[2].textContent).toMatch(/2:05$/)
+    })
+
+    it('a terminal step has no duration', async () => {
+      getTemplateJob.mockResolvedValue(withSteps({ state: 'Published', steps: [{ state: 'Preparing', at: t(1) }, { state: 'Published', at: t(3) }] }))
+      renderJob()
+      await screen.findByRole('list', { name: 'Timeline' })
+      expect(timeline()[2].textContent).toMatch(/^Published/)
+      expect(timeline()[2].textContent).not.toMatch(/\d:\d\d$/)
+    })
+
+    it('keeps held steps and the requester when a push arrives without them', async () => {
+      getTemplateJob.mockResolvedValue(withSteps({ requestedByName: 'Ada' }))
+      renderJob()
+      await screen.findByText('Requested by Ada')
+      hub.push(job({ state: 'Sealing', message: 'Sysprep', createdAt: t(0), requestedByName: null }))
+      expect(current()).toHaveTextContent('Sealing')
+      expect(timeline()).toHaveLength(4) // held three plus the pushed state
+      expect(screen.getByText('Requested by Ada')).toBeInTheDocument()
+    })
+
+    it('shows only the current state for a job without steps', async () => {
+      getTemplateJob.mockResolvedValue(job({ state: 'Preparing' }))
+      renderJob()
+      expect(await screen.findByText(/^Preparing since/)).toBeInTheDocument()
+      expect(screen.queryByRole('list', { name: 'Timeline' })).toBeNull()
+    })
+
+    it('expands and restores the console layout', async () => {
+      getTemplateJob.mockResolvedValue(job({ state: 'Configuring' }))
+      renderJob()
+      const btn = await screen.findByRole('button', { name: 'Expand' })
+      const panel = btn.closest('div[class*="panel"]') as HTMLElement
+      expect(panel.className).not.toMatch(/expanded/)
+      await userEvent.click(btn)
+      expect(panel.className).toMatch(/expanded/)
+      await userEvent.click(screen.getByRole('button', { name: 'Exit' }))
+      expect(panel.className).not.toMatch(/expanded/)
+      expect(screen.getByRole('button', { name: 'Expand' })).toBeInTheDocument()
+    })
+
+    it('requests fullscreen when available', async () => {
+      const req = vi.fn().mockResolvedValue(undefined)
+      Object.defineProperty(document.documentElement, 'requestFullscreen', { value: req, configurable: true })
+      try {
+        getTemplateJob.mockResolvedValue(job({ state: 'Configuring' }))
+        renderJob()
+        await userEvent.click(await screen.findByRole('button', { name: 'Expand' }))
+        expect(req).toHaveBeenCalled()
+      } finally {
+        delete (document.documentElement as unknown as Record<string, unknown>).requestFullscreen
+      }
+    })
+
+    it('counts down the idle deadline', async () => {
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'], now: new Date(t(0)) })
+      getTemplateJob.mockResolvedValue(job({ state: 'Configuring', idleDeadline: t(5) }))
+      renderJob()
+      expect(await screen.findByText('Discarded in 5:00 if the console stays closed')).toBeInTheDocument()
+      act(() => { vi.advanceTimersByTime(3000) })
+      expect(screen.getByText('Discarded in 4:57 if the console stays closed')).toBeInTheDocument()
+    })
+
+    it('shows the Defender checklist during Configuring and the refusal next to it', async () => {
+      getTemplateJob.mockResolvedValue(job({ state: 'Configuring', message: 'Defender real-time protection is still on; turn it off in the console, then press Seal again.' }))
+      renderJob()
+      const items = await screen.findAllByRole('listitem')
+      const texts = items.map((li) => li.textContent)
+      const at = texts.indexOf('Open Windows Security')
+      expect(at).toBeGreaterThanOrEqual(0)
+      expect(texts.slice(at, at + 5)).toEqual(['Open Windows Security', 'Virus and threat protection → Manage settings', 'Turn off Tamper Protection', 'Turn off Real-time protection', 'Press Seal'])
+      expect(screen.getAllByText(/Defender real-time protection is still on/)).toHaveLength(1)
+    })
+
+    it('does not treat the normal guidance as a refusal, flags both refusals, and clears on a new message', async () => {
+      const guidance = 'Defender real-time protection is on. In the console open Windows Security, turn off Tamper Protection, then Real-time protection, then press Seal.'
+      getTemplateJob.mockResolvedValue(job({ state: 'Configuring', message: guidance }))
+      renderJob()
+      expect(await screen.findByText(guidance)).toBeInTheDocument()
+      expect(document.querySelector('[class*="refusal"]')).toBeNull()
+      const unconfirmed = 'Defender state could not be confirmed; wait a minute and press Seal again'
+      hub.push(job({ state: 'Configuring', message: unconfirmed }))
+      expect(screen.getByText(unconfirmed).className).toMatch(/refusal/)
+      hub.push(job({ state: 'Configuring', message: 'Defender real-time protection is still on; turn it off in the console, then press Seal again.' }))
+      expect(document.querySelector('[class*="refusal"]')).not.toBeNull()
+      hub.push(job({ state: 'Configuring', message: guidance }))
+      expect(document.querySelector('[class*="refusal"]')).toBeNull()
+    })
+
+    it('a console that reappears after leaving Configuring is not expanded', async () => {
+      getTemplateJob.mockResolvedValue(job({ state: 'Configuring' }))
+      renderJob()
+      await userEvent.click(await screen.findByRole('button', { name: 'Expand' }))
+      hub.push(job({ state: 'Sealing' }))
+      hub.push(job({ state: 'Configuring' }))
+      expect(await screen.findByRole('button', { name: 'Expand' })).toBeInTheDocument()
+    })
+
+    it('appends a row for the current state when the held steps end earlier', async () => {
+      getTemplateJob.mockResolvedValue(withSteps())
+      renderJob()
+      await screen.findByRole('list', { name: 'Timeline' })
+      hub.push(job({ state: 'Sealing', createdAt: t(0) }))
+      expect(timeline()).toHaveLength(4)
+      expect(timeline()[3].textContent).toMatch(/^Sealing/)
+    })
+
+    it('hides the checklist outside Configuring', async () => {
+      getTemplateJob.mockResolvedValue(job({ state: 'Sealing' }))
+      renderJob()
+      await screen.findByRole('heading', { name: /Edit/ })
+      expect(screen.queryByText('Open Windows Security')).toBeNull()
+    })
+
+    it('shows the provisioning log inline as text and truncates over 1 MiB with a download', async () => {
+      const big = '<script>alert(1)</script>' + 'a'.repeat(1024 * 1024)
+      fetchBlob.mockResolvedValue(new Blob([big]))
+      downloadFile.mockResolvedValue(undefined)
+      getTemplateJob.mockResolvedValue(job({ kind: 'Build', state: 'Provisioning', hasProvisionLog: true }))
+      renderJob()
+      const pre = await screen.findByText(/<script>alert\(1\)<\/script>/)
+      expect(pre.tagName).toBe('PRE')
+      expect(document.querySelector('pre script')).toBeNull()
+      expect(pre.textContent!.length).toBe(1024 * 1024)
+      await userEvent.click(screen.getByRole('button', { name: 'Download the full log' }))
+      expect(downloadFile).toHaveBeenCalledWith('/api/admin/template-jobs/job-1/provision-log', 'provision-job-1.log')
+    })
+
+    it('a small log has no download', async () => {
+      fetchBlob.mockResolvedValue(new Blob(['short']))
+      getTemplateJob.mockResolvedValue(job({ kind: 'Build', state: 'Provisioning', hasProvisionLog: true }))
+      renderJob()
+      await screen.findByText('short')
+      expect(screen.queryByRole('button', { name: 'Download the full log' })).toBeNull()
+    })
+
+    it('shows a Retry banner when the log fetch fails', async () => {
+      fetchBlob.mockRejectedValueOnce(new ApiError(500, { title: 'Log unavailable' })).mockResolvedValue(new Blob(['ok now']))
+      getTemplateJob.mockResolvedValue(job({ kind: 'Build', state: 'Provisioning', hasProvisionLog: true }))
+      renderJob()
+      expect(await screen.findByRole('alert')).toHaveTextContent('Log unavailable')
+      await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
+      expect(await screen.findByText('ok now')).toBeInTheDocument()
+    })
+  })
+
   describe('Build', () => {
     const build = (over: Partial<TemplateJobDto> = {}) => job({ kind: 'Build', baseVersionNumber: null, ...over })
     const stepsOf = () => within(screen.getByRole('list', { name: 'Progress' })).getAllByRole('listitem').map((li) => li.textContent?.trim())
@@ -329,13 +499,16 @@ describe('TemplateJobPage', () => {
       expect(cancelTemplateJob).toHaveBeenCalledWith('job-1')
     })
 
-    it('links the provisioning log only when the job has one', async () => {
+    it('shows the provisioning log only when the job has one', async () => {
+      fetchBlob.mockResolvedValue(new Blob(['line one']))
       getTemplateJob.mockResolvedValue(build({ state: 'Provisioning', hasProvisionLog: false }))
       renderJob()
       await screen.findByRole('heading', { name: /New template/ })
-      expect(screen.queryByRole('link', { name: 'Provisioning log' })).toBeNull()
+      expect(screen.queryByRole('heading', { name: 'Provisioning log' })).toBeNull()
+      expect(fetchBlob).not.toHaveBeenCalled()
       hub.push(build({ state: 'Configuring', hasProvisionLog: true }))
-      expect(screen.getByRole('link', { name: 'Provisioning log' })).toHaveAttribute('href', '/api/admin/template-jobs/job-1/provision-log')
+      expect(await screen.findByText('line one')).toBeInTheDocument()
+      expect(fetchBlob).toHaveBeenCalledWith('/api/admin/template-jobs/job-1/provision-log')
     })
 
     it('Seal requested follows the server; a refusal turns it back, enables Seal, shows the message and remounts the console', async () => {
@@ -348,10 +521,10 @@ describe('TemplateJobPage', () => {
       expect(screen.getByRole('button', { name: 'Seal' })).toBeDisabled()
       expect(getTemplateJobTunnelToken).toHaveBeenCalledTimes(1)
 
-      hub.push(build({ state: 'Configuring', sealRequested: false, message: 'Defender is still on: turn off Tamper Protection and Real-time protection, then seal again.' }))
+      hub.push(build({ state: 'Configuring', sealRequested: false, message: 'Defender real-time protection is still on; turn it off in the console, then press Seal again.' }))
       await waitFor(() => expect(screen.getByRole('button', { name: 'Seal' })).toBeEnabled())
       expect(screen.queryByText('Seal requested')).toBeNull()
-      expect(screen.getByText(/Defender is still on/)).toBeInTheDocument()
+      expect(screen.getByText(/Defender real-time protection is still on/)).toBeInTheDocument()
       await waitFor(() => expect(getTemplateJobTunnelToken).toHaveBeenCalledTimes(2)) // a fresh token for the remounted console
       expect(guac.state.disconnects).toBe(1)
       expect(screen.getByLabelText('Seal note (optional)')).toBeEnabled()
