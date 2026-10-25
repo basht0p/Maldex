@@ -4,7 +4,8 @@ namespace Maldex.Infrastructure.Fakes;
 
 /// <summary>
 /// Fake mode has no disks: every version "exists" (unless a test lists it in <see cref="Missing"/>), has no known size, and
-/// copies, seals and deletes are only recorded.
+/// copies, seals and deletes are only recorded. Like the real store, a blank disk is never created over a disk this store made
+/// (a working copy or a blank, until it is deleted).
 /// </summary>
 public sealed class FakeTemplateStore : ITemplateStore
 {
@@ -15,6 +16,9 @@ public sealed class FakeTemplateStore : ITemplateStore
     public List<string> Deleted { get; } = [];
 
     public List<(string Stem, long DiskBytes, string VarsTemplatePath)> Blanks { get; } = [];
+
+    /// <summary>The stems of the disks this store created and has not deleted.</summary>
+    private readonly HashSet<string> _created = [];
 
     public bool Exists(string fileStem)
     {
@@ -30,16 +34,17 @@ public sealed class FakeTemplateStore : ITemplateStore
     {
         OnCreateWorkingCopy?.Invoke();
         lock (WorkingCopies) WorkingCopies.Add((fromStem, toStem));
+        lock (_created) _created.Add(toStem);
         return Task.CompletedTask;
     }
 
     public Task CreateBlankAsync(string stem, long diskBytes, string varsTemplatePath, CancellationToken ct)
     {
-        lock (Blanks)
+        lock (_created)
         {
-            if (Blanks.Any(b => b.Stem == stem)) throw new InvalidOperationException($"Template file stem '{stem}' already exists.");
-            Blanks.Add((stem, diskBytes, varsTemplatePath));
+            if (!_created.Add(stem)) throw new InvalidOperationException($"Template file stem '{stem}' already exists.");
         }
+        lock (Blanks) Blanks.Add((stem, diskBytes, varsTemplatePath));
         lock (Missing) Missing.Remove(stem); // the stem now exists
         return Task.CompletedTask;
     }
@@ -53,6 +58,7 @@ public sealed class FakeTemplateStore : ITemplateStore
     public Task DeleteAsync(string fileStem, CancellationToken ct)
     {
         lock (Deleted) Deleted.Add(fileStem);
+        lock (_created) _created.Remove(fileStem);
         return Task.CompletedTask;
     }
 }

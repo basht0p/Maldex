@@ -74,7 +74,20 @@ public sealed class FakeGuest
     /// <summary>What the fake guest answers to <c>provenance</c>.</summary>
     public string ProvenanceEdition { get; set; } = "Windows 11 Pro";
     public string ProvenanceBuild { get; set; } = "26300.1";
-    public string ProvenanceAgentVersion { get; set; } = "0.1.0-fake+000000000000";
+    /// <summary>When set, the agent version <c>provenance</c> reports, whatever is installed (a test's stale or current agent).</summary>
+    public string? ProvenanceAgentVersion { get; set; }
+
+    /// <summary>
+    /// The build id of the agent the fake guest "runs": in the app it is the one <c>./build.sh agent</c> left on disk, as sealing
+    /// installs it into a real guest. Null (or a null answer) when there is none.
+    /// </summary>
+    public Func<string?>? InstalledAgentBuildId { get; set; }
+
+    /// <summary>What <c>provenance</c> reports when neither an override nor an installed agent is known.</summary>
+    public const string FakeAgentVersion = "0.1.0-fake+000000000000";
+
+    /// <summary>The agent version <c>provenance</c> answers: the override, else the installed agent, else <see cref="FakeAgentVersion"/>.</summary>
+    public string ReportedAgentVersion => ProvenanceAgentVersion ?? InstalledAgentBuildId?.Invoke() ?? FakeAgentVersion;
     public bool? ProvenanceOfficePresent { get; set; } = false;
     public bool? ProvenanceRealTimeProtection { get; set; } = false;
 

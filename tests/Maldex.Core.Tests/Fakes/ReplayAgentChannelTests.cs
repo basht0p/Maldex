@@ -342,7 +342,32 @@ public sealed class ReplayAgentChannelTests : IDisposable
     {
         var g = new FakeGuest();
         Assert.Equal(("Windows 11 Pro", "26300.1", "0.1.0-fake+000000000000", false, false),
-            (g.ProvenanceEdition, g.ProvenanceBuild, g.ProvenanceAgentVersion, g.ProvenanceOfficePresent, g.ProvenanceRealTimeProtection));
+            (g.ProvenanceEdition, g.ProvenanceBuild, g.ReportedAgentVersion, g.ProvenanceOfficePresent, g.ProvenanceRealTimeProtection));
+    }
+
+    [Fact]
+    public void FakeGuest_ReportsTheInstalledAgent_UnlessOverridden()
+    {
+        var g = new FakeGuest { InstalledAgentBuildId = () => "1.0.0+0123456789ab" };
+        Assert.Equal("1.0.0+0123456789ab", g.ReportedAgentVersion);
+        g.ProvenanceAgentVersion = "0.9.0+aaaaaaaaaaaa"; // a test's stale agent wins
+        Assert.Equal("0.9.0+aaaaaaaaaaaa", g.ReportedAgentVersion);
+        Assert.Equal("0.1.0-fake+000000000000", new FakeGuest { InstalledAgentBuildId = () => null }.ReportedAgentVersion);
+    }
+
+    [Fact]
+    public async Task Provenance_ReportsTheInstalledAgent()
+    {
+        var guest = new FakeGuest { InstalledAgentBuildId = () => "1.0.0+0123456789ab" };
+        await using var ch = new ReplayAgentChannel([], 1.0, holdOpen: true, _time, guest, Vm.TaskId);
+        await ch.SendAsync(new ProvenanceCommand("p1"), TestContext.Current.CancellationToken);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cts.CancelAfter(Timeout);
+        await foreach (var m in ch.ReadAsync(cts.Token))
+        {
+            Assert.Equal("1.0.0+0123456789ab", Assert.IsType<ProvenanceMessage>(m).AgentVersion);
+            break;
+        }
     }
 
     [Fact]
