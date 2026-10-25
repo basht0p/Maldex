@@ -26,27 +26,35 @@ media) or Edit` and exits 2. This directory keeps the files the Build uses as it
 
 It runs at first logon of the `analyst` account, from the provisioning CD (`MALDEXPROV`, built by the Build from
 `Autounattend.xml`, `Provision.ps1`, `sysmon-config.xml`, `Sysmon64.exe`, the agent and the mitmproxy CA `maldex-ca.cer`):
-installs the virtio tools and Sysmon, imports the CA, optionally installs Office, applies the policy settings listed below,
-registers the agent task (only if every critical step succeeded), clears the event logs and shuts down (the shutdown is in a
-`finally`, so a failure cannot stall the build). After the reboot the Build waits for the agent's `"type":"ready"` frame on
-the `org.maldex.agent` channel.
+installs the virtio tools, registers and starts the agent task (early, and even if a later step fails, so the host can
+always read the result), installs Sysmon, sets up autologon, imports the CA, applies the policy settings listed below and
+optionally installs Office. It ends by writing `C:\ProgramData\Maldex\provision-result.json`
+(`{"ok":true|false,"failedSteps":[…]}`). It does **not** clear the event logs or shut down: the host reads the result through
+the agent, collects the log, powers the guest off, boots it once more without media, checks the agent's build, and only then
+opens Configuring. The event logs are cleared later, when the version is sealed.
 
 **The provisioning log** is `C:\ProgramData\Maldex\provision.log` in the guest; the Build copies it out and shows it on the
-job page. A failed critical step (virtio tools, Sysmon, CA import) is named there; the agent task is then not registered, so
-the agent check fails loudly. The log also states whether Defender could be turned off and warns if it is still on.
+job page (**Provisioning log**). A failed critical step (virtio tools, agent, Sysmon, autologon, CA import, Office when
+selected) is named there and in the result file, and the Build fails with that list. The log also records whether Defender
+real-time protection is on; the Build then waits at Configuring with guidance instead of sealing.
 
 ## Decisions worth knowing
 
-- **Image selection:** the Build loop-mounts the ISO read-only (`sudo`; Windows media are UDF, which xorriso cannot read) and lists `sources/install.wim` (or `.esd`) with `wiminfo` (apt `wimtools`, installed by `real-setup`). It picks, in order, `Windows 11 Enterprise Evaluation`, `Windows 11 Enterprise`, `Windows 11 Pro`, and fails (exit 2, listing the images) rather than fall back to Home. `MALDEX_WIN_IMAGE_INDEX` forces an index. 
+- **Image selection:** the Build loop-mounts the ISO read-only (`sudo`; Windows media are UDF, which xorriso cannot read) and lists `sources/install.wim` (or `.esd`) with `wiminfo` (apt `wimtools`, installed by `real-setup`). It picks, in order, `Windows 11 Enterprise Evaluation`, `Windows 11 Enterprise`, `Windows 11 Pro`, and never falls back to Home. To build another supported edition (for example Education), choose its index in the **New
+template** dialog; unsupported editions are listed with the reason.
 - **Product key:** evaluation media need none. Enterprise, Pro and Education get Microsoft's generic KMS client setup key, so Setup does not stop at the key page; the guest stays unactivated, which is fine for a disposable analysis VM. Production with volume licensing can pass its own key or activate against its KMS.
 - **No LabConfig bypass keys.** 26H2 still checks TPM 2.0 / Secure Boot / RAM; the OVMF + vTPM domain satisfies them. Offline OOBE uses `BypassNRO` plus a local `analyst` account from the unattend file.
 - **The `analyst` password (`Maldex-Analyst-1!`) is a fixed, throwaway value, not a secret.** The guest is disposable, has no network during the build and no route to anything at run time.
 - **The agent is not a service.** `Provision.ps1` registers scheduled task `MaldexAgent` (at logon of `analyst`, highest run level, interactive, no time limit, restart every minute up to 999 times, ignore new instances) so it runs in the interactive session; autologon makes it fire at boot. The agent logs to `C:\ProgramData\Maldex\agent.log` (5 MiB, one old file).
-- **Defender real-time protection and SmartScreen are turned off** by policy keys and `Set-MpPreference` (best effort). Tamper Protection can refuse this on some builds; the provisioning log (`C:\ProgramData\Maldex\provision.log`) states the outcome and warns if Defender is still on.
+- **Defender:** `Provision.ps1` sets the Defender and SmartScreen policy keys and `Set-MpPreference` (best effort), but on Pro
+  media Tamper Protection keeps real-time protection on. Turning it off is the admin's step at **Configuring** (Tamper
+  Protection first, then Real-time protection). Seal and verification read the state over a minute (it briefly reads "off"
+  right after boot) and refuse while it is on or not yet settled.
 - **Edge Startup Boost and background mode are off** (`HKLM:\SOFTWARE\Policies\Microsoft\Edge`, `StartupBoostEnabled=0`, `BackgroundModeEnabled=0`, best effort). Edge also resolves names through Windows (`BuiltInDnsClientEnabled=0`, `DnsOverHttpsMode=off`), so its lookups appear as Sysmon DNS events. Dropped files are collected only from the sample's process tree (children of the agent); a pre-running Edge would take a URL run over outside that tree. **The first real-VM run must confirm that a file downloaded during a URL run is collected as a dropped file.**
 - **BitLocker device encryption is prevented** (`PreventDeviceEncryption`), because the vTPM state is not carried into cloned runs.
 - **Sysmon.zip** is pinned by SHA-256 in `build.sh`. Sysinternals publishes no checksum file, so the hash was taken from a download; bump `SYSMON_URL` / `SYSMON_SHA256` together when updating.
-- A failed critical provisioning step (virtio tools, Sysmon, CA import) still powers the VM off, but the agent task is then NOT registered, so the host-side boot check fails loudly (no `ready` frame). The failing step is named in `C:\ProgramData\Maldex\provision.log`.
+- A failed critical provisioning step fails the Build with the step names from `provision-result.json`; the blank disk is
+  deleted and only the provisioning log is kept.
 
 ## Changing an existing template: Edit and Refresh in the app
 
@@ -71,7 +79,8 @@ agent comes from `.data/agent/Maldex.Agent.exe` and its `Maldex.Agent.version`: 
 1. Have the default template's image `win11-26h2` (build it in the app as above, or import an existing image listed in `Maldex:Images`) and run `./build.sh real-setup` for the host toolchain. Without `.data/vm/base/win11-26h2.qcow2` and `.vars.fd` the tests skip with a message naming the default template.
 2. Run `./build.sh e2e`. It sets `MALDEX_REAL_VM=1` and `MALDEX_REAL_NET=1` and runs only `RealVmE2ETests` (needs Docker for the SQL container, and the passwordless sudo that real mode uses). Without those variables and the image the tests skip with a message.
 3. The test output records the time from `Preparing` to agent Ready for every run (measured, not asserted), and each run is followed by a check that no `maldex-*` libvirt domain and no `mx*` link or namespace survived.
-4. Calc-macro test: needs Office in the image (`MALDEX_OFFICE_ISO` at build time) and a macro-enabled document whose AutoOpen starts `calc.exe`, which is not stored in the repository. Opt in with `MALDEX_E2E_OFFICE=1 MALDEX_E2E_OFFICE_SAMPLE=/path/to/calc-macro.doc`; otherwise the test skips with a message.
+4. Calc-macro test: needs Office in the template (add Office media to the library and select it in **New template**, which
+   installs it during provisioning) and a macro-enabled document whose AutoOpen starts `calc.exe`, which is not stored in the repository. Opt in with `MALDEX_E2E_OFFICE=1 MALDEX_E2E_OFFICE_SAMPLE=/path/to/calc-macro.doc`; otherwise the test skips with a message.
 
 5. Template jobs (`RealTemplateJobTests`, and `RealGuestDiskEditorTests` for the libguestfs disk editor): a Refresh of
    `win11-26h2` that must publish v2 and then pass the three scenarios above on v2; an Edit with `Direct` network whose guest
