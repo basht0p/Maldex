@@ -22,6 +22,7 @@ public static class TaskEndpoints
     private const int MaxFieldBytes = 4096;
     private const int MaxFileNameLength = 260;
     private const int MaxUrlLength = 2048;
+    private const int MaxSearchLength = 256;
     private const long MultipartOverheadBytes = 64 * 1024;
 
     public static IEndpointRouteBuilder MapTaskEndpoints(this IEndpointRouteBuilder app)
@@ -30,25 +31,78 @@ public static class TaskEndpoints
 
         g.MapPost("", SubmitAsync);
 
-        g.MapGet("", async (Guid? orgId, string? status, int? skip, int? take, MaldexDbContext db, CancellationToken ct) =>
+        g.MapGet("", async (Guid? orgId, string? status, string? q, string? verdict, bool? mine, string? from, string? to, string? sort, string? dir,
+            int? skip, int? take, MaldexDbContext db, CurrentUser user, CancellationToken ct) =>
         {
+            var errors = new Dictionary<string, string[]>();
             RunStatus? statusFilter = null;
             if (!string.IsNullOrWhiteSpace(status))
             {
-                if (!TryParseEnum<RunStatus>(status, out var s))
-                    return Results.ValidationProblem(new Dictionary<string, string[]> { ["status"] = ["Unknown status."] });
-                statusFilter = s;
+                if (TryParseEnum<RunStatus>(status, out var s)) statusFilter = s;
+                else errors["status"] = ["Unknown status."];
             }
-            if (skip is < 0)
-                return Results.ValidationProblem(new Dictionary<string, string[]> { ["skip"] = ["skip must be 0 or more."] });
+            Verdict? verdictFilter = null;
+            if (!string.IsNullOrWhiteSpace(verdict))
+            {
+                if (TryParseEnum<Verdict>(verdict, out var v)) verdictFilter = v;
+                else errors["verdict"] = ["Unknown verdict."];
+            }
+            var text = q?.Trim();
+            if (text is not null && (text.Length is 0 or > MaxSearchLength))
+                errors["q"] = [$"q must be 1 to {MaxSearchLength} characters."];
+            DateTimeOffset? fromAt = null, toBefore = null;
+            if (!string.IsNullOrWhiteSpace(from))
+            {
+                if (DateOnly.TryParseExact(from, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var d))
+                    fromAt = new DateTimeOffset(d.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero);
+                else errors["from"] = ["from must be yyyy-MM-dd."];
+            }
+            if (!string.IsNullOrWhiteSpace(to))
+            {
+                if (DateOnly.TryParseExact(to, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var d) && d < DateOnly.MaxValue)
+                    toBefore = new DateTimeOffset(d.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero).AddDays(1);
+                else errors["to"] = ["to must be yyyy-MM-dd."];
+            }
+            var sortKey = string.IsNullOrWhiteSpace(sort) ? "created" : sort.Trim().ToLowerInvariant();
+            if (sortKey is not ("created" or "verdict" or "duration")) errors["sort"] = ["sort must be created, verdict or duration."];
+            var dirKey = string.IsNullOrWhiteSpace(dir) ? "desc" : dir.Trim().ToLowerInvariant();
+            if (dirKey is not ("asc" or "desc")) errors["dir"] = ["dir must be asc or desc."];
+            if (skip is < 0) errors["skip"] = ["skip must be 0 or more."];
+            if (errors.Count > 0) return Results.ValidationProblem(errors);
             var takeN = Math.Clamp(take ?? 50, 1, 100);
+            var desc = dirKey == "desc";
 
             var query = db.Tasks.AsNoTracking().AsQueryable();
             if (orgId is not null) query = query.Where(t => t.OrgId == orgId);
             if (statusFilter is not null) query = query.Where(t => t.Status == statusFilter);
+            if (verdictFilter is not null) query = query.Where(t => t.Verdict == verdictFilter);
+            if (mine == true) { var me = user.UserId; query = query.Where(t => t.SubmittedByUserId == me); }
+            if (fromAt is { } f) query = query.Where(t => t.CreatedAt >= f);
+            if (toBefore is { } tb) query = query.Where(t => t.CreatedAt < tb);
+            if (text is not null)
+            {
+                var lower = text.ToLowerInvariant();
+                if (lower.Length == 64 && IsHex(lower)) query = query.Where(t => t.SampleSha256 == lower);
+                else if (lower.Length == 40 && IsHex(lower)) query = query.Where(t => t.Sample!.Sha1 == lower);
+                else if (lower.Length == 32 && IsHex(lower)) query = query.Where(t => t.Sample!.Md5 == lower);
+                else query = query.Where(t => (t.OriginalFileName != null && t.OriginalFileName.Contains(text)) || (t.Url != null && t.Url.Contains(text)));
+            }
 
             var total = await query.CountAsync(ct);
-            var page = await query.Include(t => t.Org).OrderByDescending(t => t.CreatedAt).ThenByDescending(t => t.Id)
+            IOrderedQueryable<AnalysisTask> ordered = sortKey switch
+            {
+                // Verdicts are stored as text, so rank them explicitly by enum value instead of sorting the names.
+                "verdict" => (desc ? query.OrderByDescending(VerdictRank) : query.OrderBy(VerdictRank))
+                    .ThenByDescending(t => t.CreatedAt),
+                // Rows without both ends sort last in both directions.
+                "duration" => desc
+                    ? query.OrderBy(t => EF.Functions.DateDiffSecond(t.StartedAt, t.EndedAt ?? t.CompletedAt) == null ? 1 : 0)
+                        .ThenByDescending(t => EF.Functions.DateDiffSecond(t.StartedAt, t.EndedAt ?? t.CompletedAt))
+                    : query.OrderBy(t => EF.Functions.DateDiffSecond(t.StartedAt, t.EndedAt ?? t.CompletedAt) == null ? 1 : 0)
+                        .ThenBy(t => EF.Functions.DateDiffSecond(t.StartedAt, t.EndedAt ?? t.CompletedAt)),
+                _ => desc ? query.OrderByDescending(t => t.CreatedAt) : query.OrderBy(t => t.CreatedAt),
+            };
+            var page = await ordered.ThenByDescending(t => t.Id).Include(t => t.Org).Include(t => t.SubmittedBy)
                 .Skip(skip ?? 0).Take(takeN).ToListAsync(ct);
             var queued = await QueuedAsync(db, ct);
             var templates = await TemplateProvenance.LoadAsync(db, page.Select(t => t.TemplateVersionId), ct); // one query for the whole page
@@ -307,6 +361,14 @@ public static class TaskEndpoints
                 break;
         }
     }
+
+    /// <summary>The verdict's enum value as a SQL expression (the column holds the name, which would sort alphabetically).</summary>
+    private static readonly System.Linq.Expressions.Expression<Func<AnalysisTask, int>> VerdictRank = t =>
+        t.Verdict == Verdict.Malicious ? (int)Verdict.Malicious
+        : t.Verdict == Verdict.Suspicious ? (int)Verdict.Suspicious
+        : t.Verdict == Verdict.NoThreats ? (int)Verdict.NoThreats : (int)Verdict.Unknown;
+
+    private static bool IsHex(string s) => s.All(Uri.IsHexDigit);
 
     internal static bool TryParseEnum<T>(string raw, out T value) where T : struct, Enum
     {

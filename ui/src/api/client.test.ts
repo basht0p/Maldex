@@ -75,6 +75,23 @@ describe('client', () => {
     expect(q.get('take')).toBe('25')
   })
 
+  it('serializes the search, filter and sort fields and leaves out empty ones', async () => {
+    let search = ''
+    server.use(
+      http.get('/api/tasks', ({ request }) => {
+        search = new URL(request.url).search
+        return HttpResponse.json({ items: [], total: 0 })
+      }),
+    )
+    await listTasks({ q: 'a b', verdict: 'Malicious', mine: true, from: '2026-01-02', to: '2026-01-03', sort: 'duration', dir: 'asc' })
+    const q = new URLSearchParams(search)
+    expect([...q.entries()].sort()).toEqual([
+      ['dir', 'asc'], ['from', '2026-01-02'], ['mine', 'true'], ['q', 'a b'], ['sort', 'duration'], ['to', '2026-01-03'], ['verdict', 'Malicious'],
+    ])
+    await listTasks({ q: '', mine: false })
+    expect(search).toBe('')
+  })
+
   it('extend posts {seconds}; stop tolerates an empty 202', async () => {
     let body: unknown
     server.use(
