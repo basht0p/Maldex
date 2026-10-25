@@ -1,18 +1,31 @@
-import { fireEvent, screen, within } from '@testing-library/react'
+import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { useLocation } from 'react-router-dom'
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { HOSTILE, reportFixture, SHA256, taskFixture } from '../../test/reportFixture'
 import { renderWithKit } from '../../test/renderWithKit'
 import { TaskReport } from './TaskReport'
 
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
 const server = setupServer(
   http.get('/api/tasks/t1/events', () => HttpResponse.json([])),
+  http.get('/api/artifacts/:id/image', ({ params }) =>
+    params.id === 's1' ? HttpResponse.json({ title: 'Unauthorized' }, { status: 401 }) : new HttpResponse(PNG, { headers: { 'Content-Type': 'image/png' } })),
 )
 beforeAll(() => server.listen({ onUnhandledFrame: 'error' }))
-afterEach(() => server.resetHandlers())
+afterEach(() => {
+  server.resetHandlers()
+  vi.restoreAllMocks()
+})
+
+/** Captures the file names that authenticated downloads saved. */
+function captureDownloads() {
+  const saved: string[] = []
+  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) { saved.push(this.download) })
+  return saved
+}
 afterAll(() => server.close())
 
 function LocationProbe() {
@@ -127,13 +140,26 @@ describe('TaskReport', () => {
 
   it('expands an HTTP row and offers the body download', async () => {
     renderReport(reportFixture(), '/tasks/t1?tab=http')
-    expect(screen.queryByRole('link', { name: 'Download body (ZIP)' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Download body (ZIP)' })).toBeNull()
     const row = screen.getByRole('button', { name: /payload\.bin/ })
     expect(row).toHaveAttribute('aria-expanded', 'false')
     await userEvent.click(row)
     expect(row).toHaveAttribute('aria-expanded', 'true')
     expect(screen.getByText('Content-Type: application/octet-stream')).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: 'Download body (ZIP)' })).toHaveAttribute('href', '/api/tasks/t1/http/42/body')
+    let hit = false
+    server.use(http.get('/api/tasks/t1/http/42/body', () => { hit = true; return new HttpResponse('PK') }))
+    const saved = captureDownloads()
+    await userEvent.click(screen.getByRole('button', { name: 'Download body (ZIP)' }))
+    await waitFor(() => expect(saved).toEqual(['http-42.zip']))
+    expect(hit).toBe(true)
+  })
+
+  it('shows a failed download as an error toast', async () => {
+    server.use(http.get('/api/tasks/t1/http/42/body', () => HttpResponse.json({ title: 'The body is no longer stored.' }, { status: 404 })))
+    renderReport(reportFixture(), '/tasks/t1?tab=http')
+    await userEvent.click(screen.getByRole('button', { name: /payload\.bin/ }))
+    await userEvent.click(screen.getByRole('button', { name: 'Download body (ZIP)' }))
+    expect(await screen.findByText('The body is no longer stored.')).toBeInTheDocument()
   })
 
   it('shows the truncation notice', () => {
@@ -151,22 +177,38 @@ describe('TaskReport', () => {
     expect(firstRule()).toBe('Rule_Sev9')
   })
 
-  it('lists dropped files with a ZIP link', () => {
+  it('lists dropped files with an authenticated ZIP download', async () => {
+    server.use(http.get('/api/artifacts/f1/download', () => new HttpResponse('PK')))
     renderReport(reportFixture(), '/tasks/t1?tab=files')
     expect(screen.getByText('C:\\Users\\a\\payload.dll')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Copy SHA-256' })).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: /ZIP/ })).toHaveAttribute('href', '/api/artifacts/f1/download')
+    const saved = captureDownloads()
+    await userEvent.click(screen.getByRole('button', { name: /ZIP/ }))
+    await waitFor(() => expect(saved).toEqual([`${'d'.repeat(64)}.zip`]))
   })
 
-  it('replaces a broken screenshot with a Not available tile', () => {
+  it('exports events through an authenticated download', async () => {
+    let search = ''
+    server.use(http.get('/api/tasks/t1/events/export', ({ request }) => { search = new URL(request.url).search; return new HttpResponse('id') }))
+    renderReport(reportFixture(), '/tasks/t1?tab=events')
+    const saved = captureDownloads()
+    await userEvent.click(screen.getByRole('button', { name: 'Export CSV' }))
+    await waitFor(() => expect(saved).toEqual(['task-t1-events.csv']))
+    expect(new URLSearchParams(search).get('format')).toBe('csv')
+    await userEvent.click(screen.getByRole('button', { name: 'Export JSON' }))
+    await waitFor(() => expect(saved).toEqual(['task-t1-events.csv', 'task-t1-events.json']))
+  })
+
+  it('loads screenshots with an authenticated fetch and shows Not available when one fails', async () => {
     renderReport()
-    const imgs = screen.getAllByRole('img', { name: /^Screenshot at / })
-    expect(imgs).toHaveLength(4)
-    expect(imgs[0]).toHaveAttribute('src', '/api/artifacts/s0/image')
     expect(screen.getByRole('button', { name: '+2' })).toBeInTheDocument()
-    fireEvent.error(imgs[0])
-    expect(screen.getAllByRole('img', { name: /^Screenshot at / })).toHaveLength(3)
-    expect(screen.getByText('Not available')).toBeInTheDocument()
+    // s1 answers 401: a Not available tile, never a raw <img src> to the API.
+    expect(await screen.findByText('Not available')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getAllByRole('img', { name: /^Screenshot at / })).toHaveLength(3))
+    for (const img of screen.getAllByRole('img', { name: /^Screenshot at / })) expect(img.getAttribute('src')).toMatch(/^blob:/)
+    // An image that fetched but does not decode also becomes the tile.
+    fireEvent.error(screen.getAllByRole('img', { name: /^Screenshot at / })[0])
+    expect(screen.getAllByText('Not available')).toHaveLength(2)
   })
 
   it('shows events for a process in one URL update', async () => {

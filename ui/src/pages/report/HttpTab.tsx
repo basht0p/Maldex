@@ -2,6 +2,7 @@ import { Fragment, useState } from 'react'
 import { httpBodyUrl } from '../../api/client'
 import type { TaskReportDto } from '../../api/types'
 import { EmptyState } from '../../kit/EmptyState'
+import { useDownload } from '../../kit/useDownload'
 import { safeText } from '../../util/safeText'
 import forms from '../forms.module.css'
 import { safeLines } from './reportUtil'
@@ -20,6 +21,7 @@ function pathOf(url: string): string {
 
 export function HttpTab({ report, taskId }: { report: TaskReportDto; taskId: string }) {
   const [open, setOpen] = useState<ReadonlySet<number>>(new Set())
+  const download = useDownload()
   const toggle = (id: number) =>
     setOpen((prev) => {
       const next = new Set(prev)
@@ -65,7 +67,13 @@ export function HttpTab({ report, taskId }: { report: TaskReportDto; taskId: str
                           <pre className={styles.detail}>{safeLines(h.reqHeaders)}</pre>
                           <p className={styles.detailLabel}>Response headers</p>
                           <pre className={styles.detail}>{safeLines(h.respHeaders)}</pre>
-                          {h.hasBody && <p><a href={httpBodyUrl(taskId, h.id)}>Download body (ZIP)</a></p>}
+                          {h.hasBody && (
+                            <p>
+                              <button type="button" className={styles.linkButton} onClick={() => void download(httpBodyUrl(taskId, h.id), `http-${h.id}.zip`)}>
+                                Download body (ZIP)
+                              </button>
+                            </p>
+                          )}
                         </td>
                       </tr>
                     )}

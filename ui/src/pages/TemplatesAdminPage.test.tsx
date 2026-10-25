@@ -36,7 +36,7 @@ import { ApiError } from '../api/client'
 import { renderWithKit } from '../test/renderWithKit'
 import TemplatesAdminPage from './TemplatesAdminPage'
 
-const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin' }
+const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin', maxUploadBytes: 268_435_456 }
 
 const version = (over: Partial<TemplateVersionDto>): TemplateVersionDto => ({
   id: 'v-id', number: 1, origin: 'Imported', status: 'Ready', role: 'Pending', isCurrent: false, diskPresent: true,

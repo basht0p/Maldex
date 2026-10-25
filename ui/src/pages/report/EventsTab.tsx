@@ -3,6 +3,7 @@ import { eventsExportUrl, getEvents } from '../../api/client'
 import type { LiveEventDto, TaskReportDto } from '../../api/types'
 import { EventTable } from '../../components/EventTable'
 import { ErrorBanner } from '../../kit/ErrorBanner'
+import { useDownload } from '../../kit/useDownload'
 import { Skeleton } from '../../kit/Skeleton'
 import { messageOf } from '../../util/apiMessage'
 import { safeText } from '../../util/safeText'
@@ -73,6 +74,7 @@ export function EventsTab({ taskId, report, live, liveEvents, liveProcesses }: {
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState<{ key: string; message: string } | null>(null)
   const [reload, setReload] = useState(0)
+  const download = useDownload()
 
   useEffect(() => {
     if (live) return
@@ -109,8 +111,11 @@ export function EventsTab({ taskId, report, live, liveEvents, liveProcesses }: {
     <div>
       <EventFilterBar processes={report.processes} bar={bar} />
       <div className={styles.eventExport}>
-        <a href={eventsExportUrl(taskId, 'csv', exportFilters)} download>Export CSV</a>
-        <a href={eventsExportUrl(taskId, 'json', exportFilters)} download>Export JSON</a>
+        {(['csv', 'json'] as const).map((fmt) => (
+          <button key={fmt} type="button" className={styles.exportButton} onClick={() => void download(eventsExportUrl(taskId, fmt, exportFilters), `task-${taskId}-events.${fmt}`)}>
+            {`Export ${fmt.toUpperCase()}`}
+          </button>
+        ))}
       </div>
       {failure ? (
         <ErrorBanner message={failure} onRetry={() => { setError(null); setReload((n) => n + 1) }} />

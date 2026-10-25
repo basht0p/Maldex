@@ -15,6 +15,8 @@ export interface MeDto {
   id: string
   displayName: string
   role: UserRole
+  /** The effective submit cap in bytes; files over it are refused before upload. */
+  maxUploadBytes: number
 }
 
 export interface OrgDto {

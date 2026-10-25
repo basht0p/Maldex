@@ -4,7 +4,7 @@ import { ApiError, getTask, listOrgs, listTasks, listTemplates, resubmitTask, su
 import type { NetworkMode, OrgDto, ProblemDetails, TaskDto, TemplateSummaryDto } from '../api/types'
 import { VerdictBadge } from '../components/StatusBadge'
 import { RelativeTime } from '../kit/RelativeTime'
-import { useToast } from '../kit/Toaster'
+import { useToast } from '../kit/useToast'
 import { messageOf } from '../util/apiMessage'
 import { safeText } from '../util/safeText'
 import { DropZone, type DropItem } from './submit/DropZone'

@@ -66,7 +66,38 @@ async function request<T>(method: string, path: string, body?: BodyInit | null, 
   return parsed as T
 }
 
-function query(params: Record<string, string | number | undefined>): string {
+/**
+ * GET `path` as a Blob, with the same bearer token as every other call (Entra mode is bearer-only, so a plain
+ * `<img src>` or `<a href>` would get 401). Throws {@link ApiError} on a non-2xx response.
+ */
+export async function fetchBlob(path: string, signal?: AbortSignal): Promise<Blob> {
+  const headers: Record<string, string> = { Accept: '*/*' }
+  const token = await getAccessToken()
+  if (token) headers.Authorization = `Bearer ${token}`
+  const res = await fetch(path, { method: 'GET', headers, signal })
+  if (!res.ok) throw new ApiError(res.status, await parseBody(res))
+  return res.blob()
+}
+
+/** Downloads `path` (authenticated, see {@link fetchBlob}) and saves it as `fileName`. */
+export async function downloadFile(path: string, fileName: string): Promise<void> {
+  const blob = await fetchBlob(path)
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = fileName
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  try {
+    a.click()
+  } finally {
+    a.remove()
+    // Revoked on the next task: the click has started the download by then.
+    setTimeout(() => URL.revokeObjectURL(url), 0)
+  }
+}
+
+function query(params:Record<string, string | number | undefined>): string {
   const q = new URLSearchParams()
   for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== '') q.set(k, String(v))
   const s = q.toString()

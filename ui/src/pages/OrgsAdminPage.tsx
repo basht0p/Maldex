@@ -3,7 +3,7 @@ import { ApiError, createOrg, listOrgs, updateOrg } from '../api/client'
 import type { MeDto, OrgDto, ProblemDetails } from '../api/types'
 import { ErrorBanner } from '../kit/ErrorBanner'
 import { Skeleton } from '../kit/Skeleton'
-import { useToast } from '../kit/Toaster'
+import { useToast } from '../kit/useToast'
 import styles from './forms.module.css'
 
 function messageOf(e: unknown): string[] {

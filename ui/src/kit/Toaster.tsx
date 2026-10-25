@@ -1,13 +1,12 @@
-import { createContext, useCallback, useContext, useMemo, useRef, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import styles from './Toaster.module.css'
+import { ToastContext as Ctx, type ToastApi } from './useToast'
 
 type Kind = 'success' | 'error'
 type Toast = { id: number; kind: Kind; text: string }
-type ToastApi = { success(text: string): void; error(text: string): void }
 
 const SUCCESS_MS = 5_000
-const Ctx = createContext<ToastApi | null>(null)
 
 /** Toast stack, fixed bottom-right. Success toasts vanish after 5 s; errors stay until dismissed. */
 export function ToastProvider({ children }: { children: ReactNode }) {
@@ -34,10 +33,4 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       </div>
     </Ctx.Provider>
   )
-}
-
-export function useToast(): ToastApi {
-  const api = useContext(Ctx)
-  if (!api) throw new Error('useToast must be used inside ToastProvider')
-  return api
 }

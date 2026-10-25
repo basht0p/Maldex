@@ -3,7 +3,7 @@ namespace Maldex.Web.Security;
 public sealed class SecurityHeadersMiddleware(RequestDelegate next)
 {
     public const string Csp =
-        "default-src 'self'; connect-src 'self' https://login.microsoftonline.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'";
+        "default-src 'self'; connect-src 'self' https://login.microsoftonline.com; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'";
 
     public Task InvokeAsync(HttpContext ctx)
     {

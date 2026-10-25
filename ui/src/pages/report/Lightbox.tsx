@@ -2,15 +2,11 @@ import { useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { useDialogFocus } from '../dialogFocus'
 import forms from '../forms.module.css'
+import { AuthedImage } from './shared'
 import styles from './report.module.css'
 
+/** `src` is an API path; it is fetched with the bearer token, never put in an `<img>` as is. */
 export interface LightboxItem { src: string; caption: string }
-
-function LightboxImage({ item }: { item: LightboxItem }) {
-  const [failed, setFailed] = useState(false)
-  if (failed) return <div className={styles.missing}>Not available</div>
-  return <img className={styles.lightboxImg} src={item.src} alt={item.caption} onError={() => setFailed(true)} />
-}
 
 /** Modal image viewer. ArrowLeft/ArrowRight wrap, Escape closes. Pass `onIndex` to control the index from the parent. */
 export function Lightbox({ items, index, onClose, onIndex }: {
@@ -46,7 +42,7 @@ export function Lightbox({ items, index, onClose, onIndex }: {
         onKeyDown={onKeyDown}
         onClick={(e) => e.stopPropagation()}
       >
-        <LightboxImage key={item.src} item={item} />
+        <AuthedImage key={item.src} path={item.src} alt={item.caption} className={styles.lightboxImg} />
         <p className={styles.muted}>{item.caption}</p>
         <div className={styles.lightboxBar}>
           <button type="button" className={forms.secondary} onClick={() => go(current - 1)}>Previous</button>

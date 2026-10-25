@@ -13,11 +13,11 @@ import {
   startTemplateRefresh,
 } from '../api/client'
 import type { AdminTemplateDto, MeDto, TemplateJobDto, TemplateJobNetwork, TemplateVersionDto } from '../api/types'
-import { useConfirm } from '../kit/Confirm'
+import { useConfirm } from '../kit/useConfirm'
 import { ErrorBanner } from '../kit/ErrorBanner'
 import { RelativeTime } from '../kit/RelativeTime'
 import { Skeleton } from '../kit/Skeleton'
-import { useToast } from '../kit/Toaster'
+import { useToast } from '../kit/useToast'
 import { messageOf } from '../util/apiMessage'
 import { useDialogFocus } from './dialogFocus'
 import styles from './forms.module.css'

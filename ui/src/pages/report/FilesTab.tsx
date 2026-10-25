@@ -2,11 +2,13 @@ import type { TaskReportDto } from '../../api/types'
 import { CopyButton } from '../../kit/CopyButton'
 import { EmptyState } from '../../kit/EmptyState'
 import { FileSize } from '../../kit/RelativeTime'
+import { useDownload } from '../../kit/useDownload'
 import { safeText } from '../../util/safeText'
 import forms from '../forms.module.css'
 import styles from './report.module.css'
 
 export function FilesTab({ report }: { report: TaskReportDto }) {
+  const download = useDownload()
   if (report.droppedFiles.length === 0) return <EmptyState title="No dropped files" />
   return (
     <div className={styles.scroll}>
@@ -30,7 +32,12 @@ export function FilesTab({ report }: { report: TaskReportDto }) {
                 </span>
               </td>
               <td><FileSize bytes={f.size} /></td>
-              <td><a href={`/api/artifacts/${encodeURIComponent(f.artifactId)}/download`}>ZIP</a></td>
+              <td>
+                <button type="button" className={styles.linkButton} aria-label={`Download ${f.sha256.slice(0, 8)} (ZIP)`}
+                  onClick={() => void download(`/api/artifacts/${encodeURIComponent(f.artifactId)}/download`, `${f.sha256}.zip`)}>
+                  ZIP
+                </button>
+              </td>
             </tr>
           ))}
         </tbody>
