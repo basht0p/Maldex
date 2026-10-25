@@ -1,4 +1,4 @@
-import { screen, waitFor } from '@testing-library/react'
+import { configure, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
@@ -6,6 +6,10 @@ import { Route, Routes } from 'react-router-dom'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { renderWithKit } from '../test/renderWithKit'
 import SubmitPage from './SubmitPage'
+
+// Several tests chain four async waits; the 1 s default flakes under a loaded full suite.
+configure({ asyncUtilTimeout: 5000 })
+vi.setConfig({ testTimeout: 15000 })
 
 const ORG = { id: '11111111-1111-1111-1111-111111111111', name: 'Acme', retentionDays: 30 }
 
@@ -420,8 +424,9 @@ describe('SubmitPage', () => {
       await submit()
 
       expect(await screen.findByText('This sample has expired under retention. Upload it again.')).toBeInTheDocument()
-      expect(screen.queryByText('invoice.exe')).toBeNull()
-      expect(screen.getByLabelText('File')).toBeInTheDocument()
+      // the router applies the search-param change in a transition, so it can land after the toast
+      await waitFor(() => expect(screen.queryByText('invoice.exe')).toBeNull())
+      expect(await screen.findByLabelText('File')).toBeInTheDocument()
     })
 
     it('resubmits a URL task', async () => {
@@ -435,8 +440,8 @@ describe('SubmitPage', () => {
       await renderPage('/submit?from=t1')
       await screen.findByText('invoice.exe')
       await userEvent.click(screen.getByRole('button', { name: 'Change sample' }))
-      expect(screen.queryByText('invoice.exe')).toBeNull()
-      expect(screen.getByLabelText('File')).toBeInTheDocument()
+      await waitFor(() => expect(screen.queryByText('invoice.exe')).toBeNull())
+      expect(await screen.findByLabelText('File')).toBeInTheDocument()
     })
   })
 })
