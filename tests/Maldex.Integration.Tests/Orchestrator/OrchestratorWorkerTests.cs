@@ -214,7 +214,7 @@ public class OrchestratorWorkerTests(SqlServerFixture sql)
     /// <summary>Lists fail a few times (libvirt/DB not ready at boot), then work.</summary>
     private sealed class FlakyHypervisor(Maldex.Core.Abstractions.IHypervisor inner, int failures) : Maldex.Core.Abstractions.IHypervisor
     {
-        public Task SendKeyAsync(Maldex.Core.Abstractions.VmHandle vm, string key, CancellationToken ct) => throw new NotSupportedException();
+        public Task SendKeyAsync(Maldex.Core.Abstractions.VmHandle vm, string key, CancellationToken ct) => inner.SendKeyAsync(vm, key, ct);
         public int ListCalls;
         public Task<Maldex.Core.Abstractions.VmHandle> StartAsync(Maldex.Core.Abstractions.VmSpec spec, CancellationToken ct) => inner.StartAsync(spec, ct);
         public Task DestroyAsync(Maldex.Core.Abstractions.VmHandle vm, CancellationToken ct) => inner.DestroyAsync(vm, ct);

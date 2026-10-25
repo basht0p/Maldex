@@ -51,6 +51,7 @@ public static class DependencyInjection
         services.AddSingleton<JobConsoleRegistry>();
         services.AddSingleton<TemplateSealer>();
         services.AddSingleton<TemplateVerifier>();
+        services.AddSingleton<TemplateInstaller>();
         services.AddSingleton<TemplateCoordinator>();
         // Hosted by Maldex.Web next to the OrchestratorWorker, behind the same gate.
         services.AddSingleton<TemplateJobWorker>();

@@ -577,6 +577,47 @@ public class TemplateCatalogTests(SqlServerFixture sql)
     }
 
     [Fact]
+    public async Task SetDefault_InsideAnOpenTransaction_JoinsIt_AndCommitsWithIt()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a", isDefault: true);
+            await AddTemplateAsync(db, "b");
+            await using (var tx = await db.Database.BeginTransactionAsync(Ct))
+            {
+                await Catalog(db).SetDefaultAsync("b", Ct, new TemplateAudit(null, "template.default", "first template"));
+                await tx.CommitAsync(Ct);
+            }
+
+            await using var fresh = sql.CreateContext(db.Database.GetConnectionString()!);
+            Assert.Equal(["b"], await fresh.Templates.Where(t => t.IsDefault).Select(t => t.Id).ToListAsync(Ct));
+            var audit = await fresh.AuditLogs.SingleAsync(Ct);
+            Assert.Equal(("template.default", (Guid?)null, "b", "first template"), (audit.Action, audit.UserId, audit.Target, audit.Details));
+        }
+    }
+
+    [Fact]
+    public async Task SetDefault_InsideAnOpenTransaction_RollsBackWithIt()
+    {
+        var (db, _) = await FreshAsync();
+        await using (db)
+        {
+            await AddTemplateAsync(db, "a", isDefault: true);
+            await AddTemplateAsync(db, "b");
+            await using (var tx = await db.Database.BeginTransactionAsync(Ct))
+            {
+                await Catalog(db).SetDefaultAsync("b", Ct, new TemplateAudit(null, "template.default"));
+                await tx.RollbackAsync(Ct);
+            }
+
+            await using var fresh = sql.CreateContext(db.Database.GetConnectionString()!);
+            Assert.Equal(["a"], await fresh.Templates.Where(t => t.IsDefault).Select(t => t.Id).ToListAsync(Ct));
+            Assert.Empty(await fresh.AuditLogs.ToListAsync(Ct));
+        }
+    }
+
+    [Fact]
     public async Task SetDefault_DisabledTemplate_Throws()
     {
         var (db, _) = await FreshAsync();
