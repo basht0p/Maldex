@@ -559,8 +559,18 @@ TEMPLATE_E2E_PATHS=(
   src/Maldex.Web/Endpoints/GuacamoleTunnelEndpoint.cs
   deploy/guest/provision/sysmon-config.xml
   deploy/host/
+  src/Maldex.Orchestrator/SelfTestGate.cs
+  src/Maldex.Orchestrator/TransferInbox.cs
+  src/Maldex.Orchestrator/DependencyInjection.cs
+  src/Maldex.Core/Abstractions/
+  src/Maldex.Infrastructure/Execution/
+  src/Maldex.Infrastructure/Real/
+  src/Maldex.Infrastructure/DependencyInjection.cs
+  src/Maldex.Web/Templates/TemplateProvenance.cs
   tests/Maldex.Integration.Tests/E2E/RealTemplateJobTests.cs
   tests/Maldex.Integration.Tests/E2E/RealGuestDiskEditorTests.cs
+  tests/Maldex.Integration.Tests/E2E/RealVmE2ETests.cs
+  tests/Maldex.Integration.Tests/E2E/ProvenanceRoundTrips.cs
 )
 TEMPLATE_E2E_STAMP=".data/e2e-templates.validated"
 
@@ -618,8 +628,10 @@ require_base_image() {
 # Harmless real-VM end-to-end suite (needs the built guest image; see deploy/guest/README.md "Running the E2E suite").
 cmd_e2e() {
   require_base_image || return $?
-  MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 dotnet test --project tests/Maldex.Integration.Tests --filter-class "*RealVmE2ETests"
+  local rc=0
+  MALDEX_REAL_VM=1 MALDEX_REAL_NET=1 dotnet test --project tests/Maldex.Integration.Tests --filter-class "*RealVmE2ETests" || rc=$?
   template_e2e_gate_notice
+  return "$rc"
 }
 
 # The real template-job E2E (Refresh, Edit with Direct network, Roll back, guest disk editor): up to about two hours, so it runs
