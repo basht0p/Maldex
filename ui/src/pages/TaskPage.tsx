@@ -16,6 +16,7 @@ import { useTaskLive } from '../live/useTaskLive'
 import { safeText } from '../util/safeText'
 import forms from './forms.module.css'
 import { LiveEventsPanel } from './report/EventsTab'
+import { ProcessingWarnings } from './report/shared'
 import { TaskReport } from './report/TaskReport'
 import styles from './TaskPage.module.css'
 
@@ -27,6 +28,7 @@ function formatCountdown(deadlineAt: string, now: number): string {
 }
 
 const COUNTING: readonly RunStatus[] = ['Preparing', 'Running']
+const REPORT_RETRY_MS = 2000
 
 function errorMessage(e: unknown): string {
   if (e instanceof ApiError || e instanceof Error) return e.message
@@ -48,11 +50,13 @@ function networkLabel(mode: NetworkMode, exitCountry?: string | null): string {
   }
 }
 
-/** organization · submitted by · created · ran · template · network mode */
-function TaskDetails({ task }: { task: TaskDto }) {
+/** organization · submitted by · created · started · completed · ran · template · network mode · MIME type */
+function TaskDetails({ task, mime }: { task: TaskDto; mime?: string | null }) {
   const parts: ReactNode[] = [<span key="org">{safeText(task.orgName)}</span>]
   if (task.submittedByName) parts.push(<span key="by">submitted by {safeText(task.submittedByName)}</span>)
   parts.push(<RelativeTime key="created" iso={task.createdAt} />)
+  if (task.startedAt) parts.push(<span key="started">started <RelativeTime iso={task.startedAt} /></span>)
+  if (task.completedAt) parts.push(<span key="completed">completed <RelativeTime iso={task.completedAt} /></span>)
   if (task.ranSec != null) parts.push(<span key="ran">ran <Duration seconds={task.ranSec} /></span>)
   parts.push(
     <span key="tpl">
@@ -61,6 +65,7 @@ function TaskDetails({ task }: { task: TaskDto }) {
     </span>,
   )
   parts.push(<span key="net">{networkLabel(task.networkMode, task.exitCountry)}</span>)
+  if (mime) parts.push(<span key="mime" className={styles.mono}>{safeText(mime)}</span>)
   return (
     <div className={styles.meta} role="group" aria-label="Task details">
       {parts.flatMap((p, i) => (i === 0 ? [p] : [<span key={`sep${i}`} aria-hidden="true" className={styles.sep}>·</span>, p]))}
@@ -174,14 +179,17 @@ function LiveTask({ taskId }: { taskId: string }) {
   const completed = status === 'Completed'
 
   // The report is fetched once the task is Completed (from a push or the fetch). A 409 report-not-ready means the
-  // server has not caught up with the push yet: it is not an error, and the next status push retries.
+  // server has not caught up with the push yet: it is not an error. The next status push retries, and so does a
+  // single timer 2 s later (a completed task may get no further push).
   const [report, setReport] = useState<TaskReportDto | null>(null)
   const [reportError, setReportError] = useState<string | null>(null)
   const [reportReload, setReportReload] = useState(0)
+  const notReadyRetried = useRef(false)
   const push = live.status
   useEffect(() => {
     if (!completed || report) return
     let cancelled = false
+    let retry: ReturnType<typeof setTimeout> | undefined
     getTaskReport(taskId).then(
       (r) => {
         if (cancelled) return
@@ -189,11 +197,19 @@ function LiveTask({ taskId }: { taskId: string }) {
         setReportError(null)
       },
       (e: unknown) => {
-        if (!cancelled && !isReportNotReady(e)) setReportError(errorMessage(e))
+        if (cancelled) return
+        if (!isReportNotReady(e)) setReportError(errorMessage(e))
+        else if (!notReadyRetried.current) {
+          retry = setTimeout(() => {
+            notReadyRetried.current = true
+            setReportReload((n) => n + 1)
+          }, REPORT_RETRY_MS)
+        }
       },
     )
     return () => {
       cancelled = true
+      clearTimeout(retry)
     }
   }, [taskId, completed, report, push, reportReload])
 
@@ -277,9 +293,10 @@ function LiveTask({ taskId }: { taskId: string }) {
           <CopyButton value={task.sampleSha256} label="Copy SHA-256" />
         </p>
       )}
-      {details && <TaskDetails task={details} />}
+      {details && <TaskDetails task={details} mime={report?.mime} />}
       {(liveNow?.reason ?? task?.failureReason) && <p className={styles.error}>{safeText(liveNow?.reason ?? task?.failureReason)}</p>}
 
+      {!completed && <ProcessingWarnings warnings={task?.processingWarnings} />}
       {completed ? (
         report ? (
           <TaskReport report={report} taskId={taskId} eventCount={live.events.length} />

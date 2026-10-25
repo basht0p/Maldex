@@ -44,3 +44,9 @@
 .lightbox { max-width: min(96vw, 1200px); max-height: 94vh; display: grid; gap: 0.5rem; padding: 0.8rem; background: var(--mx-surface); border: 1px solid var(--mx-border); border-radius: var(--mx-radius-control); overflow: auto; }
 .lightboxImg { max-width: 100%; max-height: 74vh; object-fit: contain; justify-self: center; }
 .lightboxBar { display: flex; gap: 0.5rem; justify-content: center; }
+.warnings { grid-column: 1 / -1; margin: 0 0 0.75rem; padding: 0.6rem 1rem; border: 1px solid var(--mx-warning); border-radius: var(--mx-radius-control); background: var(--mx-raised); }
+.warnings h2 { font-size: 1rem; margin: 0 0 0.4rem; }
+.warnings ul { margin: 0; padding-left: 1.2rem; }
+.tags { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.tag { font-family: var(--mx-font-mono); font-size: 0.75rem; padding: 0.05rem 0.45rem; border: 1px solid var(--mx-border-strong); border-radius: 999px; background: var(--mx-raised); overflow-wrap: anywhere; }
+.cell { display: inline-flex; gap: 0.3rem; align-items: center; }

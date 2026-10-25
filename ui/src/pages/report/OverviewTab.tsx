@@ -5,7 +5,7 @@ import { CopyButton } from '../../kit/CopyButton'
 import { Duration, FileSize } from '../../kit/RelativeTime'
 import { safeText } from '../../util/safeText'
 import { formatTime, verdictLabel } from './reportUtil'
-import { Screenshot } from './shared'
+import { ProcessingWarnings, Screenshot } from './shared'
 import type { ReportTab } from './TaskReport'
 import styles from './report.module.css'
 
@@ -176,6 +176,7 @@ function StatusTimeline({ report }: { report: TaskReportDto }) {
 export function OverviewTab({ report, onShowTab }: { report: TaskReportDto; onShowTab: (tab: ReportTab) => void }) {
   return (
     <div className={styles.overview}>
+      <ProcessingWarnings warnings={report.task.processingWarnings} />
       <WhyCard report={report} onShowTab={onShowTab} />
       <SampleCard report={report} />
       <ContactedCard report={report} />

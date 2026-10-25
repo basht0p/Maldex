@@ -201,6 +201,7 @@ export default function MediaLibrary() {
       <input ref={resumeInput} type="file" aria-label="Resume file" style={{ display: 'none' }} onChange={onResumeFile} />
       {loadError && <ErrorBanner message={loadError} onRetry={() => void refresh()} />}
       {!loaded && !loadError && <Skeleton rows={3} />}
+      <div className={styles.tableScroll}>
       <table className={styles.table} aria-label="Media">
         <thead><tr><th>Kind</th><th>Name</th><th>Size</th><th>SHA-256</th><th>Status</th><th>Detected</th><th>Added</th><th>Used by</th><th>Actions</th></tr></thead>
         <tbody>
@@ -226,6 +227,7 @@ export default function MediaLibrary() {
           ))}
         </tbody>
       </table>
+      </div>
       {loaded && rows.length === 0 && <EmptyState title="No media yet." body="Upload an ISO or fetch one from a URL." />}
     </section>
   )

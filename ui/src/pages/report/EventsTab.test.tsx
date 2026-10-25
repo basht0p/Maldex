@@ -97,6 +97,15 @@ describe('EventsTab', () => {
     vi.restoreAllMocks()
   })
 
+  it('matches the live text filter against the event data too, like the server', async () => {
+    const events = [
+      { ...ev(1, 'Registry', 'set value'), dataJson: '{"key":"HKCU\\\\Run\\\\EvilStartup"}' },
+      { ...ev(2, 'Registry', 'set value'), dataJson: '{"key":"HKCU\\\\Run\\\\Benign"}' },
+    ]
+    renderTab('/tasks/t1?eq=evilstartup', { live: true, liveEvents: events })
+    expect(await screen.findAllByText('set value')).toHaveLength(1) // only the event whose data matches
+  })
+
   it('filters live events client-side by the same rules', async () => {
     const events = [ev(1, 'File', 'write Evil.dll', 1), ev(2, 'Network', 'connect EVIL.example', 1), ev(3, 'Network', 'connect ok', 2), ev(4, 'Network', 'connect evil', 2)]
     renderTab('/tasks/t1?etype=Network&process=2&eq=evil', { live: true, liveEvents: events })

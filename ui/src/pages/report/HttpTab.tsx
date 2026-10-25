@@ -1,6 +1,7 @@
 import { Fragment, useState } from 'react'
 import { httpBodyUrl } from '../../api/client'
 import type { TaskReportDto } from '../../api/types'
+import { CopyButton } from '../../kit/CopyButton'
 import { EmptyState } from '../../kit/EmptyState'
 import { useDownload } from '../../kit/useDownload'
 import { safeText } from '../../util/safeText'
@@ -52,11 +53,14 @@ export function HttpTab({ report, taskId }: { report: TaskReportDto; taskId: str
                   <Fragment key={h.id}>
                     <tr>
                       <td className={styles.mono}>{safeText(h.method)}</td>
-                      <td className={styles.mono}>{safeText(h.host)}</td>
+                      <td className={styles.mono}><span className={styles.cell}>{safeText(h.host)}<CopyButton value={h.host} label="Copy host" /></span></td>
                       <td>
-                        <button type="button" className={`${styles.rowButton} ${styles.mono}`} aria-expanded={expanded} onClick={() => toggle(h.id)}>
-                          {safeText(pathOf(h.url))}
-                        </button>
+                        <span className={styles.cell}>
+                          <button type="button" className={`${styles.rowButton} ${styles.mono}`} aria-expanded={expanded} onClick={() => toggle(h.id)}>
+                            {safeText(pathOf(h.url))}
+                          </button>
+                          <CopyButton value={h.url} label="Copy URL" />
+                        </span>
                       </td>
                       <td className={styles.mono}>{h.status ?? '-'}</td>
                     </tr>

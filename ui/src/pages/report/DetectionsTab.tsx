@@ -34,6 +34,7 @@ export function DetectionsTab({ report }: { report: TaskReportDto }) {
             <SortHeader field="rule" label="Rule" sort={sort} dir={dir} onSort={onSort} />
             <SortHeader field="source" label="Source" sort={sort} dir={dir} onSort={onSort} />
             <th scope="col">Target</th>
+            <th scope="col">Tags</th>
           </tr>
         </thead>
         <tbody>
@@ -50,10 +51,17 @@ export function DetectionsTab({ report }: { report: TaskReportDto }) {
                   </td>
                   <td>{d.source}</td>
                   <td className={styles.mono}>{safeText(d.target)}</td>
+                  <td>
+                    {d.tags.length > 0 && (
+                      <span className={styles.tags}>
+                        {d.tags.map((t, j) => <span key={j} className={styles.tag}>{safeText(t)}</span>)}
+                      </span>
+                    )}
+                  </td>
                 </tr>
                 {expanded && (
                   <tr>
-                    <td colSpan={4}>
+                    <td colSpan={5}>
                       {d.details ? <pre className={styles.detail}>{safeLines(d.details)}</pre> : <p className={styles.muted}>No details</p>}
                     </td>
                   </tr>

@@ -51,6 +51,7 @@ describe('MediaLibrary', () => {
   it('shows kind, name, size, SHA-256 prefix, status, detected images, uploader, date and users', async () => {
     renderWithKit(<MediaLibrary />)
     await screen.findByText('win11.iso')
+    expect(screen.getByRole('table', { name: 'Media' }).parentElement?.className).toMatch(/tableScroll/)
     const w = rowOf('win11.iso')
     expect(w).toHaveTextContent('OS installer')
     expect(w).toHaveTextContent('abcdef012345')

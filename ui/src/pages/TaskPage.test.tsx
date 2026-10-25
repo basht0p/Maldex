@@ -197,6 +197,45 @@ describe('TaskPage', () => {
     expect(screen.queryByLabelText('Live view')).toBeNull()
   })
 
+  it('retries the report once 2 s after a 409 even without another push', async () => {
+    getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious' }))
+    getTaskReport.mockRejectedValueOnce(new ApiError(409, { type: 'report-not-ready', title: 'Not ready.', status: 409 }))
+    renderPage()
+    await waitFor(() => expect(getTaskReport).toHaveBeenCalledTimes(1))
+    expect(screen.queryByRole('tab', { name: 'Overview' })).toBeNull()
+    expect(await screen.findByRole('tab', { name: 'Overview' }, { timeout: 4000 })).toBeInTheDocument()
+    expect(getTaskReport).toHaveBeenCalledTimes(2)
+  })
+
+  it('clears the report retry timer on unmount', async () => {
+    getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious' }))
+    getTaskReport.mockRejectedValue(new ApiError(409, { type: 'report-not-ready', title: 'Not ready.', status: 409 }))
+    const view = renderPage()
+    await waitFor(() => expect(getTaskReport).toHaveBeenCalledTimes(1))
+    await new Promise((r) => setTimeout(r, 0))
+    view.unmount()
+    await new Promise((r) => setTimeout(r, 2300))
+    expect(getTaskReport).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows processing warnings on the running layout', async () => {
+    getTask.mockResolvedValue(task({ processingWarnings: ['Telemetry was cut short.'] }))
+    renderPage()
+    const panel = await screen.findByRole('region', { name: 'Processing warnings' })
+    expect(panel).toHaveTextContent('Telemetry was cut short.')
+  })
+
+  it('shows the started and completed times and the MIME type in the header', async () => {
+    getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious', startedAt: '2026-10-19T00:00:10Z', completedAt: '2026-10-19T00:05:10Z' }))
+    renderPage()
+    await screen.findByRole('tab', { name: 'Overview' })
+    const line = screen.getByLabelText('Task details')
+    expect(line).toHaveTextContent(/started .+ago/)
+    expect(line).toHaveTextContent(/completed .+ago/)
+    expect(line).toHaveTextContent('application/x-dosexec')
+    expect(line.querySelector('time[datetime="2026-10-19T00:00:10Z"]')).not.toBeNull()
+  })
+
   it('shows a report load failure with Retry', async () => {
     getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious' }))
     getTaskReport.mockRejectedValueOnce(new ApiError(500, { title: 'The report could not be built.' }))

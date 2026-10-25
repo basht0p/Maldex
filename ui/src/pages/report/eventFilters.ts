@@ -68,6 +68,10 @@ export function useEventFilters(): EventFilterState {
 export function eventMatches(e: LiveEventDto, f: EventFilters): boolean {
   if (f.type && e.type !== f.type) return false
   if (f.processId !== undefined && e.processId !== f.processId) return false
-  if (f.q && !e.summary.toLowerCase().includes(f.q.toLowerCase())) return false
+  // Like the server: the text matches the summary or the raw event data, ignoring case.
+  if (f.q) {
+    const q = f.q.toLowerCase()
+    if (!e.summary.toLowerCase().includes(q) && !(e.dataJson ?? '').toLowerCase().includes(q)) return false
+  }
   return true
 }

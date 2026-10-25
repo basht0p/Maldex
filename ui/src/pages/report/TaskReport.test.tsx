@@ -211,6 +211,38 @@ describe('TaskReport', () => {
     expect(screen.getAllByText('Not available')).toHaveLength(2)
   })
 
+  it('shows processing warnings on the Overview as text, and nothing when there are none', () => {
+    const first = renderReport(reportFixture({ task: taskFixture({ processingWarnings: [`YARA timed out ${HOSTILE}`, 'Suricata skipped'] }) }))
+    const panel = screen.getByRole('region', { name: 'Processing warnings' })
+    expect(within(panel).getByText(`YARA timed out ${HOSTILE}`)).toBeInTheDocument()
+    expect(within(panel).getAllByRole('listitem')).toHaveLength(2)
+    expect(first.container.querySelector('script')).toBeNull()
+    first.unmount()
+    renderReport()
+    expect(screen.queryByRole('region', { name: 'Processing warnings' })).toBeNull()
+  })
+
+  it('lists detection tags as chips', () => {
+    const detections = reportFixture().detections.map((d, i) => (i === 1 ? { ...d, tags: ['ransomware', HOSTILE] } : d))
+    renderReport(reportFixture({ detections }), '/tasks/t1?tab=detections')
+    expect(screen.getByRole('columnheader', { name: 'Tags' })).toBeInTheDocument()
+    const row = screen.getAllByRole('row')[1] // Rule_Sev9 sorts first
+    expect(within(row).getByText('ransomware')).toBeInTheDocument()
+    expect(within(row).getByText(HOSTILE)).toBeInTheDocument()
+  })
+
+  it('offers copy buttons for flow endpoints, DNS values and HTTP host and URL', async () => {
+    const first = renderReport(reportFixture(), '/tasks/t1?tab=network')
+    expect(screen.getAllByRole('button', { name: 'Copy source' })).toHaveLength(2)
+    expect(screen.getAllByRole('button', { name: 'Copy destination' })).toHaveLength(2)
+    expect(screen.getByRole('button', { name: 'Copy query' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Copy answers' })).toBeInTheDocument()
+    first.unmount()
+    renderReport(reportFixture(), '/tasks/t1?tab=http')
+    expect(screen.getByRole('button', { name: 'Copy host' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Copy URL' })).toBeInTheDocument()
+  })
+
   it('shows events for a process in one URL update', async () => {
     renderReport(reportFixture(), '/tasks/t1?tab=processes')
     await userEvent.click(screen.getByRole('button', { name: 'Show events' }))

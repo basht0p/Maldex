@@ -191,7 +191,7 @@ export default function TasksPage() {
           <EmptyState title="Submit your first sample" body="Tasks you submit appear here with their status and verdict." action={<Link to="/submit">Submit a sample</Link>} />
         )
       )}
-      {items.length > 0 && <table className={styles.table}>
+      {items.length > 0 && <div className={styles.tableScroll}><table className={styles.table}>
         <thead>
           <tr>
             <th>Sample</th><th>Organization</th><th>Submitted by</th><th>Status</th>
@@ -227,7 +227,7 @@ export default function TasksPage() {
             </tr>
           ))}
         </tbody>
-      </table>}
+      </table></div>}
 
       <div className={styles.pager}>
         <button type="button" className={styles.secondary} disabled={f.page === 0} onClick={() => setF({ page: Math.max(0, f.page - 1) })}>Previous</button>
