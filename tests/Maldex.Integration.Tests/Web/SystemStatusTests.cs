@@ -138,6 +138,42 @@ public sealed class SystemStatusTests(SqlServerFixture sql) : IDisposable
     }
 
     [Fact]
+    public async Task Auth_warning_when_no_break_glass()
+    {
+        const string Warning = "No enabled break-glass admin: if single sign-on fails, nobody can sign in. Create one with: sudo maldex-admin create-user <name> --admin --break-glass";
+        const string Pw = "correct horse battery";
+        var f = new MaldexAppFactory(sql, authMode: "Local", settings: new Dictionary<string, string?>
+        {
+            ["Maldex:Auth:Oidc:Enabled"] = "true",
+            ["Maldex:Auth:Oidc:Authority"] = "https://idp.example.invalid",
+            ["Maldex:Auth:Oidc:ClientId"] = "test-client",
+        });
+        _factories.Add(f);
+        await LocalAuth.SeedUserAsync(f, "glass", Pw, UserRole.Admin, u => u.IsBreakGlass = true);
+        var (host, admin) = await PasswordOffHost.SignInAsync(f, "glass", Pw);
+        using var _h = host;
+        using var _c = admin;
+
+        Assert.Empty((await StatusAsync(admin)).GetProperty("authWarnings").EnumerateArray());
+
+        using (var scope = f.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+            (await db.Users.SingleAsync(u => u.UserName == "glass", Ct)).IsBreakGlass = false;
+            await db.SaveChangesAsync(Ct);
+        }
+        // The session survives until the next stamp check; with no break-glass admin left the warning shows.
+        Assert.Equal([Warning], (await StatusAsync(admin)).GetProperty("authWarnings").EnumerateArray().Select(w => w.GetString()));
+    }
+
+    [Fact]
+    public async Task No_auth_warning_with_password_login()
+    {
+        var f = Factory();
+        Assert.Empty((await StatusAsync(f.CreateClient(UserRole.Admin))).GetProperty("authWarnings").EnumerateArray());
+    }
+
+    [Fact]
     public async Task Missing_disk_path_reports_the_nearest_existing_ancestor()
     {
         var f = Factory();

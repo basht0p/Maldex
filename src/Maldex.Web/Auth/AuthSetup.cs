@@ -53,6 +53,7 @@ public static class AuthSetup
 
         builder.Services.AddScoped<CurrentUser>();
         builder.Services.AddScoped<Audit.AuditWriter>();
+        builder.Services.AddScoped<UserAdminService>();
         return builder;
     }
 
