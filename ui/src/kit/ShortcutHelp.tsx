@@ -9,6 +9,7 @@ const SHORTCUTS: ReadonlyArray<readonly [string, string]> = [
   ['g t', 'Go to Tasks'],
   ['g s', 'Go to Submit'],
   ['g a', 'Go to Administration (admins)'],
+  ['g u', 'Go to Users (admins)'],
   ['Esc', 'Close a dialog or menu'],
 ]
 

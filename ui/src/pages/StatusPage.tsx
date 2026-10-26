@@ -22,6 +22,15 @@ export default function StatusPage() {
         <>
           <p className={styles.updated}>Last updated <RelativeTime iso={status.generatedAt} /></p>
 
+          {status.authWarnings.length > 0 && (
+            <div className={`${styles.panel} ${styles.warning}`} role="status">
+              <h2>Authentication warnings</h2>
+              <ul className={styles.holders}>
+                {status.authWarnings.map((w) => <li key={w}>{safeText(w)}</li>)}
+              </ul>
+            </div>
+          )}
+
           <div className={styles.panel}>
             <h2>VM slot</h2>
             <p>{status.vmSlot.busy} of {status.vmSlot.capacity} in use</p>

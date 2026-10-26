@@ -23,6 +23,10 @@ import type {
   TaskListDto,
   TaskListQuery,
   SystemStatusDto,
+  AuthSettingsDto,
+  CreateUserRequest,
+  UpdateUserRequest,
+  UserDto,
   TaskReportDto,
   TemplateJobDto,
   TemplateJobNetwork,
@@ -213,3 +217,12 @@ export const httpBodyUrl = (taskId: string, txId: number) => `/api/tasks/${encod
 export const resubmitTask = (id: string, req: ResubmitRequest) => post<TaskDto>(`/api/tasks/${encodeURIComponent(id)}/resubmit`, req)
 
 export const getSystemStatus = (signal?: AbortSignal) => request<SystemStatusDto>('GET', '/api/admin/status', undefined, undefined, { signal })
+
+const userPath = (id: string) => `/api/admin/users/${encodeURIComponent(id)}`
+export const listUsers = () => get<UserDto[]>('/api/admin/users')
+export const createUser = (req: CreateUserRequest) => post<UserDto>('/api/admin/users', req)
+export const updateUser = (id: string, req: UpdateUserRequest) => request<UserDto>('PATCH', userPath(id), undefined, req)
+export const resetUserPassword = (id: string, newPassword: string) => post<void>(`${userPath(id)}/reset-password`, { newPassword })
+export const clearUserTotp = (id: string) => post<void>(`${userPath(id)}/clear-totp`)
+export const getAuthSettings = () => get<AuthSettingsDto>('/api/admin/settings')
+export const putAuthSettings = (req: AuthSettingsDto) => request<AuthSettingsDto>('PUT', '/api/admin/settings', undefined, req)

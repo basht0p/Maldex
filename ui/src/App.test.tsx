@@ -73,7 +73,7 @@ const statusBody = (over: Record<string, unknown> = {}) => ({
   vmSlot: { capacity: 1, busy: 0, holders: [] }, queueDepth: 0, runningTasks: 0, activeJobs: 0,
   disks: [{ name: 'data', path: '/d', freeBytes: 50, totalBytes: 100 }],
   workers: [{ name: 'orchestrator', lastTickAt: null, expectedIntervalSec: 5, stalled: false }],
-  recentFailures: [], generatedAt: '2026-10-25T10:00:00Z', ...over,
+  recentFailures: [], authWarnings: [], generatedAt: '2026-10-25T10:00:00Z', ...over,
 })
 const stalledWorkers = [{ name: 'orchestrator', lastTickAt: null, expectedIntervalSec: 5, stalled: true }]
 const lowDisk = [{ name: 'vm', path: '/v', freeBytes: 5, totalBytes: 100 }]

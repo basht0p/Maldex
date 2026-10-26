@@ -15,7 +15,7 @@ const status = (over: Partial<SystemStatusDto> = {}): SystemStatusDto => ({
   vmSlot: { capacity: 1, busy: 0, holders: [] }, queueDepth: 0, runningTasks: 0, activeJobs: 0,
   disks: [{ name: 'data', path: '/var/lib/maldex', freeBytes: 50, totalBytes: 100 }],
   workers: [{ name: 'orchestrator', lastTickAt: '2026-10-25T10:00:00Z', expectedIntervalSec: 5, stalled: false }],
-  recentFailures: [], generatedAt: '2026-10-25T10:00:00Z', ...over,
+  recentFailures: [], authWarnings: [], generatedAt: '2026-10-25T10:00:00Z', ...over,
 })
 
 function Probe() {
