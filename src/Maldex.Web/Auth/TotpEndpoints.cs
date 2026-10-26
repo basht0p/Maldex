@@ -1,10 +1,10 @@
-using System.Security.Claims;
 using System.Security.Cryptography;
 using Maldex.Core.Domain;
 using Maldex.Data;
 using Maldex.Web.Audit;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 
 namespace Maldex.Web.Auth;
@@ -38,74 +38,45 @@ public static class TotpEndpoints
             await LoginFlow.SignInFullAsync(ctx, user, LoginFlow.SessionIssuedAt(ctx));
             return;
         }
-        var services = ctx.RequestServices;
         var window = (await ctx.AuthenticateAsync(AuthSchemes.Partial)).Properties;
-        if (window?.IssuedUtc is null || window.ExpiresUtc is null)
-        {
-            await LoginFlow.SignInPartialAsync(ctx, user, step);
-            return;
-        }
-        var stampType = services.GetRequiredService<IOptions<IdentityOptions>>().Value.ClaimsIdentity.SecurityStampClaimType;
-        var identity = new ClaimsIdentity(AuthSchemes.Partial);
-        identity.AddClaim(new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()));
-        identity.AddClaim(new Claim(MaldexClaims.Next, step));
-        identity.AddClaim(new Claim(stampType, await services.GetRequiredService<UserManager<AppUser>>().GetSecurityStampAsync(user)));
-        await ctx.SignInAsync(AuthSchemes.Partial, new ClaimsPrincipal(identity), new AuthenticationProperties
-        {
-            IsPersistent = false,
-            AllowRefresh = false,
-            IssuedUtc = window.IssuedUtc,
-            ExpiresUtc = window.ExpiresUtc,
-        });
+        await LoginFlow.SignInPartialAsync(ctx, user, step, window?.IssuedUtc, window?.ExpiresUtc);
     }
 
-    private const string StepProvider = "maldex";
-    private const string StepToken = "TotpLastStep";
-    private const string Base32Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    /// <summary>Where the last accepted TOTP step is stored (replay protection); cleared with the authenticator.</summary>
+    internal const string StepProvider = "maldex";
+    internal const string StepToken = "TotpLastStep";
+
+    private enum TotpCheck { Rejected, Accepted, Raced }
 
     /// <summary>
     /// Checks a 6-digit code against the user's authenticator key (RFC 6238, SHA-1, 30 s, one step either side) and refuses a
     /// step that is not newer than the last one accepted. With <paramref name="record"/> the matched step becomes the last accepted.
+    /// <see cref="TotpCheck.Raced"/>: the code matched, but recording the step collided with a concurrent request (the first
+    /// step's primary key, or the user row's concurrency stamp); the code counts as used, and this request's pending changes are dropped.
     /// </summary>
-    private static async Task<bool> AcceptTotpAsync(UserManager<AppUser> users, TimeProvider time, AppUser user, string code, bool record)
+    private static async Task<TotpCheck> AcceptTotpAsync(UserManager<AppUser> users, MaldexDbContext db, TimeProvider time, AppUser user, string code, bool record)
     {
-        if (code.Length != 6 || !code.All(char.IsAsciiDigit)) return false;
-        if (await users.GetAuthenticatorKeyAsync(user) is not { Length: > 0 } key) return false;
-        var secret = Base32Decode(key);
+        if (code.Length != 6 || !code.All(char.IsAsciiDigit)) return TotpCheck.Rejected;
+        if (await users.GetAuthenticatorKeyAsync(user) is not { Length: > 0 } key) return TotpCheck.Rejected;
+        var secret = TotpCode.Base32Decode(key);
         var current = time.GetUtcNow().ToUnixTimeSeconds() / 30;
         var last = long.TryParse(await users.GetAuthenticationTokenAsync(user, StepProvider, StepToken), out var l) ? l : -1;
         var matched = -1L;
         for (var step = current - 1; step <= current + 1; step++)
-            if (CryptographicOperations.FixedTimeEquals(System.Text.Encoding.ASCII.GetBytes(CodeFor(secret, step)), System.Text.Encoding.ASCII.GetBytes(code)))
+            if (CryptographicOperations.FixedTimeEquals(System.Text.Encoding.ASCII.GetBytes(TotpCode.For(secret, step)), System.Text.Encoding.ASCII.GetBytes(code)))
                 matched = step;
-        if (matched < 0 || matched <= last) return false;
-        if (!record) return true;
-        return (await users.SetAuthenticationTokenAsync(user, StepProvider, StepToken, matched.ToString(System.Globalization.CultureInfo.InvariantCulture))).Succeeded;
-    }
-
-    private static string CodeFor(byte[] secret, long step)
-    {
-        Span<byte> message = stackalloc byte[8];
-        for (var i = 7; i >= 0; i--) { message[i] = (byte)(step & 0xff); step >>= 8; }
-        var hash = HMACSHA1.HashData(secret, message);
-        var offset = hash[^1] & 0x0f;
-        var binary = ((hash[offset] & 0x7f) << 24) | (hash[offset + 1] << 16) | (hash[offset + 2] << 8) | hash[offset + 3];
-        return (binary % 1_000_000).ToString("D6", System.Globalization.CultureInfo.InvariantCulture);
-    }
-
-    private static byte[] Base32Decode(string text)
-    {
-        var bytes = new List<byte>();
-        int buffer = 0, bits = 0;
-        foreach (var c in text.TrimEnd('=').ToUpperInvariant())
+        if (matched < 0 || matched <= last) return TotpCheck.Rejected;
+        if (!record) return TotpCheck.Accepted;
+        try
         {
-            var v = Base32Alphabet.IndexOf(c);
-            if (v < 0) continue;
-            buffer = (buffer << 5) | v;
-            bits += 5;
-            if (bits >= 8) { bits -= 8; bytes.Add((byte)((buffer >> bits) & 0xff)); }
+            if ((await users.SetAuthenticationTokenAsync(user, StepProvider, StepToken, matched.ToString(System.Globalization.CultureInfo.InvariantCulture))).Succeeded)
+                return TotpCheck.Accepted;
         }
-        return [.. bytes];
+        catch (DbUpdateException)
+        {
+        }
+        db.ChangeTracker.Clear();
+        return TotpCheck.Raced;
     }
 
     /// <summary>The 6-digit code typed by the user, or a recovery code, with spaces and dashes removed.</summary>
@@ -120,11 +91,17 @@ public static class TotpEndpoints
         if (await users.IsLockedOutAsync(user)) return AuthEndpoints.Error(StatusCodes.Status401Unauthorized, "locked");
 
         var code = Clean(req.Code);
-        var valid = code.Length > 0
-            && (code.Length == 6
-                ? await AcceptTotpAsync(users, time, user, code, record: true)
-                : (await users.RedeemTwoFactorRecoveryCodeAsync(user, MaldexUserStore.NormalizeCode(code))).Succeeded);
-        if (!valid)
+        var check = code.Length == 0 ? TotpCheck.Rejected
+            : code.Length == 6 ? await AcceptTotpAsync(users, db, time, user, code, record: true)
+            : (await users.RedeemTwoFactorRecoveryCodeAsync(user, MaldexUserStore.NormalizeCode(code))).Succeeded ? TotpCheck.Accepted
+            : TotpCheck.Rejected;
+        if (check == TotpCheck.Raced)
+        {
+            // A concurrent sign-in used the same code first. Not a wrong code, so not counted; the user entity is no longer tracked.
+            await audit.WriteAsync("auth.login_failed", name, "totp code already used", user.Id, ct);
+            return AuthEndpoints.Error(StatusCodes.Status401Unauthorized, "invalid");
+        }
+        if (check == TotpCheck.Rejected)
         {
             if (!await users.GetLockoutEnabledAsync(user)) await users.SetLockoutEnabledAsync(user, true);
             await users.AccessFailedAsync(user);
@@ -159,8 +136,9 @@ public static class TotpEndpoints
         if (await users.GetTwoFactorEnabledAsync(user)) return AuthEndpoints.Error(StatusCodes.Status409Conflict, "totp_enabled");
 
         var reset = await users.ResetAuthenticatorKeyAsync(user);
-        await users.RemoveAuthenticationTokenAsync(user, StepProvider, StepToken);
         if (!reset.Succeeded) return AuthEndpoints.Error(StatusCodes.Status400BadRequest, "invalid");
+        // The new key starts without a last accepted step.
+        await users.RemoveAuthenticationTokenAsync(user, StepProvider, StepToken);
         var key = await users.GetAuthenticatorKeyAsync(user) ?? "";
         // Resetting the key refreshes the security stamp; keep this sign-in alive.
         await ReissueAsync(ctx, user, step);
@@ -174,8 +152,9 @@ public static class TotpEndpoints
         if (await EnrolUserAsync(ctx) is not ({ } user, var step)) return Unauthenticated();
         if (await users.GetTwoFactorEnabledAsync(user)) return AuthEndpoints.Error(StatusCodes.Status409Conflict, "totp_enabled");
 
+        // The confirming code is recorded as used, so it cannot also pass the TOTP step of the next sign-in.
         var code = Clean(req.Code);
-        if (!await AcceptTotpAsync(users, time, user, code, record: false))
+        if (await AcceptTotpAsync(users, db, time, user, code, record: true) != TotpCheck.Accepted)
             return AuthEndpoints.Error(StatusCodes.Status400BadRequest, "invalid");
 
         await users.SetTwoFactorEnabledAsync(user, true);

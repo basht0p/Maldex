@@ -64,12 +64,14 @@ public static class LoginFlow
     /// <summary>
     /// Issues the 10-minute partial cookie for an unfinished sign-in whose next step is <paramref name="next"/> (claims: user id,
     /// <c>maldex:next</c>, and the security stamp, so a password reset or disable mid-way ends it). Any session cookie is removed.
+    /// Pass <paramref name="issuedUtc"/> and <paramref name="expiresUtc"/> (both) to keep an existing partial cookie's window.
     /// </summary>
-    public static async Task SignInPartialAsync(HttpContext ctx, AppUser user, string next)
+    public static async Task SignInPartialAsync(HttpContext ctx, AppUser user, string next, DateTimeOffset? issuedUtc = null, DateTimeOffset? expiresUtc = null)
     {
         var services = ctx.RequestServices;
         var users = services.GetRequiredService<UserManager<AppUser>>();
         var now = services.GetRequiredService<TimeProvider>().GetUtcNow();
+        var keepWindow = issuedUtc is not null && expiresUtc is not null;
 
         var identity = new ClaimsIdentity(AuthSchemes.Partial);
         identity.AddClaim(new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()));
@@ -80,8 +82,8 @@ public static class LoginFlow
         {
             IsPersistent = false,
             AllowRefresh = false,
-            IssuedUtc = now,
-            ExpiresUtc = now + SessionLifetime.PartialLifetime,
+            IssuedUtc = keepWindow ? issuedUtc : now,
+            ExpiresUtc = keepWindow ? expiresUtc : now + SessionLifetime.PartialLifetime,
         });
         await ctx.SignOutAsync(AuthSchemes.Application);
     }

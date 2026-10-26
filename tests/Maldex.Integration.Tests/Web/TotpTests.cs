@@ -8,6 +8,7 @@ using Maldex.Web.Auth;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
@@ -74,7 +75,9 @@ public sealed class TotpTests(SqlServerFixture sql) : IDisposable
         var key = body.GetProperty("sharedKey").GetString()!;
         Assert.StartsWith("otpauth://totp/Maldex:", body.GetProperty("otpauthUri").GetString());
         Assert.Contains("secret=" + key, body.GetProperty("otpauthUri").GetString());
-        var confirm = await c.PostAsJsonAsync("/api/auth/totp/confirm", new { code = Totp.Code(key, DateTimeOffset.UtcNow) }, Ct);
+        // The previous step's code (still inside the window): confirming records its step as used, so a sign-in right after
+        // can use the current code.
+        var confirm = await c.PostAsJsonAsync("/api/auth/totp/confirm", new { code = Totp.Code(key, DateTimeOffset.UtcNow.AddSeconds(-30)) }, Ct);
         Assert.Equal(HttpStatusCode.OK, confirm.StatusCode);
         var result = await JsonAsync(confirm);
         var codes = result.GetProperty("recoveryCodes").EnumerateArray().Select(e => e.GetString()!).ToArray();
@@ -474,6 +477,140 @@ public sealed class TotpTests(SqlServerFixture sql) : IDisposable
                 await AssertErrorAsync(await PostAsync(client, "/api/auth/totp/recovery-codes", new { password = "wrong password here" }), HttpStatusCode.BadRequest, "invalid");
             Assert.Equal(HttpStatusCode.OK, (await PostAsync(client, "/api/auth/totp/recovery-codes", new { password = Password })).StatusCode);
         }
+    }
+
+    /// <summary>RFC 6238 Appendix B (SHA-1 seed "12345678901234567890"), truncated to the 6 digits Maldex uses.</summary>
+    [Theory]
+    [InlineData(59L, "287082")]
+    [InlineData(1111111109L, "081804")]
+    [InlineData(1111111111L, "050471")]
+    [InlineData(1234567890L, "005924")]
+    [InlineData(2000000000L, "279037")]
+    [InlineData(20000000000L, "353130")]
+    public void Codes_match_the_rfc_6238_test_vectors(long unixTime, string code) =>
+        Assert.Equal(code, TotpCode.For(System.Text.Encoding.ASCII.GetBytes("12345678901234567890"), unixTime / 30));
+
+    [Fact]
+    public void Base32_decoding_matches_the_rfc_4648_vectors()
+    {
+        Assert.Equal("foobar"u8.ToArray(), TotpCode.Base32Decode("MZXW6YTBOI======"));
+        Assert.Equal("foobar"u8.ToArray(), TotpCode.Base32Decode("mzxw6ytboi"));
+    }
+
+    [Fact]
+    public async Task The_code_that_confirmed_enrolment_cannot_sign_in()
+    {
+        var f = Factory();
+        await LocalAuth.SeedUserAsync(f, "alice", Password, UserRole.Analyst);
+        using var client = await LocalAuth.SignInAsync(f, "alice", Password);
+        var setup = await JsonAsync(await client.PostAsync("/api/auth/totp/setup", null, Ct));
+        var key = setup.GetProperty("sharedKey").GetString()!;
+        var code = Totp.Code(key, DateTimeOffset.UtcNow);
+        Assert.Equal(HttpStatusCode.OK, (await client.PostAsJsonAsync("/api/auth/totp/confirm", new { code }, Ct)).StatusCode);
+        await client.PostAsync("/api/auth/logout", null, Ct);
+
+        await AssertNextAsync(await LoginAsync(client), "totp");
+        await AssertErrorAsync(await TotpLoginAsync(client, code), HttpStatusCode.Unauthorized, "invalid");
+    }
+
+    /// <summary>
+    /// Arms on demand; then, just before the save that records a TOTP step for the first time, inserts that row from another
+    /// connection, as a concurrent sign-in with the same code would. The save then hits the primary key.
+    /// </summary>
+    private sealed class FirstStepRace(string connectionString) : SaveChangesInterceptor
+    {
+        public bool Armed { get; set; }
+        public bool Fired { get; private set; }
+
+        public override async ValueTask<InterceptionResult<int>> SavingChangesAsync(DbContextEventData eventData, InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            var token = eventData.Context!.ChangeTracker.Entries<Microsoft.AspNetCore.Identity.IdentityUserToken<Guid>>()
+                .FirstOrDefault(e => e.State == EntityState.Added && e.Entity.LoginProvider == "maldex" && e.Entity.Name == "TotpLastStep");
+            if (Armed && token is not null)
+            {
+                Armed = false;
+                Fired = true;
+                await using var conn = new Microsoft.Data.SqlClient.SqlConnection(connectionString);
+                await conn.OpenAsync(cancellationToken);
+                await using var cmd = conn.CreateCommand();
+                cmd.CommandText = "INSERT INTO UserTokens (UserId, LoginProvider, Name, Value) VALUES (@u, 'maldex', 'TotpLastStep', @v)";
+                cmd.Parameters.AddWithValue("@u", token.Entity.UserId);
+                cmd.Parameters.AddWithValue("@v", token.Entity.Value ?? "");
+                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            }
+            return await base.SavingChangesAsync(eventData, result, cancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task Losing_the_race_to_record_the_first_step_is_invalid_not_500()
+    {
+        var f = Factory();
+        var race = new FirstStepRace(f.ConnectionString);
+        using var host = f.WithWebHostBuilder(b => b.ConfigureServices(s => s.ConfigureDbContext<MaldexDbContext>(o => o.AddInterceptors(race))));
+        await LocalAuth.SeedUserAsync(f, "alice", Password, UserRole.Analyst);
+        using var client = host.CreateClient();
+        await AssertNextAsync(await LoginAsync(client), "done");
+        var key = (await JsonAsync(await client.PostAsync("/api/auth/totp/setup", null, Ct))).GetProperty("sharedKey").GetString()!;
+        // Enrol with the code of the previous step, so the next sign-in can use the current one.
+        var confirm = await client.PostAsJsonAsync("/api/auth/totp/confirm", new { code = Totp.Code(key, DateTimeOffset.UtcNow.AddSeconds(-30)) }, Ct);
+        Assert.Equal(HttpStatusCode.OK, confirm.StatusCode);
+        await client.PostAsync("/api/auth/logout", null, Ct);
+        // Start over without a recorded step: the race is about the very first one.
+        await using (var scope = f.Services.CreateAsyncScope())
+            await scope.ServiceProvider.GetRequiredService<MaldexDbContext>().Database
+                .ExecuteSqlRawAsync("DELETE FROM UserTokens WHERE LoginProvider = 'maldex' AND Name = 'TotpLastStep'", Ct);
+
+        await AssertNextAsync(await LoginAsync(client), "totp");
+        race.Armed = true;
+        await AssertErrorAsync(await TotpLoginAsync(client, Totp.Code(key, DateTimeOffset.UtcNow)), HttpStatusCode.Unauthorized, "invalid");
+        Assert.True(race.Fired);
+    }
+
+    /// <summary>Makes the next save of a modified user fail as a concurrency conflict (UserManager then reports failure), once.</summary>
+    private sealed class FailNextUserSave : SaveChangesInterceptor
+    {
+        public bool Armed { get; set; }
+
+        public override ValueTask<InterceptionResult<int>> SavingChangesAsync(DbContextEventData eventData, InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (Armed && eventData.Context!.ChangeTracker.Entries<AppUser>().Any(e => e.State == EntityState.Modified))
+            {
+                Armed = false;
+                throw new DbUpdateConcurrencyException("simulated conflict");
+            }
+            return base.SavingChangesAsync(eventData, result, cancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task A_failed_key_reset_at_setup_changes_nothing()
+    {
+        var f = Factory();
+        var fail = new FailNextUserSave();
+        using var host = f.WithWebHostBuilder(b => b.ConfigureServices(s => s.ConfigureDbContext<MaldexDbContext>(o => o.AddInterceptors(fail))));
+        var alice = await LocalAuth.SeedUserAsync(f, "alice", Password, UserRole.Analyst);
+        using var client = host.CreateClient();
+        await AssertNextAsync(await LoginAsync(client), "done");
+        var key = (await JsonAsync(await client.PostAsync("/api/auth/totp/setup", null, Ct))).GetProperty("sharedKey").GetString()!;
+        await using (var scope = f.Services.CreateAsyncScope())
+        {
+            var users = scope.ServiceProvider.GetRequiredService<Microsoft.AspNetCore.Identity.UserManager<AppUser>>();
+            await users.SetAuthenticationTokenAsync((await users.FindByIdAsync(alice.Id.ToString()))!, "maldex", "TotpLastStep", "12345");
+        }
+
+        fail.Armed = true;
+        await AssertErrorAsync(await client.PostAsync("/api/auth/totp/setup", null, Ct), HttpStatusCode.BadRequest, "invalid");
+
+        await using var check = f.Services.CreateAsyncScope();
+        var um = check.ServiceProvider.GetRequiredService<Microsoft.AspNetCore.Identity.UserManager<AppUser>>();
+        var reloaded = (await um.FindByIdAsync(alice.Id.ToString()))!;
+        Assert.Equal(key, await um.GetAuthenticatorKeyAsync(reloaded));
+        Assert.Equal("12345", await um.GetAuthenticationTokenAsync(reloaded, "maldex", "TotpLastStep"));
+        // The session is untouched: the stamp did not change.
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/me", Ct)).StatusCode);
     }
 
     [Fact]
