@@ -21,14 +21,14 @@ namespace Maldex.Integration.Tests.Fixtures;
 /// </summary>
 public sealed class FakeOidcProvider : IAsyncDisposable
 {
-    private sealed record Identity(string Sub, string? Name, string? Email, IDictionary<string, string[]>? Extra);
+    private sealed record Identity(string Sub, string? Name, string? Email, IDictionary<string, string[]>? Extra, bool SingleAsString);
     private sealed record Grant(Identity User, string ClientId, string RedirectUri, string? Nonce, string? Challenge, string? ChallengeMethod);
 
     private readonly WebApplication _app;
     private readonly RSA _key = RSA.Create(2048);
     private readonly string _kid = Guid.NewGuid().ToString("N");
     private readonly ConcurrentDictionary<string, Grant> _codes = new();
-    private volatile Identity _next = new("user-1", "User One", null, null);
+    private volatile Identity _next = new("user-1", "User One", null, null, false);
     private volatile string? _clientSecret;
 
     /// <summary>The issuer and discovery base, <c>http://127.0.0.1:&lt;port&gt;</c> (no trailing slash).</summary>
@@ -57,9 +57,13 @@ public sealed class FakeOidcProvider : IAsyncDisposable
         return fake;
     }
 
-    /// <summary>The identity every following authorize call returns (until changed).</summary>
-    public void NextUser(string sub, string? name = null, string? email = null, IDictionary<string, string[]>? extraClaims = null) =>
-        _next = new Identity(sub, name, email, extraClaims);
+    /// <summary>
+    /// The identity every following authorize call returns (until changed). Extra claims are JSON arrays, or with
+    /// <paramref name="singleValuesAsStrings"/> a one-value claim is a plain JSON string (as some IdPs send one group).
+    /// </summary>
+    public void NextUser(string sub, string? name = null, string? email = null, IDictionary<string, string[]>? extraClaims = null,
+        bool singleValuesAsStrings = false) =>
+        _next = new Identity(sub, name, email, extraClaims, singleValuesAsStrings);
 
     /// <summary>Null: a public client (no secret checked). Otherwise the token request must carry exactly this secret.</summary>
     public void RequireClientSecret(string? secret) => _clientSecret = secret;
@@ -164,7 +168,7 @@ public sealed class FakeOidcProvider : IAsyncDisposable
         if (grant.User.Name is not null) claims["name"] = grant.User.Name;
         if (grant.User.Email is not null) claims["email"] = grant.User.Email;
         if (grant.User.Extra is not null)
-            foreach (var (k, v) in grant.User.Extra) claims[k] = v;
+            foreach (var (k, v) in grant.User.Extra) claims[k] = grant.User.SingleAsString && v.Length == 1 ? v[0] : v;
 
         await JsonAsync(ctx, 200, new { access_token = accessToken, token_type = "Bearer", expires_in = 300, id_token = Sign(claims) });
     }

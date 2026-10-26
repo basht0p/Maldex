@@ -1,9 +1,11 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Security.Claims;
 using System.Text.Json;
 using Maldex.Core.Domain;
 using Maldex.Data;
 using Maldex.Integration.Tests.Fixtures;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -64,9 +66,12 @@ public sealed class SsoTests(SqlServerFixture sql) : IAsyncLifetime
     private static HttpClient AppClient(MaldexAppFactory f) => f.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
 
     /// <summary>Start → the fake's authorize → the callback; returns the callback's redirect and the app client (with its cookies).</summary>
-    private static async Task<(string location, HttpClient client)> SignInViaSsoAsync(MaldexAppFactory f, FakeOidcProvider fake, string returnUrl = "/")
+    private static Task<(string location, HttpClient client)> SignInViaSsoAsync(MaldexAppFactory f, FakeOidcProvider fake, string returnUrl = "/") =>
+        SignInViaSsoAsync(AppClient(f), returnUrl);
+
+    /// <summary>As above, on an existing app client (keeping any session it already has).</summary>
+    private static async Task<(string location, HttpClient client)> SignInViaSsoAsync(HttpClient client, string returnUrl = "/")
     {
-        var client = AppClient(f);
         var callback = await AuthorizeAsync(client, returnUrl);
         return (await CallbackAsync(client, callback), client);
     }
@@ -76,6 +81,7 @@ public sealed class SsoTests(SqlServerFixture sql) : IAsyncLifetime
     {
         var start = await client.GetAsync("/api/auth/sso/start?returnUrl=" + Uri.EscapeDataString(returnUrl), Ct);
         Assert.Equal(HttpStatusCode.Redirect, start.StatusCode);
+        AssertNoExternalCookie(start);
         using var plain = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false });
         var authorize = await plain.GetAsync(start.Headers.Location!, Ct);
         Assert.Equal(HttpStatusCode.Redirect, authorize.StatusCode);
@@ -87,7 +93,15 @@ public sealed class SsoTests(SqlServerFixture sql) : IAsyncLifetime
     {
         var resp = await client.GetAsync(callback, Ct);
         Assert.True(resp.StatusCode == HttpStatusCode.Redirect, $"callback answered {(int)resp.StatusCode}: {await resp.Content.ReadAsStringAsync(Ct)}");
+        AssertNoExternalCookie(resp);
         return resp.Headers.Location!.OriginalString;
+    }
+
+    /// <summary>The handler's sign-in cookie (Maldex.External) is never written: the callback issues the Maldex session itself.</summary>
+    private static void AssertNoExternalCookie(HttpResponseMessage resp)
+    {
+        if (resp.Headers.TryGetValues("Set-Cookie", out var cookies))
+            Assert.DoesNotContain(cookies, c => c.Contains("maldex-external", StringComparison.OrdinalIgnoreCase));
     }
 
     private static async Task<JsonElement> MeAsync(HttpClient client)
@@ -201,6 +215,110 @@ public sealed class SsoTests(SqlServerFixture sql) : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Role_claim_as_a_single_string_is_mapped()
+    {
+        var fake = await FakeAsync();
+        var f = Factory(fake, GroupMapping());
+        fake.NextUser("sub-single", "Single", extraClaims: Groups("g-admin"), singleValuesAsStrings: true);
+
+        var (location, client) = await SignInViaSsoAsync(f, fake);
+
+        Assert.Equal("/", location);
+        Assert.Equal("Admin", (await MeAsync(client)).GetProperty("role").GetString());
+    }
+
+    [Fact]
+    public async Task Configured_role_values_are_trimmed_and_matched_ordinally()
+    {
+        var fake = await FakeAsync();
+        var f = Factory(fake, new()
+        {
+            ["Maldex:Auth:Oidc:RoleClaim"] = "groups",
+            ["Maldex:Auth:Oidc:AdminValues:0"] = "  g-admin  ",
+            ["Maldex:Auth:Oidc:AdminValues:1"] = " ",
+            ["Maldex:Auth:Oidc:AnalystValues:0"] = "",
+            ["Maldex:Auth:Oidc:AnalystValues:1"] = "g-ana",
+        });
+
+        fake.NextUser("sub-trim", "Trim", extraClaims: Groups("g-admin"));
+        Assert.Equal("Admin", (await MeAsync((await SignInViaSsoAsync(f, fake)).client)).GetProperty("role").GetString());
+
+        // Case-sensitive: G-ANA is not g-ana, and a blank configured value never matches a blank claim value.
+        fake.NextUser("sub-case", "Case", extraClaims: Groups("G-ANA", "", " "));
+        Assert.Equal("/login?error=no_role", (await SignInViaSsoAsync(f, fake)).location);
+    }
+
+    [Fact]
+    public async Task Mapped_role_change_rotates_the_security_stamp()
+    {
+        var fake = await FakeAsync();
+        var f = Factory(fake, GroupMapping());
+        fake.NextUser("sub-stamp", "Stamp", extraClaims: Groups("g-ana"));
+        await SignInViaSsoAsync(f, fake);
+        var first = Assert.Single(await SsoUsersAsync(f)).SecurityStamp;
+
+        await SignInViaSsoAsync(f, fake);
+        Assert.Equal(first, Assert.Single(await SsoUsersAsync(f)).SecurityStamp);
+
+        fake.NextUser("sub-stamp", "Stamp", extraClaims: Groups("g-admin"));
+        await SignInViaSsoAsync(f, fake);
+        var user = Assert.Single(await SsoUsersAsync(f));
+        Assert.Equal(UserRole.Admin, user.Role);
+        Assert.NotEqual(first, user.SecurityStamp);
+    }
+
+    [Theory]
+    [InlineData(" ")]
+    [InlineData("")]
+    public async Task Blank_sub_is_refused_as_sso_failed(string sub)
+    {
+        var fake = await FakeAsync();
+        var f = Factory(fake);
+        fake.NextUser(sub, "No Sub");
+
+        var (location, client) = await SignInViaSsoAsync(f, fake);
+
+        Assert.Equal("/login?error=sso_failed", location);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/me", Ct)).StatusCode);
+        Assert.Empty(await SsoUsersAsync(f));
+        Assert.Equal(0, await DbAsync(f, db => db.UserLogins.CountAsync(Ct)));
+    }
+
+    [Fact]
+    public async Task Missing_or_blank_sub_is_refused_and_audited_as_no_sub()
+    {
+        // The OIDC handler already rejects such tokens (above); CompleteAsync must refuse them too, never throw.
+        var fake = await FakeAsync();
+        var f = Factory(fake);
+        var options = new Maldex.Web.Auth.OidcOptions { Enabled = true, Authority = fake.Authority, ClientId = ClientId };
+        foreach (var claims in new[] { new[] { new Claim("iss", fake.Authority) }, [new Claim("iss", fake.Authority), new Claim("sub", "  ")] })
+        {
+            await using var scope = f.Services.CreateAsyncScope();
+            var ctx = new DefaultHttpContext { RequestServices = scope.ServiceProvider };
+            var target = await Maldex.Web.Auth.SsoSignIn.CompleteAsync(ctx, new ClaimsPrincipal(new ClaimsIdentity(claims, "oidc")), options, "/tasks");
+            Assert.Equal("/login?error=sso_failed", target);
+        }
+        Assert.Empty(await SsoUsersAsync(f));
+        Assert.Equal(2, await DbAsync(f, db => db.AuditLogs.CountAsync(a => a.Action == "auth.sso_refused" && a.Details == "no_sub" && a.UserId == null, Ct)));
+    }
+
+    [Fact]
+    public async Task Refusal_ends_an_existing_session()
+    {
+        var fake = await FakeAsync();
+        var f = Factory(fake, GroupMapping());
+        fake.NextUser("sub-first", "First", extraClaims: Groups("g-ana"));
+        var (_, client) = await SignInViaSsoAsync(f, fake);
+        Assert.Equal("Analyst", (await MeAsync(client)).GetProperty("role").GetString());
+
+        fake.NextUser("sub-second", "Second", extraClaims: Groups("other"));
+        var (location, _) = await SignInViaSsoAsync(client);
+
+        Assert.Equal("/login?error=no_role", location);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/me", Ct)).StatusCode);
+    }
+
+    [Fact]
     public async Task Disabled_sso_user_is_refused()
     {
         var fake = await FakeAsync();
@@ -296,6 +414,7 @@ public sealed class SsoTests(SqlServerFixture sql) : IAsyncLifetime
     [InlineData("https://evil.example")]
     [InlineData("/\\evil.example")]
     [InlineData("evil.example")]
+    [InlineData("/\t/evil.example")]
     public async Task Sso_start_rejects_non_local_return_urls(string returnUrl)
     {
         var fake = await FakeAsync();
@@ -344,6 +463,11 @@ public sealed class SsoTests(SqlServerFixture sql) : IAsyncLifetime
         fake.NextUser("sub-long", new string('n', 300));
         await SignInViaSsoAsync(f, fake);
         Assert.Equal(new string('n', 200), (await SsoUsersAsync(f)).Single().DisplayName);
+
+        // A surrogate pair straddling the 200-character cut is dropped whole, never split.
+        fake.NextUser("sub-emoji", new string('e', 199) + "\U0001F600" + "tail");
+        var (_, emoji) = await SignInViaSsoAsync(f, fake);
+        Assert.Equal(new string('e', 199), (await MeAsync(emoji)).GetProperty("displayName").GetString());
 
         fake.NextUser("sub-bare");
         var (_, client) = await SignInViaSsoAsync(f, fake);

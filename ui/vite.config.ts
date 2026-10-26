@@ -19,6 +19,7 @@ export default defineConfig({
       '^/api/tasks/[^/]+/tunnel': { target: backend, changeOrigin: false, ws: true },
       '/api': { target: backend, changeOrigin: true },
       '/hubs': { target: backend, changeOrigin: true, ws: true },
+      '/signin-oidc': { target: backend, changeOrigin: false }, // the SSO callback (keeps Host, so redirect_uri matches)
     },
   },
   test: {

@@ -4,6 +4,7 @@ using System.Text;
 using Maldex.Core.Domain;
 using Maldex.Data;
 using Maldex.Web.Audit;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 
@@ -14,6 +15,7 @@ public static class SsoSignIn
 {
     public const string NoRoleTarget = "/login?error=no_role";
     public const string DisabledTarget = "/login?error=disabled";
+    public const string FailedTarget = "/login?error=sso_failed";
     public const int MaxDisplayNameLength = 200;
 
     /// <summary>
@@ -41,9 +43,18 @@ public static class SsoSignIn
         var audit = services.GetRequiredService<AuditWriter>();
         var time = services.GetRequiredService<TimeProvider>();
 
-        var sub = external.FindFirst("sub") ?? throw new InvalidOperationException("The IdP's id_token has no sub claim");
-        var issuer = external.FindFirstValue("iss") is { Length: > 0 } iss ? iss : sub.Issuer;
+        var sub = external.FindFirst("sub");
+        var issuer = external.FindFirstValue("iss") is { Length: > 0 } iss ? iss : sub?.Issuer ?? "";
         var provider = "oidc:" + issuer;
+        if (sub is null || string.IsNullOrWhiteSpace(sub.Value))
+        {
+            // Nothing to key the account on: refuse (never a 500), and end any session this browser already had.
+            services.GetRequiredService<ILoggerFactory>().CreateLogger(typeof(SsoSignIn))
+                .LogWarning("SSO sign-in refused: the id_token from {Issuer} has no usable sub claim", issuer);
+            await RefuseAsync(ctx);
+            await audit.WriteAsync("auth.sso_refused", provider, "no_sub", null, ct);
+            return FailedTarget;
+        }
         var displayName = DisplayNameOf(external, o, sub.Value);
 
         var user = await FindOrCreateAsync(db, provider, sub.Value, issuer, displayName, time.GetUtcNow(), ct);
@@ -67,6 +78,7 @@ public static class SsoSignIn
         else if (!string.IsNullOrWhiteSpace(o.RoleClaim) && user.Role is null) refusal = "no_role";
         if (refusal is not null)
         {
+            await RefuseAsync(ctx);
             await audit.WriteAsync("auth.sso_refused", user.UserName ?? "", refusal, user.Id, ct);
             return refusal == "disabled" ? DisabledTarget : NoRoleTarget;
         }
@@ -74,6 +86,13 @@ public static class SsoSignIn
         await LoginFlow.SignInFullAsync(ctx, user);
         await audit.WriteAsync("auth.sso_login", user.UserName ?? "", provider, user.Id, ct);
         return IsLocalPath(returnUrl) ? returnUrl! : "/";
+    }
+
+    /// <summary>A refused SSO sign-in leaves no Maldex session behind (an earlier session in the same browser ends too).</summary>
+    private static async Task RefuseAsync(HttpContext ctx)
+    {
+        await ctx.SignOutAsync(AuthSchemes.Application);
+        await ctx.SignOutAsync(AuthSchemes.Partial);
     }
 
     /// <summary>True for a path on this site: starts with <c>/</c>, but not <c>//</c> or <c>/\</c> (both mean another host).</summary>
@@ -143,14 +162,22 @@ public static class SsoSignIn
         var name = claims.Where(c => !string.IsNullOrWhiteSpace(c))
             .Select(c => external.FindFirstValue(c)?.Trim())
             .FirstOrDefault(v => !string.IsNullOrEmpty(v)) ?? sub;
-        return name.Length <= MaxDisplayNameLength ? name : name[..MaxDisplayNameLength];
+        if (name.Length <= MaxDisplayNameLength) return name;
+        // Never split a surrogate pair (an emoji, say) at the cut.
+        var cut = char.IsHighSurrogate(name[MaxDisplayNameLength - 1]) ? MaxDisplayNameLength - 1 : MaxDisplayNameLength;
+        return name[..cut];
     }
 
     private static UserRole? MapRole(ClaimsPrincipal external, OidcOptions o)
     {
-        var values = external.FindAll(o.RoleClaim).Select(c => c.Value).ToHashSet(StringComparer.Ordinal);
-        if (o.AdminValues.Any(values.Contains)) return UserRole.Admin;
-        if (o.AnalystValues.Any(values.Contains)) return UserRole.Analyst;
+        // Matching is ordinal (case-sensitive), as IdP group and role values are: "Maldex-Admins" is not "maldex-admins".
+        // Configured values are trimmed and blanks dropped; claim values are used exactly as the IdP sent them.
+        var values = external.FindAll(o.RoleClaim.Trim()).Select(c => c.Value).ToHashSet(StringComparer.Ordinal);
+        if (Configured(o.AdminValues).Overlaps(values)) return UserRole.Admin;
+        if (Configured(o.AnalystValues).Overlaps(values)) return UserRole.Analyst;
         return null;
     }
+
+    private static HashSet<string> Configured(IEnumerable<string> values) =>
+        values.Where(v => !string.IsNullOrWhiteSpace(v)).Select(v => v.Trim()).ToHashSet(StringComparer.Ordinal);
 }
