@@ -38,10 +38,14 @@ public sealed class CsrfMiddleware(RequestDelegate next)
         var https = string.Equals(request.Scheme, "https", StringComparison.OrdinalIgnoreCase);
         var port = request.Host.Port ?? (https ? 443 : 80);
         return string.Equals(uri.Scheme, request.Scheme, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(uri.IdnHost, request.Host.Host, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(Unbracket(uri.IdnHost), Unbracket(request.Host.Host), StringComparison.OrdinalIgnoreCase)
             && uri.Port == port
             && uri.AbsolutePath == "/" && string.IsNullOrEmpty(uri.Query) && string.IsNullOrEmpty(uri.UserInfo);
     }
+
+    /// <summary>An IPv6 literal without its brackets (<c>Uri.IdnHost</c> drops them, <c>HostString.Host</c> keeps them).</summary>
+    private static string Unbracket(string host) =>
+        host.Length > 1 && host[0] == '[' && host[^1] == ']' ? host[1..^1] : host;
 
     private static Task RefuseAsync(HttpContext ctx, string error)
     {

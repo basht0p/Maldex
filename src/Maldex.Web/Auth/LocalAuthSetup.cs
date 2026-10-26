@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Security.Claims;
 using System.Threading.RateLimiting;
 using Maldex.Core.Domain;
@@ -110,6 +112,7 @@ public static class LocalAuthSetup
             o.Cookie.HttpOnly = true;
             o.Cookie.SameSite = SameSiteMode.Lax;
             o.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+            o.CookieManager = new HostPrefixCookieManager();
             o.ExpireTimeSpan = SessionLifetime.PartialLifetime;
             o.SlidingExpiration = false;
             o.Events = NoRedirectEvents(null);
@@ -173,6 +176,20 @@ public static class LocalAuthSetup
     /// 10 requests a minute (<see cref="MaldexAuthOptions.LoginRateLimitPerMinute"/>) per client IP to the sign-in endpoints; then
     /// 429 <c>{"error":"rate_limited"}</c>. Requests without a remote address (in-process test servers) share one bucket.
     /// </summary>
+    /// <summary>
+    /// The rate-limit partition of a client: an IPv4 address (also when IPv4-mapped) as itself, an IPv6 address by its /64
+    /// (one host usually holds a whole /64), and no address at all as the one bucket <c>unknown</c>.
+    /// </summary>
+    public static string RateLimitKey(IPAddress? address)
+    {
+        if (address is null) return "unknown";
+        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+        if (address.AddressFamily != AddressFamily.InterNetworkV6) return address.ToString();
+        var bytes = address.GetAddressBytes();
+        Array.Clear(bytes, 8, 8);
+        return new IPAddress(bytes) + "/64";
+    }
+
     public static IServiceCollection AddMaldexLoginRateLimit(this IServiceCollection services, int permitsPerMinute)
     {
         services.AddRateLimiter(o =>
@@ -184,7 +201,7 @@ public static class LocalAuthSetup
                 await ctx.HttpContext.Response.WriteAsJsonAsync(new { error = "rate_limited" }, ct);
             };
             o.AddPolicy(LoginRateLimitPolicy, http => RateLimitPartition.GetFixedWindowLimiter(
-                http.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+                RateLimitKey(http.Connection.RemoteIpAddress),
                 _ => new FixedWindowRateLimiterOptions
                 {
                     PermitLimit = Math.Max(1, permitsPerMinute),
@@ -197,7 +214,7 @@ public static class LocalAuthSetup
     }
 }
 
-/// <summary>Names the session cookie <c>__Host-maldex</c> on HTTPS requests (Secure, Path=/, no Domain) and <c>maldex</c> otherwise.</summary>
+/// <summary>Prefixes a cookie name with <c>__Host-</c> on HTTPS requests (Secure, Path=/, no Domain): <c>__Host-maldex</c>, <c>__Host-maldex-partial</c>.</summary>
 public sealed class HostPrefixCookieManager : ICookieManager
 {
     private readonly ChunkingCookieManager _inner = new();

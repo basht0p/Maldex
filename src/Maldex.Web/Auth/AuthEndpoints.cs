@@ -56,22 +56,25 @@ public static class AuthEndpoints
 
         // Lockout applies to every local account, also rows created outside UserManager.
         if (!await users.GetLockoutEnabledAsync(user)) await users.SetLockoutEnabledAsync(user, true);
-        var lockedBefore = await users.IsLockedOutAsync(user);
+        // Ruling T2-1: a locked account is answered "locked" without checking the password against its hash (the dummy
+        // verify keeps the timing), and the attempt is not counted.
+        if (await users.IsLockedOutAsync(user))
+        {
+            users.PasswordHasher.VerifyHashedPassword(new AppUser(), DummyHash.Value, password);
+            await audit.WriteAsync("auth.login_failed", target, "locked", user.Id, ct);
+            return Error(StatusCodes.Status401Unauthorized, "locked");
+        }
         if (!await users.CheckPasswordAsync(user, password))
         {
-            if (!lockedBefore)
-            {
-                await users.AccessFailedAsync(user);
-                if (await users.IsLockedOutAsync(user)) await audit.WriteAsync("auth.lockout", target, null, user.Id, ct);
-            }
+            await users.AccessFailedAsync(user);
+            if (await users.IsLockedOutAsync(user)) await audit.WriteAsync("auth.lockout", target, null, user.Id, ct);
             await audit.WriteAsync("auth.login_failed", target, "invalid", user.Id, ct);
             return Error(StatusCodes.Status401Unauthorized, "invalid");
         }
 
         // Only now, with the password verified, may the answer say more than "invalid".
         string? refusal = null;
-        if (lockedBefore) refusal = "locked";
-        else if (user.IsDisabled) refusal = "disabled";
+        if (user.IsDisabled) refusal = "disabled";
         else if (!o.PasswordLogin && !(user.Kind == UserKind.Local && user.IsBreakGlass && user.Role == UserRole.Admin)) refusal = "password_login_disabled";
         if (refusal is not null)
         {
@@ -117,7 +120,9 @@ public static class AuthEndpoints
         await audit.WriteAsync("auth.password_changed", user.UserName ?? "", null, user.Id, ct);
 
         var next = await LoginFlow.NextAsync(user, options.Value, await SettingsAsync(db, ct), users, totpVerified: true);
-        if (next == LoginSteps.Done) await LoginFlow.SignInFullAsync(ctx, user);
+        // From an existing session the re-issued cookie keeps its sign-in time (the 7-day cap does not restart); a partial
+        // session finishing its password step is a new sign-in.
+        if (next == LoginSteps.Done) await LoginFlow.SignInFullAsync(ctx, user, step == LoginSteps.Done ? LoginFlow.SessionIssuedAt(ctx) : null);
         else await LoginFlow.SignInPartialAsync(ctx, user, next);
         return Results.Ok(new { next });
     }

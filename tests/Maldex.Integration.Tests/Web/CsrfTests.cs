@@ -171,4 +171,41 @@ public sealed class CsrfTests(SqlServerFixture sql) : IDisposable
         Assert.StartsWith("maldex=", plain);
         Assert.DoesNotContain("; secure", plain, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public async Task Ipv6_literal_origin_matches_its_host()
+    {
+        using var client = _factory.CreateClient();
+        using (var req = new HttpRequestMessage(HttpMethod.Post, "/api/auth/logout"))
+        {
+            req.Headers.Host = "[::1]:5080";
+            req.Headers.Add("Origin", "http://[::1]:5080");
+            Assert.Equal(HttpStatusCode.NoContent, (await client.SendAsync(req, Ct)).StatusCode);
+        }
+        using (var req = new HttpRequestMessage(HttpMethod.Post, "/api/auth/logout"))
+        {
+            req.Headers.Host = "[::1]:5080";
+            req.Headers.Add("Origin", "http://[::2]:5080");
+            await AssertErrorAsync(await client.SendAsync(req, Ct), "origin");
+        }
+    }
+
+    [Fact]
+    public async Task Partial_cookie_is_host_prefixed_and_secure_over_https()
+    {
+        using var f = new PeerFactory(sql);
+        await LocalAuth.SeedUserAsync(f, "alice", "correct horse battery", UserRole.Analyst, u => u.MustChangePassword = true);
+        using var client = f.CreateClient(new Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactoryClientOptions { HandleCookies = false });
+
+        using var https = new HttpRequestMessage(HttpMethod.Post, "/api/auth/login") { Content = JsonContent.Create(new { userName = "alice", password = "correct horse battery" }) };
+        https.Headers.Add("X-Test-Peer", "127.0.0.1");
+        https.Headers.Add("X-Forwarded-Proto", "https");
+        var resp = await client.SendAsync(https, Ct);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var partial = Assert.Single(resp.Headers.GetValues("Set-Cookie"), c => c.Contains("maldex-partial=") && !c.Contains("expires=Thu, 01 Jan 1970"));
+        Assert.StartsWith("__Host-maldex-partial=", partial);
+        Assert.Contains("; secure", partial, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("; path=/", partial, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("domain=", partial, StringComparison.OrdinalIgnoreCase);
+    }
 }

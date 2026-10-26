@@ -138,9 +138,9 @@ public sealed class LocalLoginTests(SqlServerFixture sql) : IDisposable
 
         for (var i = 0; i < 5; i++)
             await AssertErrorAsync(await LoginAsync(client, "alice", "wrong password " + i), HttpStatusCode.Unauthorized, "invalid");
+        // While locked the password is not checked at all (ruling T2-1): right or wrong, the answer is "locked", and uncounted.
+        await AssertErrorAsync(await LoginAsync(client, "alice", "wrong password x"), HttpStatusCode.Unauthorized, "locked");
         await AssertErrorAsync(await LoginAsync(client, "alice", Password), HttpStatusCode.Unauthorized, "locked");
-        // A wrong password while locked does not reveal the lock.
-        await AssertErrorAsync(await LoginAsync(client, "alice", "wrong password x"), HttpStatusCode.Unauthorized, "invalid");
 
         await using (var scope = f.Services.CreateAsyncScope())
         {
@@ -149,6 +149,7 @@ public sealed class LocalLoginTests(SqlServerFixture sql) : IDisposable
             Assert.True(row.LockoutEnd > DateTimeOffset.UtcNow.AddMinutes(14));
             Assert.True(row.LockoutEnd < DateTimeOffset.UtcNow.AddMinutes(16));
             Assert.Contains(await db.AuditLogs.ToListAsync(Ct), a => a.Action == "auth.lockout" && a.UserId == alice.Id);
+            Assert.Equal(0, row.AccessFailedCount); // Identity resets the count when it locks; attempts while locked are not counted
         }
 
         await UpdateUserAsync(f, alice.Id, u => u.LockoutEnd = DateTimeOffset.UtcNow.AddMinutes(-1));
@@ -379,6 +380,71 @@ public sealed class LocalLoginTests(SqlServerFixture sql) : IDisposable
         clock.Advance(TimeSpan.FromHours(12) + TimeSpan.FromMinutes(1));
         Assert.Equal(HttpStatusCode.Unauthorized, (await idle.GetAsync("/api/me", Ct)).StatusCode);
     }
+
+    [Fact]
+    public async Task Password_change_in_a_session_keeps_the_seven_day_cap()
+    {
+        var clock = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        var f = new ClockFactory(sql, clock);
+        _disposables.Add(f);
+        await LocalAuth.SeedUserAsync(f, "alice", Password, UserRole.Analyst);
+        using var client = await LocalAuth.SignInAsync(f, "alice", Password);
+
+        // Three days in, the user changes the password from the session: the cookie is re-issued but keeps the original sign-in time.
+        for (var i = 0; i < 12; i++)
+        {
+            clock.Advance(TimeSpan.FromHours(6));
+            Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/me", Ct)).StatusCode);
+        }
+        var change = await client.PostAsJsonAsync("/api/auth/password", new { currentPassword = Password, newPassword = "a brand new passphrase" }, Ct);
+        await AssertNextAsync(change, "done");
+        for (var i = 0; i < 15; i++)
+        {
+            clock.Advance(TimeSpan.FromHours(6));
+            Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/me", Ct)).StatusCode);
+        }
+        clock.Advance(TimeSpan.FromHours(6) + TimeSpan.FromMinutes(1));
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/me", Ct)).StatusCode);
+    }
+
+    [Fact]
+    public async Task Row_with_a_user_name_the_validators_refuse_can_still_sign_in()
+    {
+        var f = Factory();
+        var row = TestUsers.Create(UserRole.Analyst, "Odd");
+        row.UserName = "odd!name";
+        row.NormalizedUserName = "ODD!NAME";
+        row.LockoutEnabled = true;
+        row.PasswordHash = new PasswordHasher<AppUser>().HashPassword(row, Password);
+        await using (var scope = f.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+            db.Users.Add(row);
+            await db.SaveChangesAsync(Ct);
+        }
+        using var client = f.CreateClient();
+
+        await AssertNextAsync(await LoginAsync(client, "odd!name", Password), "done");
+        Assert.Equal("Odd", (await client.GetFromJsonAsync<JsonElement>("/api/me", Ct)).GetProperty("displayName").GetString());
+        await using (var scope = f.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+            Assert.NotNull((await db.Users.SingleAsync(u => u.Id == row.Id, Ct)).LastSignInAt);
+        }
+    }
+
+    [Theory]
+    [InlineData("192.0.2.10", "192.0.2.10")]
+    [InlineData("::ffff:192.0.2.10", "192.0.2.10")]
+    [InlineData("2001:db8:1:2:aaaa:bbbb:cccc:dddd", "2001:db8:1:2::/64")]
+    [InlineData("2001:db8:1:2::1", "2001:db8:1:2::/64")]
+    [InlineData("::1", "::/64")]
+    public void Rate_limit_key_is_the_ipv4_address_or_the_ipv6_slash_64(string address, string key) =>
+        Assert.Equal(key, Maldex.Web.Auth.LocalAuthSetup.RateLimitKey(IPAddress.Parse(address)));
+
+    [Fact]
+    public void Rate_limit_key_without_an_address_is_one_bucket() =>
+        Assert.Equal("unknown", Maldex.Web.Auth.LocalAuthSetup.RateLimitKey(null));
 
     [Fact]
     public async Task Login_is_audited()

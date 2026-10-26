@@ -93,7 +93,7 @@ public sealed class AuthAndOrgTests(SqlServerFixture sql) : IDisposable
     }
 
     [Fact]
-    public void DevHeaders_IgnoredInProduction()
+    public void DevMode_InProduction_ExitsAtStartupValidation()
     {
         // Startup validation refuses Dev auth outside Development/Testing before the host is built (exit 78).
         using var prod = new MaldexAppFactory(sql, environment: "Production", authMode: "Dev");
@@ -102,7 +102,7 @@ public sealed class AuthAndOrgTests(SqlServerFixture sql) : IDisposable
     }
 
     [Fact]
-    public void DevAuth_RejectedInStaging()
+    public void DevMode_InStaging_ExitsAtStartupValidation()
     {
         using var staging = new MaldexAppFactory(sql, environment: "Staging", authMode: "Dev");
         var ex = Assert.ThrowsAny<Exception>(() => staging.CreateClient());

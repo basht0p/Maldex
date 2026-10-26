@@ -1,8 +1,10 @@
 using System.Globalization;
 using System.Security.Claims;
 using Maldex.Core.Domain;
+using Maldex.Data;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 
 namespace Maldex.Web.Auth;
@@ -30,20 +32,29 @@ public static class LoginFlow
     /// Issues the session cookie (claims: user id, security stamp, <c>maldex:iat</c>, <c>maldex:method</c> = <c>password</c> for
     /// a local user or <c>sso</c> for an SSO user), deletes the partial cookie and records <see cref="AppUser.LastSignInAt"/>.
     /// </summary>
-    public static async Task SignInFullAsync(HttpContext ctx, AppUser user)
+    public static Task SignInFullAsync(HttpContext ctx, AppUser user) => SignInFullAsync(ctx, user, issuedAt: null);
+
+    /// <summary>
+    /// As above; <paramref name="issuedAt"/> keeps an existing session's sign-in time (a password change re-issues the cookie but
+    /// must not restart the 7-day cap). Null means now.
+    /// </summary>
+    public static async Task SignInFullAsync(HttpContext ctx, AppUser user, DateTimeOffset? issuedAt)
     {
         var services = ctx.RequestServices;
         var users = services.GetRequiredService<UserManager<AppUser>>();
         var now = services.GetRequiredService<TimeProvider>().GetUtcNow();
+        // Straight through the context, not UserManager.UpdateAsync: the user validators must not keep an existing row (a legacy
+        // or SSO user name, say) from signing in. The user entity is tracked by this request's context.
+        var db = services.GetRequiredService<MaldexDbContext>();
         user.LastSignInAt = now;
-        var updated = await users.UpdateAsync(user);
-        if (!updated.Succeeded) throw new InvalidOperationException("Could not record the sign-in: " + string.Join("; ", updated.Errors.Select(e => e.Code)));
+        if (db.Entry(user).State == EntityState.Detached) db.Attach(user).Property(u => u.LastSignInAt).IsModified = true;
+        await db.SaveChangesAsync(ctx.RequestAborted);
 
         var identity = new ClaimsIdentity(AuthSchemes.Application, ClaimTypes.Name, ClaimTypes.Role);
         identity.AddClaim(new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()));
         identity.AddClaim(new Claim(ClaimTypes.Name, user.UserName ?? ""));
         identity.AddClaim(new Claim(StampClaimType(services), await users.GetSecurityStampAsync(user)));
-        identity.AddClaim(new Claim(MaldexClaims.IssuedAt, now.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture), ClaimValueTypes.Integer64));
+        identity.AddClaim(new Claim(MaldexClaims.IssuedAt, (issuedAt ?? now).ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture), ClaimValueTypes.Integer64));
         identity.AddClaim(new Claim(MaldexClaims.Method, user.Kind == UserKind.Sso ? "sso" : "password"));
 
         await ctx.SignInAsync(AuthSchemes.Application, new ClaimsPrincipal(identity), new AuthenticationProperties { IsPersistent = true });
@@ -103,6 +114,13 @@ public static class LoginFlow
         }
         return null;
     }
+
+    /// <summary>The <c>maldex:iat</c> of the signed-in session (the request principal), if there is one.</summary>
+    public static DateTimeOffset? SessionIssuedAt(HttpContext ctx) =>
+        ctx.User.Identity is { IsAuthenticated: true } identity && identity.AuthenticationType == AuthSchemes.Application
+        && long.TryParse(ctx.User.FindFirstValue(MaldexClaims.IssuedAt), NumberStyles.None, CultureInfo.InvariantCulture, out var iat)
+            ? DateTimeOffset.FromUnixTimeSeconds(iat)
+            : null;
 
     private static string StampClaimType(IServiceProvider services) =>
         services.GetRequiredService<IOptions<IdentityOptions>>().Value.ClaimsIdentity.SecurityStampClaimType;
