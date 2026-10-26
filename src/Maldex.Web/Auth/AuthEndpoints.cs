@@ -13,10 +13,9 @@ public sealed record ChangePasswordRequest(string? CurrentPassword, string? NewP
 /// <summary><c>/api/auth</c>: sign-in options, password sign-in, password change and sign-out.</summary>
 public static class AuthEndpoints
 {
-    /// <summary>A hash of a random password, verified against when the user does not exist, so both failures cost the same.</summary>
     /// <summary>The audit target of a failed sign-in with a user name that matches no user.</summary>
     internal const string UnknownUserTarget = "(unknown)";
-
+    /// <summary>A hash of a random password, verified against when the user does not exist, so both failures cost the same.</summary>
     private static readonly Lazy<string> DummyHash = new(() => new PasswordHasher<AppUser>().HashPassword(new AppUser(), Guid.NewGuid().ToString("N")));
 
     public static void Map(IEndpointRouteBuilder app)

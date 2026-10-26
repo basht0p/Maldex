@@ -5,7 +5,7 @@ import forms from '../forms.module.css'
 import { AuthedImage } from './shared'
 import styles from './report.module.css'
 
-/** `src` is an API path; it is fetched with the bearer token, never put in an `<img>` as is. */
+/** `src` is a same-origin API path, loaded with the session cookie. */
 export interface LightboxItem { src: string; caption: string }
 
 /** Modal image viewer. ArrowLeft/ArrowRight wrap, Escape closes. Pass `onIndex` to control the index from the parent. */
