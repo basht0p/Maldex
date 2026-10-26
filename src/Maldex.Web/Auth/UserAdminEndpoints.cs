@@ -59,7 +59,7 @@ public static class UserAdminEndpoints
     private static IResult Failure(UserAdminResult r) => AuthEndpoints.Error(r.Error switch
     {
         "not_found" => StatusCodes.Status404NotFound,
-        "duplicate_user_name" or "last_admin" or "role_managed_by_idp" or "break_glass_requires_local_admin" => StatusCodes.Status409Conflict,
+        "duplicate_user_name" or "concurrent_update" or "last_admin" or "role_managed_by_idp" or "break_glass_requires_local_admin" => StatusCodes.Status409Conflict,
         _ => StatusCodes.Status400BadRequest,
     }, r.Error ?? "invalid");
 }

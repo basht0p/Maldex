@@ -4,7 +4,9 @@ using Maldex.Data;
 using Maldex.Web.Audit;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Options;
+using System.Data;
 
 namespace Maldex.Web.Auth;
 
@@ -70,7 +72,16 @@ public sealed partial class UserAdminService(UserManager<AppUser> users, MaldexD
             MustChangePassword = r.MustChangePassword,
             CreatedAt = time.GetUtcNow(),
         };
-        var created = await users.CreateAsync(user, r.Password ?? "");
+        IdentityResult created;
+        try
+        {
+            created = await users.CreateAsync(user, r.Password ?? "");
+        }
+        catch (DbUpdateException ex) when (CurrentUser.IsUniqueViolation(ex))
+        {
+            db.ChangeTracker.Clear();
+            return UserAdminResult.Fail("duplicate_user_name");
+        }
         if (!created.Succeeded) return UserAdminResult.Fail(CreateErrorCode(created));
 
         await audit.WriteAsync("user.create", userName, $"role={role}; breakGlass={r.IsBreakGlass}; mustChangePassword={r.MustChangePassword}", actorId, ct);
@@ -79,22 +90,47 @@ public sealed partial class UserAdminService(UserManager<AppUser> users, MaldexD
 
     public async Task<UserAdminResult> UpdateAsync(Guid id, UpdateUserRequest r, Guid? actorId, CancellationToken ct = default)
     {
+        // The last-admin check and the save run in one SERIALIZABLE transaction, so two concurrent demotions cannot both pass.
+        // A deadlock victim (1205) is retried once, against whatever the winner committed.
+        for (var attempt = 0; ; attempt++)
+        {
+            await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
+            try
+            {
+                var (result, details) = await UpdateCoreAsync(id, r, ct);
+                if (details is null) return result; // refused, or nothing to change: nothing written
+                await tx.CommitAsync(ct);
+                await audit.WriteAsync("user.update", result.User!.UserName, details, actorId, ct);
+                return result;
+            }
+            catch (Exception ex) when (IsDeadlock(ex))
+            {
+                db.ChangeTracker.Clear();
+                if (attempt >= 1) return UserAdminResult.Fail("concurrent_update");
+            }
+        }
+    }
+
+    private static bool IsDeadlock(Exception ex) => ex.GetBaseException() is SqlException { Number: 1205 };
+
+    private async Task<(UserAdminResult result, string? details)> UpdateCoreAsync(Guid id, UpdateUserRequest r, CancellationToken ct)
+    {
         var user = await users.FindByIdAsync(id.ToString());
-        if (user is null) return UserAdminResult.Fail("not_found");
+        if (user is null) return (UserAdminResult.Fail("not_found"), null);
 
         var role = user.Role;
         if (r.Role is not null)
         {
-            if (!TryParseRole(r.Role, out var parsed)) return UserAdminResult.Fail("invalid_role");
+            if (!TryParseRole(r.Role, out var parsed)) return (UserAdminResult.Fail("invalid_role"), null);
             if (parsed != user.Role && user.Kind == UserKind.Sso && !string.IsNullOrEmpty(Auth.Oidc.RoleClaim))
-                return UserAdminResult.Fail("role_managed_by_idp");
+                return (UserAdminResult.Fail("role_managed_by_idp"), null);
             role = parsed;
         }
         var displayName = user.DisplayName;
         if (r.DisplayName is not null)
         {
             displayName = r.DisplayName.Trim();
-            if (displayName.Length is 0 or > 200) return UserAdminResult.Fail("invalid_display_name");
+            if (displayName.Length is 0 or > 200) return (UserAdminResult.Fail("invalid_display_name"), null);
         }
 
         var after = new AppUser
@@ -106,27 +142,28 @@ public sealed partial class UserAdminService(UserManager<AppUser> users, MaldexD
             IsBreakGlass = r.IsBreakGlass ?? (user.IsBreakGlass && role == UserRole.Admin),
         };
         if (after.IsBreakGlass && (after.Kind != UserKind.Local || after.Role != UserRole.Admin))
-            return UserAdminResult.Fail("break_glass_requires_local_admin");
+            return (UserAdminResult.Fail("break_glass_requires_local_admin"), null);
 
         // Only a change that takes away an Admin who could sign in is guarded; an already-locked-out installation can still be edited.
         var wasUsableAdmin = user.Role == UserRole.Admin && AdminGuard.CanSignIn(user, Auth);
         if (wasUsableAdmin && !(after.Role == UserRole.Admin && AdminGuard.CanSignIn(after, Auth))
             && !await AdminGuard.LeavesAnAdminAsync(db, Auth, user.Id, after, ct))
-            return UserAdminResult.Fail("last_admin");
+            return (UserAdminResult.Fail("last_admin"), null);
 
         var changes = new List<string>();
         if (displayName != user.DisplayName) changes.Add("displayName");
         if (role != user.Role) changes.Add($"role {user.Role?.ToString() ?? "none"} -> {role?.ToString() ?? "none"}");
         if (after.IsDisabled != user.IsDisabled) changes.Add($"isDisabled -> {after.IsDisabled}");
-        if (after.IsBreakGlass != user.IsBreakGlass) changes.Add($"isBreakGlass -> {after.IsBreakGlass}");
+        if (after.IsBreakGlass != user.IsBreakGlass)
+            changes.Add($"isBreakGlass -> {after.IsBreakGlass}" + (r.IsBreakGlass is null ? " (cleared: role no longer Admin)" : ""));
+        if (changes.Count == 0) return (UserAdminResult.Success(ToDto(user)), null);
 
         user.DisplayName = displayName;
         user.Role = role;
         user.IsDisabled = after.IsDisabled;
         user.IsBreakGlass = after.IsBreakGlass;
         await SaveWithNewStampAsync(user, ct);
-        await audit.WriteAsync("user.update", user.UserName ?? "", changes.Count == 0 ? "no change" : string.Join("; ", changes), actorId, ct);
-        return UserAdminResult.Success(ToDto(user));
+        return (UserAdminResult.Success(ToDto(user)), string.Join("; ", changes));
     }
 
     /// <summary>

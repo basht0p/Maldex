@@ -342,4 +342,64 @@ public sealed class UserAdminTests(SqlServerFixture sql) : IDisposable
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
         Assert.Contains(await db.AuditLogs.ToListAsync(Ct), a => a.Action == "settings.update");
     }
+
+    [Fact]
+    public async Task Concurrent_demotions_of_the_only_two_admins_never_both_succeed()
+    {
+        for (var round = 0; round < 3; round++)
+        {
+            var f = Factory();
+            var a = await LocalAuth.SeedUserAsync(f, "admin-a", Password, UserRole.Admin);
+            var b = await LocalAuth.SeedUserAsync(f, "admin-b", Password, UserRole.Admin);
+            using var ca = await LocalAuth.SignInAsync(f, "admin-a", Password);
+            using var cb = await LocalAuth.SignInAsync(f, "admin-b", Password);
+
+            var results = await Task.WhenAll(PatchAsync(ca, b.Id, new { role = "Analyst" }), PatchAsync(cb, a.Id, new { role = "Analyst" }));
+            Assert.Equal(1, results.Count(r => r.StatusCode == HttpStatusCode.OK));
+
+            await using var scope = f.Services.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+            Assert.Equal(1, await db.Users.CountAsync(u => u.Role == UserRole.Admin, Ct));
+        }
+    }
+
+    [Fact]
+    public async Task Role_and_disable_in_one_patch_of_the_last_admin_is_refused()
+    {
+        var (_, root, admin) = await AdminAsync();
+        await AssertErrorAsync(await PatchAsync(admin, root.Id, new { role = "Analyst", isDisabled = true }), HttpStatusCode.Conflict, "last_admin");
+    }
+
+    [Fact]
+    public async Task Update_that_changes_nothing_keeps_the_stamp_and_writes_no_audit_row()
+    {
+        var (f, _, admin) = await AdminAsync();
+        var bob = await LocalAuth.SeedUserAsync(f, "bob", Password, UserRole.Analyst);
+        string StampOf() { using var s = f.Services.CreateScope(); return s.ServiceProvider.GetRequiredService<MaldexDbContext>().Users.AsNoTracking().Single(u => u.Id == bob.Id).SecurityStamp!; }
+        var before = StampOf();
+
+        var resp = await PatchAsync(admin, bob.Id, new { displayName = "bob", role = "Analyst", isDisabled = false });
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.Equal("bob", (await JsonAsync(resp)).GetProperty("userName").GetString());
+        Assert.Equal(before, StampOf());
+        await using var scope = f.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        Assert.DoesNotContain(await db.AuditLogs.ToListAsync(Ct), a => a.Action == "user.update");
+    }
+
+    [Fact]
+    public async Task Audit_rows_carry_the_actor_and_note_an_auto_cleared_break_glass()
+    {
+        var (f, root, admin) = await AdminAsync();
+        var glass = await LocalAuth.SeedUserAsync(f, "glass", Password, UserRole.Admin, u => u.IsBreakGlass = true);
+        Assert.Equal(HttpStatusCode.OK, (await PatchAsync(admin, glass.Id, new { role = "Analyst" })).StatusCode);
+        Assert.Equal(HttpStatusCode.Created, (await CreateAsync(admin, "carol")).StatusCode);
+
+        await using var scope = f.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        var rows = await db.AuditLogs.Where(a => a.Action.StartsWith("user.")).ToListAsync(Ct);
+        Assert.NotEmpty(rows);
+        Assert.All(rows, a => Assert.Equal(root.Id, a.UserId));
+        Assert.Contains("isBreakGlass -> False (cleared: role no longer Admin)", rows.Single(a => a.Action == "user.update").Details);
+    }
 }
