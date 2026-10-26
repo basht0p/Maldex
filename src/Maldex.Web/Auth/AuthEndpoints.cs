@@ -26,6 +26,12 @@ public static class AuthEndpoints
             return Results.Ok(new { passwordLogin = o.PasswordLogin, sso = o.Oidc.Enabled ? new { displayName = o.Oidc.DisplayName } : null });
         });
 
+        // Single sign-on: a top-level navigation from the login page; the IdP comes back to /signin-oidc (OidcSetup), which
+        // redirects to returnUrl. Only a local path is kept as returnUrl (no open redirect).
+        auth.MapGet("/sso/start", (string? returnUrl, IOptions<MaldexAuthOptions> options) => options.Value.Oidc.Enabled
+            ? Results.Challenge(new AuthenticationProperties { RedirectUri = SsoSignIn.IsLocalPath(returnUrl) ? returnUrl : "/" }, [OidcSetup.Scheme])
+            : Results.NotFound());
+
         auth.MapPost("/login", LoginAsync).RequireRateLimiting(LocalAuthSetup.LoginRateLimitPolicy);
         auth.MapPost("/password", ChangePasswordAsync);
         auth.MapPost("/logout", LogoutAsync);
