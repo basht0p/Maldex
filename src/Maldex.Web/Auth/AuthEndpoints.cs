@@ -14,6 +14,9 @@ public sealed record ChangePasswordRequest(string? CurrentPassword, string? NewP
 public static class AuthEndpoints
 {
     /// <summary>A hash of a random password, verified against when the user does not exist, so both failures cost the same.</summary>
+    /// <summary>The audit target of a failed sign-in with a user name that matches no user.</summary>
+    internal const string UnknownUserTarget = "(unknown)";
+
     private static readonly Lazy<string> DummyHash = new(() => new PasswordHasher<AppUser>().HashPassword(new AppUser(), Guid.NewGuid().ToString("N")));
 
     public static void Map(IEndpointRouteBuilder app)
@@ -56,7 +59,8 @@ public static class AuthEndpoints
         if (user is null || user.PasswordHash is null)
         {
             users.PasswordHasher.VerifyHashedPassword(new AppUser(), DummyHash.Value, password);
-            await audit.WriteAsync("auth.login_failed", target, "invalid", user?.Id, ct);
+            // An unknown name is not written as typed: people sometimes type their password into the user-name field.
+            await audit.WriteAsync("auth.login_failed", user is null ? UnknownUserTarget : target, "invalid", user?.Id, ct);
             return Error(StatusCodes.Status401Unauthorized, "invalid");
         }
 
@@ -126,10 +130,16 @@ public static class AuthEndpoints
         await users.ResetAccessFailedCountAsync(user);
         await audit.WriteAsync("auth.password_changed", user.UserName ?? "", null, user.Id, ct);
 
+        // From an existing session the re-issued cookie keeps its sign-in time (the 7-day cap does not restart) and stays a full
+        // session: the remaining sign-in steps (a TOTP enrolment required since this sign-in) apply at the next sign-in. A partial
+        // session finishing its password step is a new sign-in and goes on to its next step.
+        if (step == LoginSteps.Done)
+        {
+            await LoginFlow.SignInFullAsync(ctx, user, LoginFlow.SessionIssuedAt(ctx));
+            return Results.Ok(new { next = LoginSteps.Done });
+        }
         var next = await LoginFlow.NextAsync(user, options.Value, await SettingsAsync(db, ct), users, totpVerified: true);
-        // From an existing session the re-issued cookie keeps its sign-in time (the 7-day cap does not restart); a partial
-        // session finishing its password step is a new sign-in.
-        if (next == LoginSteps.Done) await LoginFlow.SignInFullAsync(ctx, user, step == LoginSteps.Done ? LoginFlow.SessionIssuedAt(ctx) : null);
+        if (next == LoginSteps.Done) await LoginFlow.SignInFullAsync(ctx, user);
         else await LoginFlow.SignInPartialAsync(ctx, user, next);
         return Results.Ok(new { next });
     }
