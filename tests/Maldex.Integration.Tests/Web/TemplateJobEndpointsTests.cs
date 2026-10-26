@@ -743,6 +743,7 @@ public sealed class TemplateJobEndpointsTests(SqlServerFixture sql) : IDisposabl
                 o.HttpMessageHandlerFactory = _ => server.CreateHandler();
                 o.Headers["X-Dev-Role"] = role.ToString();
                 o.Headers["X-Dev-User"] = user;
+                o.Headers["X-Maldex-Csrf"] = "1"; // the negotiate POST, as the SPA's SignalR client sends it
                 o.WebSocketFactory = async (ctx, ct) =>
                 {
                     var ws = server.CreateWebSocketClient();

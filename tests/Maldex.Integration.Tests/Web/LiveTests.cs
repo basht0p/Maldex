@@ -104,6 +104,7 @@ public sealed class LiveTests(SqlServerFixture sql) : IDisposable
         {
             h["X-Dev-Role"] = "Analyst";
             h["X-Dev-User"] = user;
+            h["X-Maldex-Csrf"] = "1"; // the negotiate POST, as the SPA's SignalR client sends it
         }
 
         var conn = new HubConnectionBuilder()

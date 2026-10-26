@@ -180,15 +180,10 @@ public sealed class ResubmitTests(SqlServerFixture sql) : IDisposable
         using var client = f.CreateClient(UserRole.Analyst, "analyst");
         var org = await CreateOrgAsync(f.CreateClient(UserRole.Admin, "admin"));
         var src = await SubmitAsync(client, org, file: false);
-        // A second host on the same database, in Entra mode: dev auth would admit an unauthenticated client.
-        var entra = new MaldexAppFactory(sql, authMode: "Entra", connectionString: f.ConnectionString, settings: new Dictionary<string, string?>
-        {
-            ["AzureAd:Instance"] = "https://login.microsoftonline.com/",
-            ["AzureAd:TenantId"] = "00000000-0000-0000-0000-000000000000",
-            ["AzureAd:ClientId"] = "00000000-0000-0000-0000-000000000001",
-        });
-        _factories.Add(entra);
-        using var anonymous = entra.CreateClient();
+        // A second host on the same database, in Local mode: dev auth would admit an unauthenticated client.
+        var local = new MaldexAppFactory(sql, authMode: "Local", connectionString: f.ConnectionString);
+        _factories.Add(local);
+        using var anonymous = local.CreateClient();
 
         var resp = await anonymous.PostAsJsonAsync($"/api/tasks/{src.GetProperty("id").GetGuid()}/resubmit", new { }, Ct);
         Assert.Equal(HttpStatusCode.Unauthorized, resp.StatusCode);

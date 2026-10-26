@@ -1,6 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
   <ItemGroup>
-    <PackageReference Include="Microsoft.Identity.Web" />
     <PackageReference Include="Microsoft.Playwright" />
   </ItemGroup>
   <ItemGroup>
