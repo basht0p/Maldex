@@ -126,9 +126,9 @@ start_backend() {
 }
 
 wait_for_api() {
-  echo "Waiting for http://localhost:5080/api/me ..."
+  echo "Waiting for http://localhost:5080/api/auth/config ..."
   for _ in $(seq 1 120); do
-    if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5080/api/me || true)" = "200" ]; then
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5080/api/auth/config || true)" = "200" ]; then
       echo "Backend is up."; return 0
     fi
     if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
@@ -136,13 +136,15 @@ wait_for_api() {
     fi
     sleep 1
   done
-  echo "Backend did not answer /api/me with 200 in time; log:" >&2
+  echo "Backend did not answer /api/auth/config with 200 in time; log:" >&2
   tail -n 40 "$BACKEND_LOG" >&2
   return 1
 }
 
 # Live development: backend on :5080 plus the Vite dev server (which proxies /api and /hubs to it).
 cmd_run() {
+  # MALDEX_AUTH=local: sign in with local accounts (the dev Admin "dev" / "dev-password-123" is seeded) instead of DevAuth.
+  if [ "${MALDEX_AUTH:-}" = local ]; then export Maldex__Auth__Mode=Local; fi
   cmd_dev_db
   [ -d ui/node_modules ] || npm --prefix ui ci
   trap stop_children EXIT INT TERM
@@ -519,6 +521,7 @@ cmd_package() {
   # 5. bundled assets (tracked files only), the setup command and its library
   git ls-files -z -- deploy rules | tar --null -T - -cf - | tar -xf - -C "$opt"
   install -D -m 0755 packaging/bin/maldex-setup "$opt/bin/maldex-setup"
+  install -D -m 0755 packaging/bin/maldex-admin "$opt/bin/maldex-admin"
   install -D -m 0644 packaging/lib/maldex-common.sh "$opt/lib/maldex-common.sh"
   # The admin template, with RHEL 9's edk2-ovmf firmware paths for the .rpm.
   sed -e 's#/usr/share/OVMF/OVMF_CODE_4M\.secboot\.fd#/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd#' \

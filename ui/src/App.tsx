@@ -1,20 +1,26 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { BrowserRouter, NavLink, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
-import { getMe } from './api/client'
+import { BrowserRouter, Link, NavLink, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
+import { ApiError, getMe } from './api/client'
 import type { MeDto } from './api/types'
 import styles from './App.module.css'
 import markDark from '../../brand/logo/maldex-mark.svg'
 import markLight from '../../brand/logo/maldex-mark-light.svg'
+import { onBlocked, onNoRole, onUnauthorized, safeReturnUrl } from './auth/session'
+import { useSignOut } from './components/useSignOut'
 import { ConfirmProvider } from './kit/Confirm'
 import { ShortcutHelp } from './kit/ShortcutHelp'
 import { ThemeSwitch } from './kit/ThemeSwitch'
 import { ToastProvider } from './kit/Toaster'
 import { applyTheme, loadTheme } from './kit/theme'
 import { useShortcuts } from './kit/useShortcuts'
+import { useToast } from './kit/useToast'
 import { SystemStatusProvider } from './live/SystemStatusProvider'
 import { useSystemStatus } from './live/useSystemStatus'
+import AccountPage from './pages/AccountPage'
+import LoginPage from './pages/LoginPage'
 import MediaPage from './pages/MediaPage'
 import OrgsAdminPage from './pages/OrgsAdminPage'
+import UsersAdminPage from './pages/UsersAdminPage'
 import StatusPage from './pages/StatusPage'
 import SubmitPage from './pages/SubmitPage'
 import TaskPage from './pages/TaskPage'
@@ -22,6 +28,7 @@ import TemplateDetailPage from './pages/TemplateDetailPage'
 import TasksPage from './pages/TasksPage'
 import TemplateJobPage from './pages/TemplateJobPage'
 import TemplatesAdminPage from './pages/TemplatesAdminPage'
+import WaitingPage from './pages/WaitingPage'
 
 applyTheme(loadTheme())
 
@@ -44,6 +51,7 @@ function useNarrow(): boolean {
 const ADMIN_LINKS = [
   { to: '/admin/templates', label: 'Templates' },
   { to: '/admin/media', label: 'Media' },
+  { to: '/admin/users', label: 'Users' },
   { to: '/admin/orgs', label: 'Organizations' },
   { to: '/admin/status', label: 'Status' },
 ]
@@ -94,6 +102,52 @@ function AdminMenu({ narrow }: { narrow: boolean }) {
   )
 }
 
+function UserMenu({ me }: { me: MeDto }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  const signOut = useSignOut()
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) setOpen(false) }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey) }
+  }, [open])
+  return (
+    <div ref={ref} className={styles.menu}>
+      <button type="button" className={styles.menuButton} aria-haspopup="true" aria-expanded={open} onClick={() => setOpen((o) => !o)}>{me.displayName} ({me.role})</button>
+      {open && (
+        <div className={`${styles.menuPanel} ${styles.menuPanelRight}`} onClick={() => setOpen(false)}>
+          <Link to="/account">Account</Link>
+          <button type="button" className={styles.menuItem} onClick={() => void signOut()}>Sign out</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Wires the API client's session hooks to routing and toasts. Renders nothing. */
+function SessionBridge() {
+  const navigate = useNavigate()
+  const toast = useToast()
+  useEffect(() => {
+    const offs = [
+      onUnauthorized(() => {
+        const { pathname, search } = window.location
+        if (pathname === '/login') return
+        const back = safeReturnUrl(pathname + search)
+        const target = pathname === '/waiting' || pathname === '/login' ? '/' : back
+        navigate(`/login?returnUrl=${encodeURIComponent(target)}`, { replace: true })
+      }),
+      onNoRole(() => { if (window.location.pathname !== '/waiting') navigate('/waiting', { replace: true }) }),
+      onBlocked(() => toast.error('Request blocked; reload the page.')),
+    ]
+    return () => offs.forEach((off) => off())
+  }, [navigate, toast])
+  return null
+}
+
 function Shell() {
   const [me, setMe] = useState<MeDto | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -105,8 +159,18 @@ function Shell() {
   const location = useLocation()
 
   useEffect(() => {
-    getMe().then(setMe, (e: unknown) => setError(e instanceof Error ? e.message : 'Could not load the current user.'))
-  }, [])
+    getMe().then(
+      (m) => {
+        if (m.role === null) navigate('/waiting', { replace: true })
+        else setMe(m)
+      },
+      (e: unknown) => {
+        // A 401 or no_role is already routed by SessionBridge.
+        if (e instanceof ApiError && (e.status === 401 || e.code === 'no_role')) return
+        setError(e instanceof Error ? e.message : 'Could not load the current user.')
+      },
+    )
+  }, [navigate])
 
   const isAdmin = me?.role === 'Admin'
 
@@ -127,7 +191,10 @@ function Shell() {
     'g t': () => navigate('/'),
     'g s': () => navigate('/submit'),
   }
-  if (isAdmin) shortcuts['g a'] = () => navigate('/admin/templates')
+  if (isAdmin) {
+    shortcuts['g a'] = () => navigate('/admin/templates')
+    shortcuts['g u'] = () => navigate('/admin/users')
+  }
   useShortcuts(shortcuts)
 
   const links = (
@@ -150,7 +217,7 @@ function Shell() {
           <button type="button" className={styles.menuButton} aria-expanded={menuOpen} onClick={() => setMenuOpen((o) => !o)}>Menu</button>
         ) : links}
         <span className={styles.spacer} />
-        {me && <span className={styles.user}>{me.displayName} ({me.role})</span>}
+        {me && <UserMenu me={me} />}
         <ThemeSwitch />
       </nav>
       {narrow && menuOpen && <div className={styles.drawer} onClick={() => setMenuOpen(false)}>{links}</div>}
@@ -160,6 +227,7 @@ function Shell() {
           <Route path="/" element={<TasksPage />} />
           <Route path="/submit" element={<SubmitPage maxUploadBytes={me?.maxUploadBytes} />} />
           <Route path="/tasks/:id" element={<TaskPage />} />
+          <Route path="/admin/users" element={<UsersAdminPage me={me} />} />
           <Route path="/admin/orgs" element={<OrgsAdminPage me={me} />} />
           <Route path="/admin/templates" element={<TemplatesAdminPage me={me} />} />
           <Route path="/admin/templates/:id" element={<TemplateDetailPage me={me} />} />
@@ -179,7 +247,13 @@ export default function App() {
     <BrowserRouter>
       <ToastProvider>
         <ConfirmProvider>
-          <Shell />
+          <SessionBridge />
+          <Routes>
+            <Route path="/login" element={<LoginPage />} />
+            <Route path="/account" element={<AccountPage />} />
+            <Route path="/waiting" element={<WaitingPage />} />
+            <Route path="*" element={<Shell />} />
+          </Routes>
         </ConfirmProvider>
       </ToastProvider>
     </BrowserRouter>

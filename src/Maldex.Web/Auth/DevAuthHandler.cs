@@ -26,31 +26,27 @@ public sealed class DevAuthHandler(
     : AuthenticationHandler<AuthenticationSchemeOptions>(options, logger, encoder)
 {
     public const string SchemeName = "Dev";
-    public static readonly Guid DefaultOid = Guid.Parse("00000000-0000-0000-0000-000000000001");
+
+    /// <summary>The Users.UserName of the dev account for a display name: <c>dev-</c> plus 12 hex characters of SHA-256("dev:" + name).</summary>
+    public static string DevUserName(string name) =>
+        "dev-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("dev:" + name)))[..12].ToLowerInvariant();
 
     protected override Task<AuthenticateResult> HandleAuthenticateAsync()
     {
         if (!env.IsDevelopment() && !env.IsEnvironment("Testing"))
             return Task.FromResult(AuthenticateResult.Fail($"Dev auth is not allowed in {env.EnvironmentName}"));
 
-        var oid = DefaultOid;
         var name = "Dev User";
         var role = ParseRole(devOptions.Value.DevRole) ?? UserRole.Admin;
 
         var user = Request.Headers["X-Dev-User"].ToString();
-        if (!string.IsNullOrWhiteSpace(user))
-        {
-            name = user;
-            oid = new Guid(SHA256.HashData(Encoding.UTF8.GetBytes("dev:" + user)).AsSpan(0, 16));
-        }
+        if (!string.IsNullOrWhiteSpace(user)) name = user;
         role = ParseRole(Request.Headers["X-Dev-Role"].ToString()) ?? role;
 
-        var appRole = role == UserRole.Admin ? AuthSetup.AdminRole : AuthSetup.AnalystRole;
         var identity = new ClaimsIdentity(
         [
-            new Claim("oid", oid.ToString()),
             new Claim(ClaimTypes.Name, name),
-            new Claim("roles", appRole),
+            new Claim(AuthSetup.DevRoleClaim, role.ToString()),
         ], SchemeName, ClaimTypes.Name, ClaimTypes.Role);
         var ticket = new AuthenticationTicket(new ClaimsPrincipal(identity), SchemeName);
         return Task.FromResult(AuthenticateResult.Success(ticket));

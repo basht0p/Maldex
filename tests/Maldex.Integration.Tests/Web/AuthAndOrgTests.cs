@@ -93,24 +93,20 @@ public sealed class AuthAndOrgTests(SqlServerFixture sql) : IDisposable
     }
 
     [Fact]
-    public async Task DevHeaders_IgnoredInProduction()
+    public void DevMode_InProduction_ExitsAtStartupValidation()
     {
+        // Startup validation refuses Dev auth outside Development/Testing before the host is built (exit 78).
         using var prod = new MaldexAppFactory(sql, environment: "Production", authMode: "Dev");
         var ex = Assert.ThrowsAny<Exception>(() => prod.CreateClient());
-        var inner = ex is InvalidOperationException ? ex : ex.InnerException ?? ex;
-        Assert.IsType<InvalidOperationException>(inner);
-        Assert.Equal("Dev auth is not allowed in Production", inner.Message);
-        await Task.CompletedTask;
+        Assert.Contains("exited without ever building", (ex.InnerException ?? ex).Message + ex.Message);
     }
 
     [Fact]
-    public void DevAuth_RejectedInStaging()
+    public void DevMode_InStaging_ExitsAtStartupValidation()
     {
         using var staging = new MaldexAppFactory(sql, environment: "Staging", authMode: "Dev");
         var ex = Assert.ThrowsAny<Exception>(() => staging.CreateClient());
-        var inner = ex is InvalidOperationException ? ex : ex.InnerException ?? ex;
-        Assert.IsType<InvalidOperationException>(inner);
-        Assert.Equal("Dev auth is not allowed in Staging", inner.Message);
+        Assert.Contains("exited without ever building", (ex.InnerException ?? ex).Message + ex.Message);
     }
 
     [Fact]
@@ -129,7 +125,7 @@ public sealed class AuthAndOrgTests(SqlServerFixture sql) : IDisposable
         using var client = _factory.CreateClient();
         var resp = await client.GetAsync("/api/me", Ct);
         Assert.Equal(
-            "default-src 'self'; connect-src 'self' https://login.microsoftonline.com; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
+            "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
             resp.Headers.GetValues("Content-Security-Policy").Single());
         Assert.Equal("nosniff", resp.Headers.GetValues("X-Content-Type-Options").Single());
         Assert.Equal("no-referrer", resp.Headers.GetValues("Referrer-Policy").Single());

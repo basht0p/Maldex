@@ -13,7 +13,7 @@ using Microsoft.Extensions.Options;
 namespace Maldex.Web.Endpoints;
 
 public sealed record SystemStatusDto(VmSlotStatusDto VmSlot, int QueueDepth, int RunningTasks, int ActiveJobs,
-    IReadOnlyList<DiskStatusDto> Disks, IReadOnlyList<WorkerStatusDto> Workers, IReadOnlyList<RecentFailureDto> RecentFailures, DateTimeOffset GeneratedAt);
+    IReadOnlyList<DiskStatusDto> Disks, IReadOnlyList<WorkerStatusDto> Workers, IReadOnlyList<RecentFailureDto> RecentFailures, IReadOnlyList<string> AuthWarnings, DateTimeOffset GeneratedAt);
 public sealed record VmSlotStatusDto(int Capacity, int Busy, IReadOnlyList<SlotHolderDto> Holders);
 /// <summary>Kind is "task" or "job".</summary>
 public sealed record SlotHolderDto(string Kind, Guid Id, string Label, DateTimeOffset Since);
@@ -30,7 +30,7 @@ public static class StatusEndpoints
     {
         app.MapGet("/api/admin/status", async (MaldexDbContext db, WorkerHealth health, IDiskUsageProbe disks, TimeProvider time,
             IOptions<OrchestratorOptions> orchestrator, IOptions<ArtifactStoreOptions> artifacts, IOptions<LibvirtOptions> libvirt,
-            IOptions<MediaOptions> media, CancellationToken ct) =>
+            IOptions<MediaOptions> media, IOptions<MaldexAuthOptions> auth, CancellationToken ct) =>
         {
             var now = time.GetUtcNow();
 
@@ -70,7 +70,7 @@ public static class StatusEndpoints
                 .Select(w => new WorkerStatusDto(w.Name, w.LastTickAt, (int)Math.Ceiling(w.ExpectedInterval.TotalSeconds), w.Stalled)).ToList();
 
             return new SystemStatusDto(new VmSlotStatusDto(orchestrator.Value.MaxConcurrentVms, busy, holders),
-                queueDepth, runningTasks, activeJobs, diskStatus, workers, failures, now);
+                queueDepth, runningTasks, activeJobs, diskStatus, workers, failures, await AdminGuard.BreakGlassWarnings(db, auth.Value, ct), now);
         }).RequireAuthorization(AuthSetup.AdminPolicy);
 
         return app;

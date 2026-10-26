@@ -21,3 +21,5 @@
 .table th, .table td { padding: 0.35rem 0.6rem; text-align: left; border-bottom: 1px solid var(--mx-border); }
 .stalled { padding: 0.05rem 0.5rem; border: 1px solid var(--mx-critical); border-radius: 999px; color: var(--mx-critical); font-size: 0.75rem; font-weight: 700; text-transform: uppercase; }
 .stalled::before { content: '\26A0\00a0'; }
+.warning { border-color: var(--mx-warning); }
+.warning h2::before { content: '\26A0\00a0'; color: var(--mx-warning); }

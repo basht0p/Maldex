@@ -17,6 +17,7 @@ using Maldex.Web.Reports;
 using Maldex.Web.Security;
 using Maldex.Web.Templates;
 using Microsoft.AspNetCore.Http.Features;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 
@@ -78,6 +79,23 @@ if (builder.Environment.IsProduction() && builder.Configuration["Maldex:Mode"] =
     return StartupChecks.ConfigErrorExitCode;
 }
 
+// Sign-in configuration (Maldex:Auth): an unsupported mode, Dev outside Development/Testing, or no way to sign in at all.
+if (AuthStartupValidation.Problem(builder.Configuration, builder.Environment) is { } authProblem)
+{
+    Console.Error.WriteLine(authProblem);
+    return StartupChecks.ConfigErrorExitCode;
+}
+
+// `Maldex.Web admin <command>`: bootstrap and recovery of local accounts against the configured database, without starting the web host
+// (the packaged /opt/maldex/bin/maldex-admin wraps it). Exit codes: 0 done, 1 refused, 64 usage error, 78 configuration error.
+if (args.Length > 0 && args[0] == "admin")
+{
+    using var cancelled = new CancellationTokenSource();
+    Console.CancelKeyPress += (_, e) => { e.Cancel = true; cancelled.Cancel(); };
+    return await AdminCli.RunAsync(args[1..], builder.Configuration, builder.Environment, Console.In, Console.Out, Console.Error,
+        new ConsolePasswordPrompt(), cancelled.Token);
+}
+
 builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddDbContext<MaldexDbContext>(o => o.UseSqlServer(
     builder.Configuration.GetConnectionString("Maldex")
@@ -126,17 +144,26 @@ await using (var scope = app.Services.CreateAsyncScope())
         scope.ServiceProvider.GetRequiredService<IOptions<SubmissionOptions>>().Value.Images,
         scope.ServiceProvider.GetRequiredService<TimeProvider>(),
         scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("Maldex.TemplateImport"), CancellationToken.None);
-    if (app.Environment.IsDevelopment()) await DevSeed.SeedAsync(db);
+    if (app.Environment.IsDevelopment()) await DevSeed.SeedAsync(scope.ServiceProvider);
 }
 
+// A TLS proxy on this host (the app listens on loopback) sets the scheme and host the browser used, and the client address.
+// Only loopback peers are trusted (the KnownProxies / KnownNetworks defaults).
+app.UseForwardedHeaders(new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedProto | ForwardedHeaders.XForwardedHost | ForwardedHeaders.XForwardedFor,
+});
 app.UseMiddleware<SecurityHeadersMiddleware>();
 // The built React SPA is copied into wwwroot by ./build.sh build; it is served same-origin with the API.
 app.UseStaticFiles();
 app.UseWebSockets();
+app.UseMiddleware<CsrfMiddleware>();
+app.UseRateLimiter();
 app.UseAuthentication();
 app.UseMiddleware<CurrentUserMiddleware>();
 app.UseAuthorization();
 
+app.MapMaldexAuthEndpoints();
 app.MapMeEndpoints();
 app.MapOrgEndpoints();
 app.MapStatusEndpoints();

@@ -20,7 +20,7 @@ public class PersistenceTests(SqlServerFixture sql)
     private static (OrgEntity org, AppUser user, Sample sample) Seed(MaldexDbContext db)
     {
         var org = new OrgEntity { Id = Guid.NewGuid(), Name = "Acme-" + Guid.NewGuid().ToString("N"), RetentionDays = 30 };
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "A", Role = UserRole.Analyst };
+        var user = TestUsers.Create(UserRole.Analyst, "A");
         var sample = new Sample { Sha256 = Sha('a'), Sha1 = new string('b', 40), Md5 = new string('c', 32), Size = 5, BlobKey = "k", FirstSeen = Now };
         db.AddRange(org, user, sample);
         return (org, user, sample);

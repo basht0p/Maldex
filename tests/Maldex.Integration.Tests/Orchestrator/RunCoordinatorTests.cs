@@ -159,7 +159,7 @@ internal sealed class OrchestratorHarness : IAsyncDisposable
             blobKey = blob.Key;
         }
         var org = new OrgEntity { Id = Guid.NewGuid(), Name = "Org-" + Guid.NewGuid().ToString("N"), RetentionDays = 30 };
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "A", Role = UserRole.Analyst };
+        var user = TestUsers.Create(UserRole.Analyst, "A");
         var sample = new Sample { Sha256 = sha, Sha1 = new string('b', 40), Md5 = new string('c', 32), Size = 5, BlobKey = blobKey, FirstSeen = Time.GetUtcNow() };
         var task = new AnalysisTask
         {

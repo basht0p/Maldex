@@ -12,7 +12,7 @@ afterAll(() => server.close())
 
 describe('OrgsAdminPage', () => {
   it('scrolls the organizations table inside its panel', async () => {
-    renderWithKit(<OrgsAdminPage me={{ id: 'u1', displayName: 'Dev', role: 'Admin', maxUploadBytes: 1024 }} />)
+    renderWithKit(<OrgsAdminPage me={{ id: 'u1', displayName: 'Dev', role: 'Admin', kind: 'Local', totpEnabled: false, isBreakGlass: false, roleManagedByIdp: false, maxUploadBytes: 1024 }} />)
     await screen.findByLabelText('Name of Acme')
     expect(screen.getByRole('table').parentElement?.className).toMatch(/tableScroll/)
   })

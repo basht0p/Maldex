@@ -13,12 +13,13 @@ export default defineConfig({
     // folder is added: the repo root also holds .data/ (samples, artifacts), which the dev server must never serve.
     fs: { allow: [searchForWorkspaceRoot(process.cwd()), '../brand'] },
     proxy: {
-      // The live-view WebSocket. It must come before '/api' (first match wins) and keep the browser's Host header
-      // (changeOrigin: false): the backend only accepts an upgrade whose Origin matches its Host, and the browser sends
-      // Origin http://localhost:5173. The backend sees Host localhost:5173 and Origin http://localhost:5173: same origin.
-      '^/api/tasks/[^/]+/tunnel': { target: backend, changeOrigin: false, ws: true },
-      '/api': { target: backend, changeOrigin: true },
-      '/hubs': { target: backend, changeOrigin: true, ws: true },
+      // Every entry keeps the browser's Host header (changeOrigin: false). The backend refuses an /api or /hubs request (and a
+      // WebSocket upgrade) whose Origin is not its own {scheme}://{Host}, and the browser sends Origin http://localhost:5173 on
+      // every mutation and upgrade; with Host localhost:5173 the two match. The SSO callback needs it too, so redirect_uri
+      // matches. vite.config.test.ts runs this table through a real dev server.
+      '/api': { target: backend, changeOrigin: false, ws: true }, // ws: the live-view tunnels (/api/tasks/{id}/tunnel, /api/admin/template-jobs/{id}/tunnel)
+      '/hubs': { target: backend, changeOrigin: false, ws: true },
+      '/signin-oidc': { target: backend, changeOrigin: false },
     },
   },
   test: {

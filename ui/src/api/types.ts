@@ -14,10 +14,27 @@ export const NETWORK_MODES: readonly NetworkMode[] = ['None', 'Simulated', 'Live
 export interface MeDto {
   id: string
   displayName: string
-  role: UserRole
+  /** Null when the account has no Maldex role yet (the waiting page). */
+  role: UserRole | null
+  kind: 'Local' | 'Sso'
+  totpEnabled: boolean
+  isBreakGlass: boolean
+  /** True when an identity provider assigns the role (SSO). */
+  roleManagedByIdp: boolean
   /** The effective submit cap in bytes; files over it are refused before upload. */
   maxUploadBytes: number
 }
+
+export interface AuthConfigDto {
+  passwordLogin: boolean
+  sso: { displayName: string } | null
+}
+/** The next sign-in step the server wants. */
+export type AuthNext = 'done' | 'totp' | 'change-password' | 'enrol-totp'
+export interface AuthNextDto { next: AuthNext }
+export interface TotpSetupDto { sharedKey: string; otpauthUri: string }
+export interface RecoveryCodesDto { recoveryCodes: string[] }
+export interface TotpConfirmDto extends RecoveryCodesDto { next: AuthNext }
 
 export interface OrgDto {
   id: string
@@ -433,5 +450,36 @@ export interface SystemStatusDto {
   disks: DiskStatusDto[]
   workers: WorkerStatusDto[]
   recentFailures: RecentFailureDto[]
+  /** Plain-language auth configuration warnings (for example a missing break-glass account). */
+  authWarnings: string[]
   generatedAt: string
 }
+
+export interface UserDto {
+  id: string
+  userName: string
+  displayName: string
+  kind: 'Local' | 'Sso'
+  role: UserRole | null
+  isDisabled: boolean
+  totpEnabled: boolean
+  isBreakGlass: boolean
+  roleManagedByIdp: boolean
+  createdAt: string
+  lastSignInAt: string | null
+}
+export interface CreateUserRequest {
+  userName: string
+  displayName: string
+  role: UserRole
+  password: string
+  mustChangePassword: boolean
+  isBreakGlass: boolean
+}
+export interface UpdateUserRequest {
+  displayName?: string
+  role?: UserRole | 'none'
+  isDisabled?: boolean
+  isBreakGlass?: boolean
+}
+export interface AuthSettingsDto { requireTotpForLocal: boolean }

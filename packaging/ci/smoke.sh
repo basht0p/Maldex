@@ -63,5 +63,95 @@ else
   fail "$cfg missing"
 fi
 
+# maldex-admin is installed and refuses a non-root caller (spec §8)
+if [ -x /usr/sbin/maldex-admin ] && [ -x /opt/maldex/bin/maldex-admin ]; then
+  if [ "$(id -u)" != 0 ] || ! command -v runuser >/dev/null 2>&1; then
+    pass "maldex-admin installed (the non-root refusal is checked only as root with runuser)"
+  elif out="$(runuser -u maldex-isuser -- /usr/sbin/maldex-admin list 2>&1)"; rc=$?; [ "$rc" = 1 ] && grep -q 'must be run as root' <<<"$out"; then
+    pass "maldex-admin refuses a non-root caller"
+  else
+    fail "maldex-admin as a non-root user: exit $rc, '$out'"
+  fi
+else
+  fail "/usr/sbin/maldex-admin not installed"
+fi
+
+# ---- the app, started the way the unit starts it (as maldex, from /var/lib/maldex, with the unit's Environment= lines) ----
+# With MALDEX_SMOKE_SQL (a connection string to a throwaway SQL Server; smoke-deb) the app runs against it: maldex-admin creates
+# an admin and POST /api/auth/login must accept it. Without it the connection string points at a closed port and the check is that
+# GET /api/auth/config answers before the database error. If the app exits before serving, that is reported and the check falls
+# back to --print-paths (asserted above); see the ruling in the task 9 report.
+APP_URL=http://127.0.0.1:5080
+APP_LOG=/tmp/maldex-smoke-app.log
+if [ -f "$unit" ] && [ -f "$cfg" ]; then
+  if [ -n "${MALDEX_SMOKE_SQL:-}" ]; then
+    cs="$MALDEX_SMOKE_SQL"; mode=db
+  else
+    cs="Server=127.0.0.1,1;Database=maldex;User Id=maldex;Password=smoke;TrustServerCertificate=True;Connect Timeout=2"; mode=closed
+  fi
+  case "$cs" in *\"*|*\\*) fail "the smoke connection string may not contain a quote or backslash"; cs="" ;; esac
+  if [ -n "$cs" ]; then
+    # keeps the file's mode and owner (root:maldex 0640): the template's empty ConnectionStrings:Maldex gets the value
+    shopt -u patsub_replacement 2>/dev/null || true
+    body="$(cat "$cfg")"
+    if [[ "$body" == *'"Maldex": ""'* ]]; then
+      printf '%s\n' "${body/'"Maldex": ""'/\"Maldex\": \"$cs\"}" > "$cfg"
+    else
+      fail "$cfg has no empty ConnectionStrings:Maldex to fill"
+    fi
+
+    admin_ok=1
+    if [ "$mode" = db ]; then
+      smoke_pw="$(head -c 24 /dev/urandom | base64 | tr -d '/+=')Aa1"
+      if out="$(printf '%s\n' "$smoke_pw" | /usr/sbin/maldex-admin create-user smoke --admin --password-stdin 2>&1)"; then
+        pass "maldex-admin create-user smoke --admin"
+      else
+        fail "maldex-admin create-user failed: $out"; admin_ok=0
+      fi
+      if [ "$admin_ok" = 1 ]; then
+        if out="$(/usr/sbin/maldex-admin list --json 2>&1)" && grep -q '"userName":"smoke"' <<<"$out" && grep -q '^#config ' <<<"$out"; then
+          pass "maldex-admin list --json shows the admin and the #config line"
+        else
+          fail "maldex-admin list --json: $out"
+        fi
+      fi
+    fi
+
+    mapfile -t unit_env < <(sed -n 's/^Environment=//p' "$unit")
+    (cd /var/lib/maldex && exec runuser -u maldex -- env "${unit_env[@]}" /opt/maldex/app/Maldex.Web) > "$APP_LOG" 2>&1 &
+    app_pid=$!
+    served=0; exited=0; config_json=""
+    for _ in $(seq 1 60); do
+      if config_json="$(curl -fsS --max-time 3 "$APP_URL/api/auth/config" 2>/dev/null)"; then served=1; break; fi
+      if ! kill -0 "$app_pid" 2>/dev/null; then exited=1; break; fi
+      sleep 1
+    done
+    if [ "$served" = 1 ]; then
+      if grep -q '"passwordLogin":true' <<<"$config_json"; then pass "GET /api/auth/config answers ($mode)"; else fail "GET /api/auth/config: $config_json"; fi
+      if [ "$mode" = db ] && [ "$admin_ok" = 1 ]; then
+        login="$(printf '{"userName":"smoke","password":"%s"}' "$smoke_pw" \
+          | curl -sS --max-time 20 -X POST -H 'Content-Type: application/json' -H 'X-Maldex-Csrf: 1' --data-binary @- "$APP_URL/api/auth/login" 2>&1)"
+        if grep -q '"next":"done"' <<<"$login"; then pass "POST /api/auth/login signs the admin in"; else fail "POST /api/auth/login: $login"; fi
+      fi
+    elif [ "$exited" = 0 ]; then
+      fail "the app is running but did not serve $APP_URL/api/auth/config within 60 s"; tail -n 40 "$APP_LOG" >&2
+    elif [ "$mode" = db ]; then
+      wait "$app_pid" 2>/dev/null; fail "the app exited (status $?) instead of serving against the smoke database"; tail -n 40 "$APP_LOG" >&2
+    else
+      # Closed database port: the app migrates before it listens, so it may only die of the database error. Exit 78 (a
+      # configuration error) or any other crash fails the smoke.
+      wait "$app_pid" 2>/dev/null; app_rc=$?
+      if [ "$app_rc" != 78 ] && grep -qE 'SqlException|network-related|error: 40|A network-related or instance-specific error' "$APP_LOG"; then
+        pass "app start against a closed port: exited ($app_rc) with the database connection error, as expected"
+      else
+        fail "app start against a closed port: exit status $app_rc without a database connection error in the log"; tail -n 40 "$APP_LOG" >&2
+      fi
+    fi
+    if [ "$exited" = 0 ]; then kill "$app_pid" 2>/dev/null; pkill -u maldex -f /opt/maldex/app/Maldex.Web 2>/dev/null; wait "$app_pid" 2>/dev/null; fi
+  fi
+else
+  fail "no unit file or config to start the app from"
+fi
+
 if [ "$FAILS" -ne 0 ]; then echo "smoke ($KIND): $FAILS assertion(s) failed" >&2; exit 1; fi
 echo "smoke ($KIND): all assertions passed"

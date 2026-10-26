@@ -193,7 +193,7 @@ internal sealed class TemplateJobRig : IAsyncDisposable
         rig.Guest.ProvenanceRealTimeProtection = false;
 
         await using var db = rig.H.NewContext();
-        var admin = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "basht0p", Role = UserRole.Admin };
+        var admin = TestUsers.Create(UserRole.Admin, "basht0p");
         db.Users.Add(admin);
         await db.SaveChangesAsync(Ct);
         rig.AdminId = admin.Id;

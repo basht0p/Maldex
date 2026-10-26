@@ -160,6 +160,10 @@ contents:
     dst: /opt/maldex/bin/maldex-setup
     file_info:
       mode: 0755
+  - src: packaging/stage/opt/maldex/bin/maldex-admin
+    dst: /opt/maldex/bin/maldex-admin
+    file_info:
+      mode: 0755
   - src: packaging/stage/opt/maldex/lib/maldex-common.sh
     dst: /opt/maldex/lib/maldex-common.sh
     file_info:
@@ -179,6 +183,9 @@ contents:
   # ---- commands on PATH ----
   - src: /opt/maldex/bin/maldex-setup
     dst: /usr/sbin/maldex-setup
+    type: symlink
+  - src: /opt/maldex/bin/maldex-admin
+    dst: /usr/sbin/maldex-admin
     type: symlink
   - src: /opt/maldex/mitmproxy/mitmdump
     dst: /usr/bin/mitmdump

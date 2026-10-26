@@ -71,7 +71,7 @@ MALdex is an internal tool, not a commercial product. It is built from a custom 
 
 ### Operations
 
-- **Entra ID SSO** with `Analyst` and `Admin` app roles (`DevAuth` in development).
+- **Local accounts by default, optional OIDC SSO.** Built-in users with `Analyst` and `Admin` roles, lockout, optional TOTP and break-glass admins; any OpenID Connect provider (Entra ID, Keycloak, ...) can be added for single sign-on (`DevAuth` in development).
 - **Org tagging.** Every task belongs to a customer org, and each org has its own retention window, enforced by a nightly job.
 - **Audit log** of submissions, downloads, session joins, deletions and admin changes.
 - **Safe rendering.** Guest-derived strings are always shown as text, never as HTML. The SPA and the reports run under a strict CSP.
@@ -205,7 +205,7 @@ Release packages are built and signed by the release workflow: a `.deb` for Ubun
 
    **RHEL: install INetSim by hand.** EL9 has no INetSim package (not in the base repositories, not in EPEL), so the rpm cannot depend on it. Install it from the [INetSim release tarball](https://www.inetsim.org/downloads.html) and its Perl dependencies so that `/usr/bin/inetsim` and its data directory `/var/lib/inetsim` exist, then create its system user: `sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin inetsim`. `maldex-setup` checks all three. The rpm also links `/usr/bin/qemu-system-x86_64` to RHEL's `/usr/libexec/qemu-kvm`, the emulator path the VMs use.
 
-3. **Configure.** Edit `/etc/maldex/appsettings.Production.json` (mode 0640, `root:maldex`): set the SQL Server connection string and the `AzureAd` section (tenant, client ID, audience). No SQL Server yet? See [SQL Server Express on the same host](#sql-server-express-on-the-same-host).
+3. **Configure the database.** Edit `/etc/maldex/appsettings.Production.json` (mode 0640, `root:maldex`) and set the SQL Server connection string. Nothing else is required: sign-in uses local accounts, and single sign-on is optional (see [Single sign-on](#single-sign-on-optional)). No SQL Server yet? See [SQL Server Express on the same host](#sql-server-express-on-the-same-host).
 
 4. **Run the host setup.**
 
@@ -215,11 +215,105 @@ Release packages are built and signed by the release workflow: a `.deb` for Ubun
 
    It installs and checks the rest of the host (libvirt/KVM, mitmproxy, guest tooling, Sysmon and the virtio drivers), then restarts maldex and checks that it stays up; if it does not, `journalctl -u maldex -n 50` names the problem. `maldex-setup --check` re-runs only the read-only checks.
 
+   **First admin.** Right after the database check, setup creates the first Maldex admin if no enabled admin exists yet: it asks for a user name (default `admin`) and then, without echo, for a password (12 to 256 characters). Run it from a terminal for this. Without one the step fails and prints the command to run yourself: `sudo maldex-admin create-user <name> --admin`. Re-running setup later does nothing here once an enabled admin exists, and `maldex-setup --check` fails while there is none. Reading the users needs root, so `--check` reaches `maldex-admin` through `sudo -n`; run as a user without passwordless sudo, its `admin` line fails with the exit status instead of a verdict, so run `sudo maldex-setup --check` for that line.
+
    **Offline.** On a host without internet access, copy `Sysmon.zip` and `virtio-win.iso` into a directory and run `sudo maldex-setup --offline <dir>`. Offline mode does not cover the OS packages (use a local mirror) or the Playwright Chromium that PDF reports need. To include Chromium, install it on a connected host with the same Maldex version (`PLAYWRIGHT_BROWSERS_PATH=$PWD/ms-playwright /opt/maldex/app/Maldex.Web --install-browsers --no-deps`) and copy that `ms-playwright` directory to `<dir>/ms-playwright`; maldex-setup copies it to `/var/lib/maldex/ms-playwright`. Without it, setup warns, finishes, and everything except PDF reports works; add Chromium later with `sudo maldex-setup` once the host can reach the Playwright CDN.
 
-5. **Open the app.** It listens on `http://127.0.0.1:5080` only; reach it through an SSH forward (`ssh -L 5080:127.0.0.1:5080 <host>`) or a reverse proxy you provide. Then build the first guest image under **Admin → Sandbox Templates → New template**.
+5. **Sign in.** The app listens on `http://127.0.0.1:5080` only; reach it through an SSH forward (`ssh -L 5080:127.0.0.1:5080 <host>`, then open `http://127.0.0.1:5080`) or a reverse proxy you provide, and sign in with the admin from step 4. Create analyst accounts under **Admin → Users** (or with `maldex-admin`, see below), then build the first guest image under **Admin → Sandbox Templates → New template**.
+
+   **Behind a TLS reverse proxy,** the proxy runs on the same host, forwards to `127.0.0.1:5080` and must set `X-Forwarded-Proto`, `X-Forwarded-Host` and `X-Forwarded-For`. Maldex honours these headers only from a loopback client. They decide the cookie's `Secure` flag and the single sign-on redirect URI, so without them HTTPS sign-in and SSO break. SSO needs an HTTPS origin unless you use the SSH forward (`http://127.0.0.1` counts as a secure context in browsers; any other plain-HTTP address is not supported). The sign-in rate limit (10 requests a minute) is kept per client address, so everyone who comes in through an SSH forward shares the one `127.0.0.1` allowance, and a local process can set `X-Forwarded-For` to get a fresh one; the per-account lockout still limits password guessing.
 
 Restarting or upgrading the maldex package, restarting `maldex-host-guard`, or re-running `maldex-setup` (which restarts maldex) stops any running analysis VMs; let runs finish first.
+
+### Single sign-on (optional)
+
+Local accounts work with no identity provider. To also let people sign in with a standard **OpenID Connect** provider (Entra ID, Keycloak, Okta, ...), set `Maldex:Auth:Oidc` in `/etc/maldex/appsettings.Production.json` and run `sudo systemctl restart maldex`. SAML is not supported.
+
+Register Maldex at the provider as a web application with the redirect (callback) URI **`<origin>/signin-oidc`**, where `<origin>` is the URL people open, for example `https://maldex.example.com/signin-oidc`. Behind a reverse proxy, see the forwarded-header note in step 5 above: the redirect URI Maldex sends is built from `X-Forwarded-Proto` and `X-Forwarded-Host`. Maldex uses the authorization code flow with PKCE.
+
+| Key (under `Maldex:Auth`) | Meaning |
+| --- | --- |
+| `PasswordLogin` | `true` (default) keeps the password form for everyone. `false` turns password sign-in off except for break-glass local admins (below). It needs `Oidc.Enabled=true`, or Maldex refuses to start. |
+| `Oidc.Enabled` | `true` switches SSO on. Startup then checks the other keys and exits with status 78 and a message if they are wrong. |
+| `Oidc.DisplayName` | The label on the sign-in button ("Sign in with Company SSO"). |
+| `Oidc.Authority` | The issuer URL. It must be `https://` and serve `/.well-known/openid-configuration`. |
+| `Oidc.ClientId` / `Oidc.ClientSecret` | The registration's client. The secret is optional: without one Maldex acts as a public client (PKCE only), for providers that allow it. The secret sits in the same `0640 root:maldex` file as the database password. |
+| `Oidc.Scopes` | Default `openid profile email`. Add the scope your provider needs to release the role or group claim. |
+| `Oidc.NameClaim` | Claim for the display name, default `name` (falls back to `preferred_username`, then `email`, then `sub`). |
+| `Oidc.RoleClaim`, `AdminValues`, `AnalystValues` | The role mapping, below. |
+
+**Who is who.** An SSO user is identified by the provider's issuer and `sub` claim, never by e-mail or user name, so an SSO sign-in never takes over a local account with the same name. Changing `Authority` therefore creates new users instead of re-binding the old ones.
+
+**Roles.**
+
+- *With a mapping* (`RoleClaim` set): the provider decides at every sign-in. All values of that claim are read; the user is **Admin** if any value is in `AdminValues`, else **Analyst** if any is in `AnalystValues`, else the sign-in is refused ("your account has no Maldex role") and audited. `AdminValues` must not be empty. Values are compared **exactly: case-sensitive**, after trimming spaces. Roles of SSO users are then managed by the provider and cannot be changed in Maldex.
+- *Without a mapping* (`RoleClaim` empty): a new SSO user starts with **no access** and sees a "waiting for an administrator" page until an admin grants a role under **Admin → Users** (or `maldex-admin set-role`). Existing users keep their role.
+
+**Break-glass admins.** With `PasswordLogin=false` an identity-provider outage would lock everyone out. A **break-glass** account is a local Admin that may still use a password (and must use TOTP) while password login is off. Create one with `sudo maldex-admin create-user <name> --admin --break-glass`, or mark an existing local admin with `sudo maldex-admin set-break-glass <name> on`. The password form stays reachable at `/login?local=1` for these accounts. `maldex-setup --check` warns when password login is off, SSO is on and no break-glass admin exists, and `maldex-setup` creates the first admin as break-glass when password login is off.
+
+**Entra ID example.**
+
+1. In the Entra admin center, **App registrations → New registration**. Choose a single tenant, platform **Web**, and the redirect URI `https://maldex.example.com/signin-oidc`.
+2. **Certificates & secrets → New client secret**; copy the secret value.
+3. **App roles → Create app role** twice: display name *Maldex Admin*, value `Maldex.Admin`, allowed member types *Users/Groups*; and *Maldex Analyst* with value `Maldex.Analyst`.
+4. In **Enterprise applications** for the same app, **Users and groups**, assign people or groups to the roles. (Turn on *Assignment required* to keep everyone else out.)
+5. Configure Maldex:
+
+   ```jsonc
+   "Maldex": { "Auth": {
+     "Oidc": {
+       "Enabled": true,
+       "DisplayName": "Contoso",
+       "Authority": "https://login.microsoftonline.com/<tenant-id>/v2.0",
+       "ClientId": "<application (client) id>",
+       "ClientSecret": "<secret value>",
+       "RoleClaim": "roles",
+       "AdminValues": ["Maldex.Admin"],
+       "AnalystValues": ["Maldex.Analyst"]
+     }
+   }}
+   ```
+
+**Keycloak example.**
+
+1. In the realm, **Clients → Create client**: client type *OpenID Connect*, a client ID such as `maldex`, **Client authentication on** (a confidential client), the standard flow only, and the valid redirect URI `https://maldex.example.com/signin-oidc`. Copy the secret from the **Credentials** tab.
+2. **Clients → maldex → Client scopes → maldex-dedicated → Add mapper → By configuration → Group Membership**: token claim name `groups`, **Full group path off**, add to ID token on.
+3. Create the groups (for example `maldex-admins`, `maldex-analysts`) and add the users.
+4. Configure Maldex:
+
+   ```jsonc
+   "Maldex": { "Auth": {
+     "Oidc": {
+       "Enabled": true,
+       "DisplayName": "Keycloak",
+       "Authority": "https://keycloak.example.com/realms/<realm>",
+       "ClientId": "maldex",
+       "ClientSecret": "<client secret>",
+       "RoleClaim": "groups",
+       "AdminValues": ["maldex-admins"],
+       "AnalystValues": ["maldex-analysts"]
+     }
+   }}
+   ```
+
+### Managing users from the command line
+
+Accounts are managed in the app under **Admin → Users** (create users, reset passwords, change roles, disable, clear TOTP, mark break-glass, and the *Require TOTP for local accounts* switch). `maldex-admin` does the same from the host and works when nobody can sign in. It must run as root, runs the app as the `maldex` user against the configured database, and never takes a password as an argument: you are asked twice without echo, or you pipe it in with `--password-stdin` (one line on stdin).
+
+```bash
+sudo maldex-admin list [--json]
+sudo maldex-admin create-user <name> [--admin|--analyst] [--display-name <text>] [--break-glass] [--password-stdin]
+sudo maldex-admin reset-password <name> [--reset-totp] [--password-stdin]
+sudo maldex-admin set-break-glass <name> on|off
+sudo maldex-admin disable <name>        # and: enable <name>
+sudo maldex-admin set-role <name> admin|analyst|none
+```
+
+- `create-user` makes a local user (analyst unless `--admin`); users created here do **not** have to change their password at first sign-in. Names are 1 to 64 characters of letters, digits and `. _ @ -`; passwords are 12 to 256 characters.
+- `list` shows name, kind (local or SSO), role, disabled, TOTP, break-glass and last sign-in; `--json` is for scripts.
+- Changes that would leave no enabled admin able to sign in are refused (exit status 1), and so is changing the role of an SSO user while a role mapping is configured. Other exit codes: 64 for a usage error, 78 for a configuration or database error. Every change is written to the audit log with no acting user and details starting `via maldex-admin: <command line>`.
+
+**Recovering a locked-out admin.** Five failed attempts lock an account for 15 minutes. Wrong passwords at sign-in, wrong TOTP or recovery codes, and a wrong current password when changing the password or the TOTP settings all count. To get back in right away, or after losing the password or the authenticator, run `sudo maldex-admin reset-password <name> --reset-totp` (leave out `--reset-totp` to keep the authenticator). It sets the new password, clears the lockout and ends the user's open sessions within five minutes. If every admin is gone, create a new one with `sudo maldex-admin create-user <name> --admin`.
 
 ### SQL Server Express on the same host
 

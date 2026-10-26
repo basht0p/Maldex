@@ -30,7 +30,7 @@ const dto = (over: Partial<SystemStatusDto> = {}): SystemStatusDto => ({
     { name: 'retention', lastTickAt: null, expectedIntervalSec: 3600, stalled: true },
   ],
   recentFailures: [{ kind: 'task', id: 't9', label: '<img src=x onerror=alert(1)>', reason: 'bad‮reason', at: '2026-10-25T08:00:00Z' }],
-  generatedAt: '2026-10-25T10:00:05Z', ...over,
+  authWarnings: [], generatedAt: '2026-10-25T10:00:05Z', ...over,
 })
 
 const page = () => renderWithKit(<SystemStatusProvider enabled><StatusPage /></SystemStatusProvider>, { route: '/admin/status' })
@@ -43,6 +43,20 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers())
 
 describe('StatusPage', () => {
+  it('shows auth warnings', async () => {
+    getSystemStatus.mockResolvedValue(dto({ authWarnings: ['No break-glass administrator is configured.', 'Single sign-on is unreachable.'] }))
+    page()
+    const panel = (await screen.findByRole('heading', { name: 'Authentication warnings' })).parentElement as HTMLElement
+    expect(within(panel).getByText('No break-glass administrator is configured.')).toBeInTheDocument()
+    expect(within(panel).getByText('Single sign-on is unreachable.')).toBeInTheDocument()
+  })
+
+  it('hides the auth warnings panel when there are none', async () => {
+    page()
+    await screen.findByText('2 of 2 in use')
+    expect(screen.queryByRole('heading', { name: 'Authentication warnings' })).toBeNull()
+  })
+
   it('renders slot holders, counts, disks with thresholds, workers and failures', async () => {
     page()
     expect(await screen.findByText('2 of 2 in use')).toBeInTheDocument()

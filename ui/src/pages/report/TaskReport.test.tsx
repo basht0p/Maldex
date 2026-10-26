@@ -199,16 +199,15 @@ describe('TaskReport', () => {
     await waitFor(() => expect(saved).toEqual(['task-t1-events.csv', 'task-t1-events.json']))
   })
 
-  it('loads screenshots with an authenticated fetch and shows Not available when one fails', async () => {
+  it('loads screenshots as plain images and shows Not available when one fails to load', async () => {
     renderReport()
     expect(screen.getByRole('button', { name: '+2' })).toBeInTheDocument()
-    // s1 answers 401: a Not available tile, never a raw <img src> to the API.
-    expect(await screen.findByText('Not available')).toBeInTheDocument()
-    await waitFor(() => expect(screen.getAllByRole('img', { name: /^Screenshot at / })).toHaveLength(3))
-    for (const img of screen.getAllByRole('img', { name: /^Screenshot at / })) expect(img.getAttribute('src')).toMatch(/^blob:/)
-    // An image that fetched but does not decode also becomes the tile.
-    fireEvent.error(screen.getAllByRole('img', { name: /^Screenshot at / })[0])
-    expect(screen.getAllByText('Not available')).toHaveLength(2)
+    const imgs = screen.getAllByRole('img', { name: /^Screenshot at / })
+    expect(imgs).toHaveLength(4)
+    for (const img of imgs) expect(img.getAttribute('src')).toMatch(/^\/api\/artifacts\/.+\/image$/)
+    fireEvent.error(imgs[0])
+    expect(screen.getAllByText('Not available')).toHaveLength(1)
+    expect(screen.getAllByRole('img', { name: /^Screenshot at / })).toHaveLength(3)
   })
 
   it('shows processing warnings on the Overview as text, and nothing when there are none', () => {
