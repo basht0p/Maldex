@@ -65,7 +65,7 @@ public sealed class CsrfTests(SqlServerFixture sql) : IDisposable
         req.Headers.Add("Origin", "https://evil.example");
         await AssertErrorAsync(await client.SendAsync(req, Ct), "origin");
 
-        // A foreign Origin is refused on reads under /api as well, and a malformed one is foreign.
+        // A foreign Origin is refused on reads under /api as well (5173 is foreign to Host localhost), and a malformed one is foreign.
         using var get = new HttpRequestMessage(HttpMethod.Get, "/api/auth/config");
         get.Headers.Add("Origin", "http://localhost:5173");
         await AssertErrorAsync(await client.SendAsync(get, Ct), "origin");
@@ -94,6 +94,20 @@ public sealed class CsrfTests(SqlServerFixture sql) : IDisposable
             Assert.NotEqual(HttpStatusCode.Forbidden, resp.StatusCode);
             Assert.True(resp.IsSuccessStatusCode, origin);
         }
+    }
+
+    /// <summary>
+    /// The dev loop: Vite on :5173 forwards the browser's Host (changeOrigin: false, pinned by ui/vite.config.test.ts), so the
+    /// backend sees Host localhost:5173 with Origin http://localhost:5173, which is same-origin.
+    /// </summary>
+    [Fact]
+    public async Task Request_through_the_vite_dev_proxy_is_same_origin()
+    {
+        using var client = _factory.CreateClient(new Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactoryClientOptions { BaseAddress = new Uri("http://localhost:5173") });
+        using var req = new HttpRequestMessage(HttpMethod.Post, "/api/auth/logout");
+        req.Headers.Add("Origin", "http://localhost:5173");
+        var resp = await client.SendAsync(req, Ct);
+        Assert.Equal(HttpStatusCode.NoContent, resp.StatusCode);
     }
 
     /// <summary>Sets the connection's peer address from <c>X-Test-Peer</c> before the app's middleware, as a real socket would.</summary>
