@@ -205,7 +205,7 @@ Release packages are built and signed by the release workflow: a `.deb` for Ubun
 
    **RHEL: install INetSim by hand.** EL9 has no INetSim package (not in the base repositories, not in EPEL), so the rpm cannot depend on it. Install it from the [INetSim release tarball](https://www.inetsim.org/downloads.html) and its Perl dependencies so that `/usr/bin/inetsim` and its data directory `/var/lib/inetsim` exist, then create its system user: `sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin inetsim`. `maldex-setup` checks all three. The rpm also links `/usr/bin/qemu-system-x86_64` to RHEL's `/usr/libexec/qemu-kvm`, the emulator path the VMs use.
 
-3. **Configure.** Edit `/etc/maldex/appsettings.Production.json` (mode 0640, `root:maldex`): set the SQL Server connection string and the `AzureAd` section (tenant, client ID, audience).
+3. **Configure.** Edit `/etc/maldex/appsettings.Production.json` (mode 0640, `root:maldex`): set the SQL Server connection string and the `AzureAd` section (tenant, client ID, audience). No SQL Server yet? See [SQL Server Express on the same host](#sql-server-express-on-the-same-host).
 
 4. **Run the host setup.**
 
@@ -220,6 +220,76 @@ Release packages are built and signed by the release workflow: a `.deb` for Ubun
 5. **Open the app.** It listens on `http://127.0.0.1:5080` only; reach it through an SSH forward (`ssh -L 5080:127.0.0.1:5080 <host>`) or a reverse proxy you provide. Then build the first guest image under **Admin → Sandbox Templates → New template**.
 
 Restarting or upgrading the maldex package, restarting `maldex-host-guard`, or re-running `maldex-setup` (which restarts maldex) stops any running analysis VMs; let runs finish first.
+
+### SQL Server Express on the same host
+
+Maldex needs a SQL Server database. If your organization already runs SQL Server, ask for an empty database and a login that owns it, and skip this section. Otherwise you can run the free **SQL Server 2025 Express** edition on the Maldex host itself. Express is limited to 50 GB per database, 4 cores and about 1.4 GB of buffer memory, which is enough for one Maldex host with retention enabled. Maldex creates its tables itself on first start, so you only need an empty database and a login.
+
+Run these steps before step 3 above.
+
+1. **Add Microsoft's repositories and install SQL Server and `sqlcmd`.**
+
+   On Ubuntu 24.04:
+
+   ```bash
+   curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+   curl -fsSL https://packages.microsoft.com/config/ubuntu/24.04/mssql-server-2025.list | sudo tee /etc/apt/sources.list.d/mssql-server-2025.list
+   curl -fsSL https://packages.microsoft.com/config/ubuntu/24.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+   sudo apt-get update
+   sudo apt-get install -y mssql-server
+   sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
+   ```
+
+   On RHEL 9:
+
+   ```bash
+   curl -fsSL https://packages.microsoft.com/config/rhel/9/mssql-server-2025.repo | sudo tee /etc/yum.repos.d/mssql-server-2025.repo
+   curl -fsSL https://packages.microsoft.com/config/rhel/9/prod.repo | sudo tee /etc/yum.repos.d/mssql-release.repo
+   sudo dnf install -y mssql-server
+   sudo ACCEPT_EULA=Y dnf install -y mssql-tools18 unixODBC-devel
+   ```
+
+   With SELinux enforcing, you can also `sudo dnf install -y mssql-server-selinux` to run SQL Server confined.
+
+2. **Configure SQL Server as Express.** Generate an `sa` password, run the setup without prompts, then limit SQL Server to loopback and cap its memory. By default SQL Server takes 80% of the host's RAM, which the analysis VMs need.
+
+   ```bash
+   SA_PW="$(openssl rand -base64 24 | tr -d '/+=')Aa1"
+   sudo MSSQL_PID=Express ACCEPT_EULA=Y MSSQL_SA_PASSWORD="$SA_PW" /opt/mssql/bin/mssql-conf -n setup
+   sudo /opt/mssql/bin/mssql-conf set network.ipaddress 127.0.0.1
+   sudo /opt/mssql/bin/mssql-conf set memory.memorylimitmb 2048
+   sudo systemctl restart mssql-server
+   systemctl is-active mssql-server
+   ```
+
+   Keep `$SA_PW` in your password manager; it is the only administrator login.
+
+3. **Create the database and the Maldex login.** The login owns only the `maldex` database. Both passwords reach `sqlcmd` through the environment, so they don't appear in the process list.
+
+   ```bash
+   DB_PW="$(openssl rand -base64 24 | tr -d '/+=')Aa1"
+   SQLCMDPASSWORD="$SA_PW" MALDEX_DB_PW="$DB_PW" /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -C -b <<'SQL'
+   CREATE DATABASE maldex;
+   GO
+   CREATE LOGIN maldex WITH PASSWORD = '$(MALDEX_DB_PW)', DEFAULT_DATABASE = maldex;
+   GO
+   USE maldex;
+   CREATE USER maldex FOR LOGIN maldex;
+   ALTER ROLE db_owner ADD MEMBER maldex;
+   GO
+   SQL
+   ```
+
+4. **Print the connection string** and paste it into `ConnectionStrings:Maldex` in `/etc/maldex/appsettings.Production.json` (step 3 above). Then clear the variables.
+
+   ```bash
+   echo "Server=127.0.0.1,1433;Database=maldex;User Id=maldex;Password=$DB_PW;TrustServerCertificate=True"
+   unset SA_PW DB_PW
+   ```
+
+   `TrustServerCertificate=True` is needed because SQL Server uses a self-signed certificate. The generated passwords contain no `;` or quotes, which would break the connection string. `sudo maldex-setup` then checks that it can reach the database.
+
+SQL Server listens on 127.0.0.1 only, so you don't need to open a firewall port. Back up the database with your usual tooling (`BACKUP DATABASE maldex TO DISK = ...` through `sqlcmd`). Express has no SQL Server Agent jobs to schedule this, so use a cron job or systemd timer.
 
 ## Development progress
 
