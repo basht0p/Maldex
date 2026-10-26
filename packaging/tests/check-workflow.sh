@@ -48,6 +48,30 @@ if [ -f "$WF" ]; then
   # a top-level concurrency group keyed on the ref, never cancelling a run in progress (a re-pushed tag must not race a release)
   conc=$(awk '/^concurrency:/{c=1;next} /^[^ #]/{c=0} c' "$WF")
   if printf '%s\n' "$conc" | grep -qE '^  group: .*\$\{\{ github\.ref \}\}' && printf '%s\n' "$conc" | grep -qE '^  cancel-in-progress: false$'; then ok "concurrency group per ref, no cancel-in-progress"; else fail "release.yml needs a top-level concurrency: group keyed on github.ref with cancel-in-progress: false"; fi
+
+  # smoke-deb runs the app against a throwaway SQL Server Express container (the smoke then creates an admin and signs in)
+  debjob=$(awk '/^  smoke-deb:/{j=1;print;next} /^  [A-Za-z0-9_-]+:[ \t]*$/{j=0} j' "$WF")
+  if printf '%s\n' "$debjob" | grep -q 'mcr.microsoft.com/mssql/server:2025-latest' \
+     && printf '%s\n' "$debjob" | grep -q 'MSSQL_PID=Express' && printf '%s\n' "$debjob" | grep -q 'ACCEPT_EULA=Y' \
+     && printf '%s\n' "$debjob" | grep -q 'MALDEX_SMOKE_SQL'; then
+    ok "smoke-deb has an mssql service and MALDEX_SMOKE_SQL"
+  else
+    fail "smoke-deb needs the mssql 2025-latest container (MSSQL_PID=Express, ACCEPT_EULA=Y) and MALDEX_SMOKE_SQL"
+  fi
+  # smoke-rpm stays database-free (the closed-port variant of the smoke)
+  if printf '%s\n' "$rpmjob" | grep -q 'MALDEX_SMOKE_SQL\|mssql'; then fail "smoke-rpm must not use SQL Server"; else ok "smoke-rpm has no SQL Server"; fi
+  # the SA password: generated in the job, masked before anything else, passed on by environment, never literal or echoed
+  sa_ok=1
+  printf '%s\n' "$debjob" | grep -q 'openssl rand' || sa_ok=0
+  printf '%s\n' "$debjob" | grep -q '::add-mask::' || sa_ok=0
+  printf '%s\n' "$debjob" | grep -q 'GITHUB_ENV' || sa_ok=0
+  # no literal password: MSSQL_SA_PASSWORD only appears as a bare name (-e NAME) or an assignment from the generated value
+  if printf '%s\n' "$debjob" | grep -E 'MSSQL_SA_PASSWORD=' | grep -Ev 'MSSQL_SA_PASSWORD="?\$(\{?pw\}?|\{?MSSQL_SA_PASSWORD\}?)"?' | grep -q .; then sa_ok=0; fi
+  # the value is only ever handed on (echo/printf/cat of it may not appear except the add-mask and GITHUB_ENV lines)
+  if printf '%s\n' "$debjob" | grep -E '(echo|printf|cat)[^|>]*(\$pw|\$\{pw\}|MSSQL_SA_PASSWORD|MALDEX_SMOKE_SQL)' \
+       | grep -Ev '::add-mask::|GITHUB_ENV' | grep -q .; then sa_ok=0; fi
+  if printf '%s\n' "$debjob" | grep -qE 'set -x|bash -x|docker (run|exec).*(-e|--env) *MSSQL_SA_PASSWORD=[^$"]'; then sa_ok=0; fi
+  if [ "$sa_ok" = 1 ]; then ok "SA password is generated, not hard-coded or echoed"; else fail "smoke-deb's SA password must be generated (openssl rand), masked (::add-mask::) first, passed via GITHUB_ENV, and never echoed or literal"; fi
 fi
 
 # CI scripts parse

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# maldex-admin: manage Maldex user accounts from the host (spec §8). Run it as root (sudo maldex-admin <command>); it runs
+# `Maldex.Web admin <command>` as the maldex user with the environment maldex.service sets, against the configured database.
+#
+#   maldex-admin create-user <name> [--admin|--analyst] [--display-name <s>] [--break-glass] [--password-stdin]
+#   maldex-admin reset-password <name> [--reset-totp] [--password-stdin]
+#   maldex-admin set-break-glass <name> on|off
+#   maldex-admin disable <name> | enable <name>
+#   maldex-admin set-role <name> admin|analyst|none
+#   maldex-admin list [--json]
+#
+# Passwords are prompted without echo, or read from stdin with --password-stdin; never pass one as an argument.
+# MALDEX_ADMIN_EXEC replaces the executable (tests only). Keep the env values equal to Environment= in maldex.service
+# (packaging/tests/check-package.sh asserts it).
+set -uo pipefail
+
+if [ "$(id -u)" != 0 ]; then
+  echo "maldex-admin must be run as root (sudo maldex-admin ...)" >&2
+  exit 1
+fi
+
+exec runuser -u maldex -- env \
+  ASPNETCORE_ENVIRONMENT=Production \
+  MALDEX_EXTRA_CONFIG=/opt/maldex/app/appsettings.Package.json:/etc/maldex/appsettings.Production.json \
+  ASPNETCORE_CONTENTROOT=/opt/maldex/app \
+  HOME=/var/lib/maldex \
+  "${MALDEX_ADMIN_EXEC:-/opt/maldex/app/Maldex.Web}" admin "$@"

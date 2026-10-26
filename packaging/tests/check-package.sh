@@ -63,7 +63,8 @@ required_dsts() {
   local d dsts
   dsts="$(nfpm_entries | cut -f2)"
   for d in /opt/maldex/app /opt/maldex/agent /opt/maldex/mitmproxy /opt/maldex/deploy /opt/maldex/rules \
-           /opt/maldex/bin/maldex-setup /opt/maldex/lib/maldex-common.sh /usr/sbin/maldex-setup /usr/bin/mitmdump \
+           /opt/maldex/bin/maldex-setup /opt/maldex/bin/maldex-admin /opt/maldex/lib/maldex-common.sh /usr/sbin/maldex-setup \
+           /usr/sbin/maldex-admin /usr/bin/mitmdump \
            /etc/maldex/appsettings.Production.json /etc/maldex/maldex-host-guard.nft /etc/udev/rules.d/99-maldex-kvm.rules \
            /usr/lib/systemd/system/maldex.service /usr/lib/systemd/system/maldex-host-guard.service \
            /usr/lib/systemd/system/guacd.service.d/maldex.conf; do
@@ -249,6 +250,65 @@ template_parses() {
   done
 }
 check "etc/appsettings.Production.json parses (comments stripped) and leaves Mode to the package" template_parses
+
+# ---- maldex-admin (spec §8) ----
+admin_installed() {
+  local blk
+  blk="$(awk '/^  - src: packaging\/stage\/opt\/maldex\/bin\/maldex-admin$/{f=1;next} f&&/^  - /{f=0} f' "$NFPM")"
+  grep -qxF '    dst: /opt/maldex/bin/maldex-admin' <<<"$blk" || OUT+="no content entry for /opt/maldex/bin/maldex-admin"$'\n'
+  grep -qE '^      mode: 0?755$' <<<"$blk" || OUT+="/opt/maldex/bin/maldex-admin is not mode 0755"$'\n'
+  grep -qxF $'/opt/maldex/bin/maldex-admin\t/usr/sbin/maldex-admin\tsymlink\t-' <<<"$(nfpm_entries)" \
+    || OUT+="/usr/sbin/maldex-admin is not a symlink to /opt/maldex/bin/maldex-admin"$'\n'
+  grep -q 'packaging/bin/maldex-admin' "$REPO/build.sh" || OUT+="build.sh does not stage packaging/bin/maldex-admin"$'\n'
+  if [ -d "$PKG/stage" ]; then
+    [ "$(stat -c %a "$PKG/stage/opt/maldex/bin/maldex-admin" 2>/dev/null)" = 755 ] || OUT+="the staged maldex-admin is missing or not 0755"$'\n'
+  fi
+  [ -z "$OUT" ]
+}
+check "maldex-admin installed 0755 and linked in /usr/sbin" admin_installed
+
+# The wrapper gives the app the unit's environment: the four values equal the ones in maldex.service.
+admin_env_matches() {
+  local k v w="$PKG/bin/maldex-admin"
+  for k in ASPNETCORE_ENVIRONMENT MALDEX_EXTRA_CONFIG ASPNETCORE_CONTENTROOT HOME; do
+    v="$(sed -n "s/^Environment=$k=//p" "$UNIT")"
+    [ -n "$v" ] || { OUT+="maldex.service has no $k"$'\n'; continue; }
+    grep -qE "^[[:space:]]+$k=" "$w" && [ "$(sed -n -E "s/^[[:space:]]+$k=([^ ]*)( \\\\)?\$/\\1/p" "$w")" = "$v" ] \
+      || OUT+="maldex-admin does not set $k=$v"$'\n'
+  done
+  grep -q 'id -u' "$w" && grep -q 'must be run as root' "$w" || OUT+="maldex-admin does not refuse non-root"$'\n'
+  grep -q 'MALDEX_ADMIN_EXEC' "$w" || OUT+="maldex-admin lacks the MALDEX_ADMIN_EXEC override"$'\n'
+  [ -z "$OUT" ]
+}
+check "maldex-admin env matches maldex.service" admin_env_matches
+
+# The config template (and the staged rpm copy) carry the Maldex:Auth block of spec §7 and no AzureAd.
+auth_template() {
+  local t
+  for t in "$PKG/etc/appsettings.Production.json" "$PKG/stage/etc/appsettings.Production.rpm.json"; do
+    [ -f "$t" ] || { [ "$t" != "$PKG/etc/appsettings.Production.json" ] || OUT+="missing: $t"$'\n'; continue; }
+    OUT+="$(python3 -I -c '
+import json, re, sys
+d = json.loads(re.sub(r"(?m)^\s*//.*$", "", open(sys.argv[1]).read()))
+errs = []
+if "AzureAd" in d: errs.append("AzureAd is still present")
+a = d.get("Maldex", {}).get("Auth")
+if not isinstance(a, dict): errs.append("Maldex:Auth is missing")
+else:
+    if a.get("PasswordLogin") is not True: errs.append("PasswordLogin is not true")
+    if "Mode" in a: errs.append("Auth:Mode must not be in the template")
+    o = a.get("Oidc") or {}
+    want = {"Enabled": False, "DisplayName": "Company SSO", "Authority": "", "ClientId": "", "ClientSecret": "",
+            "Scopes": ["openid", "profile", "email"], "NameClaim": "name", "RoleClaim": "", "AdminValues": [], "AnalystValues": []}
+    for k, v in want.items():
+        if o.get(k) != v: errs.append("Oidc.%s is %r, expected %r" % (k, o.get(k), v))
+print("\n".join(sys.argv[1] + ": " + e for e in errs))
+' "$t" 2>&1)"
+    grep -q 'AzureAd' "$t" && OUT+="$t mentions AzureAd"$'\n'
+  done
+  [ -z "$OUT" ]
+}
+check "config template has Maldex:Auth and no AzureAd" auth_template
 
 # The .rpm's copy of the template names RHEL 9's edk2-ovmf firmware (the app's default is Ubuntu's /usr/share/OVMF/*_4M*).
 rpm_template() {

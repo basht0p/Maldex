@@ -11,7 +11,7 @@ SETUP_SRC="$PKG/bin/maldex-setup"
 LIB_SRC="$PKG/lib/maldex-common.sh"
 
 # Checks --check prints: db plus the verify list (the downloads' file presence is part of the verify list).
-EXPECTED_CHECKS=32
+EXPECTED_CHECKS=33
 
 PASS=0
 FAIL=0
@@ -28,6 +28,18 @@ only_id_called() { [ ! -e "$T/data" ] && ! grep -Eqv '^id ' "$STUB_LOG"; }
 stub() { # name, body (the body runs after the call is recorded)
   printf '#!/usr/bin/env bash\necho "%s $*" >> "$STUB_LOG"\n%s\n' "$1" "$2" > "$T/bin/$1"
   /bin/chmod +x "$T/bin/$1"
+}
+
+# Canned `Maldex.Web admin list --json` output: $1 = admin (one enabled local Admin) | breakglass (that admin is break-glass) |
+# disabled (the only Admin is disabled) | none (an enabled Analyst only); $2 = passwordLogin; $3 = ssoEnabled.
+admin_list() {
+  local role=Admin dis=false bg=false
+  case "$1" in breakglass) bg=true ;; disabled) dis=true ;; none) role=Analyst ;; esac
+  {
+    printf '[{"userName":"u1","displayName":"U One","kind":"Local","role":"%s","isDisabled":%s,"totpEnabled":false,"isBreakGlass":%s,"lastSignInAt":null}]\n' \
+      "$role" "$dis" "$bg"
+    printf '#config {"passwordLogin":%s,"ssoEnabled":%s}\n' "$2" "$3"
+  } > "$T/admin-list"
 }
 
 # A fresh sandbox: stubs, a copy of the script and library with test pins, config, an offline dir and a fake download server.
@@ -69,11 +81,17 @@ esac'
 cp "$STUB_SRV/${url##*/}" "$out"'
   stub timeout 'shift; case "$*" in *dev/tcp*) exit "${STUB_TCP_RC:-0}";; esac; exec "$@"'
   # For a non-root caller, sudo without -n would prompt for a password: the stub fails it, as a hang would.
-  stub sudo '[ "$STUB_EUID" = 0 ] || [ "$1" = -n ] || exit 1; while [ $# -gt 0 ]; do case "$1" in -n) shift;; -u) shift 2;; --) shift; break;; *) break;; esac; done; exec "$@"'
+  stub sudo '[ "$STUB_EUID" = 0 ] || [ "$1" = -n ] || exit 1; while [ $# -gt 0 ]; do case "$1" in -n) shift;; -u) shift 2;; --) shift; break;; *) break;; esac; done; STUB_EUID=0 exec "$@"'
   stub runuser 'while [ $# -gt 0 ]; do case "$1" in -u) shift 2;; --) shift; break;; *) break;; esac; done; exec "$@"'
   stub systemctl 'case "$*" in is-active*maldex*) exit "${STUB_ACTIVE_RC:-0}";; esac; exit 0'
   stub dpkg-query 'echo "1.52.0-test"'
   stub libguestfs-make-fixed-appliance '[ ! -e "$STUB_SRV/guestfs-fail" ] || exit 1; mkdir -p "$1"; touch "$1/kernel" "$1/initrd" "$1/root"'
+  # maldex-admin: the real wrapper (it runs through the runuser stub) around a stub standing in for Maldex.Web (MALDEX_ADMIN_EXEC).
+  cp "$PKG/bin/maldex-admin" "$T/pkg/bin/maldex-admin"
+  stub admin-exec 'case "$2" in list) cat "$STUB_ADMIN_LIST"; exit "${STUB_LIST_RC:-0}";; create-user) exit "${STUB_CREATE_RC:-0}";; esac; exit 0'
+  export MALDEX_ADMIN_EXEC="$T/bin/admin-exec" STUB_ADMIN_LIST="$T/admin-list"
+  admin_list admin true false
+  unset MALDEX_ASSUME_TTY SETUP_STDIN
   printf '#!/usr/bin/env bash\necho "Maldex.Web $*" >> "$STUB_LOG"\nmkdir -p "$PLAYWRIGHT_BROWSERS_PATH/chromium-1"\n' > "$T/opt/app/Maldex.Web"
   /bin/chmod +x "$T/opt/app/Maldex.Web"
 
@@ -100,7 +118,8 @@ JSON
 teardown() { [ -z "$T" ] || rm -rf "$T"; T=""; }
 
 run_setup() {
-  OUT="$(bash "$T/pkg/bin/maldex-setup" "$@" 2>&1)"; RC=$?
+  # stdin is a pipe (SETUP_STDIN, empty by default), never the caller's terminal; MALDEX_ASSUME_TTY=1 stands in for [ -t 0 ].
+  OUT="$(bash "$T/pkg/bin/maldex-setup" "$@" 2>&1 <<<"${SETUP_STDIN-}")"; RC=$?
   [ "${MALDEX_TEST_VERBOSE:-0}" = 0 ] || printf '>>> maldex-setup %s (rc=%s)\n%s\n' "$*" "$RC" "$OUT"
 }
 
@@ -351,6 +370,113 @@ test_modes_and_symlinks() {
   teardown
 }
 
+test_admin_step() {
+  # an enabled Admin exists: a no-op
+  setup_sandbox; write_config
+  run_setup
+  check "admin step passes when an enabled admin exists" grep -q '^ok   admin$' <<<"$OUT"
+  check "admin step is a no-op when an admin exists (no create-user)" not_logged 'create-user'
+  check "admin step lists users as JSON through maldex-admin" called_with 'admin-exec admin list --json'
+  check "maldex-admin gives the app the unit environment" \
+    called_with 'env ASPNETCORE_ENVIRONMENT=Production MALDEX_EXTRA_CONFIG=/opt/maldex/app/appsettings.Package.json:/etc/maldex/appsettings.Production.json ASPNETCORE_CONTENTROOT=/opt/maldex/app HOME=/var/lib/maldex'
+  check "admin step runs between db and downloads" bash -c '[ "$(grep -n "^ok   " <<<"$1" | sed -n "1,2p" | cut -d: -f2 | tr "\n" ",")" = "ok   db,ok   admin," ]' _ "$OUT"
+  teardown
+
+  # no admin, on a terminal: prompts and creates (default name)
+  setup_sandbox; write_config; admin_list none true false
+  export MALDEX_ASSUME_TTY=1 SETUP_STDIN=""
+  run_setup
+  check "admin step creates the first admin on a tty (default name admin)" called_with 'admin-exec admin create-user admin --admin$'
+  check "admin step prompts for the user name" grep -q 'First admin user name \[admin\]: ' <<<"$OUT"
+  check "admin step passes when the create succeeds" grep -q '^ok   admin$' <<<"$OUT"
+  check "admin step does not add --break-glass while password login is on" not_logged 'create-user.*--break-glass'
+  teardown
+
+  setup_sandbox; write_config; admin_list disabled true false
+  export MALDEX_ASSUME_TTY=1 SETUP_STDIN="alice"
+  run_setup
+  check "a disabled admin does not count; the typed name is used" called_with 'admin-exec admin create-user alice --admin$'
+  teardown
+
+  setup_sandbox; write_config; admin_list none true false
+  export MALDEX_ASSUME_TTY=1 SETUP_STDIN="--evil"
+  run_setup
+  check "a user name that looks like an option is refused" grep -q '^FAIL admin -- ' <<<"$OUT"
+  check "a refused name creates nothing" not_logged 'create-user'
+  teardown
+
+  setup_sandbox; write_config; admin_list none true false
+  export MALDEX_ASSUME_TTY=1 SETUP_STDIN="" STUB_CREATE_RC=1
+  run_setup
+  check "a refused create-user fails the admin step" grep -q '^FAIL admin -- ' <<<"$OUT"
+  check "a failed admin step stops before downloads" not_in_out '^ok   downloads'
+  unset STUB_CREATE_RC
+  teardown
+
+  # password login off: the first admin is a break-glass admin
+  setup_sandbox; write_config; admin_list none false true
+  export MALDEX_ASSUME_TTY=1 SETUP_STDIN=""
+  run_setup
+  check "admin step adds --break-glass when password login is off" called_with 'create-user admin --admin --break-glass$'
+  teardown
+
+  # no admin, not on a terminal: fail with the command to run
+  setup_sandbox; write_config; admin_list none true false
+  run_setup
+  check "admin step fails non-interactively" grep -q '^FAIL admin -- ' <<<"$OUT"
+  check "admin step names the create-user command when non-interactive" \
+    grep -qF 'no Maldex admin exists; create one with: sudo maldex-admin create-user <name> --admin' <<<"$OUT"
+  check "admin step does not create a user non-interactively" not_logged 'create-user'
+  check "admin step exits 1 and stops before downloads" bash -c '[ "$1" = 1 ] && ! grep -q "^ok   downloads" <<<"$2"' _ "$RC" "$OUT"
+  teardown
+
+  # maldex-admin itself failing (exit 78: configuration or database)
+  setup_sandbox; write_config
+  export STUB_LIST_RC=78
+  run_setup
+  check "a failing maldex-admin list fails the admin step with its exit status" grep -Eq '^FAIL admin -- .*(exit status 78|78)' <<<"$OUT"
+  unset STUB_LIST_RC
+  teardown
+}
+
+test_admin_check() {
+  setup_sandbox; write_config; export STUB_EUID=1000
+  admin_list none true false
+  run_setup --check
+  check "--check fails without an admin" grep -q '^FAIL admin -- ' <<<"$OUT"
+  check "--check names the create-user command without an admin" grep -qF 'sudo maldex-admin create-user <name> --admin' <<<"$OUT"
+  check "--check without an admin exits 1" [ "$RC" = 1 ]
+  check "--check never creates a user" not_logged 'create-user'
+  check "--check reaches maldex-admin through sudo -n" called_with 'sudo -n .*maldex-admin list --json'
+  teardown
+
+  setup_sandbox; write_config; export STUB_EUID=1000
+  admin_list disabled true false
+  run_setup --check
+  check "--check fails when the only admin is disabled" grep -q '^FAIL admin -- ' <<<"$OUT"
+  teardown
+
+  setup_sandbox; write_config; export STUB_EUID=1000
+  run_setup --check
+  check "--check passes with an enabled admin" grep -q '^ok   admin$' <<<"$OUT"
+  check "--check is quiet when password login is on" not_in_out '^warn admin'
+  teardown
+
+  setup_sandbox; write_config; export STUB_EUID=1000
+  admin_list admin false true
+  run_setup --check
+  check "--check warns about a missing break-glass admin (password login off, SSO on)" \
+    grep -Eq '^warn admin -- .*break-glass.*set-break-glass' <<<"$OUT"
+  check "--check still passes admin on that warning" grep -q '^ok   admin$' <<<"$OUT"
+  teardown
+
+  setup_sandbox; write_config; export STUB_EUID=1000
+  admin_list breakglass false true
+  run_setup --check
+  check "--check does not warn when a break-glass admin exists" not_in_out '^warn admin'
+  teardown
+}
+
 test_usage() {
   setup_sandbox
   run_setup --bogus
@@ -362,7 +488,7 @@ test_usage() {
 
 for t in test_check_without_config test_check_lists_every_check test_downloads_skip_and_refetch test_offline \
          test_rerun_after_guestfs_failure test_requires_root test_start_step test_check_never_prompts test_modes_and_symlinks test_usage \
-         test_verify_yara_and_emulator test_offline_browsers test_connection_string_parse; do
+         test_verify_yara_and_emulator test_offline_browsers test_connection_string_parse test_admin_step test_admin_check; do
   echo "# $t"
   OUT=""
   "$t"

@@ -66,7 +66,10 @@ jobs:
   smoke-deb:
     needs: build
     runs-on: ubuntu-24.04
-    container: ubuntu:24.04
+    timeout-minutes: 30
+    # Not a job container with a services: block: service containers start before the first step, so a password generated in
+    # the job could not reach them. The sidecar is started by a step instead, on a user-defined network where the Ubuntu
+    # container below reaches it by the name "mssql".
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -77,13 +80,37 @@ jobs:
         with:
           name: dist
           path: dist
-      - name: Install the package
+      - name: Start SQL Server Express
         run: |
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y ./dist/maldex_*.deb
-      - name: Smoke
-        run: bash packaging/ci/smoke.sh deb
+          # a throwaway SA password: generated here, masked before anything else, handed on only by environment
+          pw="$(openssl rand -base64 24 | tr -d '/+=')Aa1"
+          echo "::add-mask::$pw"
+          echo "MSSQL_SA_PASSWORD=$pw" >> "$GITHUB_ENV"
+          export MSSQL_SA_PASSWORD="$pw"
+          docker network create smoke
+          docker run -d --name mssql --network smoke -e ACCEPT_EULA=Y -e MSSQL_PID=Express -e MSSQL_SA_PASSWORD \
+            mcr.microsoft.com/mssql/server:2025-latest
+          for _ in $(seq 1 90); do
+            docker logs mssql 2>&1 | grep -q 'SQL Server is now ready for client connections' && exit 0
+            sleep 2
+          done
+          echo "SQL Server did not become ready" >&2
+          docker logs --tail 30 mssql >&2
+          exit 1
+      - name: Install the package and smoke
+        run: |
+          export MALDEX_SMOKE_SQL="Server=mssql,1433;Database=maldex;User Id=sa;Password=${MSSQL_SA_PASSWORD};TrustServerCertificate=True"
+          docker run --rm --network smoke -e DEBIAN_FRONTEND=noninteractive -e MALDEX_SMOKE_SQL \
+            -v "$PWD:/w:ro" -w /w ubuntu:24.04 bash -c '
+              set -e
+              apt-get update
+              apt-get install -y ./dist/maldex_*.deb
+              bash packaging/ci/smoke.sh deb'
+      - name: Remove the SQL Server container
+        if: always()
+        run: |
+          docker rm -f mssql || true
+          docker network rm smoke || true
 
   smoke-rpm:
     needs: build
@@ -135,9 +162,11 @@ jobs:
 
           1. Verify: `gpg --import maldex-signing-key.asc`, then `gpg --verify SHA256SUMS.asc SHA256SUMS`, then `sha256sum -c SHA256SUMS`.
           2. Install: `sudo apt install ./maldex_*.deb`, or on RHEL `sudo dnf install epel-release`, enable crb, then `sudo dnf install ./maldex-*.rpm`.
-          3. Edit `/etc/maldex/appsettings.Production.json` (connection string, AzureAd).
-          4. Run `sudo maldex-setup` (add `--offline <dir>` to use pre-downloaded Sysmon.zip and virtio-win.iso).
-          5. Open the app through an SSH forward or a reverse proxy, then build the first template under Admin > Sandbox Templates > New template.
+          3. Edit `/etc/maldex/appsettings.Production.json`: the SQL Server connection string (single sign-on is optional; see the README).
+          4. Run `sudo maldex-setup` (add `--offline <dir>` to use pre-downloaded Sysmon.zip and virtio-win.iso); it asks for the name and password of the first admin.
+          5. Open the app through an SSH forward or a reverse proxy, sign in, then build the first template under Admin > Sandbox Templates > New template.
+
+          Upgrading from a build that used Entra ID sign-in: local accounts replace it. Existing Entra users become disabled single sign-on users and keep their history; create the first admin with `maldex-setup` (or `sudo maldex-admin create-user <name> --admin`).
 
           The package grants the maldex service user passwordless sudo for a fixed list of commands and assumes a dedicated host.
           EOF
