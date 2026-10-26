@@ -1,11 +1,12 @@
-import { render, screen, within } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest'
 import App from './App'
 
-const me = (role: 'Admin' | 'Analyst') => http.get('/api/me', () => HttpResponse.json({ id: 'u1', displayName: 'Pat', role }))
+const me = (role: 'Admin' | 'Analyst' | null) => http.get('/api/me', () => HttpResponse.json({ id: 'u1', displayName: 'Pat', role, kind: 'Local', totpEnabled: false, isBreakGlass: false, roleManagedByIdp: false }))
+const authConfig = http.get('/api/auth/config', () => HttpResponse.json({ passwordLogin: true, sso: null }))
 
 const server = setupServer(
   http.get('/api/tasks', () => HttpResponse.json({ items: [], total: 0 })),
@@ -85,7 +86,7 @@ it.each([
   window.history.pushState({}, '', '/admin/status')
   render(<App />)
   await screen.findByRole('heading', { name: 'System status' })
-  const button = await screen.findByRole('button', { name: /Admin/ })
+  const button = await screen.findByRole('button', { name: /^Admin/ })
   expect(await within(button).findByRole('img', { name: 'needs attention' })).toBeInTheDocument()
   await userEvent.setup().click(button)
   expect(within(screen.getByRole('link', { name: /Status/ })).getByRole('img', { name: 'needs attention' })).toBeInTheDocument()
@@ -107,4 +108,44 @@ it('does not request status for analysts or for an admin outside /admin', async 
   await screen.findByText('Pat (Admin)')
   await settle()
   expect(calls).toBe(0)
+})
+
+it('unauthenticated load routes to /login?returnUrl=<current path>', async () => {
+  server.use(http.get('/api/me', () => HttpResponse.json({ error: 'unauthorized' }, { status: 401 })), authConfig)
+  window.history.pushState({}, '', '/admin/orgs?tab=net')
+  render(<App />)
+  expect(await screen.findByLabelText('User name')).toBeInTheDocument()
+  expect(window.location.pathname).toBe('/login')
+  expect(new URLSearchParams(window.location.search).get('returnUrl')).toBe('/admin/orgs?tab=net')
+  expect(screen.queryByRole('navigation', { name: 'Main' })).not.toBeInTheDocument()
+})
+
+it('role null routes to the waiting page with Sign out', async () => {
+  let out = 0
+  server.use(me(null), authConfig, http.post('/api/auth/logout', () => { out++; return new HttpResponse(null, { status: 204 }) }))
+  render(<App />)
+  expect(await screen.findByText('Your account has no Maldex role. Ask an administrator.')).toBeInTheDocument()
+  expect(window.location.pathname).toBe('/waiting')
+  expect(screen.queryByRole('navigation', { name: 'Main' })).not.toBeInTheDocument()
+  await userEvent.setup().click(screen.getByRole('button', { name: 'Sign out' }))
+  await waitFor(() => expect(window.location.pathname).toBe('/login'))
+  expect(out).toBe(1)
+})
+
+it('user menu shows Account and Sign out; Sign out calls logout and routes to /login', async () => {
+  let out = 0
+  const user = userEvent.setup()
+  server.use(me('Analyst'), authConfig, http.post('/api/auth/logout', () => { out++; return new HttpResponse(null, { status: 204 }) }))
+  render(<App />)
+  await user.click(await screen.findByRole('button', { name: /Pat/ }))
+  expect(screen.getByRole('link', { name: 'Account' })).toHaveAttribute('href', '/account')
+  await user.click(screen.getByRole('button', { name: 'Sign out' }))
+  await waitFor(() => expect(window.location.pathname).toBe('/login'))
+  expect(out).toBe(1)
+})
+
+it('a 403 csrf response shows a blocked toast', async () => {
+  server.use(me('Analyst'), http.get('/api/tasks', () => HttpResponse.json({ error: 'csrf' }, { status: 403 })))
+  render(<App />)
+  expect(await screen.findByText('Request blocked; reload the page.')).toBeInTheDocument()
 })

@@ -30,7 +30,7 @@ import { ApiError } from '../api/client'
 import { renderWithKit } from '../test/renderWithKit'
 import TemplateDetailPage from './TemplateDetailPage'
 
-const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin', maxUploadBytes: 268_435_456 }
+const admin: MeDto = { id: 'u1', displayName: 'Dev', role: 'Admin', kind: 'Local', totpEnabled: false, isBreakGlass: false, roleManagedByIdp: false, maxUploadBytes: 268_435_456 }
 const SYSMON = 'a'.repeat(64)
 const MITM = 'b'.repeat(64)
 

@@ -1,8 +1,13 @@
-import { getAccessToken } from '../auth/auth'
+import { notifyBlocked, notifyNoRole, notifyUnauthorized } from '../auth/session'
 import type {
   AdminTemplateDto,
   TemplateDetailDto,
   ArtifactDto,
+  AuthConfigDto,
+  AuthNextDto,
+  RecoveryCodesDto,
+  TotpConfirmDto,
+  TotpSetupDto,
   EventsQuery,
   LiveEventDto,
   MediaFileDto,
@@ -28,18 +33,33 @@ import type {
 export class ApiError extends Error {
   readonly status: number
   readonly problem: unknown
+  /** The machine-readable `error` of the problem body (for example "invalid" or "no_role"), when there is one. */
+  readonly code: string | undefined
 
   constructor(status: number, problem: unknown) {
     super(problemTitle(problem) ?? `Request failed with status ${status}`)
     this.name = 'ApiError'
     this.status = status
     this.problem = problem
+    this.code = problemCode(problem)
   }
 }
 
 function problemTitle(problem: unknown): string | undefined {
   if (problem && typeof problem === 'object' && 'title' in problem && typeof problem.title === 'string') return problem.title
   return undefined
+}
+
+function problemCode(problem: unknown): string | undefined {
+  if (problem && typeof problem === 'object' && 'error' in problem && typeof problem.error === 'string') return problem.error
+  return undefined
+}
+
+/** Session-level reactions to a failed response. Sign-in calls (/api/auth/*) answer 401 for a wrong password, which is not an expired session. */
+function react(path: string, err: ApiError): void {
+  if (err.status === 401 && !path.startsWith('/api/auth/')) notifyUnauthorized()
+  else if (err.status === 403 && err.code === 'no_role') notifyNoRole()
+  else if (err.status === 403 && (err.code === 'csrf' || err.code === 'origin')) notifyBlocked()
 }
 
 async function parseBody(res: Response): Promise<unknown> {
@@ -54,34 +74,35 @@ async function parseBody(res: Response): Promise<unknown> {
 
 async function request<T>(method: string, path: string, body?: BodyInit | null, json?: unknown, extra?: { headers?: Record<string, string>; signal?: AbortSignal }): Promise<T> {
   const headers: Record<string, string> = { Accept: 'application/json', ...extra?.headers }
-  const token = await getAccessToken()
-  if (token) headers.Authorization = `Bearer ${token}`
+  if (method !== 'GET') headers['X-Maldex-Csrf'] = '1'
   let payload = body ?? undefined
   if (json !== undefined) {
     headers['Content-Type'] = 'application/json'
     payload = JSON.stringify(json)
   }
   // FormData bodies must not get a Content-Type: the browser adds the multipart boundary itself.
-  const res = await fetch(path, { method, headers, body: payload, signal: extra?.signal })
+  const res = await fetch(path, { method, headers, body: payload, signal: extra?.signal, credentials: 'same-origin' })
   const parsed = await parseBody(res)
-  if (!res.ok) throw new ApiError(res.status, parsed)
+  if (!res.ok) {
+    const err = new ApiError(res.status, parsed)
+    react(path, err)
+    throw err
+  }
   return parsed as T
 }
 
-/**
- * GET `path` as a Blob, with the same bearer token as every other call (Entra mode is bearer-only, so a plain
- * `<img src>` or `<a href>` would get 401). Throws {@link ApiError} on a non-2xx response.
- */
+/** GET `path` as a Blob (same-origin cookie). Throws {@link ApiError} on a non-2xx response. */
 export async function fetchBlob(path: string, signal?: AbortSignal): Promise<Blob> {
-  const headers: Record<string, string> = { Accept: '*/*' }
-  const token = await getAccessToken()
-  if (token) headers.Authorization = `Bearer ${token}`
-  const res = await fetch(path, { method: 'GET', headers, signal })
-  if (!res.ok) throw new ApiError(res.status, await parseBody(res))
+  const res = await fetch(path, { method: 'GET', headers: { Accept: '*/*' }, signal, credentials: 'same-origin' })
+  if (!res.ok) {
+    const err = new ApiError(res.status, await parseBody(res))
+    react(path, err)
+    throw err
+  }
   return res.blob()
 }
 
-/** Downloads `path` (authenticated, see {@link fetchBlob}) and saves it as `fileName`. */
+/** Downloads `path` (see {@link fetchBlob}) and saves it as `fileName`. */
 export async function downloadFile(path: string, fileName: string): Promise<void> {
   const blob = await fetchBlob(path)
   const url = URL.createObjectURL(blob)
@@ -110,6 +131,18 @@ const get = <T>(path: string) => request<T>('GET', path)
 const post = <T>(path: string, json?: unknown) => request<T>('POST', path, undefined, json)
 
 export const getMe = () => get<MeDto>('/api/me')
+
+export const getAuthConfig = () => get<AuthConfigDto>('/api/auth/config')
+export const login = (userName: string, password: string) => post<AuthNextDto>('/api/auth/login', { userName, password })
+export const loginTotp = (code: string) => post<AuthNextDto>('/api/auth/login/totp', { code })
+export const changePassword = (currentPassword: string, newPassword: string) => post<AuthNextDto>('/api/auth/password', { currentPassword, newPassword })
+export const totpSetup = () => post<TotpSetupDto>('/api/auth/totp/setup')
+export const totpConfirm = (code: string) => post<TotpConfirmDto>('/api/auth/totp/confirm', { code })
+export const removeTotp = (password: string) => request<void>('DELETE', '/api/auth/totp', undefined, { password })
+export const regenerateRecoveryCodes = (password: string) => post<RecoveryCodesDto>('/api/auth/totp/recovery-codes', { password })
+export const logout = () => post<void>('/api/auth/logout')
+/** SSO start is a full-page navigation, not a fetch. */
+export const ssoStartUrl = (returnUrl: string) => `/api/auth/sso/start?returnUrl=${encodeURIComponent(returnUrl)}`
 
 export const listOrgs = () => get<OrgDto[]>('/api/orgs')
 export const createOrg = (req: OrgRequest) => request<OrgDto>('POST', '/api/orgs', undefined, req)

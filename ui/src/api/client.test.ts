@@ -2,12 +2,11 @@ import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import {
-  ApiError, cancelTask, cancelTemplateJob, discardTemplateVersion, downloadFile, extendTask, fetchBlob, getMe, getTemplateJobTunnelToken, listTasks, publishTemplateVersion,
+  ApiError, cancelTask, getAuthConfig, login, logout, ssoStartUrl, cancelTemplateJob, discardTemplateVersion, downloadFile, extendTask, fetchBlob, getMe, getTemplateJobTunnelToken, listTasks, publishTemplateVersion,
   sealTemplateJob, startTemplateEdit, startTemplateRefresh, stopTask,
 } from './client'
 
-vi.mock('../auth/auth', () => ({ getAccessToken: vi.fn(async () => null) }))
-import { getAccessToken } from '../auth/auth'
+import { onBlocked, onNoRole, onUnauthorized } from '../auth/session'
 
 const server = setupServer()
 beforeAll(() => server.listen({ onUnhandledFrame: 'error' }))
@@ -33,63 +32,106 @@ describe('client', () => {
     expect(err.problem).toBe('boom')
   })
 
-  it('sends no Authorization header when there is no token (dev mode)', async () => {
-    let auth: string | null = 'unset'
-    server.use(
-      http.get('/api/me', ({ request }) => {
-        auth = request.headers.get('authorization')
-        return HttpResponse.json({ id: 'u', displayName: 'Dev', role: 'Admin' })
-      }),
-    )
-    const me = await getMe()
-    expect(me.role).toBe('Admin')
-    expect(auth).toBeNull()
+  it('non-GET requests carry X-Maldex-Csrf', async () => {
+    let csrf: string | null = null
+    server.use(http.post('/api/tasks/t1/stop', ({ request }) => { csrf = request.headers.get('x-maldex-csrf'); return new HttpResponse(null, { status: 202 }) }))
+    await stopTask('t1')
+    expect(csrf).toBe('1')
   })
 
-  it('attaches the bearer token when auth provides one (entra mode)', async () => {
-    vi.mocked(getAccessToken).mockResolvedValueOnce('tok123')
-    let auth: string | null = null
+  it('GET does not', async () => {
+    let csrf: string | null = 'unset'
+    server.use(http.get('/api/me', ({ request }) => { csrf = request.headers.get('x-maldex-csrf'); return HttpResponse.json({}) }))
+    await getMe()
+    expect(csrf).toBeNull()
+  })
+
+  it('401 triggers onUnauthorized', async () => {
+    const handler = vi.fn()
+    const off = onUnauthorized(handler)
+    server.use(http.get('/api/me', () => HttpResponse.json({ error: 'unauthorized' }, { status: 401 })))
+    const err = (await getMe().catch((e: unknown) => e)) as ApiError
+    expect(err.status).toBe(401)
+    expect(handler).toHaveBeenCalledOnce()
+    off()
+  })
+
+  it('a 401 from a sign-in call is a wrong password, not an expired session', async () => {
+    const handler = vi.fn()
+    const off = onUnauthorized(handler)
+    server.use(http.post('/api/auth/login', () => HttpResponse.json({ error: 'invalid' }, { status: 401 })))
+    const err = (await login('a', 'b').catch((e: unknown) => e)) as ApiError
+    expect(err.code).toBe('invalid')
+    expect(handler).not.toHaveBeenCalled()
+    off()
+  })
+
+  it('403 no_role triggers onNoRole', async () => {
+    const handler = vi.fn()
+    const off = onNoRole(handler)
+    server.use(http.get('/api/tasks', () => HttpResponse.json({ error: 'no_role' }, { status: 403 })))
+    const err = (await listTasks().catch((e: unknown) => e)) as ApiError
+    expect(err.code).toBe('no_role')
+    expect(handler).toHaveBeenCalledOnce()
+    off()
+  })
+
+  it.each(['csrf', 'origin'])('403 %s triggers onBlocked', async (error) => {
+    const handler = vi.fn()
+    const off = onBlocked(handler)
+    server.use(http.post('/api/tasks/t1/stop', () => HttpResponse.json({ error }, { status: 403 })))
+    await stopTask('t1').catch(() => undefined)
+    expect(handler).toHaveBeenCalledOnce()
+    off()
+  })
+
+  it('no Authorization header is ever sent', async () => {
+    const seen: (string | null)[] = []
     server.use(
-      http.get('/api/me', ({ request }) => {
-        auth = request.headers.get('authorization')
-        return HttpResponse.json({ id: 'u', displayName: 'A', role: 'Analyst' })
-      }),
+      http.get('/api/me', ({ request }) => { seen.push(request.headers.get('authorization')); return HttpResponse.json({}) }),
+      http.post('/api/tasks/t1/stop', ({ request }) => { seen.push(request.headers.get('authorization')); return new HttpResponse(null, { status: 202 }) }),
+      http.get('/api/artifacts/a1/image', ({ request }) => { seen.push(request.headers.get('authorization')); return new HttpResponse('x') }),
     )
     await getMe()
-    expect(auth).toBe('Bearer tok123')
+    await stopTask('t1')
+    await fetchBlob('/api/artifacts/a1/image')
+    expect(seen).toEqual([null, null, null])
   })
 
-  it('fetchBlob sends the bearer token and throws ApiError on a non-2xx response', async () => {
-    vi.mocked(getAccessToken).mockResolvedValue('tok123')
-    let auth: string | null = null
+  it('sends same-origin credentials', async () => {
+    const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}'))
+    await getMe()
+    expect(spy.mock.calls[0][1]?.credentials).toBe('same-origin')
+    spy.mockRestore()
+  })
+
+  it('auth calls use the contract routes and bodies', async () => {
+    const hits: string[] = []
     server.use(
-      http.get('/api/artifacts/a1/image', ({ request }) => {
-        auth = request.headers.get('authorization')
-        return new HttpResponse(new Uint8Array([0x89, 0x50]), { headers: { 'Content-Type': 'image/png' } })
-      }),
-      http.get('/api/artifacts/a2/image', () => HttpResponse.json({ title: 'Unauthorized' }, { status: 401 })),
+      http.get('/api/auth/config', () => HttpResponse.json({ passwordLogin: true, sso: null })),
+      http.post('/api/auth/logout', ({ request }) => { hits.push(`${request.method} ${new URL(request.url).pathname}`); return new HttpResponse(null, { status: 204 }) }),
     )
-    const blob = await fetchBlob('/api/artifacts/a1/image')
-    expect(blob.size).toBe(2)
-    expect(auth).toBe('Bearer tok123')
+    expect(await getAuthConfig()).toEqual({ passwordLogin: true, sso: null })
+    await expect(logout()).resolves.toBeUndefined()
+    expect(hits).toEqual(['POST /api/auth/logout'])
+    expect(ssoStartUrl('/tasks/a b?x=1')).toBe('/api/auth/sso/start?returnUrl=%2Ftasks%2Fa%20b%3Fx%3D1')
+  })
+
+  it('fetchBlob throws ApiError on a non-2xx response', async () => {
+    server.use(
+      http.get('/api/artifacts/a2/image', () => HttpResponse.json({ title: 'Nope' }, { status: 404 })),
+    )
     const err = (await fetchBlob('/api/artifacts/a2/image').catch((e: unknown) => e)) as ApiError
     expect(err).toBeInstanceOf(ApiError)
-    expect(err.status).toBe(401)
-    vi.mocked(getAccessToken).mockResolvedValue(null)
+    expect(err.status).toBe(404)
   })
 
-  it('downloadFile saves the authenticated blob under the given name and revokes the URL', async () => {
-    vi.mocked(getAccessToken).mockResolvedValueOnce('tok123')
-    let auth: string | null = null
-    server.use(http.get('/api/tasks/t1/report.pdf', ({ request }) => {
-      auth = request.headers.get('authorization')
-      return new HttpResponse('%PDF', { headers: { 'Content-Type': 'application/pdf' } })
-    }))
+  it('downloadFile saves the blob under the given name and revokes the URL', async () => {
+    server.use(http.get('/api/tasks/t1/report.pdf', () => new HttpResponse('%PDF', { headers: { 'Content-Type': 'application/pdf' } })))
     const create = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:x/1')
     const revoke = vi.spyOn(URL, 'revokeObjectURL')
     const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
     await downloadFile('/api/tasks/t1/report.pdf', 'maldex-t1.pdf')
-    expect(auth).toBe('Bearer tok123')
     const a = click.mock.contexts[0] as HTMLAnchorElement
     expect(create).toHaveBeenCalledOnce()
     expect(a.download).toBe('maldex-t1.pdf')

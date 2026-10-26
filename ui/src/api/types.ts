@@ -14,10 +14,27 @@ export const NETWORK_MODES: readonly NetworkMode[] = ['None', 'Simulated', 'Live
 export interface MeDto {
   id: string
   displayName: string
-  role: UserRole
+  /** Null when the account has no Maldex role yet (the waiting page). */
+  role: UserRole | null
+  kind: 'Local' | 'Sso'
+  totpEnabled: boolean
+  isBreakGlass: boolean
+  /** True when an identity provider assigns the role (SSO). */
+  roleManagedByIdp: boolean
   /** The effective submit cap in bytes; files over it are refused before upload. */
   maxUploadBytes: number
 }
+
+export interface AuthConfigDto {
+  passwordLogin: boolean
+  sso: { displayName: string } | null
+}
+/** The next sign-in step the server wants. */
+export type AuthNext = 'done' | 'totp' | 'change-password' | 'enrol-totp'
+export interface AuthNextDto { next: AuthNext }
+export interface TotpSetupDto { sharedKey: string; otpauthUri: string }
+export interface RecoveryCodesDto { recoveryCodes: string[] }
+export interface TotpConfirmDto extends RecoveryCodesDto { next: AuthNext }
 
 export interface OrgDto {
   id: string
