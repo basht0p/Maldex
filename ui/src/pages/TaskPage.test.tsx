@@ -46,6 +46,7 @@ beforeEach(() => {
 afterEach(() => {
   expect(confirmSpy).not.toHaveBeenCalled() // confirmations are in-app dialogs, never window.confirm
   vi.restoreAllMocks()
+  vi.useRealTimers()
 })
 
 describe('TaskPage', () => {
@@ -223,6 +224,9 @@ describe('TaskPage', () => {
   })
 
   it('shows the started and completed times and the MIME type in the header', async () => {
+    // Pinned: relative times become absolute dates after 7 days.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-19T01:00:00Z'))
     getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious', startedAt: '2026-10-19T00:00:10Z', completedAt: '2026-10-19T00:05:10Z' }))
     renderPage()
     await screen.findByRole('tab', { name: 'Overview' })

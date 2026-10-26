@@ -5,7 +5,7 @@ import type { MeDto } from './api/types'
 import styles from './App.module.css'
 import markDark from '../../brand/logo/maldex-mark.svg'
 import markLight from '../../brand/logo/maldex-mark-light.svg'
-import { onBlocked, onNoRole, onUnauthorized } from './auth/session'
+import { onBlocked, onNoRole, onUnauthorized, safeReturnUrl } from './auth/session'
 import { useSignOut } from './components/useSignOut'
 import { ConfirmProvider } from './kit/Confirm'
 import { ShortcutHelp } from './kit/ShortcutHelp'
@@ -134,7 +134,9 @@ function SessionBridge() {
       onUnauthorized(() => {
         const { pathname, search } = window.location
         if (pathname === '/login') return
-        navigate(`/login?returnUrl=${encodeURIComponent(pathname + search)}`, { replace: true })
+        const back = safeReturnUrl(pathname + search)
+        const target = pathname === '/waiting' || pathname === '/login' ? '/' : back
+        navigate(`/login?returnUrl=${encodeURIComponent(target)}`, { replace: true })
       }),
       onNoRole(() => { if (window.location.pathname !== '/waiting') navigate('/waiting', { replace: true }) }),
       onBlocked(() => toast.error('Request blocked; reload the page.')),

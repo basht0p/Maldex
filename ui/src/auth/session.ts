@@ -29,6 +29,7 @@ export const nav = {
 
 /** `raw` only when it is a same-origin path (starts with `/`, not `//` and not `/\`); otherwise `/`. */
 export function safeReturnUrl(raw: string | null): string {
-  if (raw && raw.startsWith('/') && !raw.startsWith('//') && !raw.startsWith('/\\')) return raw
+  // eslint-disable-next-line no-control-regex
+  if (raw && !/[\x00-\x1f\x7f]/.test(raw) && raw.startsWith('/') && !raw.startsWith('//') && !raw.startsWith('/\\')) return raw
   return '/'
 }

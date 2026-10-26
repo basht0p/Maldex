@@ -59,6 +59,12 @@ describe('LoginPage', () => {
     expect(await screen.findByLabelText('User name')).toBeInTheDocument()
   })
 
+  it('says so when no sign-in method is configured', async () => {
+    server.use(config({ passwordLogin: false, sso: null }))
+    renderLogin()
+    expect(await screen.findByRole('alert')).toHaveTextContent('Sign-in is not configured. Ask an administrator.')
+  })
+
   it.each([
     [401, { error: 'invalid' }, 'Wrong user name or password.'],
     [401, { error: 'locked' }, 'Too many failed attempts. Try again in 15 minutes.'],

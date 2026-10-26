@@ -85,6 +85,10 @@ export default function LoginPage() {
       {configError && <p className={forms.error} role="alert">Could not load the sign-in options. Reload the page.</p>}
       {error && <p className={forms.error} role="alert">{error}</p>}
 
+      {step === 'credentials' && config !== null && !showForm && config.sso === null && (
+        <p className={forms.error} role="alert">Sign-in is not configured. Ask an administrator.</p>
+      )}
+
       {step === 'credentials' && showForm && (
         <form className={forms.form} onSubmit={submitCredentials}>
           <div className={forms.field}>
