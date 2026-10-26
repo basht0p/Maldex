@@ -215,7 +215,7 @@ Release packages are built and signed by the release workflow: a `.deb` for Ubun
 
    It installs and checks the rest of the host (libvirt/KVM, mitmproxy, guest tooling, Sysmon and the virtio drivers), then restarts maldex and checks that it stays up; if it does not, `journalctl -u maldex -n 50` names the problem. `maldex-setup --check` re-runs only the read-only checks.
 
-   **First admin.** Right after the database check, setup creates the first Maldex admin if no enabled admin exists yet: it asks for a user name (default `admin`) and then, without echo, for a password (12 to 256 characters). Run it from a terminal for this. Without one the step fails and prints the command to run yourself: `sudo maldex-admin create-user <name> --admin`. Re-running setup later does nothing here once an enabled admin exists, and `maldex-setup --check` fails while there is none.
+   **First admin.** Right after the database check, setup creates the first Maldex admin if no enabled admin exists yet: it asks for a user name (default `admin`) and then, without echo, for a password (12 to 256 characters). Run it from a terminal for this. Without one the step fails and prints the command to run yourself: `sudo maldex-admin create-user <name> --admin`. Re-running setup later does nothing here once an enabled admin exists, and `maldex-setup --check` fails while there is none. Reading the users needs root, so `--check` reaches `maldex-admin` through `sudo -n`; run as a user without passwordless sudo, its `admin` line fails with the exit status instead of a verdict, so run `sudo maldex-setup --check` for that line.
 
    **Offline.** On a host without internet access, copy `Sysmon.zip` and `virtio-win.iso` into a directory and run `sudo maldex-setup --offline <dir>`. Offline mode does not cover the OS packages (use a local mirror) or the Playwright Chromium that PDF reports need. To include Chromium, install it on a connected host with the same Maldex version (`PLAYWRIGHT_BROWSERS_PATH=$PWD/ms-playwright /opt/maldex/app/Maldex.Web --install-browsers --no-deps`) and copy that `ms-playwright` directory to `<dir>/ms-playwright`; maldex-setup copies it to `/var/lib/maldex/ms-playwright`. Without it, setup warns, finishes, and everything except PDF reports works; add Chromium later with `sudo maldex-setup` once the host can reach the Playwright CDN.
 
@@ -277,7 +277,7 @@ Register Maldex at the provider as a web application with the redirect (callback
 **Keycloak example.**
 
 1. In the realm, **Clients → Create client**: client type *OpenID Connect*, a client ID such as `maldex`, **Client authentication on** (a confidential client), the standard flow only, and the valid redirect URI `https://maldex.example.com/signin-oidc`. Copy the secret from the **Credentials** tab.
-2. **Client scopes → maldex-dedicated → Add mapper → By configuration → Group Membership**: token claim name `groups`, **Full group path off**, add to ID token on.
+2. **Clients → maldex → Client scopes → maldex-dedicated → Add mapper → By configuration → Group Membership**: token claim name `groups`, **Full group path off**, add to ID token on.
 3. Create the groups (for example `maldex-admins`, `maldex-analysts`) and add the users.
 4. Configure Maldex:
 

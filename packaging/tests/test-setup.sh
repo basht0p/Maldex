@@ -88,8 +88,8 @@ cp "$STUB_SRV/${url##*/}" "$out"'
   stub libguestfs-make-fixed-appliance '[ ! -e "$STUB_SRV/guestfs-fail" ] || exit 1; mkdir -p "$1"; touch "$1/kernel" "$1/initrd" "$1/root"'
   # maldex-admin: the real wrapper (it runs through the runuser stub) around a stub standing in for Maldex.Web (MALDEX_ADMIN_EXEC).
   cp "$PKG/bin/maldex-admin" "$T/pkg/bin/maldex-admin"
-  stub admin-exec 'case "$2" in list) cat "$STUB_ADMIN_LIST"; exit "${STUB_LIST_RC:-0}";; create-user) exit "${STUB_CREATE_RC:-0}";; esac; exit 0'
-  export MALDEX_ADMIN_EXEC="$T/bin/admin-exec" STUB_ADMIN_LIST="$T/admin-list"
+  stub admin-exec 'case "$2" in list) [ -z "${STUB_LIST_STDERR:-}" ] || echo "warn: noise on stderr" >&2; cat "$STUB_ADMIN_LIST"; exit "${STUB_LIST_RC:-0}";; create-user) exit "${STUB_CREATE_RC:-0}";; esac; exit 0'
+  export MALDEX_ADMIN_EXEC="$T/bin/admin-exec" STUB_ADMIN_LIST="$T/admin-list" MALDEX_ADMIN_CWD="$T"
   admin_list admin true false
   unset MALDEX_ASSUME_TTY SETUP_STDIN
   printf '#!/usr/bin/env bash\necho "Maldex.Web $*" >> "$STUB_LOG"\nmkdir -p "$PLAYWRIGHT_BROWSERS_PATH/chromium-1"\n' > "$T/opt/app/Maldex.Web"
@@ -436,6 +436,21 @@ test_admin_step() {
   run_setup
   check "a failing maldex-admin list fails the admin step with its exit status" grep -Eq '^FAIL admin -- .*(exit status 78|78)' <<<"$OUT"
   unset STUB_LIST_RC
+  teardown
+
+  # stderr noise must not corrupt the JSON stream
+  setup_sandbox; write_config
+  export STUB_LIST_STDERR=1
+  run_setup
+  check "stderr output of maldex-admin list does not break the admin step" grep -q '^ok   admin$' <<<"$OUT"
+  unset STUB_LIST_STDERR
+  teardown
+
+  # the wrapper runs from the unit's working directory and says so when it is missing
+  setup_sandbox; write_config
+  export MALDEX_ADMIN_CWD="$T/nonexistent"
+  run_setup
+  check "a missing /var/lib/maldex fails the admin step with a clear hint" grep -q 'FAIL admin -- .*/var/lib/maldex is missing' <<<"$OUT"
   teardown
 }
 

@@ -142,13 +142,17 @@ CREATE_HINT="no Maldex admin exists; create one with: sudo maldex-admin create-u
 # included), ADMIN_BREAKGLASS (enabled break-glass local Admins), ADMIN_PASSWORD_LOGIN and ADMIN_SSO (true|false). Fails with
 # HINT set when maldex-admin or the parse fails (exit 78 from maldex-admin: configuration or database error).
 admin_state() {
-  local out rc state
+  local out rc state errf
+  errf="$(mktemp)" || { fail "cannot create a temporary file"; return 1; }
+  # stdout is the JSON stream; stderr (messages, warnings) is kept apart and shown only on failure
   # shellcheck disable=SC2086  # MALDEX_SUDO is empty or "sudo -n"
-  out="$($MALDEX_SUDO "$ADMIN_CMD" list --json 2>&1)"; rc=$?
+  out="$($MALDEX_SUDO "$ADMIN_CMD" list --json 2>"$errf")"; rc=$?
   if [ "$rc" != 0 ]; then
-    fail "maldex-admin list failed (exit status $rc; 78 is a configuration or database error, so check ConnectionStrings:Maldex and Maldex:Auth in $CONFIG): $(printf '%s' "$out" | tail -n 3 | tr '\n' ' ')"
+    fail "maldex-admin list failed (exit status $rc; 78 is a configuration or database error, so check ConnectionStrings:Maldex and Maldex:Auth in $CONFIG): $(tail -n 3 "$errf" | tr '\n' ' ')"
+    rm -f "$errf"
     return 1
   fi
+  rm -f "$errf"
   command -v python3 >/dev/null 2>&1 || { fail "python3 is needed to read the maldex-admin output"; return 1; }
   # shellcheck disable=SC2016  # a python program, not shell
   state="$(printf '%s\n' "$out" | python3 -I -c '

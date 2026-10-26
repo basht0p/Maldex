@@ -133,15 +133,21 @@ if [ -f "$unit" ] && [ -f "$cfg" ]; then
           | curl -sS --max-time 20 -X POST -H 'Content-Type: application/json' -H 'X-Maldex-Csrf: 1' --data-binary @- "$APP_URL/api/auth/login" 2>&1)"
         if grep -q '"next":"done"' <<<"$login"; then pass "POST /api/auth/login signs the admin in"; else fail "POST /api/auth/login: $login"; fi
       fi
+    elif [ "$exited" = 0 ]; then
+      fail "the app is running but did not serve $APP_URL/api/auth/config within 60 s"; tail -n 40 "$APP_LOG" >&2
     elif [ "$mode" = db ]; then
-      fail "the app did not serve $APP_URL/api/auth/config against the smoke database"; tail -n 40 "$APP_LOG" >&2
+      wait "$app_pid" 2>/dev/null; fail "the app exited (status $?) instead of serving against the smoke database"; tail -n 40 "$APP_LOG" >&2
     else
+      # Closed database port: the app migrates before it listens, so it may only die of the database error. Exit 78 (a
+      # configuration error) or any other crash fails the smoke.
       wait "$app_pid" 2>/dev/null; app_rc=$?
-      echo "note app exited before serving against a closed database port (exit status $app_rc); the --print-paths check above stands in" >&2
-      tail -n 5 "$APP_LOG" >&2
-      pass "app start against a closed port: exited before serving (checked --print-paths instead)"
+      if [ "$app_rc" != 78 ] && grep -qE 'SqlException|network-related|error: 40|A network-related or instance-specific error' "$APP_LOG"; then
+        pass "app start against a closed port: exited ($app_rc) with the database connection error, as expected"
+      else
+        fail "app start against a closed port: exit status $app_rc without a database connection error in the log"; tail -n 40 "$APP_LOG" >&2
+      fi
     fi
-    [ "$exited" = 1 ] || { kill "$app_pid" 2>/dev/null; pkill -u maldex -f /opt/maldex/app/Maldex.Web 2>/dev/null; wait "$app_pid" 2>/dev/null; }
+    if [ "$exited" = 0 ]; then kill "$app_pid" 2>/dev/null; pkill -u maldex -f /opt/maldex/app/Maldex.Web 2>/dev/null; wait "$app_pid" 2>/dev/null; fi
   fi
 else
   fail "no unit file or config to start the app from"

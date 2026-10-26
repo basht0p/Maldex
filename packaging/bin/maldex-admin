@@ -19,6 +19,9 @@ if [ "$(id -u)" != 0 ]; then
   exit 1
 fi
 
+# The unit's WorkingDirectory: relative paths in the configuration resolve the same way.
+cd "${MALDEX_ADMIN_CWD:-/var/lib/maldex}" 2>/dev/null || { echo "maldex-admin: /var/lib/maldex is missing; reinstall the maldex package" >&2; exit 1; }
+
 exec runuser -u maldex -- env \
   ASPNETCORE_ENVIRONMENT=Production \
   MALDEX_EXTRA_CONFIG=/opt/maldex/app/appsettings.Package.json:/etc/maldex/appsettings.Production.json \
