@@ -2,7 +2,6 @@ using System.Security.Claims;
 using Maldex.Core.Domain;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
-using Microsoft.Identity.Web;
 
 namespace Maldex.Web.Auth;
 
@@ -15,13 +14,15 @@ public static class AuthSetup
     public const string DevRoleClaim = "maldex:dev-role";
 
     /// <summary>
-    /// Registers authentication (Dev or Entra), the role policies and <see cref="CurrentUser"/>.
-    /// Throws when dev auth is configured in Production.
+    /// Registers authentication (the Local cookie sessions, or Dev), Identity for local accounts, the key ring, the sign-in
+    /// rate limit, the role policies and <see cref="CurrentUser"/>. <see cref="AuthStartupValidation.Problem"/> has already
+    /// refused unsupported modes; Dev outside Development and Testing still throws here as a second line.
     /// </summary>
     public static WebApplicationBuilder AddMaldexAuth(this WebApplicationBuilder builder)
     {
-        var mode = builder.Configuration["Maldex:Auth:Mode"] ?? "Entra";
-        var isDev = string.Equals(mode, "Dev", StringComparison.OrdinalIgnoreCase);
+        var section = builder.Configuration.GetSection(MaldexAuthOptions.SectionName);
+        var auth = MaldexAuthOptions.Read(builder.Configuration);
+        var isDev = auth.IsDev;
         if (isDev)
         {
             if (!builder.Environment.IsDevelopment() && !builder.Environment.IsEnvironment("Testing"))
@@ -31,26 +32,37 @@ public static class AuthSetup
                 throw new InvalidOperationException($"Invalid Maldex:Auth:DevRole '{devRole}' (expected Admin or Analyst)");
         }
 
-        builder.Services.Configure<DevAuthOptions>(builder.Configuration.GetSection("Maldex:Auth"));
-        if (isDev)
-        {
-            builder.Services.AddAuthentication(DevAuthHandler.SchemeName)
-                .AddScheme<AuthenticationSchemeOptions, DevAuthHandler>(DevAuthHandler.SchemeName, null);
-        }
-        else
-        {
-            builder.Services.AddAuthentication().AddMicrosoftIdentityWebApi(builder.Configuration.GetSection("AzureAd"));
-        }
+        builder.Services.AddOptions<MaldexAuthOptions>().Configure(o => MaldexAuthOptions.Bind(section, o));
+        builder.Services.Configure<DevAuthOptions>(section);
+        builder.Services.AddMaldexIdentityCore(builder.Configuration);
+        builder.Services.AddMaldexDataProtection(builder.Configuration, builder.Environment);
+        builder.Services.AddMaldexLoginRateLimit(auth.LoginRateLimitPerMinute);
+
+        // The cookie schemes exist in both modes (sign-out and the sign-in endpoints always work); only the default differs.
+        var authentication = builder.Services.AddAuthentication(isDev ? DevAuthHandler.SchemeName : AuthSchemes.Application);
+        if (isDev) authentication.AddScheme<AuthenticationSchemeOptions, DevAuthHandler>(DevAuthHandler.SchemeName, null);
+        authentication.AddMaldexCookies();
+        OidcSetup.AddMaldexOidc(authentication, auth);
 
         builder.Services.AddAuthorizationBuilder()
             .AddPolicy(AnalystPolicy, p => p.RequireAuthenticatedUser().AddRequirements(new RoleRequirement(UserRole.Analyst)))
             .AddPolicy(AdminPolicy, p => p.RequireAuthenticatedUser().AddRequirements(new RoleRequirement(UserRole.Admin)));
+        builder.Services.AddSingleton<IAuthorizationMiddlewareResultHandler, NoRoleResultHandler>();
         builder.Services.AddHttpContextAccessor();
         builder.Services.AddScoped<IAuthorizationHandler, RoleRequirementHandler>();
 
         builder.Services.AddScoped<CurrentUser>();
         builder.Services.AddScoped<Audit.AuditWriter>();
         return builder;
+    }
+
+    /// <summary>Maps <c>/api/auth</c> (sign-in, password, TOTP) and the user administration endpoints.</summary>
+    public static IEndpointRouteBuilder MapMaldexAuthEndpoints(this IEndpointRouteBuilder app)
+    {
+        AuthEndpoints.Map(app);
+        TotpEndpoints.Map(app);
+        UserAdminEndpoints.Map(app);
+        return app;
     }
 }
 

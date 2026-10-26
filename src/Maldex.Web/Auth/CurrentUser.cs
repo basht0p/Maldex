@@ -102,6 +102,9 @@ public sealed class CurrentUserMiddleware(RequestDelegate next)
     public async Task InvokeAsync(HttpContext ctx, CurrentUser current)
     {
         await current.ResolveAsync(ctx.User, ctx.RequestAborted);
+        // A valid cookie (or dev identity) whose user row is gone or disabled counts as not signed in: 401 on this very
+        // request, without waiting for the next security-stamp check.
+        if (ctx.User.Identity?.IsAuthenticated == true && !current.IsResolved) ctx.User = new ClaimsPrincipal(new ClaimsIdentity());
         await next(ctx);
     }
 }

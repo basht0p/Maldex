@@ -197,15 +197,10 @@ public sealed class EventQueryTests(SqlServerFixture sql) : IDisposable
     {
         var f = Factory();
         var seeded = await CompletedTaskSeed.SeedAsync(f);
-        // A second host on the same database, in Entra mode: dev auth would admit an unauthenticated client.
-        var entra = new MaldexAppFactory(sql, authMode: "Entra", connectionString: f.ConnectionString, settings: new Dictionary<string, string?>
-        {
-            ["AzureAd:Instance"] = "https://login.microsoftonline.com/",
-            ["AzureAd:TenantId"] = "00000000-0000-0000-0000-000000000000",
-            ["AzureAd:ClientId"] = "00000000-0000-0000-0000-000000000001",
-        });
-        _factories.Add(entra);
-        using var anonymous = entra.CreateClient();
+        // A second host on the same database, in Local mode: dev auth would admit an unauthenticated client.
+        var local = new MaldexAppFactory(sql, authMode: "Local", connectionString: f.ConnectionString);
+        _factories.Add(local);
+        using var anonymous = local.CreateClient();
 
         Assert.Equal(HttpStatusCode.Unauthorized, (await anonymous.GetAsync($"/api/tasks/{seeded.TaskId}/events/export?format=csv", Ct)).StatusCode);
     }

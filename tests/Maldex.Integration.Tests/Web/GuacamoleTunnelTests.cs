@@ -43,10 +43,6 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
             ["Maldex:Guacamole:GuacdPort"] = guacdPort.ToString(),
             ["Maldex:Guacamole:StatusPollInterval"] = "00:00:00.100",
             ["Maldex:Guacamole:ConsoleKeepAliveInterval"] = keepAlive,
-            // Only read in Entra mode: placeholders so the JWT bearer scheme can be built (no token is ever validated here).
-            ["AzureAd:Instance"] = "https://login.microsoftonline.com/",
-            ["AzureAd:TenantId"] = "00000000-0000-0000-0000-000000000000",
-            ["AzureAd:ClientId"] = "00000000-0000-0000-0000-000000000001",
         })
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -324,13 +320,13 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
     }
 
     [Fact]
-    public async Task Tunnel_TokenIsTheCredential_NoAuthHeaders_EntraMode()
+    public async Task Tunnel_TokenIsTheCredential_NoAuthHeaders_LocalMode()
     {
         using var guacd = new FakeGuacd();
-        var f = new TunnelFactory(sql, guacd.Port, new VncEndpoint("127.0.0.1", 5901, VncPassword), authMode: "Entra");
+        var f = new TunnelFactory(sql, guacd.Port, new VncEndpoint("127.0.0.1", 5901, VncPassword), authMode: "Local");
         _disposables.Add(f);
 
-        // Seed a Running task and a user straight into the database: Entra mode has no dev sign-in.
+        // Seed a Running task and a user straight into the database: Local mode has no dev sign-in.
         var userId = Guid.NewGuid();
         var taskId = Guid.NewGuid();
         await using (var scope = f.Services.CreateAsyncScope())
@@ -352,7 +348,7 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
         using var anonymous = f.CreateClient();
         Assert.Equal(HttpStatusCode.Unauthorized, (await anonymous.GetAsync($"/api/tasks/{taskId}/tunnel-token", Ct)).StatusCode);
 
-        // The upgrade carries no Authorization header and no dev headers: only the token.
+        // The upgrade carries no session cookie and no dev headers: only the token.
         var token = f.Services.GetRequiredService<GuacamoleTokenService>().Issue(taskId, userId);
         var client = f.Server.CreateWebSocketClient();
         client.SubProtocols.Add("guacamole");

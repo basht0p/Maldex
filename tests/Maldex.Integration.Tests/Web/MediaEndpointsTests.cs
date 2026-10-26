@@ -37,10 +37,6 @@ public sealed class MediaEndpointsTests(SqlServerFixture sql) : IDisposable
             ["Maldex:Media:Root"] = _root,
             ["Maldex:Media:MaxChunkBytes"] = MaxChunk.ToString(),
             ["Maldex:Media:ChunkBytes"] = "512",
-            // Only read in Entra mode: placeholders so the JWT bearer scheme can be built (no token is validated here).
-            ["AzureAd:Instance"] = "https://login.microsoftonline.com/",
-            ["AzureAd:TenantId"] = "00000000-0000-0000-0000-000000000000",
-            ["AzureAd:ClientId"] = "00000000-0000-0000-0000-000000000001",
         });
         _disposables.Add(f);
         return f;
@@ -347,7 +343,7 @@ public sealed class MediaEndpointsTests(SqlServerFixture sql) : IDisposable
     [Fact]
     public async Task EveryRoute_Unauthenticated401()
     {
-        var f = Factory(authMode: "Entra");
+        var f = Factory(authMode: "Local");
         using var anonymous = f.CreateClient();
         var id = Guid.NewGuid();
 
