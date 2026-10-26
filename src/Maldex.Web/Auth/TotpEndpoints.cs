@@ -1,6 +1,9 @@
+using System.Security.Claims;
+using System.Security.Cryptography;
 using Maldex.Core.Domain;
 using Maldex.Data;
 using Maldex.Web.Audit;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Options;
 
@@ -24,17 +27,92 @@ public static class TotpEndpoints
 
     private static IResult Unauthenticated() => AuthEndpoints.Error(StatusCodes.Status401Unauthorized, "unauthenticated");
 
-    /// <summary>Re-issues the cookie that was in use after the security stamp changed (a full session keeps its sign-in time).</summary>
-    private static Task ReissueAsync(HttpContext ctx, AppUser user, string step) =>
-        step == LoginSteps.Done
-            ? LoginFlow.SignInFullAsync(ctx, user, LoginFlow.SessionIssuedAt(ctx))
-            : LoginFlow.SignInPartialAsync(ctx, user, step);
+    /// <summary>
+    /// Re-issues the cookie that was in use after the security stamp changed. A full session keeps its sign-in time; a partial
+    /// one keeps its original 10-minute window (enrolling must not extend it).
+    /// </summary>
+    private static async Task ReissueAsync(HttpContext ctx, AppUser user, string step)
+    {
+        if (step == LoginSteps.Done)
+        {
+            await LoginFlow.SignInFullAsync(ctx, user, LoginFlow.SessionIssuedAt(ctx));
+            return;
+        }
+        var services = ctx.RequestServices;
+        var window = (await ctx.AuthenticateAsync(AuthSchemes.Partial)).Properties;
+        if (window?.IssuedUtc is null || window.ExpiresUtc is null)
+        {
+            await LoginFlow.SignInPartialAsync(ctx, user, step);
+            return;
+        }
+        var stampType = services.GetRequiredService<IOptions<IdentityOptions>>().Value.ClaimsIdentity.SecurityStampClaimType;
+        var identity = new ClaimsIdentity(AuthSchemes.Partial);
+        identity.AddClaim(new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()));
+        identity.AddClaim(new Claim(MaldexClaims.Next, step));
+        identity.AddClaim(new Claim(stampType, await services.GetRequiredService<UserManager<AppUser>>().GetSecurityStampAsync(user)));
+        await ctx.SignInAsync(AuthSchemes.Partial, new ClaimsPrincipal(identity), new AuthenticationProperties
+        {
+            IsPersistent = false,
+            AllowRefresh = false,
+            IssuedUtc = window.IssuedUtc,
+            ExpiresUtc = window.ExpiresUtc,
+        });
+    }
+
+    private const string StepProvider = "maldex";
+    private const string StepToken = "TotpLastStep";
+    private const string Base32Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+    /// <summary>
+    /// Checks a 6-digit code against the user's authenticator key (RFC 6238, SHA-1, 30 s, one step either side) and refuses a
+    /// step that is not newer than the last one accepted. With <paramref name="record"/> the matched step becomes the last accepted.
+    /// </summary>
+    private static async Task<bool> AcceptTotpAsync(UserManager<AppUser> users, TimeProvider time, AppUser user, string code, bool record)
+    {
+        if (code.Length != 6 || !code.All(char.IsAsciiDigit)) return false;
+        if (await users.GetAuthenticatorKeyAsync(user) is not { Length: > 0 } key) return false;
+        var secret = Base32Decode(key);
+        var current = time.GetUtcNow().ToUnixTimeSeconds() / 30;
+        var last = long.TryParse(await users.GetAuthenticationTokenAsync(user, StepProvider, StepToken), out var l) ? l : -1;
+        var matched = -1L;
+        for (var step = current - 1; step <= current + 1; step++)
+            if (CryptographicOperations.FixedTimeEquals(System.Text.Encoding.ASCII.GetBytes(CodeFor(secret, step)), System.Text.Encoding.ASCII.GetBytes(code)))
+                matched = step;
+        if (matched < 0 || matched <= last) return false;
+        if (!record) return true;
+        return (await users.SetAuthenticationTokenAsync(user, StepProvider, StepToken, matched.ToString(System.Globalization.CultureInfo.InvariantCulture))).Succeeded;
+    }
+
+    private static string CodeFor(byte[] secret, long step)
+    {
+        Span<byte> message = stackalloc byte[8];
+        for (var i = 7; i >= 0; i--) { message[i] = (byte)(step & 0xff); step >>= 8; }
+        var hash = HMACSHA1.HashData(secret, message);
+        var offset = hash[^1] & 0x0f;
+        var binary = ((hash[offset] & 0x7f) << 24) | (hash[offset + 1] << 16) | (hash[offset + 2] << 8) | hash[offset + 3];
+        return (binary % 1_000_000).ToString("D6", System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static byte[] Base32Decode(string text)
+    {
+        var bytes = new List<byte>();
+        int buffer = 0, bits = 0;
+        foreach (var c in text.TrimEnd('=').ToUpperInvariant())
+        {
+            var v = Base32Alphabet.IndexOf(c);
+            if (v < 0) continue;
+            buffer = (buffer << 5) | v;
+            bits += 5;
+            if (bits >= 8) { bits -= 8; bytes.Add((byte)((buffer >> bits) & 0xff)); }
+        }
+        return [.. bytes];
+    }
 
     /// <summary>The 6-digit code typed by the user, or a recovery code, with spaces and dashes removed.</summary>
     private static string Clean(string? code) => (code ?? "").Replace(" ", "").Replace("-", "").Trim();
 
     private static async Task<IResult> LoginTotpAsync(TotpCodeRequest req, HttpContext ctx, UserManager<AppUser> users, MaldexDbContext db,
-        IOptions<MaldexAuthOptions> options, AuditWriter audit, CancellationToken ct)
+        IOptions<MaldexAuthOptions> options, AuditWriter audit, TimeProvider time, CancellationToken ct)
     {
         if (await LoginFlow.PartialUserAsync(ctx) is not ({ } user, LoginSteps.Totp)) return Unauthenticated();
         var name = user.UserName ?? "";
@@ -44,7 +122,7 @@ public static class TotpEndpoints
         var code = Clean(req.Code);
         var valid = code.Length > 0
             && (code.Length == 6
-                ? await users.VerifyTwoFactorTokenAsync(user, TokenOptions.DefaultAuthenticatorProvider, code)
+                ? await AcceptTotpAsync(users, time, user, code, record: true)
                 : (await users.RedeemTwoFactorRecoveryCodeAsync(user, MaldexUserStore.NormalizeCode(code))).Succeeded);
         if (!valid)
         {
@@ -81,6 +159,7 @@ public static class TotpEndpoints
         if (await users.GetTwoFactorEnabledAsync(user)) return AuthEndpoints.Error(StatusCodes.Status409Conflict, "totp_enabled");
 
         var reset = await users.ResetAuthenticatorKeyAsync(user);
+        await users.RemoveAuthenticationTokenAsync(user, StepProvider, StepToken);
         if (!reset.Succeeded) return AuthEndpoints.Error(StatusCodes.Status400BadRequest, "invalid");
         var key = await users.GetAuthenticatorKeyAsync(user) ?? "";
         // Resetting the key refreshes the security stamp; keep this sign-in alive.
@@ -90,13 +169,13 @@ public static class TotpEndpoints
     }
 
     private static async Task<IResult> ConfirmAsync(TotpCodeRequest req, HttpContext ctx, UserManager<AppUser> users, MaldexDbContext db,
-        IOptions<MaldexAuthOptions> options, AuditWriter audit, CancellationToken ct)
+        IOptions<MaldexAuthOptions> options, AuditWriter audit, TimeProvider time, CancellationToken ct)
     {
         if (await EnrolUserAsync(ctx) is not ({ } user, var step)) return Unauthenticated();
         if (await users.GetTwoFactorEnabledAsync(user)) return AuthEndpoints.Error(StatusCodes.Status409Conflict, "totp_enabled");
 
         var code = Clean(req.Code);
-        if (code.Length != 6 || !await users.VerifyTwoFactorTokenAsync(user, TokenOptions.DefaultAuthenticatorProvider, code))
+        if (!await AcceptTotpAsync(users, time, user, code, record: false))
             return AuthEndpoints.Error(StatusCodes.Status400BadRequest, "invalid");
 
         await users.SetTwoFactorEnabledAsync(user, true);
@@ -108,7 +187,7 @@ public static class TotpEndpoints
         var next = await LoginFlow.NextAsync(user, options.Value, await AuthEndpoints.SettingsAsync(db, ct), users, totpVerified: true);
         if (step == LoginSteps.Done) await LoginFlow.SignInFullAsync(ctx, user, LoginFlow.SessionIssuedAt(ctx));
         else if (next == LoginSteps.Done) await LoginFlow.SignInFullAsync(ctx, user);
-        else await LoginFlow.SignInPartialAsync(ctx, user, next);
+        else await ReissueAsync(ctx, user, next);
         return Results.Ok(new { recoveryCodes = codes, next = step == LoginSteps.Done ? LoginSteps.Done : next });
     }
 
@@ -117,6 +196,7 @@ public static class TotpEndpoints
     {
         if (await FullSessionUserAsync(ctx) is not { } user) return Unauthenticated();
 
+        if (!await users.GetTwoFactorEnabledAsync(user)) return AuthEndpoints.Error(StatusCodes.Status409Conflict, "totp_not_enabled");
         var settings = await AuthEndpoints.SettingsAsync(db, ct);
         if (settings.RequireTotpForLocal || (!options.Value.PasswordLogin && user.IsBreakGlass))
             return AuthEndpoints.Error(StatusCodes.Status409Conflict, "totp_required");
@@ -125,6 +205,7 @@ public static class TotpEndpoints
         await users.SetTwoFactorEnabledAsync(user, false);
         await users.RemoveAuthenticationTokenAsync(user, MaldexUserStore.InternalLoginProvider, MaldexUserStore.AuthenticatorKeyTokenName);
         await users.RemoveAuthenticationTokenAsync(user, MaldexUserStore.InternalLoginProvider, MaldexUserStore.RecoveryCodesTokenName);
+        await users.RemoveAuthenticationTokenAsync(user, StepProvider, StepToken);
         await users.UpdateSecurityStampAsync(user);
         await audit.WriteAsync("auth.totp_disabled", user.UserName ?? "", null, user.Id, ct);
         await LoginFlow.SignInFullAsync(ctx, user, LoginFlow.SessionIssuedAt(ctx));
@@ -152,7 +233,11 @@ public static class TotpEndpoints
     private static async Task<IResult?> CheckPasswordAsync(UserManager<AppUser> users, AppUser user, string? password, AuditWriter audit, CancellationToken ct)
     {
         if (await users.IsLockedOutAsync(user)) return AuthEndpoints.Error(StatusCodes.Status400BadRequest, "locked");
-        if (!string.IsNullOrEmpty(password) && await users.CheckPasswordAsync(user, password)) return null;
+        if (!string.IsNullOrEmpty(password) && await users.CheckPasswordAsync(user, password))
+        {
+            await users.ResetAccessFailedCountAsync(user);
+            return null;
+        }
         if (!await users.GetLockoutEnabledAsync(user)) await users.SetLockoutEnabledAsync(user, true);
         await users.AccessFailedAsync(user);
         if (await users.IsLockedOutAsync(user)) await audit.WriteAsync("auth.lockout", user.UserName ?? "", "totp settings", user.Id, ct);

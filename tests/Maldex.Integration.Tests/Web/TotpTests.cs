@@ -6,9 +6,12 @@ using Maldex.Data;
 using Maldex.Integration.Tests.Fixtures;
 using Maldex.Web.Auth;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Time.Testing;
 using Xunit;
 
 namespace Maldex.Integration.Tests.Web;
@@ -284,6 +287,193 @@ public sealed class TotpTests(SqlServerFixture sql) : IDisposable
         await using var scope = f.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
         Assert.Contains(await db.AuditLogs.ToListAsync(Ct), a => a.Action == "auth.recovery_codes" && a.UserId == alice.Id);
+    }
+
+    private sealed class ClockFactory(SqlServerFixture sql, FakeTimeProvider clock) : MaldexAppFactory(sql, authMode: "Local")
+    {
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            base.ConfigureWebHost(builder);
+            builder.ConfigureServices(s => s.Replace(ServiceDescriptor.Singleton<TimeProvider>(clock)));
+        }
+    }
+
+    private static Task<HttpResponseMessage> PostAsync(HttpClient c, string url, object body) => c.PostAsJsonAsync(url, body, Ct);
+
+    [Fact]
+    public async Task Reissued_session_cookies_keep_the_seven_day_cap()
+    {
+        var clock = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        var f = new ClockFactory(sql, clock);
+        _disposables.Add(f);
+        await LocalAuth.SeedUserAsync(f, "alice", Password, UserRole.Analyst);
+        using var client = await LocalAuth.SignInAsync(f, "alice", Password);
+
+        // Almost six days in (activity every 11 hours keeps the sliding expiry alive).
+        for (var i = 0; i < 13; i++)
+        {
+            clock.Advance(TimeSpan.FromHours(11));
+            Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/me", Ct)).StatusCode);
+        }
+
+        // Setup, confirm, regenerate and remove each re-issue the cookie; none may restart the 7-day cap.
+        var key = (await JsonAsync(await client.PostAsync("/api/auth/totp/setup", null, Ct))).GetProperty("sharedKey").GetString()!;
+        Assert.Equal(HttpStatusCode.OK, (await PostAsync(client, "/api/auth/totp/confirm", new { code = Totp.Code(key, clock.GetUtcNow()) })).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await PostAsync(client, "/api/auth/totp/recovery-codes", new { password = Password })).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent, (await client.SendAsync(DeleteTotp(Password), Ct)).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/me", Ct)).StatusCode);
+
+        clock.Advance(TimeSpan.FromHours(11));
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/me", Ct)).StatusCode);
+        clock.Advance(TimeSpan.FromHours(11));
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/me", Ct)).StatusCode);
+        clock.Advance(TimeSpan.FromHours(4));
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/me", Ct)).StatusCode);
+    }
+
+    [Fact]
+    public async Task Setup_keeps_the_original_partial_window()
+    {
+        var clock = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        var f = new ClockFactory(sql, clock);
+        _disposables.Add(f);
+        await LocalAuth.SeedUserAsync(f, "alice", Password, UserRole.Analyst);
+        await SetRequireTotpAsync(f);
+        using var client = f.CreateClient();
+        await AssertNextAsync(await LoginAsync(client), "enrol-totp");
+
+        clock.Advance(TimeSpan.FromMinutes(6));
+        Assert.Equal(HttpStatusCode.OK, (await client.PostAsync("/api/auth/totp/setup", null, Ct)).StatusCode);
+        clock.Advance(TimeSpan.FromMinutes(5));
+        // 11 minutes after sign-in: had setup extended the window, this would still be allowed.
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.PostAsync("/api/auth/totp/setup", null, Ct)).StatusCode);
+    }
+
+    [Fact]
+    public async Task Partial_sessions_at_other_steps_cannot_enrol_or_manage_totp()
+    {
+        var f = Factory();
+        await LocalAuth.SeedUserAsync(f, "alice", Password, UserRole.Analyst, u => u.MustChangePassword = true);
+        using var client = f.CreateClient();
+        await AssertNextAsync(await LoginAsync(client), "change-password");
+
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.PostAsync("/api/auth/totp/setup", null, Ct)).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await PostAsync(client, "/api/auth/totp/confirm", new { code = "123456" })).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/tasks", Ct)).StatusCode);
+
+        // A partial session still owing the TOTP code can neither re-key, regenerate nor remove.
+        await LocalAuth.SeedUserAsync(f, "bob", Password, UserRole.Analyst);
+        using var bob = await LocalAuth.SignInAsync(f, "bob", Password);
+        await EnrolAsync(bob);
+        await bob.PostAsync("/api/auth/logout", null, Ct);
+        await AssertNextAsync(await LoginAsync(bob, "bob"), "totp");
+        Assert.Equal(HttpStatusCode.Unauthorized, (await bob.PostAsync("/api/auth/totp/setup", null, Ct)).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await PostAsync(bob, "/api/auth/totp/confirm", new { code = "123456" })).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await PostAsync(bob, "/api/auth/totp/recovery-codes", new { password = Password })).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await bob.SendAsync(DeleteTotp(Password), Ct)).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await bob.GetAsync("/api/tasks", Ct)).StatusCode);
+    }
+
+    [Fact]
+    public async Task Totp_login_is_rate_limited()
+    {
+        var f = Factory(new() { ["Maldex:Auth:LoginRateLimitPerMinute"] = "10" });
+        using var client = f.CreateClient();
+        for (var i = 0; i < 10; i++)
+            await AssertErrorAsync(await TotpLoginAsync(client, "123456"), HttpStatusCode.Unauthorized, "unauthenticated");
+        await AssertErrorAsync(await TotpLoginAsync(client, "123456"), HttpStatusCode.TooManyRequests, "rate_limited");
+    }
+
+    [Fact]
+    public async Task Five_wrong_codes_lock_the_account()
+    {
+        var f = Factory();
+        var alice = await LocalAuth.SeedUserAsync(f, "alice", Password, UserRole.Analyst);
+        using var client = await LocalAuth.SignInAsync(f, "alice", Password);
+        var (key, _) = await EnrolAsync(client);
+        await client.PostAsync("/api/auth/logout", null, Ct);
+        await AssertNextAsync(await LoginAsync(client), "totp");
+
+        for (var i = 0; i < 5; i++)
+            await AssertErrorAsync(await TotpLoginAsync(client, WrongCode(key)), HttpStatusCode.Unauthorized, "invalid");
+        // Even the right code is refused now.
+        await AssertErrorAsync(await TotpLoginAsync(client, Totp.Code(key, DateTimeOffset.UtcNow)), HttpStatusCode.Unauthorized, "locked");
+
+        await using var scope = f.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+        Assert.Contains(await db.AuditLogs.ToListAsync(Ct), a => a.Action == "auth.lockout" && a.UserId == alice.Id);
+    }
+
+    [Fact]
+    public async Task Fresh_password_logins_do_not_reset_the_totp_failure_count()
+    {
+        var f = Factory();
+        await LocalAuth.SeedUserAsync(f, "alice", Password, UserRole.Analyst);
+        using var client = await LocalAuth.SignInAsync(f, "alice", Password);
+        var (key, _) = await EnrolAsync(client);
+        await client.PostAsync("/api/auth/logout", null, Ct);
+        await AssertNextAsync(await LoginAsync(client), "totp");
+
+        for (var i = 0; i < 3; i++)
+            await AssertErrorAsync(await TotpLoginAsync(client, WrongCode(key)), HttpStatusCode.Unauthorized, "invalid");
+        await AssertNextAsync(await LoginAsync(client), "totp");
+        for (var i = 0; i < 2; i++)
+            await AssertErrorAsync(await TotpLoginAsync(client, WrongCode(key)), HttpStatusCode.Unauthorized, "invalid");
+        await AssertErrorAsync(await TotpLoginAsync(client, Totp.Code(key, DateTimeOffset.UtcNow)), HttpStatusCode.Unauthorized, "locked");
+    }
+
+    [Fact]
+    public async Task A_totp_code_cannot_be_used_twice()
+    {
+        var f = Factory();
+        await LocalAuth.SeedUserAsync(f, "alice", Password, UserRole.Analyst);
+        using var client = await LocalAuth.SignInAsync(f, "alice", Password);
+        var (key, _) = await EnrolAsync(client);
+        await client.PostAsync("/api/auth/logout", null, Ct);
+
+        var code = Totp.Code(key, DateTimeOffset.UtcNow);
+        await AssertNextAsync(await LoginAsync(client), "totp");
+        await AssertNextAsync(await TotpLoginAsync(client, code), "done");
+        await client.PostAsync("/api/auth/logout", null, Ct);
+        await AssertNextAsync(await LoginAsync(client), "totp");
+        await AssertErrorAsync(await TotpLoginAsync(client, code), HttpStatusCode.Unauthorized, "invalid");
+    }
+
+    [Fact]
+    public async Task Setup_and_confirm_are_refused_when_totp_is_already_on()
+    {
+        var f = Factory();
+        await LocalAuth.SeedUserAsync(f, "alice", Password, UserRole.Analyst);
+        using var client = await LocalAuth.SignInAsync(f, "alice", Password);
+        var (key, _) = await EnrolAsync(client);
+
+        await AssertErrorAsync(await client.PostAsync("/api/auth/totp/setup", null, Ct), HttpStatusCode.Conflict, "totp_enabled");
+        await AssertErrorAsync(await PostAsync(client, "/api/auth/totp/confirm", new { code = Totp.Code(key, DateTimeOffset.UtcNow) }), HttpStatusCode.Conflict, "totp_enabled");
+    }
+
+    [Fact]
+    public async Task Remove_without_totp_is_refused()
+    {
+        var f = Factory();
+        await LocalAuth.SeedUserAsync(f, "alice", Password, UserRole.Analyst);
+        using var client = await LocalAuth.SignInAsync(f, "alice", Password);
+        await AssertErrorAsync(await client.SendAsync(DeleteTotp(Password), Ct), HttpStatusCode.Conflict, "totp_not_enabled");
+    }
+
+    [Fact]
+    public async Task A_correct_password_resets_the_failure_count_on_regenerate()
+    {
+        var f = Factory();
+        await LocalAuth.SeedUserAsync(f, "alice", Password, UserRole.Analyst);
+        using var client = await LocalAuth.SignInAsync(f, "alice", Password);
+        await EnrolAsync(client);
+
+        for (var round = 0; round < 2; round++)
+        {
+            for (var i = 0; i < 4; i++)
+                await AssertErrorAsync(await PostAsync(client, "/api/auth/totp/recovery-codes", new { password = "wrong password here" }), HttpStatusCode.BadRequest, "invalid");
+            Assert.Equal(HttpStatusCode.OK, (await PostAsync(client, "/api/auth/totp/recovery-codes", new { password = Password })).StatusCode);
+        }
     }
 
     [Fact]

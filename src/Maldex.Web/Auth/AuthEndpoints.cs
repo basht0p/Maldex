@@ -82,8 +82,9 @@ public static class AuthEndpoints
             return Error(StatusCodes.Status401Unauthorized, refusal);
         }
 
-        await users.ResetAccessFailedCountAsync(user);
         var next = await LoginFlow.NextAsync(user, o, await SettingsAsync(db, ct), users);
+        // With TOTP pending the count stays: the TOTP step resets it on success, so wrong codes plus fresh passwords can't dodge the lockout.
+        if (next != LoginSteps.Totp) await users.ResetAccessFailedCountAsync(user);
         if (next == LoginSteps.Done) await LoginFlow.SignInFullAsync(ctx, user);
         else await LoginFlow.SignInPartialAsync(ctx, user, next);
         await audit.WriteAsync("auth.login", user.UserName ?? target, "next=" + next, user.Id, ct);
