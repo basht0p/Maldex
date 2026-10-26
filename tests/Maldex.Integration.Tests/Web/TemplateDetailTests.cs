@@ -34,7 +34,7 @@ public sealed class TemplateDetailTests(SqlServerFixture sql) : IDisposable
         await using var scope = f.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
         var now = DateTimeOffset.UtcNow;
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "Builder", Role = UserRole.Admin };
+        var user = TestUsers.Create(UserRole.Admin, "Builder");
         var media = new MediaFile
         {
             Id = Guid.NewGuid(), Kind = MediaKind.OsInstaller, FileName = "Win11.iso", Size = 1, ReceivedBytes = 1, Sha256 = new string('a', 64),

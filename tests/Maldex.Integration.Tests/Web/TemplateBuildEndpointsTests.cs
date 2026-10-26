@@ -103,7 +103,7 @@ public sealed class TemplateBuildEndpointsTests(SqlServerFixture sql) : IDisposa
     {
         await using var scope = r.Factory.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "Seeder", Role = UserRole.Admin };
+        var user = TestUsers.Create(UserRole.Admin, "Seeder");
         db.Users.Add(user);
         var now = DateTimeOffset.UtcNow;
         var media = new MediaFile

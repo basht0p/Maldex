@@ -146,7 +146,7 @@ public class TemplateSchemaTests(SqlServerFixture sql)
     {
         var (db, cs) = await FreshAsync();
         var org = new OrgEntity { Id = Guid.NewGuid(), Name = "Acme-" + Guid.NewGuid().ToString("N"), RetentionDays = 30 };
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "A", Role = UserRole.Analyst };
+        var user = TestUsers.Create(UserRole.Analyst, "A");
         var task = new AnalysisTask
         {
             Id = Guid.NewGuid(), OrgId = org.Id, SubmittedByUserId = user.Id, Url = "http://x.test",

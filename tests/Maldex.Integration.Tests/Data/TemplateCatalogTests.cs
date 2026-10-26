@@ -687,7 +687,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
     private static async Task SeedTaskAsync(MaldexDbContext db, Guid versionId, RunStatus status)
     {
         var org = new OrgEntity { Id = Guid.NewGuid(), Name = "Org-" + Guid.NewGuid().ToString("N"), RetentionDays = 30 };
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "A", Role = UserRole.Analyst };
+        var user = TestUsers.Create(UserRole.Analyst, "A");
         var task = new AnalysisTask
         {
             Id = Guid.NewGuid(), OrgId = org.Id, SubmittedByUserId = user.Id, Url = "http://x.test",
@@ -877,7 +877,7 @@ public class TemplateCatalogTests(SqlServerFixture sql)
 
     private static async Task<Guid> AddUserAsync(MaldexDbContext db)
     {
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "Admin", Role = UserRole.Admin };
+        var user = TestUsers.Create(UserRole.Admin, "Admin");
         db.Users.Add(user);
         await db.SaveChangesAsync(Ct);
         return user.Id;
