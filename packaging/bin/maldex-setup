@@ -8,6 +8,9 @@
 #   maldex-setup --check            run only the read-only checks, print every result, change nothing (root not required);
 #                                   its guest disk editor check boots a throwaway libguestfs appliance (libguestfs-test-tool)
 #
+# The admin step (after db) creates the first Maldex admin with maldex-admin when none is enabled: on a terminal it asks for the
+# user name and maldex-admin asks for the password; without one it fails and prints the command to run.
+#
 # Each step prints "ok   <step>" or "FAIL <step> -- <hint>". Paths can be moved for tests: MALDEX_ETC (default /etc/maldex),
 # MALDEX_DATA (default /var/lib/maldex, Maldex:Real:Root) and MALDEX_OPT (default /opt/maldex).
 set -uo pipefail
@@ -128,6 +131,76 @@ db_check() {
   timeout 5 bash -c '</dev/tcp/$1/$2' _ "$host" "$port" >/dev/null 2>&1 \
     || fail "cannot reach SQL Server at $host:$port (from ConnectionStrings:Maldex in $CONFIG); check the server, the firewall and the host name" \
     || return 1
+}
+
+# ---- admin ----
+
+ADMIN_CMD="$HERE/maldex-admin"   # /opt/maldex/bin/maldex-admin (it must run as root: $MALDEX_SUDO is "sudo -n" for --check)
+CREATE_HINT="no Maldex admin exists; create one with: sudo maldex-admin create-user <name> --admin"
+
+# Reads `maldex-admin list --json` (one JSON array line, then "#config {...}") and sets ADMIN_ENABLED (enabled Admins, SSO
+# included), ADMIN_BREAKGLASS (enabled break-glass local Admins), ADMIN_PASSWORD_LOGIN and ADMIN_SSO (true|false). Fails with
+# HINT set when maldex-admin or the parse fails (exit 78 from maldex-admin: configuration or database error).
+admin_state() {
+  local out rc state errf
+  errf="$(mktemp)" || { fail "cannot create a temporary file"; return 1; }
+  # stdout is the JSON stream; stderr (messages, warnings) is kept apart and shown only on failure
+  # shellcheck disable=SC2086  # MALDEX_SUDO is empty or "sudo -n"
+  out="$($MALDEX_SUDO "$ADMIN_CMD" list --json 2>"$errf")"; rc=$?
+  if [ "$rc" != 0 ]; then
+    fail "maldex-admin list failed (exit status $rc; 78 is a configuration or database error, so check ConnectionStrings:Maldex and Maldex:Auth in $CONFIG): $(tail -n 3 "$errf" | tr '\n' ' ')"
+    rm -f "$errf"
+    return 1
+  fi
+  rm -f "$errf"
+  command -v python3 >/dev/null 2>&1 || { fail "python3 is needed to read the maldex-admin output"; return 1; }
+  # shellcheck disable=SC2016  # a python program, not shell
+  state="$(printf '%s\n' "$out" | python3 -I -c '
+import json, sys
+users, cfg = [], {}
+for line in sys.stdin:
+    line = line.strip()
+    if line.startswith("#config "):
+        cfg = json.loads(line[8:])
+    elif line.startswith("["):
+        users = json.loads(line)
+adm = [u for u in users if u.get("role") == "Admin" and not u.get("isDisabled")]
+bg = [u for u in adm if u.get("kind") == "Local" and u.get("isBreakGlass")]
+print(len(adm), len(bg), str(cfg.get("passwordLogin", True)).lower(), str(cfg.get("ssoEnabled", False)).lower())
+' 2>/dev/null)" || { fail "cannot parse the maldex-admin list output"; return 1; }
+  read -r ADMIN_ENABLED ADMIN_BREAKGLASS ADMIN_PASSWORD_LOGIN ADMIN_SSO <<<"$state"
+  [ -n "$ADMIN_SSO" ] || { fail "cannot parse the maldex-admin list output"; return 1; }
+}
+
+# Creates the first admin when none is enabled. Interactive only ([ -t 0 ]; MALDEX_ASSUME_TTY=1 is the test stand-in): the user
+# name is asked here, and maldex-admin prompts for the password itself, without echo.
+step_admin() {
+  admin_state || return 1
+  [ "$ADMIN_ENABLED" = 0 ] || return 0
+  if [ ! -t 0 ] && [ "${MALDEX_ASSUME_TTY:-0}" != 1 ]; then
+    fail "$CREATE_HINT" || return 1
+  fi
+  local name args=(--admin)
+  printf 'First admin user name [admin]: ' >&2
+  IFS= read -r name || name=""
+  [ -t 0 ] || echo >&2   # on a terminal the Enter key ends the prompt line; piped input does not
+  name="${name:-admin}"
+  [[ "$name" =~ ^[A-Za-z0-9._@][A-Za-z0-9._@-]{0,63}$ ]] \
+    || fail "invalid user name '$name' (1-64 characters of A-Z a-z 0-9 . _ @ -, not starting with -); $CREATE_HINT" || return 1
+  # With password login off, the first admin is the break-glass account that keeps Maldex reachable.
+  [ "$ADMIN_PASSWORD_LOGIN" = true ] || args+=(--break-glass)
+  "$ADMIN_CMD" create-user "$name" "${args[@]}" \
+    || fail "maldex-admin create-user $name failed; fix the cause above, or run it yourself: sudo maldex-admin create-user $name ${args[*]}" || return 1
+}
+
+# --check: fails without an enabled Admin; warns (does not fail) when password login is off, SSO is on and no break-glass admin
+# exists (an IdP outage would then lock everyone out).
+admin_check() {
+  admin_state || return 1
+  [ "$ADMIN_ENABLED" != 0 ] || fail "$CREATE_HINT" || return 1
+  if [ "$ADMIN_PASSWORD_LOGIN" = false ] && [ "$ADMIN_SSO" = true ] && [ "$ADMIN_BREAKGLASS" = 0 ]; then
+    echo "warn admin -- password login is off and no break-glass admin exists, so an SSO outage locks everyone out; run: sudo maldex-admin set-break-glass <local admin> on" >&2
+  fi
 }
 
 # ---- downloads ----
@@ -337,11 +410,15 @@ if [ "$CHECK" = 1 ]; then
   rc=0
   HINT=""
   if db_check; then echo "ok   db"; else echo "FAIL db -- $HINT" >&2; rc=1; fi
+  HINT=""
+  if admin_check; then echo "ok   admin"; else echo "FAIL admin -- $HINT" >&2; rc=1; fi
+  HINT=""
   verify_checks || rc=1
   exit "$rc"
 fi
 
 run_step db db_check
+run_step admin step_admin
 run_step downloads step_downloads
 run_step mitm-ca step_mitm_ca
 run_step inetsim step_inetsim
@@ -351,4 +428,5 @@ run_step verify step_verify
 run_step start step_start
 echo
 echo "Maldex is running on $APP_URL (localhost only: put a reverse proxy in front, or use ssh -L 5080:127.0.0.1:5080 <host>)."
-echo "Next: build the first template in the app under Admin → Sandbox Templates → New template."
+echo "Next: sign in at that URL with the admin you created (more users: Admin → Users, or sudo maldex-admin), then build the first"
+echo "template under Admin → Sandbox Templates → New template."

@@ -521,6 +521,7 @@ cmd_package() {
   # 5. bundled assets (tracked files only), the setup command and its library
   git ls-files -z -- deploy rules | tar --null -T - -cf - | tar -xf - -C "$opt"
   install -D -m 0755 packaging/bin/maldex-setup "$opt/bin/maldex-setup"
+  install -D -m 0755 packaging/bin/maldex-admin "$opt/bin/maldex-admin"
   install -D -m 0644 packaging/lib/maldex-common.sh "$opt/lib/maldex-common.sh"
   # The admin template, with RHEL 9's edk2-ovmf firmware paths for the .rpm.
   sed -e 's#/usr/share/OVMF/OVMF_CODE_4M\.secboot\.fd#/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd#' \
