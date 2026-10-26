@@ -86,6 +86,16 @@ if (AuthStartupValidation.Problem(builder.Configuration, builder.Environment) is
     return StartupChecks.ConfigErrorExitCode;
 }
 
+// `Maldex.Web admin <command>`: bootstrap and recovery of local accounts against the configured database, without starting the web host
+// (the packaged /opt/maldex/bin/maldex-admin wraps it). Exit codes: 0 done, 1 refused, 64 usage error, 78 configuration error.
+if (args.Length > 0 && args[0] == "admin")
+{
+    using var cancelled = new CancellationTokenSource();
+    Console.CancelKeyPress += (_, e) => { e.Cancel = true; cancelled.Cancel(); };
+    return await AdminCli.RunAsync(args[1..], builder.Configuration, builder.Environment, Console.In, Console.Out, Console.Error,
+        new ConsolePasswordPrompt(), cancelled.Token);
+}
+
 builder.Services.ConfigureHttpJsonOptions(o => o.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddDbContext<MaldexDbContext>(o => o.UseSqlServer(
     builder.Configuration.GetConnectionString("Maldex")
