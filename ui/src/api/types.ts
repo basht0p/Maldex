@@ -450,5 +450,36 @@ export interface SystemStatusDto {
   disks: DiskStatusDto[]
   workers: WorkerStatusDto[]
   recentFailures: RecentFailureDto[]
+  /** Plain-language auth configuration warnings (for example a missing break-glass account). */
+  authWarnings: string[]
   generatedAt: string
 }
+
+export interface UserDto {
+  id: string
+  userName: string
+  displayName: string
+  kind: 'Local' | 'Sso'
+  role: UserRole | null
+  isDisabled: boolean
+  totpEnabled: boolean
+  isBreakGlass: boolean
+  roleManagedByIdp: boolean
+  createdAt: string
+  lastSignInAt: string | null
+}
+export interface CreateUserRequest {
+  userName: string
+  displayName: string
+  role: UserRole
+  password: string
+  mustChangePassword: boolean
+  isBreakGlass: boolean
+}
+export interface UpdateUserRequest {
+  displayName?: string
+  role?: UserRole | 'none'
+  isDisabled?: boolean
+  isBreakGlass?: boolean
+}
+export interface AuthSettingsDto { requireTotpForLocal: boolean }

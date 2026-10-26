@@ -20,6 +20,7 @@ import AccountPage from './pages/AccountPage'
 import LoginPage from './pages/LoginPage'
 import MediaPage from './pages/MediaPage'
 import OrgsAdminPage from './pages/OrgsAdminPage'
+import UsersAdminPage from './pages/UsersAdminPage'
 import StatusPage from './pages/StatusPage'
 import SubmitPage from './pages/SubmitPage'
 import TaskPage from './pages/TaskPage'
@@ -50,6 +51,7 @@ function useNarrow(): boolean {
 const ADMIN_LINKS = [
   { to: '/admin/templates', label: 'Templates' },
   { to: '/admin/media', label: 'Media' },
+  { to: '/admin/users', label: 'Users' },
   { to: '/admin/orgs', label: 'Organizations' },
   { to: '/admin/status', label: 'Status' },
 ]
@@ -189,7 +191,10 @@ function Shell() {
     'g t': () => navigate('/'),
     'g s': () => navigate('/submit'),
   }
-  if (isAdmin) shortcuts['g a'] = () => navigate('/admin/templates')
+  if (isAdmin) {
+    shortcuts['g a'] = () => navigate('/admin/templates')
+    shortcuts['g u'] = () => navigate('/admin/users')
+  }
   useShortcuts(shortcuts)
 
   const links = (
@@ -222,6 +227,7 @@ function Shell() {
           <Route path="/" element={<TasksPage />} />
           <Route path="/submit" element={<SubmitPage maxUploadBytes={me?.maxUploadBytes} />} />
           <Route path="/tasks/:id" element={<TaskPage />} />
+          <Route path="/admin/users" element={<UsersAdminPage me={me} />} />
           <Route path="/admin/orgs" element={<OrgsAdminPage me={me} />} />
           <Route path="/admin/templates" element={<TemplatesAdminPage me={me} />} />
           <Route path="/admin/templates/:id" element={<TemplateDetailPage me={me} />} />

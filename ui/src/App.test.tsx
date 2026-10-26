@@ -34,14 +34,14 @@ it('shows the Admin menu to admins only', async () => {
   expect(screen.queryByRole('button', { name: 'Admin' })).not.toBeInTheDocument()
 })
 
-it('opens shortcut help on ? and lists the six shortcuts', async () => {
+it('opens shortcut help on ? and lists the seven shortcuts', async () => {
   const user = userEvent.setup()
   server.use(me('Analyst'))
   render(<App />)
   await screen.findByText('Pat (Analyst)')
   await user.keyboard('?')
   const dialog = screen.getByRole('dialog', { name: 'Keyboard shortcuts' })
-  expect(within(dialog).getAllByRole('listitem')).toHaveLength(6)
+  expect(within(dialog).getAllByRole('listitem')).toHaveLength(7)
   await user.keyboard('{Escape}')
   expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
 })
@@ -73,7 +73,7 @@ const statusBody = (over: Record<string, unknown> = {}) => ({
   vmSlot: { capacity: 1, busy: 0, holders: [] }, queueDepth: 0, runningTasks: 0, activeJobs: 0,
   disks: [{ name: 'data', path: '/d', freeBytes: 50, totalBytes: 100 }],
   workers: [{ name: 'orchestrator', lastTickAt: null, expectedIntervalSec: 5, stalled: false }],
-  recentFailures: [], generatedAt: '2026-10-25T10:00:00Z', ...over,
+  recentFailures: [], authWarnings: [], generatedAt: '2026-10-25T10:00:00Z', ...over,
 })
 const stalledWorkers = [{ name: 'orchestrator', lastTickAt: null, expectedIntervalSec: 5, stalled: true }]
 const lowDisk = [{ name: 'vm', path: '/v', freeBytes: 5, totalBytes: 100 }]
