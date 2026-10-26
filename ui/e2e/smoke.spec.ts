@@ -48,13 +48,13 @@ test('submit a URL, watch live telemetry, stop, and read the report', async ({ p
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
 
   // Admin pages: Status, Templates -> detail, Media.
-  await page.getByRole('button', { name: 'Admin' }).click()
+  await page.getByRole('button', { name: 'Admin', exact: true }).click()
   await page.getByRole('link', { name: 'Status' }).click()
   await expect(page.getByRole('heading', { name: 'System status' })).toBeVisible()
   await expect(page.getByText(/of \d+ in use/)).toBeVisible()
   await expect(page.getByRole('cell', { name: 'orchestrator', exact: true })).toBeVisible()
 
-  await page.getByRole('button', { name: 'Admin' }).click()
+  await page.getByRole('button', { name: 'Admin', exact: true }).click()
   await page.getByRole('link', { name: 'Templates' }).click()
   await expect(page.getByRole('heading', { name: 'Sandbox Templates' })).toBeVisible()
   // The importer seeds the default template with displayName = id.
@@ -64,7 +64,7 @@ test('submit a URL, watch live telemetry, stop, and read the report', async ({ p
   await expect(page.getByRole('heading', { name: 'win10-ltsc-2021', level: 1 })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Versions' })).toBeVisible()
 
-  await page.getByRole('button', { name: 'Admin' }).click()
+  await page.getByRole('button', { name: 'Admin', exact: true }).click()
   await page.getByRole('link', { name: 'Media' }).click()
   await expect(page.getByRole('heading', { name: 'Media' })).toBeVisible()
 })
