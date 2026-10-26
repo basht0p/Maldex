@@ -136,10 +136,11 @@ db_check() {
 # ---- admin ----
 
 ADMIN_CMD="$HERE/maldex-admin"   # /opt/maldex/bin/maldex-admin (it must run as root: $MALDEX_SUDO is "sudo -n" for --check)
-CREATE_HINT="no Maldex admin exists; create one with: sudo maldex-admin create-user <name> --admin"
+CREATE_HINT="no enabled Maldex admin can sign in; create one with: sudo maldex-admin create-user <name> --admin (add --break-glass while PasswordLogin is false)"
 
-# Reads `maldex-admin list --json` (one JSON array line, then "#config {...}") and sets ADMIN_ENABLED (enabled Admins, SSO
-# included), ADMIN_BREAKGLASS (enabled break-glass local Admins), ADMIN_PASSWORD_LOGIN and ADMIN_SSO (true|false). Fails with
+# Reads `maldex-admin list --json` (one JSON array line, then "#config {...}") and sets ADMIN_ENABLED (enabled Admins who can
+# sign in under the current settings, as AdminGuard.CanSignIn: a local Admin needs password login on or break-glass, an SSO
+# Admin needs SSO on), ADMIN_BREAKGLASS (enabled break-glass local Admins), ADMIN_PASSWORD_LOGIN and ADMIN_SSO (true|false). Fails with
 # HINT set when maldex-admin or the parse fails (exit 78 from maldex-admin: configuration or database error).
 admin_state() {
   local out rc state errf
@@ -164,15 +165,23 @@ for line in sys.stdin:
         cfg = json.loads(line[8:])
     elif line.startswith("["):
         users = json.loads(line)
-adm = [u for u in users if u.get("role") == "Admin" and not u.get("isDisabled")]
+pw, sso = cfg.get("passwordLogin", True) is not False, cfg.get("ssoEnabled", False) is True
+# As AdminGuard.CanSignIn: a local user needs password login on or break-glass; an SSO user needs SSO on.
+def can_sign_in(u):
+    if u.get("isDisabled"):
+        return False
+    if u.get("kind") == "Local":
+        return pw or bool(u.get("isBreakGlass"))
+    return u.get("kind") == "Sso" and sso
+adm = [u for u in users if u.get("role") == "Admin" and can_sign_in(u)]
 bg = [u for u in adm if u.get("kind") == "Local" and u.get("isBreakGlass")]
-print(len(adm), len(bg), str(cfg.get("passwordLogin", True)).lower(), str(cfg.get("ssoEnabled", False)).lower())
+print(len(adm), len(bg), str(pw).lower(), str(sso).lower())
 ' 2>/dev/null)" || { fail "cannot parse the maldex-admin list output"; return 1; }
   read -r ADMIN_ENABLED ADMIN_BREAKGLASS ADMIN_PASSWORD_LOGIN ADMIN_SSO <<<"$state"
   [ -n "$ADMIN_SSO" ] || { fail "cannot parse the maldex-admin list output"; return 1; }
 }
 
-# Creates the first admin when none is enabled. Interactive only ([ -t 0 ]; MALDEX_ASSUME_TTY=1 is the test stand-in): the user
+# Creates the first admin when no enabled Admin can sign in. Interactive only ([ -t 0 ]; MALDEX_ASSUME_TTY=1 is the test stand-in): the user
 # name is asked here, and maldex-admin prompts for the password itself, without echo.
 step_admin() {
   admin_state || return 1

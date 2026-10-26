@@ -31,13 +31,14 @@ stub() { # name, body (the body runs after the call is recorded)
 }
 
 # Canned `Maldex.Web admin list --json` output: $1 = admin (one enabled local Admin) | breakglass (that admin is break-glass) |
-# disabled (the only Admin is disabled) | none (an enabled Analyst only); $2 = passwordLogin; $3 = ssoEnabled.
+# disabled (the only Admin is disabled) | none (an enabled Analyst only) | sso (one enabled SSO Admin); $2 = passwordLogin;
+# $3 = ssoEnabled.
 admin_list() {
-  local role=Admin dis=false bg=false
-  case "$1" in breakglass) bg=true ;; disabled) dis=true ;; none) role=Analyst ;; esac
+  local role=Admin dis=false bg=false kind=Local
+  case "$1" in breakglass) bg=true ;; disabled) dis=true ;; none) role=Analyst ;; sso) kind=Sso ;; esac
   {
-    printf '[{"userName":"u1","displayName":"U One","kind":"Local","role":"%s","isDisabled":%s,"totpEnabled":false,"isBreakGlass":%s,"lastSignInAt":null}]\n' \
-      "$role" "$dis" "$bg"
+    printf '[{"userName":"u1","displayName":"U One","kind":"%s","role":"%s","isDisabled":%s,"totpEnabled":false,"isBreakGlass":%s,"lastSignInAt":null}]\n' \
+      "$kind" "$role" "$dis" "$bg"
     printf '#config {"passwordLogin":%s,"ssoEnabled":%s}\n' "$2" "$3"
   } > "$T/admin-list"
 }
@@ -398,6 +399,12 @@ test_admin_step() {
   check "a disabled admin does not count; the typed name is used" called_with 'admin-exec admin create-user alice --admin$'
   teardown
 
+  setup_sandbox; write_config; admin_list sso true false
+  export MALDEX_ASSUME_TTY=1 SETUP_STDIN="alice"
+  run_setup
+  check "an SSO admin does not count while SSO is off" called_with 'admin-exec admin create-user alice --admin$'
+  teardown
+
   setup_sandbox; write_config; admin_list none true false
   export MALDEX_ASSUME_TTY=1 SETUP_STDIN="--evil"
   run_setup
@@ -425,7 +432,7 @@ test_admin_step() {
   run_setup
   check "admin step fails non-interactively" grep -q '^FAIL admin -- ' <<<"$OUT"
   check "admin step names the create-user command when non-interactive" \
-    grep -qF 'no Maldex admin exists; create one with: sudo maldex-admin create-user <name> --admin' <<<"$OUT"
+    grep -qF 'no enabled Maldex admin can sign in; create one with: sudo maldex-admin create-user <name> --admin' <<<"$OUT"
   check "admin step does not create a user non-interactively" not_logged 'create-user'
   check "admin step exits 1 and stops before downloads" bash -c '[ "$1" = 1 ] && ! grep -q "^ok   downloads" <<<"$2"' _ "$RC" "$OUT"
   teardown
@@ -478,11 +485,30 @@ test_admin_check() {
   teardown
 
   setup_sandbox; write_config; export STUB_EUID=1000
-  admin_list admin false true
+  admin_list sso false true
   run_setup --check
   check "--check warns about a missing break-glass admin (password login off, SSO on)" \
     grep -Eq '^warn admin -- .*break-glass.*set-break-glass' <<<"$OUT"
   check "--check still passes admin on that warning" grep -q '^ok   admin$' <<<"$OUT"
+  teardown
+
+  # Only an Admin who can sign in counts (AdminGuard.CanSignIn).
+  setup_sandbox; write_config; export STUB_EUID=1000
+  admin_list sso true false
+  run_setup --check
+  check "--check fails when the only admin is an SSO user and SSO is off" grep -q '^FAIL admin -- ' <<<"$OUT"
+  teardown
+
+  setup_sandbox; write_config; export STUB_EUID=1000
+  admin_list admin false true
+  run_setup --check
+  check "--check fails when the only admin is a local non-break-glass user and password login is off" grep -q '^FAIL admin -- ' <<<"$OUT"
+  teardown
+
+  setup_sandbox; write_config; export STUB_EUID=1000
+  admin_list sso true true
+  run_setup --check
+  check "--check passes with an SSO admin while SSO is on" grep -q '^ok   admin$' <<<"$OUT"
   teardown
 
   setup_sandbox; write_config; export STUB_EUID=1000
