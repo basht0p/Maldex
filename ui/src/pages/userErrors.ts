@@ -8,6 +8,12 @@ const TEXT: Record<string, string> = {
   break_glass_requires_local_admin: 'Break-glass is only for local administrator accounts.',
   last_admin: 'Maldex needs at least one administrator who can sign in.',
   role_managed_by_idp: 'Managed by your identity provider',
+  concurrent_update: 'Someone else changed this user at the same time. Try again.',
+  invalid_password: 'That password was refused. Choose another.',
+  password_too_long: 'Use at most 256 characters.',
+  invalid_display_name: 'Display names are 1 to 200 characters.',
+  invalid_role: 'Choose Admin, Analyst or No role.',
+  not_local_user: 'Only local users have a password.',
 }
 
 /** Plain-language text for a failed user-admin call; unknown failures fall back to the problem title. */

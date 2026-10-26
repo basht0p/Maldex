@@ -132,6 +132,36 @@ it('role null routes to the waiting page with Sign out', async () => {
   expect(out).toBe(1)
 })
 
+it('the waiting page moves on once an administrator grants a role (Check again, or coming back to the tab)', async () => {
+  server.use(me(null), authConfig)
+  const user = userEvent.setup()
+  const first = render(<App />)
+  expect(await screen.findByText('Your account has no Maldex role. Ask an administrator.')).toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Check again' }))
+  expect(await screen.findByText('Still no role.')).toBeInTheDocument()
+  expect(window.location.pathname).toBe('/waiting')
+
+  server.use(me('Analyst'))
+  await user.click(screen.getByRole('button', { name: 'Check again' }))
+  await waitFor(() => expect(window.location.pathname).toBe('/'))
+  expect(await screen.findByText('Pat (Analyst)')).toBeInTheDocument()
+  first.unmount()
+
+  // Reloading /waiting checks at once; coming back to the tab checks again.
+  window.history.pushState({}, '', '/waiting')
+  const second = render(<App />)
+  await waitFor(() => expect(window.location.pathname).toBe('/'))
+  second.unmount()
+
+  server.use(me(null))
+  window.history.pushState({}, '', '/waiting')
+  render(<App />)
+  expect(await screen.findByText('Your account has no Maldex role. Ask an administrator.')).toBeInTheDocument()
+  server.use(me('Admin'))
+  window.dispatchEvent(new Event('focus'))
+  await waitFor(() => expect(window.location.pathname).toBe('/'))
+})
+
 it('user menu shows Account and Sign out; Sign out calls logout and routes to /login', async () => {
   let out = 0
   const user = userEvent.setup()

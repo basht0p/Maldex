@@ -1,5 +1,5 @@
 import QRCode from 'qrcode'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { ApiError, totpConfirm, totpSetup } from '../api/client'
 import type { AuthNext, TotpSetupDto } from '../api/types'
@@ -14,25 +14,37 @@ type Phase =
   | { kind: 'setup'; setup: TotpSetupDto; qr: string }
   | { kind: 'codes'; codes: string[]; next: AuthNext }
 
+const isExpired = (e: unknown) => e instanceof ApiError && e.code === 'unauthenticated'
+
 /**
  * Authenticator enrolment: QR code and key, a confirming code, then the recovery codes once.
- * `onComplete` runs after the recovery codes are acknowledged, with the server's next step.
+ * `onComplete` runs after the recovery codes are acknowledged, with the server's next step. `onExpired` runs instead of
+ * showing an error when the server answers 401 `unauthenticated` (the sign-in's 10-minute partial session ran out).
  */
-export function TotpEnrol({ onComplete }: { onComplete: (next: AuthNext) => void }) {
+export function TotpEnrol({ onComplete, onExpired }: { onComplete: (next: AuthNext) => void; onExpired?: () => void }) {
   const [phase, setPhase] = useState<Phase>({ kind: 'loading' })
   const [code, setCode] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  // Every setup call replaces the key (and the security stamp), so it runs once per mount: StrictMode's second effect run in
+  // development reuses the first request instead of racing it.
+  const setupOnce = useRef<Promise<TotpSetupDto> | null>(null)
+  const expiredRef = useRef(onExpired)
+  useEffect(() => { expiredRef.current = onExpired })
 
   useEffect(() => {
     let cancelled = false
+    setupOnce.current ??= totpSetup()
+    const started = setupOnce.current
     ;(async () => {
       try {
-        const setup = await totpSetup()
+        const setup = await started
         const qr = await QRCode.toDataURL(setup.otpauthUri)
         if (!cancelled) setPhase({ kind: 'setup', setup, qr })
       } catch (e) {
-        if (!cancelled) setError(messageOf(e).join(' '))
+        if (cancelled) return
+        if (isExpired(e) && expiredRef.current) expiredRef.current()
+        else setError(messageOf(e).join(' '))
       }
     })()
     return () => { cancelled = true }
@@ -46,6 +58,7 @@ export function TotpEnrol({ onComplete }: { onComplete: (next: AuthNext) => void
       const r = await totpConfirm(code.trim())
       setPhase({ kind: 'codes', codes: r.recoveryCodes, next: r.next })
     } catch (err) {
+      if (isExpired(err) && onExpired) return onExpired()
       setError(err instanceof ApiError && err.code === 'invalid' ? 'That code is not valid.' : messageOf(err).join(' '))
     } finally {
       setBusy(false)

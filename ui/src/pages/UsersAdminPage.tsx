@@ -70,7 +70,7 @@ function UserRow({ user, onChanged, onReset }: { user: UserDto; onChanged: () =>
   }
 
   async function clearTotp() {
-    const ok = await confirm({ title: `Clear TOTP for ${name}?`, body: 'They will be asked to set up an authenticator again at next sign-in.', confirmLabel: 'Clear TOTP', danger: true })
+    const ok = await confirm({ title: `Clear TOTP for ${name}?`, body: 'Their authenticator and recovery codes stop working. If TOTP is required for them, they set up a new authenticator at their next sign-in.', confirmLabel: 'Clear TOTP', danger: true })
     if (!ok) return
     try {
       await clearUserTotp(user.id)

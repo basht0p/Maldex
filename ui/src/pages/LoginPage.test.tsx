@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
@@ -168,6 +169,79 @@ describe('LoginPage', () => {
     expect(screen.queryByTestId('where')).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'I have saved these codes' }))
     await waitFor(() => expect(screen.getByTestId('where')).toBeInTheDocument())
+  })
+
+  const expired = (path: string) => http.post(path, () => HttpResponse.json({ error: 'unauthenticated' }, { status: 401 }))
+  const timedOut = 'Your sign-in timed out; sign in again.'
+
+  it.each([
+    ['totp', '/api/auth/login/totp'],
+    ['change-password', '/api/auth/password'],
+    ['enrol-totp', '/api/auth/totp/setup'],
+  ])('an expired partial session at the %s step goes back to the credentials', async (next, path) => {
+    server.use(config({ passwordLogin: true, sso: null }), loginReply({ next }), expired(path))
+    const user = userEvent.setup()
+    renderLogin()
+    await signIn(user)
+    if (next === 'totp') {
+      await user.type(await screen.findByLabelText('Authentication code or recovery code'), '123456')
+      await user.click(screen.getByRole('button', { name: 'Verify' }))
+    } else if (next === 'change-password') {
+      await user.type(await screen.findByLabelText('New password'), 'a-long-enough-pw')
+      await user.type(screen.getByLabelText('Repeat new password'), 'a-long-enough-pw')
+      await user.click(screen.getByRole('button', { name: 'Change password' }))
+    }
+    expect(await screen.findByRole('alert')).toHaveTextContent(timedOut)
+    expect(screen.getByLabelText('User name')).toBeInTheDocument()
+    expect(screen.getByLabelText('Password')).toHaveValue('')
+  })
+
+  it('an expired partial session at the enrolment confirm goes back to the credentials', async () => {
+    server.use(
+      config({ passwordLogin: true, sso: null }),
+      loginReply({ next: 'enrol-totp' }),
+      http.post('/api/auth/totp/setup', () => HttpResponse.json({ sharedKey: 'JBSWY3DPEHPK3PXP', otpauthUri: 'otpauth://totp/Maldex:pat?secret=JBSWY3DPEHPK3PXP' })),
+      expired('/api/auth/totp/confirm'),
+    )
+    const user = userEvent.setup()
+    renderLogin()
+    await signIn(user)
+    await user.type(await screen.findByLabelText('Authentication code'), '654321')
+    await user.click(screen.getByRole('button', { name: 'Confirm' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(timedOut)
+    expect(screen.getByLabelText('User name')).toBeInTheDocument()
+  })
+
+  it('a too-long new password is explained', async () => {
+    server.use(
+      config({ passwordLogin: true, sso: null }),
+      loginReply({ next: 'change-password' }),
+      http.post('/api/auth/password', () => HttpResponse.json({ error: 'password_too_long' }, { status: 400 })),
+    )
+    const user = userEvent.setup()
+    renderLogin()
+    await signIn(user)
+    await user.type(await screen.findByLabelText('New password'), 'a-long-enough-pw')
+    await user.type(screen.getByLabelText('Repeat new password'), 'a-long-enough-pw')
+    await user.click(screen.getByRole('button', { name: 'Change password' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('The new password must be at most 256 characters.')
+  })
+
+  it('enrolment starts the authenticator setup once, also under StrictMode', async () => {
+    let setups = 0
+    server.use(
+      config({ passwordLogin: true, sso: null }),
+      loginReply({ next: 'enrol-totp' }),
+      http.post('/api/auth/totp/setup', () => {
+        setups++
+        return HttpResponse.json({ sharedKey: `KEY${setups}`, otpauthUri: `otpauth://totp/Maldex:pat?secret=KEY${setups}` })
+      }),
+    )
+    const user = userEvent.setup()
+    renderWithKit(<StrictMode><Routes><Route path="/login" element={<LoginPage />} /></Routes></StrictMode>, { route: '/login' })
+    await signIn(user)
+    expect(await screen.findByText('KEY1')).toBeInTheDocument()
+    expect(setups).toBe(1)
   })
 
   it('done navigates to returnUrl', async () => {
