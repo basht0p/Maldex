@@ -27,8 +27,9 @@ export default function NewUserDialog({ onClose, onCreated }: { onClose: () => v
   const onKeyDown = useDialogFocus(dialogRef, busy, onClose)
 
   async function create() {
+    const name = userName.trim()
     const problems: string[] = []
-    if (!USER_NAME_PATTERN.test(userName)) problems.push(USER_NAME_HINT)
+    if (!USER_NAME_PATTERN.test(name)) problems.push(USER_NAME_HINT)
     if (password.length < MIN_PASSWORD) problems.push(PASSWORD_HINT)
     else if (password.length > MAX_PASSWORD) problems.push('Use at most 256 characters.')
     setErrors(problems)
@@ -36,7 +37,7 @@ export default function NewUserDialog({ onClose, onCreated }: { onClose: () => v
     setBusy(true)
     try {
       onCreated(await createUser({
-        userName, displayName: displayName.trim() || userName, role, password, mustChangePassword: mustChange, isBreakGlass: breakGlass && role === 'Admin',
+        userName: name, displayName: displayName.trim() || name, role, password, mustChangePassword: mustChange, isBreakGlass: breakGlass && role === 'Admin',
       }))
     } catch (e) {
       setErrors(userErrorText(e))

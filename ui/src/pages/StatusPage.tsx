@@ -26,7 +26,7 @@ export default function StatusPage() {
             <div className={`${styles.panel} ${styles.warning}`} role="status">
               <h2>Authentication warnings</h2>
               <ul className={styles.holders}>
-                {status.authWarnings.map((w) => <li key={w}>{safeText(w)}</li>)}
+                {status.authWarnings.map((w, i) => <li key={`${i}:${w}`}>{safeText(w)}</li>)}
               </ul>
             </div>
           )}

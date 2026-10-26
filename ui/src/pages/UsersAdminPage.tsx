@@ -136,6 +136,7 @@ export default function UsersAdminPage({ me }: { me: MeDto | null }) {
   const [users, setUsers] = useState<UserDto[]>([])
   const [loadError, setLoadError] = useState<string | null>(null)
   const [requireTotp, setRequireTotp] = useState<boolean | null>(null)
+  const [savingTotp, setSavingTotp] = useState(false)
   const [creating, setCreating] = useState(false)
   const [resetting, setResetting] = useState<UserDto | null>(null)
   const isAdmin = me?.role === 'Admin'
@@ -156,18 +157,21 @@ export default function UsersAdminPage({ me }: { me: MeDto | null }) {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch
     void refresh()
     getAuthSettings().then((s) => setRequireTotp(s.requireTotpForLocal), (e) => toast.error(userErrorText(e)[0]))
-  }, [isAdmin, refresh, toast])
+  }, [isAdmin, refresh, toast]) // toast is memoized by ToastProvider, so this runs once per admin session
 
   if (!me) return <p>Loading…</p>
   if (!isAdmin) return <p role="alert">Administrator access is required to manage users.</p>
 
   async function toggleTotp(next: boolean) {
+    setSavingTotp(true)
     try {
       const saved = await putAuthSettings({ requireTotpForLocal: next })
       setRequireTotp(saved.requireTotpForLocal)
       toast.success(saved.requireTotpForLocal ? 'TOTP is now required for local accounts' : 'TOTP is no longer required for local accounts')
     } catch (e) {
       for (const m of userErrorText(e)) toast.error(m)
+    } finally {
+      setSavingTotp(false)
     }
   }
 
@@ -184,7 +188,7 @@ export default function UsersAdminPage({ me }: { me: MeDto | null }) {
             type="checkbox"
             role="switch"
             checked={requireTotp ?? false}
-            disabled={requireTotp === null}
+            disabled={requireTotp === null || savingTotp}
             onChange={(e) => void toggleTotp(e.target.checked)}
           />
           Require TOTP for local accounts

@@ -174,6 +174,34 @@ describe('UsersAdminPage', () => {
     await waitFor(() => expect(sw).not.toBeChecked())
   })
 
+  it('disables the Require TOTP switch while saving, so it cannot double-submit', async () => {
+    let resolve!: (v: { requireTotpForLocal: boolean }) => void
+    api.putAuthSettings.mockReturnValue(new Promise((r) => { resolve = r }))
+    const ui = userEvent.setup()
+    renderWithKit(<UsersAdminPage me={me} />)
+    const sw = await screen.findByRole('switch', { name: 'Require TOTP for local accounts' })
+    await waitFor(() => expect(sw).toBeEnabled())
+    await ui.click(sw)
+    await waitFor(() => expect(sw).toBeDisabled())
+    await ui.click(sw)
+    expect(api.putAuthSettings).toHaveBeenCalledTimes(1)
+    resolve({ requireTotpForLocal: true })
+    await waitFor(() => expect(sw).toBeEnabled())
+  })
+
+  it('trims the user name before validating and sending', async () => {
+    api.createUser.mockResolvedValue(user({ id: 'u9', userName: 'dave' }))
+    const ui = userEvent.setup()
+    renderWithKit(<UsersAdminPage me={me} />)
+    await screen.findByText('alice')
+    await ui.click(screen.getByRole('button', { name: 'New user' }))
+    const dlg = screen.getByRole('dialog', { name: 'New user' })
+    await ui.type(within(dlg).getByLabelText('User name'), '  dave ')
+    await ui.type(within(dlg).getByLabelText('Password'), 'twelve-chars-ok')
+    await ui.click(within(dlg).getByRole('button', { name: 'Create user' }))
+    await waitFor(() => expect(api.createUser).toHaveBeenCalledWith(expect.objectContaining({ userName: 'dave', displayName: 'dave' })))
+  })
+
   it('shows an access notice to non-admins', () => {
     renderWithKit(<UsersAdminPage me={{ ...me, role: 'Analyst' }} />)
     expect(screen.getByRole('alert')).toHaveTextContent('Administrator access is required')
