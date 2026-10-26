@@ -2,7 +2,6 @@ import { HubConnectionBuilder, LogLevel } from '@microsoft/signalr'
 import { useEffect, useState } from 'react'
 import { getEvents, getProcesses } from '../api/client'
 import type { LiveEventDto, ProcessNodeDto, TaskStatusUpdate } from '../api/types'
-import { getAccessToken } from '../auth/auth'
 
 /** The subset of the SignalR HubConnection this hook uses, so tests can drive it with a mock. */
 export interface HubConnectionLike {
@@ -34,7 +33,7 @@ const MAX_RETRY_MS = 15000
 
 export function createHubConnection(): HubConnectionLike {
   return new HubConnectionBuilder()
-    .withUrl('/hubs/tasks', { accessTokenFactory: async () => (await getAccessToken()) ?? '' })
+    .withUrl('/hubs/tasks', { headers: { 'X-Maldex-Csrf': '1' } })
     .withAutomaticReconnect()
     .configureLogging(LogLevel.Warning)
     .build()

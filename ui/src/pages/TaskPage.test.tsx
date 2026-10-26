@@ -13,8 +13,6 @@ const extendTask = vi.fn()
 const stopTask = vi.fn()
 const listArtifacts = vi.fn()
 const getTaskReport = vi.fn()
-vi.mock('../auth/auth', () => ({ getAccessToken: vi.fn(async () => null) }))
-import { getAccessToken } from '../auth/auth'
 vi.mock('../api/client', async (orig) => ({
   ...(await orig<typeof import('../api/client')>()),
   getTask: (...a: unknown[]) => getTask(...a),
@@ -115,10 +113,9 @@ describe('TaskPage', () => {
     expect(screen.getByRole('button', { name: 'Stop' })).toBeDisabled()
   })
 
-  it('downloads the PDF, sample and artifacts with the bearer token under their file names', async () => {
+  it('downloads the PDF, sample and artifacts under their file names', async () => {
     getTask.mockResolvedValue(task({ status: 'Completed', verdict: 'Malicious', sampleSha256: 'f'.repeat(64) }))
     listArtifacts.mockResolvedValue([{ id: 'a1', kind: 'Pcap', sha256: 'abcdef0123', size: 5 }])
-    vi.mocked(getAccessToken).mockResolvedValue('tok')
     const calls: { url: string; auth: string | null }[] = []
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
       calls.push({ url: String(url), auth: new Headers(init?.headers).get('authorization') })
@@ -134,7 +131,7 @@ describe('TaskPage', () => {
     await waitFor(() => expect(saved).toEqual(['maldex-t1.pdf', `${'f'.repeat(64)}.zip`, 'abcdef0123.zip']))
     const downloads = calls.filter((c) => !c.url.endsWith('/image'))
     expect(downloads.map((c) => c.url)).toEqual(['/api/tasks/t1/report.pdf', '/api/tasks/t1/sample', '/api/artifacts/a1/download'])
-    expect(downloads.every((c) => c.auth === 'Bearer tok')).toBe(true)
+    expect(downloads.every((c) => c.auth === null)).toBe(true)
   })
 
   it('shows a failed download as an error toast', async () => {

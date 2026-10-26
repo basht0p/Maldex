@@ -1,6 +1,5 @@
 import { useState } from 'react'
 import { screenshotUrl } from '../../api/client'
-import { useAuthedObjectUrl } from '../../api/useAuthedObjectUrl'
 import { safeText } from '../../util/safeText'
 import { formatTime, TRUNCATED_NOTICE } from './reportUtil'
 import styles from './report.module.css'
@@ -22,13 +21,11 @@ export function ProcessingWarnings({ warnings }: { warnings: readonly string[] |
   )
 }
 
-/** An authenticated image (fetched with the bearer token) that turns into a "Not available" tile when it fails. */
+/** An image served with the session cookie that turns into a "Not available" tile when it fails to load. */
 export function AuthedImage({ path, alt, className }: { path: string; alt: string; className: string }) {
-  const { url, failed } = useAuthedObjectUrl(path)
   const [broken, setBroken] = useState<string | null>(null)
-  if (failed || (url !== null && broken === url)) return <div className={styles.missing}>Not available</div>
-  if (!url) return <div className={className} role="img" aria-label={`Loading ${alt}`} aria-busy="true" />
-  return <img className={className} src={url} alt={alt} onError={() => setBroken(url)} />
+  if (broken === path) return <div className={styles.missing}>Not available</div>
+  return <img className={className} src={path} alt={alt} onError={() => setBroken(path)} />
 }
 
 /** A screenshot thumbnail; "Not available" when it cannot be loaded. */
