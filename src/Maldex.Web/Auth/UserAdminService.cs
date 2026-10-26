@@ -31,9 +31,6 @@ public sealed record UserAdminResult(bool Ok, string? Error, UserDto? User)
 /// </summary>
 public sealed partial class UserAdminService(UserManager<AppUser> users, MaldexDbContext db, AuditWriter audit, IOptions<MaldexAuthOptions> options, TimeProvider time)
 {
-    public const string RecoveryCodesLoginProvider = "[AspNetUserStore]";
-    public const string RecoveryCodesTokenName = "RecoveryCodes";
-
     [GeneratedRegex("^[A-Za-z0-9._@-]{1,64}$")]
     private static partial Regex UserNamePattern();
 
@@ -91,17 +88,19 @@ public sealed partial class UserAdminService(UserManager<AppUser> users, MaldexD
     public async Task<UserAdminResult> UpdateAsync(Guid id, UpdateUserRequest r, Guid? actorId, CancellationToken ct = default)
     {
         // The last-admin check and the save run in one SERIALIZABLE transaction, so two concurrent demotions cannot both pass.
-        // A deadlock victim (1205) is retried once, against whatever the winner committed.
+        // A deadlock victim (1205) is retried once, against whatever the winner committed. The audit row is written after the
+        // loop: a failure there must surface, not be retried into a "nothing to change" success with the row lost.
+        UserAdminResult result;
+        string? details;
         for (var attempt = 0; ; attempt++)
         {
             await using var tx = await db.Database.BeginTransactionAsync(IsolationLevel.Serializable, ct);
             try
             {
-                var (result, details) = await UpdateCoreAsync(id, r, ct);
+                (result, details) = await UpdateCoreAsync(id, r, ct);
                 if (details is null) return result; // refused, or nothing to change: nothing written
                 await tx.CommitAsync(ct);
-                await audit.WriteAsync("user.update", result.User!.UserName, details, actorId, ct);
-                return result;
+                break;
             }
             catch (Exception ex) when (IsDeadlock(ex))
             {
@@ -109,6 +108,8 @@ public sealed partial class UserAdminService(UserManager<AppUser> users, MaldexD
                 if (attempt >= 1) return UserAdminResult.Fail("concurrent_update");
             }
         }
+        await audit.WriteAsync("user.update", result.User!.UserName, details, actorId, ct);
+        return result;
     }
 
     private static bool IsDeadlock(Exception ex) => ex.GetBaseException() is SqlException { Number: 1205 };
@@ -189,7 +190,7 @@ public sealed partial class UserAdminService(UserManager<AppUser> users, MaldexD
         return UserAdminResult.Success(ToDto(user));
     }
 
-    /// <summary>Disables TOTP, replaces the authenticator key and deletes the recovery codes.</summary>
+    /// <summary>Disables TOTP, replaces the authenticator key and deletes the recovery codes and the last accepted TOTP step.</summary>
     public async Task<UserAdminResult> ClearTotpAsync(Guid id, Guid? actorId, CancellationToken ct = default)
     {
         var user = await users.FindByIdAsync(id.ToString());
@@ -205,7 +206,8 @@ public sealed partial class UserAdminService(UserManager<AppUser> users, MaldexD
     {
         await users.SetTwoFactorEnabledAsync(user, false);
         await users.ResetAuthenticatorKeyAsync(user);
-        await users.RemoveAuthenticationTokenAsync(user, RecoveryCodesLoginProvider, RecoveryCodesTokenName);
+        await users.RemoveAuthenticationTokenAsync(user, MaldexUserStore.InternalLoginProvider, MaldexUserStore.RecoveryCodesTokenName);
+        await users.RemoveAuthenticationTokenAsync(user, TotpEndpoints.StepProvider, TotpEndpoints.StepToken);
     }
 
     /// <summary>

@@ -5,12 +5,18 @@ import type { AuthNext } from '../api/types'
 import forms from '../pages/forms.module.css'
 
 export const MIN_PASSWORD_LENGTH = 12
+export const MAX_PASSWORD_LENGTH = 256
 
 /**
  * Change-password form. With `currentPassword` given (the forced change right after sign-in) the current-password
- * field is left out. Length and repeat are checked here before the API is called.
+ * field is left out. Length and repeat are checked here before the API is called. `onExpired` runs instead of showing an
+ * error when the server answers 401 `unauthenticated` (the sign-in's 10-minute partial session ran out).
  */
-export function PasswordChangeForm({ currentPassword, onChanged }: { currentPassword?: string; onChanged: (next: AuthNext) => void }) {
+export function PasswordChangeForm({ currentPassword, onChanged, onExpired }: {
+  currentPassword?: string
+  onChanged: (next: AuthNext) => void
+  onExpired?: () => void
+}) {
   const [current, setCurrent] = useState('')
   const [next, setNext] = useState('')
   const [repeat, setRepeat] = useState('')
@@ -31,8 +37,11 @@ export function PasswordChangeForm({ currentPassword, onChanged }: { currentPass
       onChanged(r.next)
     } catch (err) {
       const code = err instanceof ApiError ? err.code : undefined
+      if (code === 'unauthenticated' && onExpired) return onExpired()
       setError(code === 'invalid' ? 'The current password is wrong.'
         : code === 'password_too_short' ? `The new password must be at least ${MIN_PASSWORD_LENGTH} characters.`
+        : code === 'password_too_long' ? `The new password must be at most ${MAX_PASSWORD_LENGTH} characters.`
+        : code === 'locked' ? 'Too many failed attempts. Try again in 15 minutes.'
         : err instanceof Error ? err.message : 'Could not change the password.')
     } finally {
       setBusy(false)

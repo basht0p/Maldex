@@ -6,7 +6,9 @@ using Maldex.Data;
 using Maldex.Integration.Tests.Fixtures;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Maldex.Web.Auth;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
@@ -278,6 +280,7 @@ public sealed class UserAdminTests(SqlServerFixture sql) : IDisposable
             await users.ResetAuthenticatorKeyAsync(user);
             await users.SetTwoFactorEnabledAsync(user, true);
             await users.SetAuthenticationTokenAsync(user, "[AspNetUserStore]", "RecoveryCodes", "AAAA;BBBB");
+            await users.SetAuthenticationTokenAsync(user, "maldex", "TotpLastStep", "12345");
         }
         Assert.Equal("totp", await LoginNextAsync(f, "bob", Password));
 
@@ -290,8 +293,45 @@ public sealed class UserAdminTests(SqlServerFixture sql) : IDisposable
         var reloaded = (await um.FindByIdAsync(bob.Id.ToString()))!;
         Assert.False(await um.GetTwoFactorEnabledAsync(reloaded));
         Assert.Null(await um.GetAuthenticationTokenAsync(reloaded, "[AspNetUserStore]", "RecoveryCodes"));
+        // The replay-protection step goes with the authenticator, as on the user's own removal.
+        Assert.Null(await um.GetAuthenticationTokenAsync(reloaded, "maldex", "TotpLastStep"));
         var db = check.ServiceProvider.GetRequiredService<MaldexDbContext>();
         Assert.Contains(await db.AuditLogs.ToListAsync(Ct), a => a.Action == "user.clear_totp" && a.Target == "bob");
+    }
+
+    /// <summary>Fails the first save that writes the given audit action with a SQL Server deadlock (1205), once.</summary>
+    private sealed class DeadlockOnAudit(string action) : SaveChangesInterceptor
+    {
+        public bool Armed { get; set; } = true;
+
+        public override ValueTask<InterceptionResult<int>> SavingChangesAsync(DbContextEventData eventData, InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (Armed && eventData.Context!.ChangeTracker.Entries<AuditLog>().Any(e => e.State == EntityState.Added && e.Entity.Action == action))
+            {
+                Armed = false;
+                throw new DbUpdateException("deadlock", SqlErrors.Exception(1205));
+            }
+            return base.SavingChangesAsync(eventData, result, cancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task An_audit_failure_after_the_commit_is_not_reported_as_success()
+    {
+        var (f, _, _) = await AdminAsync();
+        var bob = await LocalAuth.SeedUserAsync(f, "bob", Password, UserRole.Analyst);
+        var deadlock = new DeadlockOnAudit("user.update");
+        using var host = f.WithWebHostBuilder(b => b.ConfigureServices(s => s.ConfigureDbContext<MaldexDbContext>(o => o.AddInterceptors(deadlock))));
+
+        await using var scope = host.Services.CreateAsyncScope();
+        var service = scope.ServiceProvider.GetRequiredService<UserAdminService>();
+        // The update commits; the audit write after it fails. Retrying the update would find nothing to change and answer
+        // success with no audit row, so the failure must surface instead.
+        await Assert.ThrowsAnyAsync<DbUpdateException>(() => service.UpdateAsync(bob.Id, new UpdateUserRequest(null, "Admin", null, null), null, Ct));
+        Assert.False(deadlock.Armed);
+        await using var check = f.Services.CreateAsyncScope();
+        Assert.Equal(UserRole.Admin, (await check.ServiceProvider.GetRequiredService<MaldexDbContext>().Users.AsNoTracking().SingleAsync(u => u.Id == bob.Id, Ct)).Role);
     }
 
     [Fact]

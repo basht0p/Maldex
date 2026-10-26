@@ -102,7 +102,7 @@ function ReportsMenu({ taskId, sampleSha256, artifacts }: { taskId: string; samp
       {open && (
         <ul id={`reports-${taskId}`} className={styles.menuList}>
           {/* A plain link: it opens in a new tab and relies on the response's own CSP, which a blob: URL would drop.
-              TODO: Entra mode is bearer-only, so this needs a cookie or short-lived-token follow-up there. */}
+              The session cookie authenticates it. */}
           <li><a href={`/api/tasks/${id}/report.html`} target="_blank" rel="noreferrer">HTML report</a></li>
           <li><button type="button" className={styles.menuButton} onClick={() => void download(`/api/tasks/${id}/report.pdf`, `maldex-${taskId}.pdf`)}>PDF report</button></li>
           <li><button type="button" className={styles.menuButton} onClick={() => void download(`/api/tasks/${id}/sample`, `${sampleSha256 ?? taskId}.zip`)}>Sample (ZIP)</button></li>

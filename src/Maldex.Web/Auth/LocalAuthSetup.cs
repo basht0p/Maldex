@@ -173,10 +173,6 @@ public static class LocalAuthSetup
     }
 
     /// <summary>
-    /// 10 requests a minute (<see cref="MaldexAuthOptions.LoginRateLimitPerMinute"/>) per client IP to the sign-in endpoints; then
-    /// 429 <c>{"error":"rate_limited"}</c>. Requests without a remote address (in-process test servers) share one bucket.
-    /// </summary>
-    /// <summary>
     /// The rate-limit partition of a client: an IPv4 address (also when IPv4-mapped) as itself, an IPv6 address by its /64
     /// (one host usually holds a whole /64), and no address at all as the one bucket <c>unknown</c>.
     /// </summary>
@@ -190,6 +186,10 @@ public static class LocalAuthSetup
         return new IPAddress(bytes) + "/64";
     }
 
+    /// <summary>
+    /// 10 requests a minute (<see cref="MaldexAuthOptions.LoginRateLimitPerMinute"/>) per client IP to the sign-in endpoints; then
+    /// 429 <c>{"error":"rate_limited"}</c>. Requests without a remote address (in-process test servers) share one bucket.
+    /// </summary>
     public static IServiceCollection AddMaldexLoginRateLimit(this IServiceCollection services, int permitsPerMinute)
     {
         services.AddRateLimiter(o =>

@@ -25,6 +25,8 @@ const QUERY_ERRORS: Record<string, string> = {
   disabled: LOGIN_ERRORS.disabled,
 }
 
+const TIMED_OUT = 'Your sign-in timed out; sign in again.'
+
 function loginMessage(e: unknown): string {
   if (e instanceof ApiError) return (e.code && LOGIN_ERRORS[e.code]) || 'Sign-in failed. Try again.'
   return 'Could not reach the server. Try again.'
@@ -55,6 +57,15 @@ export default function LoginPage() {
     return () => { cancelled = true }
   }, [])
 
+  /** The partial session of an unfinished sign-in ran out (10 minutes): start over at the credentials. */
+  function expired() {
+    setStep('credentials')
+    setPassword('')
+    setCode('')
+    setBusy(false)
+    setError(TIMED_OUT)
+  }
+
   function proceed(next: AuthNext) {
     setError(null)
     setCode('')
@@ -68,6 +79,7 @@ export default function LoginPage() {
     try {
       proceed((await action()).next)
     } catch (e) {
+      if (e instanceof ApiError && e.code === 'unauthenticated' && step !== 'credentials') return expired()
       setError(e instanceof ApiError && e.code === 'invalid' && step === 'totp' ? 'That code is not valid.' : loginMessage(e))
     } finally {
       setBusy(false)
@@ -125,11 +137,11 @@ export default function LoginPage() {
         <div className={styles.section}>
           <h2>Choose a new password</h2>
           <p className={forms.hint}>You must change your password before continuing.</p>
-          <PasswordChangeForm currentPassword={password} onChanged={proceed} />
+          <PasswordChangeForm currentPassword={password} onChanged={proceed} onExpired={expired} />
         </div>
       )}
 
-      {step === 'enrol-totp' && <TotpEnrol onComplete={proceed} />}
+      {step === 'enrol-totp' && <TotpEnrol onComplete={proceed} onExpired={expired} />}
     </AuthLayout>
   )
 }

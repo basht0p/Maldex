@@ -157,6 +157,9 @@ describe('UsersAdminPage', () => {
     await waitFor(() => expect(api.updateUser).toHaveBeenCalledWith('u3', { isDisabled: false }))
 
     await ui.click(within(rowOf('root')).getByRole('button', { name: 'Clear TOTP for root' }))
+    // True whether or not TOTP is required for the user (only then are they asked to enrol again).
+    expect(await screen.findByText(/Their authenticator and recovery codes stop working\./)).toBeInTheDocument()
+    expect(screen.queryByText(/They will be asked to set up an authenticator again at next sign-in\.$/)).not.toBeInTheDocument()
     await ui.click(await screen.findByRole('button', { name: 'Clear TOTP' }))
     await waitFor(() => expect(api.clearUserTotp).toHaveBeenCalledWith('u2'))
     await waitFor(() => expect(api.listUsers.mock.calls.length).toBeGreaterThanOrEqual(3))

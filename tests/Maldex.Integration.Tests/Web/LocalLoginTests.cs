@@ -236,6 +236,34 @@ public sealed class LocalLoginTests(SqlServerFixture sql) : IDisposable
         await AssertNextAsync(await LoginAsync(fresh, "alice", "a brand new passphrase"), "done");
     }
 
+    /// <summary>
+    /// "Require TOTP" switched on after a user signed in applies at their next sign-in: a password change from the open session
+    /// keeps a full session (never a silent drop to a partial one) and answers <c>done</c>.
+    /// </summary>
+    [Fact]
+    public async Task Password_change_in_a_session_stays_signed_in_when_totp_became_required()
+    {
+        var f = Factory();
+        await LocalAuth.SeedUserAsync(f, "alice", Password, UserRole.Analyst);
+        using var client = await LocalAuth.SignInAsync(f, "alice", Password);
+        await using (var scope = f.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
+            var settings = await db.SystemSettings.FindAsync([1], Ct);
+            if (settings is null) db.SystemSettings.Add(new SystemSettings { RequireTotpForLocal = true });
+            else settings.RequireTotpForLocal = true;
+            await db.SaveChangesAsync(Ct);
+        }
+
+        var change = await client.PostAsJsonAsync("/api/auth/password", new { currentPassword = Password, newPassword = "a brand new passphrase" }, Ct);
+        await AssertNextAsync(change, "done");
+        Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/tasks", Ct)).StatusCode);
+
+        // The next sign-in asks for the enrolment.
+        using var fresh = f.CreateClient();
+        await AssertNextAsync(await LoginAsync(fresh, "alice", "a brand new passphrase"), "enrol-totp");
+    }
+
     [Fact]
     public async Task Short_new_password_is_refused()
     {
@@ -455,12 +483,17 @@ public sealed class LocalLoginTests(SqlServerFixture sql) : IDisposable
         await AssertNextAsync(await LoginAsync(client, "alice", Password), "done");
         await AssertErrorAsync(await LoginAsync(client, "nobody", Password), HttpStatusCode.Unauthorized, "invalid");
         await AssertErrorAsync(await LoginAsync(client, "alice", "wrong password here"), HttpStatusCode.Unauthorized, "invalid");
+        // A password typed into the user-name field must not land in the audit log.
+        await AssertErrorAsync(await LoginAsync(client, "Secret.Passphrase.42", Password), HttpStatusCode.Unauthorized, "invalid");
 
         await using var scope = f.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
         var rows = await db.AuditLogs.ToListAsync(Ct);
         Assert.Contains(rows, a => a.Action == "auth.login" && a.UserId == alice.Id);
-        Assert.Contains(rows, a => a.Action == "auth.login_failed" && a.UserId == null && a.Target == "nobody");
+        // An unknown user name is recorded as a constant, never as typed.
+        Assert.Equal(2, rows.Count(a => a.Action == "auth.login_failed" && a.UserId == null && a.Target == "(unknown)"));
+        Assert.DoesNotContain(rows, a => a.Target.Contains("nobody") || a.Target.Contains("Secret.Passphrase.42")
+            || (a.Details ?? "").Contains("nobody") || (a.Details ?? "").Contains("Secret.Passphrase.42"));
         Assert.Contains(rows, a => a.Action == "auth.login_failed" && a.UserId == alice.Id);
         Assert.NotNull((await db.Users.SingleAsync(u => u.Id == alice.Id, Ct)).LastSignInAt);
     }
