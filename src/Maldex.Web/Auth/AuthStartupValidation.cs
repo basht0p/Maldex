@@ -24,8 +24,31 @@ public static class AuthStartupValidation
             return "Maldex:Auth:Oidc:Enabled must be true or false";
         if (!passwordLogin && !oidcEnabled)
             return "Maldex:Auth:PasswordLogin is false but Maldex:Auth:Oidc is not enabled; nobody could sign in";
+        return oidcEnabled ? OidcProblem(MaldexAuthOptions.Read(configuration).Oidc, environment) : null;
+    }
+
+    /// <summary>
+    /// The rules for an enabled <c>Maldex:Auth:Oidc</c>: an absolute HTTPS <c>Authority</c> (plain HTTP to localhost or 127.0.0.1
+    /// only in Development and Testing), a <c>ClientId</c>, and <c>AdminValues</c> whenever a <c>RoleClaim</c> is mapped. Discovery is
+    /// not fetched here, so an IdP outage does not stop Maldex starting.
+    /// </summary>
+    private static string? OidcProblem(OidcOptions o, IHostEnvironment environment)
+    {
+        var devOrTest = environment.IsDevelopment() || environment.IsEnvironment("Testing");
+        if (!Uri.TryCreate(o.Authority?.Trim(), UriKind.Absolute, out var authority)
+            || !(authority.Scheme == Uri.UriSchemeHttps || (devOrTest && authority.Scheme == Uri.UriSchemeHttp && IsLoopbackHost(authority))))
+            return devOrTest
+                ? $"Maldex:Auth:Oidc:Authority '{o.Authority}' must be an absolute https:// URL (or http://localhost / http://127.0.0.1 in {environment.EnvironmentName})"
+                : $"Maldex:Auth:Oidc:Authority '{o.Authority}' must be an absolute https:// URL (the IdP's issuer)";
+        if (string.IsNullOrWhiteSpace(o.ClientId))
+            return "Maldex:Auth:Oidc:ClientId must be set when Maldex:Auth:Oidc:Enabled is true";
+        if (!string.IsNullOrWhiteSpace(o.RoleClaim) && !o.AdminValues.Any(v => !string.IsNullOrWhiteSpace(v)))
+            return $"Maldex:Auth:Oidc:RoleClaim is '{o.RoleClaim}' but Maldex:Auth:Oidc:AdminValues is empty; nobody could become an Admin through SSO";
         return null;
     }
+
+    private static bool IsLoopbackHost(Uri uri) =>
+        string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase) || uri.Host == "127.0.0.1";
 
     /// <summary>The boolean at <paramref name="key"/>, <paramref name="fallback"/> when unset, null when it is not a boolean.</summary>
     private static bool? Flag(IConfiguration configuration, string key, bool fallback)
