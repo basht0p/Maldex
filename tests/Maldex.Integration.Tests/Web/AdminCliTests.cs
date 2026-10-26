@@ -92,6 +92,38 @@ public sealed class AdminCliTests(SqlServerFixture sql) : IDisposable
         return await db.Users.AsNoTracking().SingleAsync(u => u.NormalizedUserName == name.ToUpperInvariant(), Ct);
     }
 
+    private sealed class NoTerminalPrompt : IPasswordPrompt
+    {
+        public string ReadPassword(string prompt) => throw new NoTerminalException();
+    }
+
+    private sealed class FailingPrompt : IPasswordPrompt
+    {
+        public string ReadPassword(string prompt) => throw new InvalidOperationException("no terminal, but not the prompt's refusal");
+    }
+
+    [Fact]
+    public async Task Without_a_terminal_the_prompt_is_a_usage_error()
+    {
+        var cs = await MigratedDbAsync();
+        var r = await RunAsync(cs, ["create-user", "dora"], prompt: new NoTerminalPrompt());
+        Assert.Equal(64, r.Exit);
+        Assert.Contains("--password-stdin", r.Err);
+        await using var db = sql.CreateContext(cs);
+        Assert.False(await db.Users.AnyAsync(u => u.NormalizedUserName == "DORA", Ct));
+
+        // Only the prompt's own refusal is a usage error, whatever another exception's message says.
+        await Assert.ThrowsAsync<InvalidOperationException>(() => RunAsync(cs, ["create-user", "dora"], prompt: new FailingPrompt()));
+    }
+
+    [Fact]
+    public async Task An_unreachable_database_is_a_configuration_error()
+    {
+        var r = await RunAsync("", ["list"], config: Config("Server=127.0.0.1,1;Database=maldex;User Id=sa;Password=x;Connect Timeout=1;TrustServerCertificate=True"));
+        Assert.Equal(78, r.Exit);
+        Assert.Contains("cannot open or migrate", r.Err);
+    }
+
     [Fact]
     public async Task Create_admin_then_login_does_not_require_password_change()
     {

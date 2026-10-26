@@ -109,7 +109,7 @@ public static class AdminCli
             await stderr.WriteLineAsync("cancelled");
             return Refused;
         }
-        catch (InvalidOperationException ex) when (ex.Message.StartsWith("no terminal", StringComparison.Ordinal))
+        catch (NoTerminalException ex)
         {
             await stderr.WriteLineAsync($"error: {ex.Message}");
             return UsageError;
