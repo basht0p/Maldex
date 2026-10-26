@@ -58,7 +58,7 @@ public class RetentionTests(SqlServerFixture sql)
         }
 
         await using var db = h.NewContext();
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "A", Role = UserRole.Analyst };
+        var user = TestUsers.Create(UserRole.Analyst, "A");
         var task = new AnalysisTask
         {
             Id = taskId, OrgId = orgId, SubmittedByUserId = user.Id, SampleSha256 = sampleSha, Url = sampleSha is null ? "http://example.test/" : null,

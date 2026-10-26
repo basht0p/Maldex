@@ -1,6 +1,7 @@
 using System.Security.Claims;
 using Maldex.Core.Domain;
 using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.Identity.Web;
 
 namespace Maldex.Web.Auth;
@@ -9,8 +10,9 @@ public static class AuthSetup
 {
     public const string AnalystPolicy = "Analyst";
     public const string AdminPolicy = "Admin";
-    public const string AnalystRole = "Maldex.Analyst";
-    public const string AdminRole = "Maldex.Admin";
+
+    /// <summary>Claim the Dev scheme uses to carry the role it provisions the dev user with.</summary>
+    public const string DevRoleClaim = "maldex:dev-role";
 
     /// <summary>
     /// Registers authentication (Dev or Entra), the role policies and <see cref="CurrentUser"/>.
@@ -41,23 +43,29 @@ public static class AuthSetup
         }
 
         builder.Services.AddAuthorizationBuilder()
-            .AddPolicy(AnalystPolicy, p => p.RequireAuthenticatedUser().RequireAssertion(c => MapRole(c.User) is not null))
-            .AddPolicy(AdminPolicy, p => p.RequireAuthenticatedUser().RequireAssertion(c => MapRole(c.User) == UserRole.Admin));
+            .AddPolicy(AnalystPolicy, p => p.RequireAuthenticatedUser().AddRequirements(new RoleRequirement(UserRole.Analyst)))
+            .AddPolicy(AdminPolicy, p => p.RequireAuthenticatedUser().AddRequirements(new RoleRequirement(UserRole.Admin)));
+        builder.Services.AddHttpContextAccessor();
+        builder.Services.AddScoped<IAuthorizationHandler, RoleRequirementHandler>();
 
         builder.Services.AddScoped<CurrentUser>();
         builder.Services.AddScoped<Audit.AuditWriter>();
         return builder;
     }
+}
 
-    /// <summary>Maps the "roles" claim (Entra app roles) to <see cref="UserRole"/>; Admin wins. Null means no Maldex role.</summary>
-    public static UserRole? MapRole(ClaimsPrincipal user)
+/// <summary>Satisfied when the signed-in user's Maldex role is at least <see cref="Minimum"/> (Admin satisfies Analyst).</summary>
+public sealed class RoleRequirement(UserRole minimum) : IAuthorizationRequirement
+{
+    public UserRole Minimum { get; } = minimum;
+}
+
+public sealed class RoleRequirementHandler(CurrentUser current, IHttpContextAccessor http) : AuthorizationHandler<RoleRequirement>
+{
+    protected override async Task HandleRequirementAsync(AuthorizationHandlerContext context, RoleRequirement requirement)
     {
-        var roles = user.FindAll("roles").Concat(user.FindAll(ClaimTypes.Role)).Select(c => c.Value).ToHashSet();
-        if (roles.Contains(AdminRole)) return UserRole.Admin;
-        if (roles.Contains(AnalystRole)) return UserRole.Analyst;
-        return null;
+        // Hub invocations run in their own scope, where CurrentUserMiddleware has not run; resolving is idempotent.
+        await current.ResolveAsync(context.User, http.HttpContext?.RequestAborted ?? CancellationToken.None);
+        if (current.Role is { } role && role >= requirement.Minimum) context.Succeed(requirement);
     }
-
-    public static string? ObjectId(ClaimsPrincipal user) =>
-        user.FindFirstValue("oid") ?? user.FindFirstValue(ClaimConstants.ObjectId) ?? user.FindFirstValue(ClaimTypes.NameIdentifier);
 }

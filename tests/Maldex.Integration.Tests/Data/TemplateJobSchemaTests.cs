@@ -25,7 +25,7 @@ public class TemplateJobSchemaTests(SqlServerFixture sql)
     {
         var db = sql.CreateContext(sql.CreateDatabaseConnectionString());
         await db.Database.MigrateAsync(Ct);
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "A", Role = UserRole.Admin };
+        var user = TestUsers.Create(UserRole.Admin, "A");
         var template = new Template { Id = "t1", DisplayName = "T1", Enabled = true, CreatedAt = Now };
         var version = new TemplateVersion
         {

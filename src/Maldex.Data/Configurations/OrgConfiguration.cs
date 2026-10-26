@@ -23,9 +23,22 @@ public sealed class AppUserConfiguration : IEntityTypeConfiguration<AppUser>
         b.ToTable("Users");
         b.HasKey(x => x.Id);
         b.Property(x => x.Id).ValueGeneratedNever();
-        b.Property(x => x.EntraObjectId).HasMaxLength(64).IsRequired();
         b.Property(x => x.DisplayName).HasMaxLength(200).IsRequired();
-        b.HasIndex(x => x.EntraObjectId).IsUnique();
+        // Nullable enums do not pick up the context's conversion convention; stored as the name, like every other enum.
+        b.Property(x => x.Role).HasConversion<string>().HasMaxLength(32);
+        b.Property(x => x.Kind).HasConversion<string>().HasMaxLength(32);
+        // Identity's NormalizedUserName index (UserNameIndex) is unique, which makes user names case-insensitively unique.
+    }
+}
+
+public sealed class SystemSettingsConfiguration : IEntityTypeConfiguration<SystemSettings>
+{
+    public void Configure(EntityTypeBuilder<SystemSettings> b)
+    {
+        b.ToTable("SystemSettings");
+        b.HasKey(x => x.Id);
+        b.Property(x => x.Id).ValueGeneratedNever();
+        b.HasData(new SystemSettings { Id = 1, RequireTotpForLocal = false });
     }
 }
 

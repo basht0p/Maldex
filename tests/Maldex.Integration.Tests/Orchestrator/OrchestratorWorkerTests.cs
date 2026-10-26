@@ -20,7 +20,7 @@ internal static class OrchestratorHarnessSeeding
     {
         await using var db = h.NewContext();
         var org = new OrgEntity { Id = Guid.NewGuid(), Name = "Org-" + Guid.NewGuid().ToString("N"), RetentionDays = 30 };
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "A", Role = UserRole.Analyst };
+        var user = TestUsers.Create(UserRole.Analyst, "A");
         var at = createdAt ?? h.Time.GetUtcNow();
         var task = new AnalysisTask
         {
@@ -104,7 +104,7 @@ public class OrchestratorWorkerTests(SqlServerFixture sql)
         await using (var db = h.NewContext())
         {
             var template = await db.Templates.SingleAsync(t => t.Id == "win10", Ct);
-            var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "J", Role = UserRole.Admin };
+            var user = TestUsers.Create(UserRole.Admin, "J");
             db.Users.Add(user);
             db.TemplateJobs.Add(new TemplateJob
             {

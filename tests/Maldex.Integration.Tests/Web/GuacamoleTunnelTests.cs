@@ -339,7 +339,7 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
             var org = new Maldex.Core.Domain.Org { Id = Guid.NewGuid(), Name = "Org-" + Guid.NewGuid().ToString("N"), RetentionDays = 30 };
             db.AddRange(
                 org,
-                new AppUser { Id = userId, EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "A", Role = UserRole.Analyst },
+                AsUser(TestUsers.Create(UserRole.Analyst, "A"), userId),
                 new AnalysisTask
                 {
                     Id = taskId, OrgId = org.Id, SubmittedByUserId = userId, Url = "http://example.test/", Image = "win10",
@@ -935,4 +935,6 @@ public sealed class GuacamoleTunnelTests(SqlServerFixture sql) : IDisposable
         Assert.Equal("<close:NormalClosure>", await ReceiveTextAsync(ws));
         Assert.Equal(closedAt, await LastConsoleAtAsync(f, id));
     }
+
+    private static AppUser AsUser(AppUser u, Guid id) { u.Id = id; return u; }
 }

@@ -51,7 +51,7 @@ public sealed class MediaEndpointsTests(SqlServerFixture sql) : IDisposable
     {
         using var scope = f.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "Seeder", Role = UserRole.Admin };
+        var user = TestUsers.Create(UserRole.Admin, "Seeder");
         db.Users.Add(user);
         var now = addedAt ?? DateTimeOffset.UtcNow;
         var media = new MediaFile

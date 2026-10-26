@@ -53,7 +53,7 @@ public sealed class MediaIntakeTests : IAsyncLifetime
     {
         await using var db = _sql.CreateContext(_connection);
         await db.Database.MigrateAsync(Ct);
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "Admin", Role = UserRole.Admin };
+        var user = TestUsers.Create(UserRole.Admin, "Admin");
         db.Add(user);
         await db.SaveChangesAsync(Ct);
         _userId = user.Id;

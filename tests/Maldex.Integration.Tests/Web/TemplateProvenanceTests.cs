@@ -100,7 +100,7 @@ internal static class TemplateSeed
         using var scope = f.Services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
 
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = "oid-" + Guid.NewGuid(), DisplayName = "basht0p", Role = UserRole.Admin };
+        var user = TestUsers.Create(UserRole.Admin, "basht0p");
         db.Users.Add(user);
         var template = new Template { Id = "win11-golden", DisplayName = "Win11 Golden", CreatedAt = SealedAt };
         db.Templates.Add(template);

@@ -67,7 +67,7 @@ public sealed class TemplateJobStepsTests(SqlServerFixture sql) : IDisposable
     {
         await using var scope = app.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "Seeder", Role = UserRole.Admin };
+        var user = TestUsers.Create(UserRole.Admin, "Seeder");
         db.Users.Add(user);
         var sha = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
         var now = DateTimeOffset.UtcNow;
@@ -172,7 +172,7 @@ public sealed class TemplateJobStepsTests(SqlServerFixture sql) : IDisposable
         await using var scope = app.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<MaldexDbContext>();
         var now = DateTimeOffset.UtcNow;
-        var user = new AppUser { Id = Guid.NewGuid(), EntraObjectId = Guid.NewGuid().ToString("N"), DisplayName = "Old Requester", Role = UserRole.Admin };
+        var user = TestUsers.Create(UserRole.Admin, "Old Requester");
         db.Users.Add(user);
         db.Templates.Add(new Template { Id = templateId, DisplayName = templateId, CreatedAt = now });
         var job = new TemplateJob
